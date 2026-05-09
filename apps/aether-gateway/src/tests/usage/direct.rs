@@ -8,6 +8,7 @@ use super::{
     Router, StatusCode, UsageReadRepository, UsageRuntimeConfig, DEVELOPMENT_ENCRYPTION_KEY,
     TRACE_ID_HEADER,
 };
+use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UsageBodyCaptureState};
 
 fn large_request_body(stream: bool) -> String {
     let large_message = "x".repeat(128 * 1024);
@@ -17,6 +18,43 @@ fn large_request_body(stream: bool) -> String {
         "stream": stream
     }))
     .expect("request body should encode")
+}
+
+fn assert_usage_has_openai_chat_request_body(
+    usage: &StoredRequestUsageAudit,
+    expected_stream: Option<bool>,
+) {
+    let request_body = usage
+        .request_body
+        .as_ref()
+        .expect("usage should capture the client request body");
+    assert_eq!(request_body["model"], "gpt-5");
+    assert!(request_body["messages"].is_array());
+    if let Some(expected_stream) = expected_stream {
+        assert_eq!(request_body["stream"], json!(expected_stream));
+    }
+
+    let provider_request_body = usage
+        .provider_request_body
+        .as_ref()
+        .expect("usage should capture the provider request body");
+    assert!(provider_request_body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|model| !model.is_empty()));
+    assert!(provider_request_body["messages"].is_array());
+    if let Some(expected_stream) = expected_stream {
+        assert_eq!(provider_request_body["stream"], json!(expected_stream));
+    }
+
+    assert_eq!(
+        usage.request_body_state,
+        Some(UsageBodyCaptureState::Inline)
+    );
+    assert_eq!(
+        usage.provider_request_body_state,
+        Some(UsageBodyCaptureState::Inline)
+    );
 }
 
 #[tokio::test]
@@ -258,6 +296,7 @@ async fn gateway_records_pending_usage_before_execution_runtime_sync_result_arri
     assert_eq!(pending.status, "pending");
     assert_eq!(pending.billing_status, "pending");
     assert_eq!(pending.response_time_ms, None);
+    assert_usage_has_openai_chat_request_body(&pending, None);
 
     allow_execution_response.notify_one();
 
@@ -278,6 +317,7 @@ async fn gateway_records_pending_usage_before_execution_runtime_sync_result_arri
     let stored = stored.expect("usage should be finalized");
     assert_eq!(stored.status, "completed");
     assert_eq!(stored.response_time_ms, Some(45));
+    assert_usage_has_openai_chat_request_body(&stored, None);
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -285,7 +325,7 @@ async fn gateway_records_pending_usage_before_execution_runtime_sync_result_arri
 }
 
 #[tokio::test]
-async fn gateway_keeps_pending_sync_usage_lightweight_for_large_request_body() {
+async fn gateway_records_pending_sync_usage_body_for_large_request_body() {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
     let execution_request_started = Arc::new(tokio::sync::Notify::new());
@@ -408,10 +448,9 @@ async fn gateway_keeps_pending_sync_usage_lightweight_for_large_request_body() {
     }
     let pending = pending.expect("pending usage should be recorded before sync result resolves");
     assert_eq!(pending.status, "pending");
-    assert!(pending.request_headers.is_none());
-    assert!(pending.request_body.is_none());
-    assert!(pending.provider_request_headers.is_none());
-    assert!(pending.provider_request_body.is_none());
+    assert!(pending.request_headers.is_some());
+    assert_usage_has_openai_chat_request_body(&pending, Some(false));
+    assert!(pending.provider_request_headers.is_some());
     assert!(pending.response_headers.is_none());
     assert!(pending.client_response_headers.is_none());
 
@@ -669,6 +708,7 @@ async fn gateway_records_pending_usage_before_execution_runtime_stream_headers_a
     assert_eq!(pending.billing_status, "pending");
     assert_eq!(pending.first_byte_time_ms, None);
     assert_eq!(pending.response_time_ms, None);
+    assert_usage_has_openai_chat_request_body(&pending, Some(true));
 
     allow_execution_response.notify_one();
 
@@ -689,6 +729,7 @@ async fn gateway_records_pending_usage_before_execution_runtime_stream_headers_a
     let stored = stored.expect("usage should be finalized");
     assert_eq!(stored.status, "completed");
     assert_eq!(stored.first_byte_time_ms, Some(19));
+    assert_usage_has_openai_chat_request_body(&stored, Some(true));
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -696,7 +737,7 @@ async fn gateway_records_pending_usage_before_execution_runtime_stream_headers_a
 }
 
 #[tokio::test]
-async fn gateway_keeps_pending_stream_usage_lightweight_for_large_request_body() {
+async fn gateway_records_pending_stream_usage_body_for_large_request_body() {
     let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
     let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
     let execution_request_started = Arc::new(tokio::sync::Notify::new());
@@ -814,10 +855,9 @@ async fn gateway_keeps_pending_stream_usage_lightweight_for_large_request_body()
     }
     let pending = pending.expect("pending usage should be recorded before stream headers arrive");
     assert_eq!(pending.status, "pending");
-    assert!(pending.request_headers.is_none());
-    assert!(pending.request_body.is_none());
-    assert!(pending.provider_request_headers.is_none());
-    assert!(pending.provider_request_body.is_none());
+    assert!(pending.request_headers.is_some());
+    assert_usage_has_openai_chat_request_body(&pending, Some(true));
+    assert!(pending.provider_request_headers.is_some());
     assert!(pending.response_headers.is_none());
     assert!(pending.client_response_headers.is_none());
 
