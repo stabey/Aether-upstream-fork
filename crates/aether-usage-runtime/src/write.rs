@@ -88,6 +88,11 @@ pub struct LifecycleUsageSeed {
     pub provider_endpoint_kind: Option<String>,
     pub has_format_conversion: Option<bool>,
     pub is_stream: bool,
+    pub request_headers: Option<Value>,
+    pub request_body: Option<Value>,
+    pub provider_request_headers: Option<Value>,
+    pub provider_request: Option<Value>,
+    body_refs: UsageBodyRefsSeed,
     routing: UsageRoutingSeed,
     body_states: UsageBodyStatesSeed,
     pub request_metadata: Option<Value>,
@@ -233,6 +238,7 @@ pub fn build_lifecycle_usage_seed(
     report_context: Option<&Value>,
 ) -> LifecycleUsageSeed {
     let context = report_context.and_then(Value::as_object);
+    let request_capture = build_runtime_request_capture_seed(plan, context);
     let api_format = context_string(context, "client_api_format")
         .or_else(|| non_empty_str(Some(plan.client_api_format.as_str())));
     let endpoint_api_format = context_string(context, "provider_api_format")
@@ -292,8 +298,24 @@ pub fn build_lifecycle_usage_seed(
         provider_endpoint_kind,
         has_format_conversion: context_bool(context, "needs_conversion"),
         is_stream: plan.stream,
+        request_headers: mask_sensitive_headers_in_json_value(context_value(
+            context,
+            "original_headers",
+        )),
+        request_body: request_capture.request_body,
+        provider_request_headers: mask_sensitive_headers_in_json_value(
+            context_usage_value(context, "provider_request_headers")
+                .or_else(|| headers_to_json(&plan.headers)),
+        ),
+        provider_request: request_capture.provider_request,
+        body_refs: UsageBodyRefsSeed {
+            request_body_ref: request_capture.request_body_ref,
+            provider_request_body_ref: request_capture.provider_request_body_ref,
+            response_body_ref: context_string(context, "response_body_ref"),
+            client_response_body_ref: context_string(context, "client_response_body_ref"),
+        },
         routing: build_runtime_routing_seed(plan, context),
-        body_states: build_runtime_body_states_seed(plan, context),
+        body_states: request_capture.body_states,
         request_metadata: build_runtime_request_metadata_seed(plan, context),
     }
 }
@@ -1025,16 +1047,18 @@ fn build_lifecycle_usage_record_owned(
         provider_endpoint_kind,
         has_format_conversion,
         is_stream,
+        request_headers,
+        request_body,
+        provider_request_headers,
+        provider_request,
+        body_refs,
         routing,
         body_states,
         request_metadata,
         ..
     } = seed;
     let routing = merge_routing_seed_with_metadata_owned(routing, request_metadata.as_ref());
-    let body_refs = merge_body_refs_seed_with_metadata_owned(
-        UsageBodyRefsSeed::default(),
-        request_metadata.as_ref(),
-    );
+    let body_refs = merge_body_refs_seed_with_metadata_owned(body_refs, request_metadata.as_ref());
     let request_metadata = if trusted_request_metadata {
         request_metadata
     } else {
@@ -1081,12 +1105,12 @@ fn build_lifecycle_usage_record_owned(
         first_byte_time_ms,
         status: status.to_string(),
         billing_status: billing_status.to_string(),
-        request_headers: None,
-        request_body: None,
+        request_headers: sanitize_usage_header_capture(request_headers),
+        request_body,
         request_body_ref: body_refs.request_body_ref,
         request_body_state: body_states.request_body_state,
-        provider_request_headers: None,
-        provider_request_body: None,
+        provider_request_headers: sanitize_usage_header_capture(provider_request_headers),
+        provider_request_body: provider_request,
         provider_request_body_ref: body_refs.provider_request_body_ref,
         provider_request_body_state: body_states.provider_request_body_state,
         response_headers: sanitize_usage_header_capture(response_headers),
@@ -1128,10 +1152,8 @@ fn build_lifecycle_usage_record_impl(
     } = options;
     let (status, billing_status) = lifecycle_status_and_billing(lifecycle_state);
     let routing = merge_routing_seed_with_metadata(&seed.routing, seed.request_metadata.as_ref());
-    let body_refs = merge_body_refs_seed_with_metadata(
-        &UsageBodyRefsSeed::default(),
-        seed.request_metadata.as_ref(),
-    );
+    let body_refs =
+        merge_body_refs_seed_with_metadata(&seed.body_refs, seed.request_metadata.as_ref());
     let request_metadata = if trusted_request_metadata {
         seed.request_metadata.clone()
     } else {
@@ -1178,12 +1200,14 @@ fn build_lifecycle_usage_record_impl(
         first_byte_time_ms,
         status: status.to_string(),
         billing_status: billing_status.to_string(),
-        request_headers: None,
-        request_body: None,
+        request_headers: sanitize_usage_header_capture(seed.request_headers.clone()),
+        request_body: seed.request_body.clone(),
         request_body_ref: body_refs.request_body_ref,
         request_body_state: seed.body_states.request_body_state,
-        provider_request_headers: None,
-        provider_request_body: None,
+        provider_request_headers: sanitize_usage_header_capture(
+            seed.provider_request_headers.clone(),
+        ),
+        provider_request_body: seed.provider_request.clone(),
         provider_request_body_ref: body_refs.provider_request_body_ref,
         provider_request_body_state: seed.body_states.provider_request_body_state,
         response_headers: sanitize_usage_header_capture(response_headers),
@@ -1624,23 +1648,6 @@ fn capture_usage_storage_value(value: Value) -> Value {
         "max_bytes": MAX_USAGE_CAPTURE_BYTES,
         "value_kind": usage_value_kind(&value),
     })
-}
-
-fn build_runtime_body_states_seed(
-    plan: &ExecutionPlan,
-    context: Option<&Map<String, Value>>,
-) -> UsageBodyStatesSeed {
-    let request_body_ref = context_string(context, "request_body_ref");
-    let provider_request_body_ref = context_string(context, "provider_request_body_ref")
-        .or_else(|| non_empty_str(plan.body.body_ref.as_deref()));
-    build_runtime_body_states_seed_from_parts(
-        context_has_inline_body(context, "original_request_body"),
-        request_body_ref.as_deref(),
-        context_has_inline_body(context, "provider_request_body")
-            || plan_has_inline_json_body_for_usage(plan),
-        provider_request_body_ref.as_deref(),
-        plan.body.body_bytes_b64.is_some(),
-    )
 }
 
 fn build_runtime_body_states_seed_from_parts(
@@ -2474,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_usage_records_stay_lightweight() {
+    fn pending_usage_records_capture_request_payloads() {
         let plan = ExecutionPlan {
             request_id: "req-pending-usage-1".to_string(),
             candidate_id: Some("cand-pending-usage-1".to_string()),
@@ -2515,9 +2522,9 @@ mod tests {
                 "execution_path": "local_execution_runtime_miss",
                 "local_execution_runtime_miss_reason": "all_candidates_skipped",
                 "original_headers": {"authorization": "Bearer upstream-secret"},
-                "original_request_body": {"messages": [{"content": "should not be persisted in pending"}]},
+                "original_request_body": {"messages": [{"content": "visible before response"}]},
                 "provider_request_headers": {"authorization": "Bearer provider-secret"},
-                "provider_request_body": {"input": "should not be persisted in pending"}
+                "provider_request_body": {"input": "visible before response"}
             })),
             1_700_000_000,
         )
@@ -2525,10 +2532,30 @@ mod tests {
 
         assert_eq!(record.status, "pending");
         assert_eq!(record.billing_status, "pending");
-        assert!(record.request_headers.is_none());
-        assert!(record.request_body.is_none());
-        assert!(record.provider_request_headers.is_none());
-        assert!(record.provider_request_body.is_none());
+        assert_eq!(
+            record.request_headers,
+            Some(json!({"authorization": "Bear****cret"}))
+        );
+        assert_eq!(
+            record.request_body,
+            Some(json!({"messages": [{"content": "visible before response"}]}))
+        );
+        assert_eq!(
+            record.provider_request_headers,
+            Some(json!({"authorization": "Bear****cret"}))
+        );
+        assert_eq!(
+            record.provider_request_body,
+            Some(json!({"input": "visible before response"}))
+        );
+        assert_eq!(
+            record.request_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
+        assert_eq!(
+            record.provider_request_body_state,
+            Some(UsageBodyCaptureState::Inline)
+        );
         assert_eq!(record.candidate_id.as_deref(), Some("cand-pending-usage-1"));
         assert_eq!(record.candidate_index, Some(0));
         assert_eq!(record.key_name.as_deref(), Some("codex-upstream"));
@@ -2592,7 +2619,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_usage_records_stay_lightweight_by_default() {
+    fn streaming_usage_records_capture_request_payloads_by_default() {
         let plan = ExecutionPlan {
             request_id: "req-streaming-usage-1".to_string(),
             candidate_id: Some("cand-streaming-usage-1".to_string()),
@@ -2619,8 +2646,10 @@ mod tests {
             &plan,
             Some(&json!({
                 "candidate_id": "cand-streaming-usage-1",
-                "original_request_body": {"messages": [{"content": "omit me"}]},
-                "provider_request_body": {"input": "omit me too"}
+                "original_headers": {"authorization": "Bearer stream-secret"},
+                "original_request_body": {"messages": [{"content": "visible while streaming"}]},
+                "provider_request_headers": {"x-api-key": "provider-stream-secret"},
+                "provider_request_body": {"input": "visible while streaming"}
             })),
             200,
             None,
@@ -2631,10 +2660,22 @@ mod tests {
         assert_eq!(record.status, "streaming");
         assert_eq!(record.billing_status, "pending");
         assert_eq!(record.status_code, Some(200));
-        assert!(record.request_headers.is_none());
-        assert!(record.request_body.is_none());
-        assert!(record.provider_request_headers.is_none());
-        assert!(record.provider_request_body.is_none());
+        assert_eq!(
+            record.request_headers,
+            Some(json!({"authorization": "Bear****cret"}))
+        );
+        assert_eq!(
+            record.request_body,
+            Some(json!({"messages": [{"content": "visible while streaming"}]}))
+        );
+        assert_eq!(
+            record.provider_request_headers,
+            Some(json!({"x-api-key": "prov****cret"}))
+        );
+        assert_eq!(
+            record.provider_request_body,
+            Some(json!({"input": "visible while streaming"}))
+        );
         assert!(record.response_headers.is_none());
         assert!(record.client_response_headers.is_none());
     }
@@ -3955,6 +3996,11 @@ mod tests {
                 provider_endpoint_kind: Some("chat".to_string()),
                 has_format_conversion: Some(false),
                 is_stream: false,
+                request_headers: None,
+                request_body: None,
+                provider_request_headers: None,
+                provider_request: None,
+                body_refs: UsageBodyRefsSeed::default(),
                 body_states: UsageBodyStatesSeed::default(),
                 routing: UsageRoutingSeed {
                     candidate_id: Some("cand-1".to_string()),
