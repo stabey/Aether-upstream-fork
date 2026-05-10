@@ -13,3 +13,4 @@ ON CONFLICT (body_ref)
 DO UPDATE SET
   payload_gzip = EXCLUDED.payload_gzip,
   updated_at = NOW()
+WHERE usage_body_blobs.payload_gzip IS DISTINCT FROM EXCLUDED.payload_gzip
