@@ -476,7 +476,10 @@ pub(crate) async fn execute_execution_runtime_stream(
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let stream_started_at = Instant::now();
     ensure_execution_request_candidate_slot(state, &mut plan, &mut report_context).await;
-    let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let lifecycle_seed = std::sync::Arc::new(build_lifecycle_usage_seed(
+        &plan,
+        report_context.as_ref(),
+    ));
     let request_candidate_status_snapshot =
         snapshot_local_request_candidate_status(&plan, report_context.as_ref());
     state
@@ -1095,7 +1098,10 @@ async fn execute_stream_from_frame_stream(
     let candidate_id = plan.candidate_id.as_deref();
     let provider_name = plan.provider_name.as_deref().unwrap_or("-");
     let model_name = plan.model_name.as_deref().unwrap_or("-");
-    let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let lifecycle_seed = std::sync::Arc::new(build_lifecycle_usage_seed(
+        &plan,
+        report_context.as_ref(),
+    ));
     let request_candidate_status_snapshot =
         snapshot_local_request_candidate_status(&plan, report_context.as_ref());
     let candidate_index = parse_request_candidate_report_context(report_context.as_ref())
@@ -1835,7 +1841,7 @@ async fn execute_stream_from_frame_stream(
 
     state.usage_runtime.record_stream_started(
         state.data.as_ref(),
-        &lifecycle_seed,
+        lifecycle_seed.clone(),
         status_code,
         prefetched_telemetry.as_ref(),
     );
@@ -2361,7 +2367,7 @@ async fn execute_stream_from_frame_stream(
                             };
                             state_for_report.usage_runtime.record_stream_started(
                                 state_for_report.data.as_ref(),
-                                &lifecycle_seed_for_report,
+                                lifecycle_seed_for_report.clone(),
                                 status_code,
                                 Some(&first_data_telemetry),
                             );
@@ -2409,7 +2415,7 @@ async fn execute_stream_from_frame_stream(
                         if should_refresh_stream_usage {
                             state_for_report.usage_runtime.record_stream_started(
                                 state_for_report.data.as_ref(),
-                                &lifecycle_seed_for_report,
+                                lifecycle_seed_for_report.clone(),
                                 status_code,
                                 Some(&frame_telemetry),
                             );

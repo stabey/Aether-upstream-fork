@@ -1047,7 +1047,10 @@ async fn execute_execution_runtime_sync_impl(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string());
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
-    let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let lifecycle_seed = std::sync::Arc::new(build_lifecycle_usage_seed(
+        &plan,
+        report_context.as_ref(),
+    ));
     state
         .usage_runtime
         .record_pending(state.data.as_ref(), lifecycle_seed);

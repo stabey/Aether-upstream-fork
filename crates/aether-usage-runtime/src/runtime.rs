@@ -119,7 +119,7 @@ impl UsageRuntime {
         Some(worker.spawn())
     }
 
-    pub fn record_pending<T>(&self, data: &T, seed: LifecycleUsageSeed)
+    pub fn record_pending<T>(&self, data: &T, seed: Arc<LifecycleUsageSeed>)
     where
         T: UsageRuntimeAccess + Clone + 'static,
     {
@@ -159,7 +159,7 @@ impl UsageRuntime {
     pub fn record_stream_started<T>(
         &self,
         data: &T,
-        seed: &LifecycleUsageSeed,
+        seed: Arc<LifecycleUsageSeed>,
         status_code: u16,
         telemetry: Option<&ExecutionTelemetry>,
     ) where
@@ -169,7 +169,6 @@ impl UsageRuntime {
             return;
         }
         let data = T::clone(data);
-        let seed = seed.clone();
         let telemetry = telemetry.cloned();
         let request_id = seed.request_id.clone();
         spawn_on_usage_background_runtime(boxed_usage_task(async move {
@@ -425,10 +424,11 @@ impl UsageRuntime {
 }
 
 async fn build_pending_usage_record_offthread(
-    seed: LifecycleUsageSeed,
+    seed: Arc<LifecycleUsageSeed>,
     now_unix_secs: u64,
 ) -> Result<UpsertUsageRecord, DataLayerError> {
     tokio::task::spawn_blocking(move || {
+        let seed = Arc::try_unwrap(seed).unwrap_or_else(|shared| (*shared).clone());
         crate::write::build_pending_usage_record_from_owned_seed(seed, now_unix_secs)
     })
     .await
@@ -436,12 +436,13 @@ async fn build_pending_usage_record_offthread(
 }
 
 async fn build_streaming_usage_record_offthread(
-    seed: LifecycleUsageSeed,
+    seed: Arc<LifecycleUsageSeed>,
     status_code: u16,
     telemetry: Option<ExecutionTelemetry>,
     now_unix_secs: u64,
 ) -> Result<UpsertUsageRecord, DataLayerError> {
     tokio::task::spawn_blocking(move || {
+        let seed = Arc::try_unwrap(seed).unwrap_or_else(|shared| (*shared).clone());
         crate::write::build_streaming_usage_record_from_owned_seed(
             seed,
             status_code,
