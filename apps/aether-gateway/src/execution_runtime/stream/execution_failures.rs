@@ -2,7 +2,7 @@ use aether_contracts::{ExecutionError, ExecutionPlan, ExecutionTelemetry};
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
 use aether_scheduler_core::SchedulerRequestCandidateStatusUpdate;
 use aether_usage_runtime::{
-    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
+    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed_with_options,
 };
 use axum::body::Body;
 use axum::http::Response;
@@ -271,11 +271,15 @@ async fn record_stream_sync_failure(
         }),
     )
     .await;
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
-    let payload_seed = build_sync_terminal_usage_payload_seed(payload);
-    state
-        .usage_runtime
-        .record_sync_terminal(state.data.as_ref(), context_seed, payload_seed);
+    if state.usage_runtime.is_enabled() {
+        let seed_options = super::usage_seed_build_options(state, plan.request_id.as_str()).await;
+        let context_seed =
+            build_terminal_usage_context_seed_with_options(plan, report_context, seed_options);
+        let payload_seed = build_sync_terminal_usage_payload_seed(payload);
+        state
+            .usage_runtime
+            .record_sync_terminal(state.data.as_ref(), context_seed, payload_seed);
+    }
     let terminal_unix_secs = current_request_candidate_unix_ms();
     record_report_request_candidate_status(
         state,

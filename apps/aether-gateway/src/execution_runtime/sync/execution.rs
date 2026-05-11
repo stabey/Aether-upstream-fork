@@ -10,8 +10,9 @@ use aether_scheduler_core::{
     SchedulerRequestCandidateStatusUpdate,
 };
 use aether_usage_runtime::{
-    build_lifecycle_usage_seed, build_sync_terminal_usage_payload_seed,
-    build_terminal_usage_context_seed,
+    build_lifecycle_usage_seed_with_options, build_sync_terminal_usage_payload_seed,
+    build_terminal_usage_context_seed_with_options, UsageRequestRecordLevel, UsageRuntimeAccess,
+    UsageSeedBuildOptions,
 };
 use async_stream::stream;
 use axum::body::{to_bytes, Body, Bytes};
@@ -122,13 +123,41 @@ struct ImplicitSyncFinalizeOutcome {
     outcome: LocalCoreSyncFinalizeOutcome,
 }
 
-fn record_sync_terminal_usage(
+async fn usage_seed_build_options(state: &AppState, request_id: &str) -> UsageSeedBuildOptions {
+    if !state.usage_runtime.is_enabled() {
+        return UsageSeedBuildOptions::without_request_payloads();
+    }
+
+    match UsageRuntimeAccess::request_record_level(state.data.as_ref()).await {
+        Ok(UsageRequestRecordLevel::Basic) => UsageSeedBuildOptions::without_request_payloads(),
+        Ok(UsageRequestRecordLevel::Full) => UsageSeedBuildOptions::full(),
+        Err(err) => {
+            warn!(
+                event_name = "usage_seed_policy_read_failed",
+                log_type = "ops",
+                request_id = %short_request_id(request_id),
+                error = %err,
+                fallback = "full",
+                "gateway failed to read usage request record level while building usage seed"
+            );
+            UsageSeedBuildOptions::full()
+        }
+    }
+}
+
+async fn record_sync_terminal_usage(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
 ) {
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    if !state.usage_runtime.is_enabled() {
+        return;
+    }
+
+    let seed_options = usage_seed_build_options(state, plan.request_id.as_str()).await;
+    let context_seed =
+        build_terminal_usage_context_seed_with_options(plan, report_context, seed_options);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     state
         .usage_runtime
@@ -1047,13 +1076,17 @@ async fn execute_execution_runtime_sync_impl(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string());
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
-    let lifecycle_seed = std::sync::Arc::new(build_lifecycle_usage_seed(
-        &plan,
-        report_context.as_ref(),
-    ));
-    state
-        .usage_runtime
-        .record_pending(state.data.as_ref(), lifecycle_seed);
+    if state.usage_runtime.is_enabled() {
+        let seed_options = usage_seed_build_options(state, plan.request_id.as_str()).await;
+        let lifecycle_seed = std::sync::Arc::new(build_lifecycle_usage_seed_with_options(
+            &plan,
+            report_context.as_ref(),
+            seed_options,
+        ));
+        state
+            .usage_runtime
+            .record_pending(state.data.as_ref(), lifecycle_seed);
+    }
     record_local_request_candidate_status(
         state,
         &plan,
@@ -1657,7 +1690,8 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             implicit_finalize.payload.report_context.as_ref(),
             usage_payload,
-        );
+        )
+        .await;
         if let Some(report_payload) = implicit_finalize.outcome.background_report {
             spawn_sync_report(state.clone(), report_payload);
         } else {
@@ -1709,7 +1743,8 @@ async fn execute_execution_runtime_sync_impl(
                 &plan,
                 payload.report_context.as_ref(),
                 usage_payload,
-            );
+            )
+            .await;
             if let Some(report_payload) = outcome.background_report {
                 spawn_sync_report(state.clone(), report_payload);
             } else {
@@ -1754,7 +1789,8 @@ async fn execute_execution_runtime_sync_impl(
                     &plan,
                     original_report_context.as_ref(),
                     &report_payload,
-                );
+                )
+                .await;
                 if let Some(snapshot) = local_task_snapshot {
                     let _ = state.upsert_video_task_snapshot(&snapshot).await?;
                     state.video_tasks.record_snapshot(snapshot);
@@ -1782,7 +1818,8 @@ async fn execute_execution_runtime_sync_impl(
                 resolve_local_sync_success_background_report_kind(payload.report_kind.as_str());
             apply_sync_success_effects(state, &plan, payload.report_context.as_ref(), &payload)
                 .await;
-            record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+            record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload)
+                .await;
             state
                 .video_tasks
                 .apply_finalize_mutation(request_path, payload.report_kind.as_str());
@@ -1822,7 +1859,8 @@ async fn execute_execution_runtime_sync_impl(
             if let Some(error_report_kind) = background_error_report_kind {
                 payload.report_kind = error_report_kind.to_string();
             }
-            record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+            record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload)
+                .await;
             if background_error_report_kind.is_some() {
                 spawn_sync_report(state.clone(), payload);
             } else {
@@ -1842,7 +1880,7 @@ async fn execute_execution_runtime_sync_impl(
                 candidate_id,
             )?));
         }
-        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload).await;
         let response =
             submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
         return Ok(Some(attach_control_metadata_headers(
@@ -1876,7 +1914,8 @@ async fn execute_execution_runtime_sync_impl(
         &plan,
         usage_payload.report_context.as_ref(),
         &usage_payload,
-    );
+    )
+    .await;
     let response = attach_control_metadata_headers(
         build_client_response_from_parts(
             status_code,

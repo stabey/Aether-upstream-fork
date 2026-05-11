@@ -229,6 +229,31 @@ struct LifecycleUsageRecordOptions {
     trusted_request_metadata: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageSeedBuildOptions {
+    pub capture_request_payloads: bool,
+}
+
+impl UsageSeedBuildOptions {
+    pub const fn full() -> Self {
+        Self {
+            capture_request_payloads: true,
+        }
+    }
+
+    pub const fn without_request_payloads() -> Self {
+        Self {
+            capture_request_payloads: false,
+        }
+    }
+}
+
+impl Default for UsageSeedBuildOptions {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
 const MAX_USAGE_CAPTURE_DEPTH: usize = 64;
 const MAX_USAGE_CAPTURE_NODES: usize = 20_000;
 const MAX_USAGE_CAPTURE_BYTES: usize = 64 * 1024;
@@ -237,8 +262,16 @@ pub fn build_lifecycle_usage_seed(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
 ) -> LifecycleUsageSeed {
+    build_lifecycle_usage_seed_with_options(plan, report_context, UsageSeedBuildOptions::full())
+}
+
+pub fn build_lifecycle_usage_seed_with_options(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    options: UsageSeedBuildOptions,
+) -> LifecycleUsageSeed {
     let context = report_context.and_then(Value::as_object);
-    let request_capture = build_runtime_request_capture_seed(plan, context);
+    let request_capture = build_runtime_request_capture_seed(plan, context, options);
     let api_format = context_string(context, "client_api_format")
         .or_else(|| non_empty_str(Some(plan.client_api_format.as_str())));
     let endpoint_api_format = context_string(context, "provider_api_format")
@@ -316,7 +349,7 @@ pub fn build_lifecycle_usage_seed(
         },
         routing: build_runtime_routing_seed(plan, context),
         body_states: request_capture.body_states,
-        request_metadata: build_runtime_request_metadata_seed(plan, context),
+        request_metadata: build_runtime_request_metadata_seed(plan, context, options),
     }
 }
 
@@ -653,8 +686,20 @@ pub fn build_terminal_usage_context_seed(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
 ) -> TerminalUsageContextSeed {
+    build_terminal_usage_context_seed_with_options(
+        plan,
+        report_context,
+        UsageSeedBuildOptions::full(),
+    )
+}
+
+pub fn build_terminal_usage_context_seed_with_options(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    options: UsageSeedBuildOptions,
+) -> TerminalUsageContextSeed {
     let context = report_context.and_then(Value::as_object);
-    let request_capture = build_runtime_request_capture_seed(plan, context);
+    let request_capture = build_runtime_request_capture_seed(plan, context, options);
     let client_contract = context_string(context, "client_contract")
         .or_else(|| context_string(context, "client_api_format"))
         .or_else(|| non_empty_str(Some(plan.client_api_format.as_str())))
@@ -715,8 +760,11 @@ pub fn build_terminal_usage_context_seed(
         },
         body_states: request_capture.body_states,
         request_metadata: merge_usage_request_metadata_owned(
-            build_usage_request_metadata_seed(plan, context),
-            build_plan_body_capture_metadata(plan.body.body_bytes_b64.as_deref()),
+            build_usage_request_metadata_seed_with_options(plan, context, options),
+            options
+                .capture_request_payloads
+                .then(|| build_plan_body_capture_metadata(plan.body.body_bytes_b64.as_deref()))
+                .flatten(),
         ),
     }
 }
@@ -1246,7 +1294,8 @@ fn build_usage_event_data_seed_with_detail(
 ) -> UsageEventData {
     let context = report_context.and_then(Value::as_object);
     let routing = build_runtime_routing_seed(plan, context);
-    let request_capture = build_runtime_request_capture_seed(plan, context);
+    let request_capture =
+        build_runtime_request_capture_seed(plan, context, UsageSeedBuildOptions::full());
     let api_format = context_string(context, "client_api_format")
         .or_else(|| non_empty_str(Some(plan.client_api_format.as_str())));
     let endpoint_api_format = context_string(context, "provider_api_format")
@@ -1512,7 +1561,18 @@ fn plan_has_inline_json_body_for_usage(plan: &ExecutionPlan) -> bool {
 fn build_runtime_request_capture_seed(
     plan: &ExecutionPlan,
     context: Option<&Map<String, Value>>,
+    options: UsageSeedBuildOptions,
 ) -> RuntimeRequestCaptureSeed {
+    if !options.capture_request_payloads {
+        return RuntimeRequestCaptureSeed {
+            request_body: None,
+            request_body_ref: None,
+            provider_request: None,
+            provider_request_body_ref: None,
+            body_states: build_runtime_body_states_seed_from_parts(false, None, false, None, false),
+        };
+    }
+
     let request_body = context_body_value(context, "original_request_body");
     let request_body_ref = context_string(context, "request_body_ref");
     let provider_request = context_body_value(context, "provider_request_body")
@@ -1539,21 +1599,34 @@ fn build_runtime_request_capture_seed(
 fn build_runtime_request_metadata_seed(
     plan: &ExecutionPlan,
     context: Option<&Map<String, Value>>,
+    options: UsageSeedBuildOptions,
 ) -> Option<Value> {
-    let request_body_ref = context_string(context, "request_body_ref");
-    let provider_request_body_ref = context_string(context, "provider_request_body_ref")
-        .or_else(|| non_empty_str(plan.body.body_ref.as_deref()));
-    let request_has_inline_body = context_has_inline_body(context, "original_request_body");
-    let provider_request_has_inline_body =
-        context_has_inline_body(context, "provider_request_body")
-            || plan_has_inline_json_body_for_usage(plan);
+    let request_body_ref = options
+        .capture_request_payloads
+        .then(|| context_string(context, "request_body_ref"))
+        .flatten();
+    let provider_request_body_ref = options
+        .capture_request_payloads
+        .then(|| {
+            context_string(context, "provider_request_body_ref")
+                .or_else(|| non_empty_str(plan.body.body_ref.as_deref()))
+        })
+        .flatten();
+    let request_has_inline_body = options.capture_request_payloads
+        && context_has_inline_body(context, "original_request_body");
+    let provider_request_has_inline_body = options.capture_request_payloads
+        && (context_has_inline_body(context, "provider_request_body")
+            || plan_has_inline_json_body_for_usage(plan));
     let mut metadata = build_runtime_request_metadata_seed_from_parts(
         context,
         request_has_inline_body,
         request_body_ref.as_deref(),
         provider_request_has_inline_body,
         provider_request_body_ref.as_deref(),
-        plan.body.body_bytes_b64.as_deref(),
+        options
+            .capture_request_payloads
+            .then_some(plan.body.body_bytes_b64.as_deref())
+            .flatten(),
     );
     if let Some(proxy) = plan.proxy.as_ref() {
         if let Some(node_id) = proxy
@@ -1575,6 +1648,28 @@ fn build_runtime_request_metadata_seed(
         }
     }
     metadata
+}
+
+fn build_usage_request_metadata_seed_with_options(
+    plan: &ExecutionPlan,
+    context: Option<&Map<String, Value>>,
+    options: UsageSeedBuildOptions,
+) -> Option<Value> {
+    if options.capture_request_payloads {
+        return build_usage_request_metadata_seed(plan, context);
+    }
+
+    let mut metadata = build_usage_request_metadata_seed(plan, context)?;
+    if let Some(object) = metadata.as_object_mut() {
+        object.remove("request_body_ref");
+        object.remove("provider_request_body_ref");
+        object.remove("provider_request_body_base64_bytes");
+        object.remove("body_capture");
+        if object.is_empty() {
+            return None;
+        }
+    }
+    Some(metadata)
 }
 
 fn build_runtime_request_metadata_seed_from_parts(
@@ -2303,16 +2398,17 @@ fn empty_to_none(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pending_usage_record, build_pending_usage_record_from_seed,
-        build_stream_terminal_usage_event, build_streaming_usage_record,
-        build_sync_terminal_usage_event, build_sync_terminal_usage_payload_seed,
-        build_sync_terminal_usage_seed, build_terminal_usage_context_seed,
+        build_lifecycle_usage_seed_with_options, build_pending_usage_record,
+        build_pending_usage_record_from_seed, build_stream_terminal_usage_event,
+        build_streaming_usage_record, build_sync_terminal_usage_event,
+        build_sync_terminal_usage_payload_seed, build_sync_terminal_usage_seed,
+        build_terminal_usage_context_seed, build_terminal_usage_context_seed_with_options,
         build_terminal_usage_event_from_seed, build_usage_event_data_seed,
         extract_token_counts_from_json, extract_token_counts_from_value, headers_to_json,
         mask_header_value, mask_sensitive_headers_in_json_value, parse_sse_body_for_storage,
         resolve_error_message, trim_owned_non_empty_string, LifecycleUsageSeed, TerminalUsageSeed,
-        UsageBodyRefsSeed, UsageBodyStatesSeed, UsageRoutingSeed, UsageTerminalState,
-        MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
+        UsageBodyRefsSeed, UsageBodyStatesSeed, UsageRoutingSeed, UsageSeedBuildOptions,
+        UsageTerminalState, MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
     };
     use crate::{
         build_upsert_usage_record_from_event, GatewayStreamReportRequest, GatewaySyncReportRequest,
@@ -3564,6 +3660,107 @@ mod tests {
             .request_metadata
             .as_ref()
             .is_none_or(|value| { value.get("provider_request_body_ref").is_none() }));
+    }
+
+    #[test]
+    fn usage_seed_build_options_can_skip_request_payload_capture() {
+        let plan = ExecutionPlan {
+            request_id: "req-skip-request-payloads-1".to_string(),
+            candidate_id: Some("cand-skip-request-payloads-1".to_string()),
+            provider_name: Some("OpenAI".to_string()),
+            provider_id: "provider-1".to_string(),
+            endpoint_id: "endpoint-1".to_string(),
+            key_id: "key-1".to_string(),
+            method: "POST".to_string(),
+            url: "https://example.com/v1/responses".to_string(),
+            headers: BTreeMap::new(),
+            content_type: Some("application/json".to_string()),
+            content_encoding: None,
+            body: RequestBody {
+                json_body: Some(json!({
+                    "model": "gpt-5.4",
+                    "input": "provider secret"
+                })),
+                body_bytes_b64: Some(
+                    base64::engine::general_purpose::STANDARD.encode(b"provider secret"),
+                ),
+                body_ref: Some("blob://provider-request".to_string()),
+            },
+            stream: false,
+            client_api_format: "openai:responses".to_string(),
+            provider_api_format: "openai:responses".to_string(),
+            model_name: Some("gpt-5.4".to_string()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let report_context = json!({
+            "trace_id": "trace-skip-request-payloads-1",
+            "client_api_format": "openai:responses",
+            "provider_api_format": "openai:responses",
+            "original_request_body": {"input": "client secret"},
+            "provider_request_body": {"input": "provider secret"},
+            "request_body_ref": "blob://client-request",
+            "provider_request_body_ref": "blob://provider-request-context",
+            "provider_request_body_base64_bytes": 15
+        });
+        let options = UsageSeedBuildOptions::without_request_payloads();
+
+        let lifecycle_seed =
+            build_lifecycle_usage_seed_with_options(&plan, Some(&report_context), options);
+
+        assert!(lifecycle_seed.request_body.is_none());
+        assert!(lifecycle_seed.provider_request.is_none());
+        assert!(lifecycle_seed.body_refs.request_body_ref.is_none());
+        assert!(lifecycle_seed.body_refs.provider_request_body_ref.is_none());
+        assert_eq!(
+            lifecycle_seed
+                .request_metadata
+                .as_ref()
+                .and_then(|value| value.get("trace_id"))
+                .and_then(Value::as_str),
+            Some("trace-skip-request-payloads-1")
+        );
+        assert!(lifecycle_seed
+            .request_metadata
+            .as_ref()
+            .is_none_or(|value| value.get("provider_request_body_base64_bytes").is_none()));
+
+        let payload = GatewaySyncReportRequest {
+            trace_id: "trace-skip-request-payloads-1".to_string(),
+            report_kind: "openai_responses_sync_success".to_string(),
+            report_context: Some(report_context),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            body_json: Some(json!({"id": "resp_123"})),
+            client_body_json: None,
+            body_base64: None,
+            telemetry: None,
+        };
+        let context_seed = build_terminal_usage_context_seed_with_options(
+            &plan,
+            payload.report_context.as_ref(),
+            options,
+        );
+        assert!(context_seed.request_body.is_none());
+        assert!(context_seed.provider_request.is_none());
+        assert!(context_seed.body_refs.request_body_ref.is_none());
+        assert!(context_seed.body_refs.provider_request_body_ref.is_none());
+        assert!(context_seed
+            .request_metadata
+            .as_ref()
+            .is_none_or(|value| value.get("provider_request_body_base64_bytes").is_none()));
+
+        let event = build_terminal_usage_event_from_seed(build_sync_terminal_usage_seed(
+            context_seed,
+            build_sync_terminal_usage_payload_seed(&payload),
+        ))
+        .expect("usage event should build from bodyless seed");
+
+        assert!(event.data.request_body.is_none());
+        assert!(event.data.provider_request_body.is_none());
+        assert!(event.data.request_body_ref.is_none());
+        assert!(event.data.provider_request_body_ref.is_none());
     }
 
     #[test]
