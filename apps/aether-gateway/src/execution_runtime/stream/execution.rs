@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Error as IoError;
+use std::sync::Arc;
 use std::time::Instant;
 
 use aether_contracts::{
@@ -12,10 +13,10 @@ use aether_scheduler_core::{
     parse_request_candidate_report_context, SchedulerRequestCandidateStatusUpdate,
 };
 use aether_usage_runtime::{
-    build_lifecycle_usage_seed, build_stream_terminal_usage_payload_seed,
-    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed,
-    UsageBodyCapturePolicy, UsageRequestRecordLevel, UsageRuntimeAccess,
-    DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
+    build_lifecycle_usage_seed_with_options, build_stream_terminal_usage_payload_seed,
+    build_sync_terminal_usage_payload_seed, build_terminal_usage_context_seed_with_options,
+    LifecycleUsageSeed, UsageBodyCapturePolicy, UsageRequestRecordLevel, UsageRuntimeAccess,
+    UsageSeedBuildOptions, DEFAULT_USAGE_RESPONSE_BODY_CAPTURE_LIMIT_BYTES,
 };
 use async_stream::stream;
 use axum::body::{Body, Bytes};
@@ -94,13 +95,41 @@ use crate::{
     AppState, GatewayError, GEMINI_FILES_DOWNLOAD_PLAN_KIND, OPENAI_VIDEO_CONTENT_PLAN_KIND,
 };
 
-fn record_sync_terminal_usage(
+async fn usage_seed_build_options(state: &AppState, request_id: &str) -> UsageSeedBuildOptions {
+    if !state.usage_runtime.is_enabled() {
+        return UsageSeedBuildOptions::without_request_payloads();
+    }
+
+    match UsageRuntimeAccess::request_record_level(state.data.as_ref()).await {
+        Ok(UsageRequestRecordLevel::Basic) => UsageSeedBuildOptions::without_request_payloads(),
+        Ok(UsageRequestRecordLevel::Full) => UsageSeedBuildOptions::full(),
+        Err(err) => {
+            warn!(
+                event_name = "usage_seed_policy_read_failed",
+                log_type = "ops",
+                request_id = %short_request_id(request_id),
+                error = %err,
+                fallback = "full",
+                "gateway failed to read usage request record level while building usage seed"
+            );
+            UsageSeedBuildOptions::full()
+        }
+    }
+}
+
+async fn record_sync_terminal_usage(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
 ) {
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    if !state.usage_runtime.is_enabled() {
+        return;
+    }
+
+    let seed_options = usage_seed_build_options(state, plan.request_id.as_str()).await;
+    let context_seed =
+        build_terminal_usage_context_seed_with_options(plan, report_context, seed_options);
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     state
         .usage_runtime
@@ -176,14 +205,20 @@ fn build_stream_error_sync_payload(
     }
 }
 
-fn record_stream_terminal_usage(
+async fn record_stream_terminal_usage(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewayStreamReportRequest,
     cancelled: bool,
 ) {
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    if !state.usage_runtime.is_enabled() {
+        return;
+    }
+
+    let seed_options = usage_seed_build_options(state, plan.request_id.as_str()).await;
+    let context_seed =
+        build_terminal_usage_context_seed_with_options(plan, report_context, seed_options);
     let payload_seed = build_stream_terminal_usage_payload_seed(payload);
     state.usage_runtime.record_stream_terminal(
         state.data.as_ref(),
@@ -460,15 +495,21 @@ pub(crate) async fn execute_execution_runtime_stream(
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let stream_started_at = Instant::now();
     ensure_execution_request_candidate_slot(state, &mut plan, &mut report_context).await;
-    let lifecycle_seed = std::sync::Arc::new(build_lifecycle_usage_seed(
-        &plan,
-        report_context.as_ref(),
-    ));
+    let seed_options = usage_seed_build_options(state, plan.request_id.as_str()).await;
+    let lifecycle_seed = state.usage_runtime.is_enabled().then(|| {
+        Arc::new(build_lifecycle_usage_seed_with_options(
+            &plan,
+            report_context.as_ref(),
+            seed_options,
+        ))
+    });
     let request_candidate_status_snapshot =
         snapshot_local_request_candidate_status(&plan, report_context.as_ref());
-    state
-        .usage_runtime
-        .record_pending(state.data.as_ref(), lifecycle_seed.clone());
+    if let Some(lifecycle_seed) = lifecycle_seed.as_ref() {
+        state
+            .usage_runtime
+            .record_pending(state.data.as_ref(), lifecycle_seed.clone());
+    }
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
     if let Some(snapshot) = request_candidate_status_snapshot.clone() {
         let state_bg = state.clone();
@@ -503,6 +544,12 @@ pub(crate) async fn execute_execution_runtime_stream(
         .unwrap_or_else(|| "-".to_string());
     match maybe_execute_kiro_web_search_stream(state, &plan, report_context.as_ref()).await {
         Ok(Some(kiro_web_search)) => {
+            let has_report_context_override = kiro_web_search.report_context.is_some();
+            let stream_lifecycle_seed = if has_report_context_override {
+                None
+            } else {
+                lifecycle_seed.clone()
+            };
             return execute_stream_from_frame_stream(
                 state,
                 plan,
@@ -514,6 +561,8 @@ pub(crate) async fn execute_execution_runtime_stream(
                 candidate_started_unix_secs,
                 stream_started_at,
                 kiro_web_search.frame_stream,
+                stream_lifecycle_seed,
+                seed_options,
             )
             .await;
         }
@@ -554,6 +603,12 @@ pub(crate) async fn execute_execution_runtime_stream(
     }
     match maybe_execute_chatgpt_web_image_stream(state, &plan, report_context.as_ref()).await {
         Ok(Some(chatgpt_web_image)) => {
+            let has_report_context_override = chatgpt_web_image.report_context.is_some();
+            let stream_lifecycle_seed = if has_report_context_override {
+                None
+            } else {
+                lifecycle_seed.clone()
+            };
             return execute_stream_from_frame_stream(
                 state,
                 plan,
@@ -565,6 +620,8 @@ pub(crate) async fn execute_execution_runtime_stream(
                 candidate_started_unix_secs,
                 stream_started_at,
                 chatgpt_web_image.frame_stream,
+                stream_lifecycle_seed,
+                seed_options,
             )
             .await;
         }
@@ -660,6 +717,8 @@ pub(crate) async fn execute_execution_runtime_stream(
             candidate_started_unix_secs,
             stream_started_at,
             frame_stream,
+            lifecycle_seed.clone(),
+            seed_options,
         )
         .await;
     }
@@ -724,6 +783,8 @@ pub(crate) async fn execute_execution_runtime_stream(
                 candidate_started_unix_secs,
                 stream_started_at,
                 frame_stream,
+                lifecycle_seed.clone(),
+                seed_options,
             )
             .await;
         }
@@ -809,6 +870,8 @@ pub(crate) async fn execute_execution_runtime_stream(
             candidate_started_unix_secs,
             stream_started_at,
             frame_stream,
+            lifecycle_seed.clone(),
+            seed_options,
         )
         .await;
     }
@@ -968,16 +1031,23 @@ async fn execute_stream_from_frame_stream(
     candidate_started_unix_secs: u64,
     stream_started_at: Instant,
     frame_stream: BoxStream<'static, Result<Bytes, IoError>>,
+    lifecycle_seed: Option<Arc<LifecycleUsageSeed>>,
+    seed_options: UsageSeedBuildOptions,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     let request_id = plan.request_id.as_str();
     let request_id_for_log = short_request_id(request_id);
     let candidate_id = plan.candidate_id.as_deref();
     let provider_name = plan.provider_name.as_deref().unwrap_or("-");
     let model_name = plan.model_name.as_deref().unwrap_or("-");
-    let lifecycle_seed = std::sync::Arc::new(build_lifecycle_usage_seed(
-        &plan,
-        report_context.as_ref(),
-    ));
+    let lifecycle_seed = lifecycle_seed.or_else(|| {
+        state.usage_runtime.is_enabled().then(|| {
+            Arc::new(build_lifecycle_usage_seed_with_options(
+                &plan,
+                report_context.as_ref(),
+                seed_options,
+            ))
+        })
+    });
     let request_candidate_status_snapshot =
         snapshot_local_request_candidate_status(&plan, report_context.as_ref());
     let candidate_index = parse_request_candidate_report_context(report_context.as_ref())
@@ -1289,7 +1359,7 @@ async fn execute_stream_from_frame_stream(
             client_body_json,
             None,
         );
-        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload);
+        record_sync_terminal_usage(state, &plan, payload.report_context.as_ref(), &payload).await;
         let terminal_unix_secs = current_request_candidate_unix_ms();
         record_local_request_candidate_status(
             state,
@@ -1489,7 +1559,8 @@ async fn execute_stream_from_frame_stream(
                                 &plan,
                                 payload.report_context.as_ref(),
                                 &payload,
-                            );
+                            )
+                            .await;
                             let response = submit_local_core_error_or_sync_finalize(
                                 state, trace_id, decision, payload,
                             )
@@ -1676,12 +1747,14 @@ async fn execute_stream_from_frame_stream(
     drop(private_stream_normalizer);
     drop(local_stream_rewriter);
 
-    state.usage_runtime.record_stream_started(
-        state.data.as_ref(),
-        lifecycle_seed.clone(),
-        status_code,
-        prefetched_telemetry.as_ref(),
-    );
+    if let Some(lifecycle_seed) = lifecycle_seed.as_ref() {
+        state.usage_runtime.record_stream_started(
+            state.data.as_ref(),
+            lifecycle_seed.clone(),
+            status_code,
+            prefetched_telemetry.as_ref(),
+        );
+    }
     if let Some(snapshot) = request_candidate_status_snapshot {
         let state_bg = state.clone();
         let latency_ms = prefetched_telemetry
@@ -2018,12 +2091,14 @@ async fn execute_stream_from_frame_stream(
                                     .as_ref()
                                     .and_then(|telemetry| telemetry.upstream_bytes),
                             };
-                            state_for_report.usage_runtime.record_stream_started(
-                                state_for_report.data.as_ref(),
-                                lifecycle_seed_for_report.clone(),
-                                status_code,
-                                Some(&first_data_telemetry),
-                            );
+                            if let Some(lifecycle_seed) = lifecycle_seed_for_report.as_ref() {
+                                state_for_report.usage_runtime.record_stream_started(
+                                    state_for_report.data.as_ref(),
+                                    lifecycle_seed.clone(),
+                                    status_code,
+                                    Some(&first_data_telemetry),
+                                );
+                            }
                             usage_stream_telemetry = Some(first_data_telemetry);
                         }
 
@@ -2054,12 +2129,14 @@ async fn execute_stream_from_frame_stream(
                             &frame_telemetry,
                         );
                         if should_refresh_stream_usage {
-                            state_for_report.usage_runtime.record_stream_started(
-                                state_for_report.data.as_ref(),
-                                lifecycle_seed_for_report.clone(),
-                                status_code,
-                                Some(&frame_telemetry),
-                            );
+                            if let Some(lifecycle_seed) = lifecycle_seed_for_report.as_ref() {
+                                state_for_report.usage_runtime.record_stream_started(
+                                    state_for_report.data.as_ref(),
+                                    lifecycle_seed.clone(),
+                                    status_code,
+                                    Some(&frame_telemetry),
+                                );
+                            }
                             usage_stream_telemetry = Some(frame_telemetry.clone());
                         }
                         telemetry = Some(frame_telemetry);
@@ -2303,7 +2380,8 @@ async fn execute_stream_from_frame_stream(
                 usage_payload.report_context.as_ref(),
                 &usage_payload,
                 true,
-            );
+            )
+            .await;
             record_local_request_candidate_status(
                 &state_for_report,
                 &plan_for_report,
@@ -2392,7 +2470,8 @@ async fn execute_stream_from_frame_stream(
             usage_payload.report_context.as_ref(),
             &usage_payload,
             false,
-        );
+        )
+        .await;
         record_local_request_candidate_status(
             &state_for_report,
             &plan_for_report,

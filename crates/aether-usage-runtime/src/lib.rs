@@ -48,14 +48,16 @@ pub use worker::{
     UsageEventRecorder, UsageQueueWorker, UsageRecordWriter,
 };
 pub use write::{
-    build_lifecycle_usage_seed, build_pending_usage_record, build_pending_usage_record_from_seed,
+    build_lifecycle_usage_seed, build_lifecycle_usage_seed_with_options,
+    build_pending_usage_record, build_pending_usage_record_from_seed,
     build_stream_terminal_usage_event, build_stream_terminal_usage_outcome,
     build_stream_terminal_usage_payload_seed, build_stream_terminal_usage_seed,
     build_streaming_usage_record, build_streaming_usage_record_from_seed,
     build_sync_terminal_usage_event, build_sync_terminal_usage_outcome,
     build_sync_terminal_usage_payload_seed, build_sync_terminal_usage_seed,
-    build_terminal_usage_context_seed, build_terminal_usage_event_from_outcome,
-    build_terminal_usage_event_from_seed, build_usage_event_data_seed, LifecycleUsageSeed,
-    StreamTerminalUsagePayloadSeed, SyncTerminalUsagePayloadSeed, TerminalUsageContextSeed,
-    TerminalUsageOutcome, TerminalUsageSeed, UsageTerminalState,
+    build_terminal_usage_context_seed, build_terminal_usage_context_seed_with_options,
+    build_terminal_usage_event_from_outcome, build_terminal_usage_event_from_seed,
+    build_usage_event_data_seed, LifecycleUsageSeed, StreamTerminalUsagePayloadSeed,
+    SyncTerminalUsagePayloadSeed, TerminalUsageContextSeed, TerminalUsageOutcome,
+    TerminalUsageSeed, UsageSeedBuildOptions, UsageTerminalState,
 };
