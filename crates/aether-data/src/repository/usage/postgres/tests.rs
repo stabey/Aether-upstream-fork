@@ -623,6 +623,11 @@ fn usage_sql_uses_json_null_placeholders_for_usage_payload_columns() {
         super::LIST_USAGE_AUDITS_PREFIX,
         super::LIST_RECENT_USAGE_AUDITS_PREFIX,
     ] {
+        assert!(sql.contains("jsonb_strip_nulls(jsonb_build_object("));
+        assert!(sql.contains("'client_ip'"));
+        assert!(sql.contains("request_metadata->>'client_ip'"));
+        assert!(sql.contains("'user_agent'"));
+        assert!(sql.contains("request_metadata->>'user_agent'"));
         assert!(sql.contains("CAST(\"usage\".input_tokens AS INTEGER) AS input_tokens"));
         assert!(sql.contains(
             "usage_settlement_snapshots.billing_input_tokens AS settlement_billing_input_tokens"

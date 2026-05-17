@@ -106,9 +106,15 @@ SELECT
   NULL::json AS client_response_body,
   NULL::bytea AS client_response_body_compressed,
   CASE
-    WHEN ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
+    WHEN NULLIF(BTRIM("usage".request_metadata->>'client_ip'), '') IS NOT NULL
+      OR NULLIF(BTRIM("usage".request_metadata->>'user_agent'), '') IS NOT NULL
+      OR ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
       OR ("usage".request_metadata->>'upstream_is_stream') IN ('true', 'false')
-      THEN jsonb_build_object(
+      THEN jsonb_strip_nulls(jsonb_build_object(
+        'client_ip',
+        NULLIF(BTRIM("usage".request_metadata->>'client_ip'), ''),
+        'user_agent',
+        NULLIF(BTRIM("usage".request_metadata->>'user_agent'), ''),
         'client_requested_stream',
         CASE
           WHEN ("usage".request_metadata->>'client_requested_stream') IN ('true', 'false')
@@ -121,7 +127,7 @@ SELECT
             THEN ("usage".request_metadata->>'upstream_is_stream')::boolean
           ELSE NULL
         END
-      )::json
+      ))::json
     ELSE NULL::json
   END AS request_metadata,
   NULL::varchar AS http_request_body_ref,
