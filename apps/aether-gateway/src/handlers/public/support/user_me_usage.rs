@@ -344,7 +344,11 @@ fn users_me_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> 
                 .and_then(serde_json::Value::as_object)
                 .and_then(|affinity| affinity.get("client_family"))
                 .and_then(serde_json::Value::as_str)
-                .or_else(|| metadata.get("client_family").and_then(serde_json::Value::as_str))
+                .or_else(|| {
+                    metadata
+                        .get("client_family")
+                        .and_then(serde_json::Value::as_str)
+                })
         })
         .map(str::trim)
         .filter(|value| !value.is_empty())

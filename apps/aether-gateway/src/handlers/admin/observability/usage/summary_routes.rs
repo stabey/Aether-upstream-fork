@@ -5,12 +5,13 @@ use crate::handlers::admin::request::{AdminAppState, AdminRequestContext};
 use crate::handlers::admin::shared::query_param_value;
 use crate::GatewayError;
 use aether_admin::observability::usage::{
-    admin_usage_bad_request_response, admin_usage_client_family, admin_usage_data_unavailable_response,
-    admin_usage_has_fallback, admin_usage_is_failed, admin_usage_matches_search,
-    admin_usage_matches_username, admin_usage_parse_ids, admin_usage_parse_limit,
-    admin_usage_parse_offset, admin_usage_provider_key_name, admin_usage_record_json,
-    build_admin_usage_active_requests_response, build_admin_usage_records_response,
-    build_admin_usage_summary_stats_response_from_summary, ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
+    admin_usage_bad_request_response, admin_usage_client_family,
+    admin_usage_data_unavailable_response, admin_usage_has_fallback, admin_usage_is_failed,
+    admin_usage_matches_search, admin_usage_matches_username, admin_usage_parse_ids,
+    admin_usage_parse_limit, admin_usage_parse_offset, admin_usage_provider_key_name,
+    admin_usage_record_json, build_admin_usage_active_requests_response,
+    build_admin_usage_records_response, build_admin_usage_summary_stats_response_from_summary,
+    ADMIN_USAGE_DATA_UNAVAILABLE_DETAIL,
 };
 use aether_data::repository::users::StoredUserSummary;
 use aether_data_contracts::repository::{
@@ -649,7 +650,9 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
             let active_client_family_filter = client_family_filter
                 .as_deref()
                 .filter(|value| !value.trim().is_empty());
-            let (usage, total) = if attempt_status_filter.is_some() || active_client_family_filter.is_some() {
+            let (usage, total) = if attempt_status_filter.is_some()
+                || active_client_family_filter.is_some()
+            {
                 let mut usage = state.list_usage_audits(&base_query).await?;
                 let user_ids: Vec<String> = usage
                     .iter()
@@ -679,12 +682,14 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                         active_username_filter,
                         &users_by_id,
                         state.has_auth_user_data_reader(),
-                    ) && attempt_status_filter.is_none_or(|attempt_status| admin_usage_matches_attempt_status(
-                        item,
-                        attempt_status,
-                        &attempt_flags_by_usage_id,
-                        request_candidate_reader_available,
-                    )) && admin_usage_matches_client_family(item, active_client_family_filter)
+                    ) && attempt_status_filter.is_none_or(|attempt_status| {
+                        admin_usage_matches_attempt_status(
+                            item,
+                            attempt_status,
+                            &attempt_flags_by_usage_id,
+                            request_candidate_reader_available,
+                        )
+                    }) && admin_usage_matches_client_family(item, active_client_family_filter)
                 });
                 sort_usage_newest_first(&mut usage);
                 let total = usage.len();

@@ -1166,9 +1166,21 @@ pub fn admin_usage_record_json(
     );
     object.insert("client_is_stream".to_string(), json!(client_is_stream));
     maybe_insert_string_field(object, "client_family", admin_usage_client_family(item));
-    maybe_insert_string_field(object, "client_ip", admin_usage_metadata_string(item, "client_ip"));
-    maybe_insert_string_field(object, "user_agent", admin_usage_metadata_string(item, "user_agent"));
-    maybe_insert_string_field(object, "request_path", admin_usage_metadata_string(item, "request_path"));
+    maybe_insert_string_field(
+        object,
+        "client_ip",
+        admin_usage_metadata_string(item, "client_ip"),
+    );
+    maybe_insert_string_field(
+        object,
+        "user_agent",
+        admin_usage_metadata_string(item, "user_agent"),
+    );
+    maybe_insert_string_field(
+        object,
+        "request_path",
+        admin_usage_metadata_string(item, "request_path"),
+    );
     maybe_insert_string_field(
         object,
         "request_path_and_query",
