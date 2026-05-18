@@ -511,7 +511,8 @@ export function useUsageData(options: UseUsageDataOptions) {
           api_key_name: existing.api_key_name || record.api_key_name,
           provider_key_name: existing.provider_key_name || record.provider_key_name,
           rate_multiplier: existing.rate_multiplier ?? record.rate_multiplier,
-          target_model: existing.target_model || record.target_model
+          target_model: existing.target_model || record.target_model,
+          scheduling_failure: existing.scheduling_failure ?? record.scheduling_failure
         }
       }
 
@@ -519,7 +520,8 @@ export function useUsageData(options: UseUsageDataOptions) {
       if (protectProvider) {
         return {
           ...record,
-          provider: existing.provider
+          provider: existing.provider,
+          scheduling_failure: existing.scheduling_failure ?? record.scheduling_failure
         }
       }
 

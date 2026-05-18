@@ -1,4 +1,5 @@
 import type { ImageProgress } from '@/api/requestTrace'
+import type { RequestSchedulingFailure } from '@/api/dashboard'
 
 // 统计数据状态
 export interface UsageStatsState {
@@ -115,6 +116,7 @@ export interface UsageRecord {
   status_code?: number
   error_message?: string
   status?: RequestStatus  // 请求状态: pending, streaming, completed, failed
+  scheduling_failure?: RequestSchedulingFailure | null
   created_at: string
   has_fallback?: boolean
   has_retry?: boolean
