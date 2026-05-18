@@ -15,8 +15,7 @@ use crate::quota::{
 };
 use crate::quota_refresh::ProviderPoolQuotaRequestSpec;
 
-pub const CODEX_BACKEND_ME_URL: &str = "https://chatgpt.com/backend-api/me";
-pub const CODEX_WHAM_USAGE_URL: &str = CODEX_BACKEND_ME_URL;
+pub const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const PLACEHOLDER_API_KEY: &str = "__placeholder__";
 
 #[derive(Debug, Clone, Default)]
@@ -111,13 +110,13 @@ pub fn build_codex_pool_quota_request(
         provider_name: "codex".to_string(),
         quota_kind: "codex".to_string(),
         method: "GET".to_string(),
-        url: CODEX_BACKEND_ME_URL.to_string(),
+        url: CODEX_WHAM_USAGE_URL.to_string(),
         headers,
         content_type: None,
         json_body: None,
         client_api_format: "openai:responses".to_string(),
         provider_api_format: "openai:responses".to_string(),
-        model_name: Some("codex-backend-me".to_string()),
+        model_name: Some("codex-wham-usage".to_string()),
         accept_invalid_certs: false,
     })
 }

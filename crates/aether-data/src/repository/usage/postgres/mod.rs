@@ -11,12 +11,13 @@ use aether_data_contracts::repository::usage::{
     UsageAuditAggregationQuery, UsageAuditKeywordSearchQuery, UsageAuditSummaryQuery,
     UsageBodyCaptureState, UsageBodyField, UsageBreakdownGroupBy, UsageBreakdownSummaryQuery,
     UsageCacheAffinityHitSummaryQuery, UsageCacheAffinityIntervalGroupBy,
-    UsageCacheAffinityIntervalQuery, UsageCacheHitSummaryQuery, UsageCleanupSummary,
-    UsageCleanupWindow, UsageCostSavingsSummaryQuery, UsageDashboardDailyBreakdownQuery,
-    UsageDashboardProviderCountsQuery, UsageDashboardSummaryQuery, UsageErrorDistributionQuery,
-    UsageLeaderboardGroupBy, UsageLeaderboardQuery, UsageMonitoringErrorCountQuery,
-    UsageMonitoringErrorListQuery, UsagePerformancePercentilesQuery, UsageProviderPerformanceQuery,
-    UsageSettledCostSummaryQuery, UsageTimeSeriesGranularity, UsageTimeSeriesQuery,
+    UsageCacheAffinityIntervalQuery, UsageCacheHitSummaryQuery, UsageCleanupExecutionMode,
+    UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow, UsageCostSavingsSummaryQuery,
+    UsageDashboardDailyBreakdownQuery, UsageDashboardProviderCountsQuery,
+    UsageDashboardSummaryQuery, UsageErrorDistributionQuery, UsageLeaderboardGroupBy,
+    UsageLeaderboardQuery, UsageMonitoringErrorCountQuery, UsageMonitoringErrorListQuery,
+    UsagePerformancePercentilesQuery, UsageProviderPerformanceQuery, UsageSettledCostSummaryQuery,
+    UsageTimeSeriesGranularity, UsageTimeSeriesQuery,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -8218,17 +8219,31 @@ impl UsageWriteRepository for SqlxUsageReadRepository {
         window: &UsageCleanupWindow,
         batch_size: usize,
         auto_delete_expired_keys: bool,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<UsageCleanupSummary, DataLayerError> {
-        Self::cleanup_usage(self, window, batch_size, auto_delete_expired_keys).await
+        Self::cleanup_usage(
+            self,
+            window,
+            batch_size,
+            auto_delete_expired_keys,
+            targets,
+            mode,
+        )
+        .await
     }
 
     async fn preview_usage_cleanup(
         &self,
         window: &UsageCleanupWindow,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<aether_data_contracts::repository::usage::UsageCleanupPreviewCounts, DataLayerError>
     {
-        crate::repository::usage::postgres::cleanup::preview_usage_cleanup_impl(&self.pool, window)
-            .await
+        crate::repository::usage::postgres::cleanup::preview_usage_cleanup_impl(
+            &self.pool, window, targets, mode,
+        )
+        .await
     }
 }
 

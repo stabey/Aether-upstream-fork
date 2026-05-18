@@ -226,7 +226,7 @@ pub(crate) struct AdminProviderUpdateRequest {
 
 pub(crate) type AdminProviderUpdatePatch = AdminTypedObjectPatch<AdminProviderUpdateRequest>;
 
-pub(crate) const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/me";
+pub(crate) const CODEX_WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 pub(crate) const KIRO_USAGE_LIMITS_PATH: &str = "/getUsageLimits";
 pub(crate) const KIRO_USAGE_SDK_VERSION: &str = "1.0.0";
 pub(crate) const ANTIGRAVITY_FETCH_AVAILABLE_MODELS_PATH: &str = "/v1internal:fetchAvailableModels";

@@ -16,7 +16,7 @@ pub use chatgpt_web::{
     CHATGPT_WEB_DEFAULT_BASE_URL,
 };
 pub use codex::CodexProviderPoolAdapter;
-pub use codex::{build_codex_pool_quota_request, CODEX_BACKEND_ME_URL, CODEX_WHAM_USAGE_URL};
+pub use codex::{build_codex_pool_quota_request, CODEX_WHAM_USAGE_URL};
 pub use default::DefaultProviderPoolAdapter;
 pub use kiro::KiroProviderPoolAdapter;
 pub use kiro::{

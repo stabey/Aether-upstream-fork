@@ -1688,16 +1688,20 @@ pub trait UsageWriteRepository: Send + Sync {
         window: &UsageCleanupWindow,
         batch_size: usize,
         auto_delete_expired_keys: bool,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<UsageCleanupSummary, crate::DataLayerError> {
-        let _ = (window, batch_size, auto_delete_expired_keys);
+        let _ = (window, batch_size, auto_delete_expired_keys, targets, mode);
         Ok(UsageCleanupSummary::default())
     }
 
     async fn preview_usage_cleanup(
         &self,
         window: &UsageCleanupWindow,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<UsageCleanupPreviewCounts, crate::DataLayerError> {
-        let _ = window;
+        let _ = (window, targets, mode);
         Ok(UsageCleanupPreviewCounts::default())
     }
 }
@@ -1728,6 +1732,58 @@ pub struct UsageCleanupWindow {
     pub compressed_cutoff: DateTime<Utc>,
     pub header_cutoff: DateTime<Utc>,
     pub log_cutoff: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UsageCleanupTargets {
+    pub detail_body: bool,
+    pub compressed_body: bool,
+    pub headers: bool,
+    pub records: bool,
+    pub expired_keys: bool,
+}
+
+impl UsageCleanupTargets {
+    pub const fn all_policy_targets() -> Self {
+        Self {
+            detail_body: true,
+            compressed_body: true,
+            headers: true,
+            records: true,
+            expired_keys: true,
+        }
+    }
+
+    pub const fn body_targets() -> Self {
+        Self {
+            detail_body: true,
+            compressed_body: true,
+            headers: false,
+            records: false,
+            expired_keys: false,
+        }
+    }
+
+    pub const fn any_selected(self) -> bool {
+        self.detail_body
+            || self.compressed_body
+            || self.headers
+            || self.records
+            || self.expired_keys
+    }
+}
+
+impl Default for UsageCleanupTargets {
+    fn default() -> Self {
+        Self::all_policy_targets()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum UsageCleanupExecutionMode {
+    #[default]
+    Policy,
+    BeforeNowBodyFields,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

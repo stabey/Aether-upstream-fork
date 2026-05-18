@@ -1004,6 +1004,24 @@ where
     read_next_frame(lines).await
 }
 
+async fn next_stream_frame_until_downstream_closed<R>(
+    buffered_frames: &mut VecDeque<StreamFrame>,
+    lines: &mut FramedRead<R, LinesCodec>,
+    tx: &mpsc::Sender<Result<Bytes, IoError>>,
+) -> Result<Option<StreamFrame>, GatewayError>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    if let Some(frame) = buffered_frames.pop_front() {
+        return Ok(Some(frame));
+    }
+
+    tokio::select! {
+        frame = read_next_frame(lines) => frame,
+        () = tx.closed() => Ok(None),
+    }
+}
+
 fn should_refresh_stream_usage_telemetry(
     previous: Option<&ExecutionTelemetry>,
     next: &ExecutionTelemetry,
@@ -2170,7 +2188,15 @@ async fn execute_stream_from_frame_stream(
                     image_stream_total_timeout.as_mut()
                 {
                     tokio::select! {
-                        result = next_stream_frame(&mut buffered_frames, &mut lines) => result,
+                        result = next_stream_frame_until_downstream_closed(
+                            &mut buffered_frames,
+                            &mut lines,
+                            &tx,
+                        ) => result,
+                        () = tx.closed() => {
+                            downstream_dropped = true;
+                            break;
+                        }
                         _ = timeout_sleep.as_mut() => {
                             let timeout_ms = openai_image_stream_total_timeout_ms
                                 .unwrap_or(OPENAI_IMAGE_STREAM_DEFAULT_TOTAL_TIMEOUT_MS);
@@ -2221,7 +2247,8 @@ async fn execute_stream_from_frame_stream(
                         }
                     }
                 } else {
-                    next_stream_frame(&mut buffered_frames, &mut lines).await
+                    next_stream_frame_until_downstream_closed(&mut buffered_frames, &mut lines, &tx)
+                        .await
                 };
                 let next_frame = match next_frame_result {
                     Ok(frame) => frame,
@@ -2244,6 +2271,9 @@ async fn execute_stream_from_frame_stream(
                     }
                 };
                 let Some(frame) = next_frame else {
+                    if tx.is_closed() {
+                        downstream_dropped = true;
+                    }
                     break;
                 };
                 let frame_elapsed_ms = stream_started_at_for_report
@@ -2461,6 +2491,7 @@ async fn execute_stream_from_frame_stream(
         }
 
         if downstream_dropped {
+            drop(lines);
             debug!(
                 event_name = "execution_runtime_stream_flush_skipped",
                 log_type = "debug",
@@ -2906,7 +2937,9 @@ mod tests {
     };
     use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
     use aether_data::repository::usage::InMemoryUsageReadRepository;
-    use aether_data_contracts::repository::candidates::RequestCandidateReadRepository;
+    use aether_data_contracts::repository::candidates::{
+        RequestCandidateReadRepository, RequestCandidateStatus,
+    };
     use aether_data_contracts::repository::usage::UsageReadRepository;
     use aether_usage_runtime::UsageRuntimeConfig;
     use async_stream::stream;
@@ -3172,6 +3205,140 @@ mod tests {
         assert!(text.contains(": aether-keepalive\n\n"));
         assert!(text.contains("event: image_generation.failed"));
         assert!(text.contains("\"type\":\"image_stream_total_timeout\""));
+    }
+
+    #[tokio::test]
+    async fn execute_stream_from_frame_stream_stops_upstream_when_client_drops_body() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+        let plan = ExecutionPlan {
+            request_id: "req-client-drop-cancels-upstream".into(),
+            candidate_id: Some("cand-client-drop-cancels-upstream".into()),
+            provider_name: Some("openai".into()),
+            provider_id: "prov-1".into(),
+            endpoint_id: "ep-1".into(),
+            key_id: "key-1".into(),
+            method: "POST".into(),
+            url: "https://example.com/v1/chat/completions".into(),
+            headers: BTreeMap::from([
+                ("content-type".into(), "application/json".into()),
+                ("accept".into(), "text/event-stream".into()),
+            ]),
+            content_type: Some("application/json".into()),
+            content_encoding: None,
+            body: RequestBody::from_json(json!({
+                "model": "gpt-5.4",
+                "messages": [],
+                "stream": true
+            })),
+            stream: true,
+            client_api_format: "openai:chat".into(),
+            provider_api_format: "openai:chat".into(),
+            model_name: Some("gpt-5.4".into()),
+            proxy: None,
+            transport_profile: None,
+            timeouts: None,
+        };
+        let frame_stream_dropped = Arc::new(Notify::new());
+        let frame_stream_dropped_for_stream = Arc::clone(&frame_stream_dropped);
+        let frame_stream = stream! {
+            struct NotifyOnDrop(Arc<Notify>);
+            impl Drop for NotifyOnDrop {
+                fn drop(&mut self) {
+                    self.0.notify_waiters();
+                }
+            }
+
+            let _drop_guard = NotifyOnDrop(frame_stream_dropped_for_stream);
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
+            ));
+            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(
+                b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"data: {\\\"id\\\":\\\"first\\\"}\\n\\n\"}}\n",
+            ));
+            std::future::pending::<()>().await;
+        }
+        .boxed();
+
+        let response = execute_stream_from_frame_stream(
+            &state,
+            plan,
+            "trace-client-drop-cancels-upstream",
+            &test_decision(),
+            "openai_chat_stream",
+            None,
+            Some(json!({
+                "request_id": "req-client-drop-cancels-upstream",
+                "candidate_id": "cand-client-drop-cancels-upstream",
+                "candidate_index": 0,
+                "retry_index": 0,
+                "provider_api_format": "openai:chat",
+                "client_api_format": "openai:chat"
+            })),
+            crate::clock::current_unix_ms(),
+            Instant::now(),
+            frame_stream,
+            None,
+        )
+        .await
+        .expect("execution should succeed")
+        .expect("execution should return a client response");
+
+        let mut body_stream = response.into_body().into_data_stream();
+        let first = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let chunk = body_stream
+                    .next()
+                    .await
+                    .expect("body should yield first chunk")
+                    .expect("first chunk should be ok");
+                if chunk.as_ref() != b": aether-keepalive\n\n" {
+                    break chunk;
+                }
+            }
+        })
+        .await
+        .expect("first business chunk should arrive");
+        assert_eq!(first.as_ref(), b"data: {\"id\":\"first\"}\n\n");
+        drop(body_stream);
+
+        tokio::time::timeout(Duration::from_secs(1), frame_stream_dropped.notified())
+            .await
+            .expect("upstream frame stream should be dropped after client disconnect");
+        let candidates = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let candidates = request_candidate_repository
+                    .list_by_request_id("req-client-drop-cancels-upstream")
+                    .await
+                    .expect("request candidates should read");
+                if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.status == RequestCandidateStatus::Cancelled)
+                {
+                    break candidates;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("candidate should be marked cancelled");
+        assert_eq!(candidates[0].status_code, Some(499));
+        assert_eq!(
+            candidates[0].error_type.as_deref(),
+            Some("downstream_disconnect")
+        );
     }
 
     #[tokio::test]

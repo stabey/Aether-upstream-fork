@@ -28,7 +28,10 @@
             {{ manualGlobalModelMode ? '选择已有模型' : '手动添加' }}
           </Button>
         </div>
-        <div v-if="!manualGlobalModelMode" class="space-y-2">
+        <div
+          v-if="!manualGlobalModelMode"
+          class="space-y-2"
+        >
           <Select
             :model-value="form.global_model_id"
             :disabled="loadingGlobalModels"
@@ -48,10 +51,16 @@
             </SelectContent>
           </Select>
         </div>
-        <div v-else class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-3">
+        <div
+          v-else
+          class="rounded-lg border border-border/60 bg-muted/20 p-3 space-y-3"
+        >
           <div class="grid grid-cols-2 gap-3">
             <div class="space-y-1.5">
-              <Label for="manual-global-model-name" class="text-xs">模型ID *</Label>
+              <Label
+                for="manual-global-model-name"
+                class="text-xs"
+              >模型ID *</Label>
               <Input
                 id="manual-global-model-name"
                 v-model="form.manual_global_model_name"
@@ -60,7 +69,10 @@
               />
             </div>
             <div class="space-y-1.5">
-              <Label for="manual-global-model-display-name" class="text-xs">显示名称</Label>
+              <Label
+                for="manual-global-model-display-name"
+                class="text-xs"
+              >显示名称</Label>
               <Input
                 id="manual-global-model-display-name"
                 v-model="form.manual_global_model_display_name"
@@ -79,7 +91,10 @@
           没有可选择的本地全局模型。可以切换到“手动添加”继续保存。
         </p>
         <div class="space-y-1.5">
-          <Label for="provider-model-name" class="text-xs">Provider 模型名 *</Label>
+          <Label
+            for="provider-model-name"
+            class="text-xs"
+          >Provider 模型名 *</Label>
           <Input
             id="provider-model-name"
             v-model="form.provider_model_name"

@@ -14,8 +14,8 @@ use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
 use crate::admin_api::{
-    admin_provider_pool_config, provider_account_self_check_endpoint_for_provider,
-    provider_type_supports_account_self_check, refresh_provider_pool_quota_locally, AdminAppState,
+    admin_provider_pool_config, provider_quota_refresh_endpoint_for_provider,
+    provider_type_supports_quota_refresh, refresh_provider_pool_quota_locally, AdminAppState,
 };
 use crate::{AppState, GatewayError};
 
@@ -547,7 +547,7 @@ fn endpoint_for_self_check(
     provider_type: &str,
     endpoints: &[StoredProviderCatalogEndpoint],
 ) -> Option<StoredProviderCatalogEndpoint> {
-    provider_account_self_check_endpoint_for_provider(provider_type, endpoints, true)
+    provider_quota_refresh_endpoint_for_provider(provider_type, endpoints, true)
 }
 
 fn gateway_error_message(err: GatewayError) -> String {
@@ -637,7 +637,7 @@ pub(crate) async fn perform_account_self_check_once_with_config(
             summary.providers_skipped = summary.providers_skipped.saturating_add(1);
             continue;
         };
-        if !provider_type_supports_account_self_check(&provider_type) {
+        if !provider_type_supports_quota_refresh(&provider_type) {
             summary.providers_skipped = summary.providers_skipped.saturating_add(1);
             continue;
         }

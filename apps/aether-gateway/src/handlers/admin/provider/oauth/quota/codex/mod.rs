@@ -8,7 +8,8 @@ use self::invalid::{
     codex_structured_invalid_reason,
 };
 use self::parse::{
-    parse_codex_backend_me_response, parse_codex_usage_headers, parse_codex_wham_usage_response,
+    build_codex_quota_exhausted_fallback_metadata, parse_codex_usage_headers,
+    parse_codex_wham_usage_response,
 };
 use self::plan::{build_codex_quota_request_spec, execute_codex_quota_plan};
 use super::shared::{
@@ -110,7 +111,7 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
                     "key_id": key.id,
                     "key_name": key.name,
                     "status": "error",
-                    "message": format!("backend-api/me 请求执行失败: {detail}"),
+                    "message": format!("wham/usage 请求执行失败: {detail}"),
                     "status_code": 502,
                 }));
                 continue;
@@ -137,9 +138,7 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
                 .as_ref()
                 .and_then(|body| body.json_body.as_ref())
             {
-                if let Some(parsed) = parse_codex_backend_me_response(body_json, now_unix_secs)
-                    .or_else(|| parse_codex_wham_usage_response(body_json, now_unix_secs))
-                {
+                if let Some(parsed) = parse_codex_wham_usage_response(body_json, now_unix_secs) {
                     metadata_update = Some(json!({
                         "codex": merge_codex_quota_metadata(header_metadata.as_ref(), &parsed)
                     }));
@@ -152,21 +151,21 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
                     status = "success".to_string();
                 } else {
                     status = "no_metadata".to_string();
-                    message = Some("backend-api/me 响应中未包含账号信息".to_string());
+                    message = Some("响应中未包含限额信息".to_string());
                 }
             } else {
-                message = Some("无法解析 backend-api/me API 响应".to_string());
+                message = Some("无法解析 wham/usage API 响应".to_string());
             }
         } else {
             let err_msg = extract_execution_error_message(&result);
             message = Some(match err_msg.as_deref() {
                 Some(detail) if !detail.is_empty() => {
                     format!(
-                        "backend-api/me API 返回状态码 {}: {}",
+                        "wham/usage API 返回状态码 {}: {}",
                         result.status_code, detail
                     )
                 }
-                _ => format!("backend-api/me API 返回状态码 {}", result.status_code),
+                _ => format!("wham/usage API 返回状态码 {}", result.status_code),
             });
 
             match result.status_code {
@@ -223,14 +222,26 @@ pub(crate) async fn refresh_codex_provider_quota_locally(
                         oauth_invalid_reason = reason;
                         status = "workspace_deactivated".to_string();
                     } else {
-                        let (at, reason) = codex_build_invalid_state(
-                            &key,
-                            codex_structured_invalid_reason(402, err_msg.as_deref()),
-                            now_unix_secs,
-                        );
-                        oauth_invalid_at_unix_secs = at;
-                        oauth_invalid_reason = reason;
-                        status = "payment_required".to_string();
+                        let plan_type = transport
+                            .key
+                            .decrypted_auth_config
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                            .and_then(|value| {
+                                value
+                                    .get("plan_type")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(ToOwned::to_owned)
+                            });
+                        metadata_update = Some(json!({
+                            "codex": build_codex_quota_exhausted_fallback_metadata(
+                                plan_type.as_deref(),
+                                now_unix_secs,
+                            )
+                        }));
+                        (oauth_invalid_at_unix_secs, oauth_invalid_reason) =
+                            quota_refresh_success_invalid_state(&key);
+                        status = "quota_exhausted".to_string();
                     }
                 }
                 403 => {

@@ -29,7 +29,6 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
     struct SeenExecutionRuntimeRequest {
         url: String,
         authorization: String,
-        accept: String,
         provider_api_format: String,
         total_ms: Option<u64>,
     }
@@ -69,7 +68,6 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
                         .get("authorization")
                         .cloned()
                         .unwrap_or_default(),
-                    accept: plan.headers.get("accept").cloned().unwrap_or_default(),
                     provider_api_format: plan.provider_api_format.clone(),
                     total_ms: plan
                         .timeouts
@@ -80,22 +78,41 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
                     request_id: plan.request_id,
                     candidate_id: None,
                     status_code: 200,
-                    headers: BTreeMap::new(),
+                    headers: BTreeMap::from([
+                        (
+                            "x-codex-primary-reset-after-seconds".to_string(),
+                            "18000".to_string(),
+                        ),
+                        (
+                            "x-codex-primary-reset-at".to_string(),
+                            "1900000000".to_string(),
+                        ),
+                        (
+                            "x-codex-secondary-reset-after-seconds".to_string(),
+                            "604800".to_string(),
+                        ),
+                        (
+                            "x-codex-secondary-reset-at".to_string(),
+                            "1900500000".to_string(),
+                        ),
+                    ]),
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
-                            "user": {
-                                "id": "user-codex-123",
-                                "email": "codex@example.com",
-                                "name": "Codex User"
+                            "plan_type": "plus",
+                            "rate_limit": {
+                                "primary_window": {
+                                    "used_percent": 12.5,
+                                    "window_minutes": 300
+                                },
+                                "secondary_window": {
+                                    "used_percent": 55.0,
+                                    "window_minutes": 10080
+                                }
                             },
-                            "account": {
-                                "id": "acct-codex-123",
-                                "name": "Personal",
-                                "plan_type": "plus"
-                            },
-                            "plan": {
-                                "type": "Plus",
-                                "title": "ChatGPT Plus"
+                            "credits": {
+                                "has_credits": true,
+                                "balance": 42.0,
+                                "unlimited": false
                             }
                         })),
                         body_bytes_b64: None,
@@ -167,22 +184,18 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
     );
     assert_eq!(payload["results"][0]["quota_snapshot"]["plan_type"], "plus");
     assert_eq!(
-        payload["results"][0]["quota_snapshot"]["exhausted"],
-        json!(false)
+        payload["results"][0]["quota_snapshot"]["reset_at"],
+        1_900_000_000u64
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["credits"]["balance"],
+        json!(42.0)
     );
     assert_eq!(
         payload["results"][0]["quota_snapshot"]["windows"]
             .as_array()
             .map(Vec::len),
-        Some(0usize)
-    );
-    assert_eq!(
-        payload["results"][0]["metadata"]["email"],
-        "codex@example.com"
-    );
-    assert_eq!(
-        payload["results"][0]["metadata"]["account_id"],
-        "acct-codex-123"
+        Some(2usize)
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
@@ -193,13 +206,12 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
         .expect("execution runtime request should be captured");
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://chatgpt.com/backend-api/me"
+        "https://chatgpt.com/backend-api/wham/usage"
     );
     assert_eq!(
         seen_execution_runtime_request.authorization,
         "Bearer sk-codex-123"
     );
-    assert_eq!(seen_execution_runtime_request.accept, "application/json");
     assert_eq!(
         seen_execution_runtime_request.provider_api_format,
         "openai:responses"
@@ -225,23 +237,33 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
             .upstream_metadata
             .as_ref()
             .and_then(|value| value.get("codex"))
-            .and_then(|value| value.get("email")),
-        Some(&json!("codex@example.com"))
+            .and_then(|value| value.get("primary_used_percent")),
+        Some(&json!(55.0))
     );
     assert_eq!(
         reloaded[0]
             .upstream_metadata
             .as_ref()
             .and_then(|value| value.get("codex"))
-            .and_then(|value| value.get("account_id")),
-        Some(&json!("acct-codex-123"))
+            .and_then(|value| value.get("primary_reset_at")),
+        Some(&json!(1_900_500_000u64))
     );
-    assert!(reloaded[0]
-        .upstream_metadata
-        .as_ref()
-        .and_then(|value| value.get("codex"))
-        .and_then(|value| value.get("primary_used_percent"))
-        .is_none());
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex"))
+            .and_then(|value| value.get("secondary_used_percent")),
+        Some(&json!(12.5))
+    );
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex"))
+            .and_then(|value| value.get("secondary_reset_at")),
+        Some(&json!(1_900_000_000u64))
+    );
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -249,7 +271,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
 }
 
 #[tokio::test]
-async fn gateway_marks_codex_key_invalid_when_backend_me_returns_payment_required() {
+async fn gateway_marks_codex_quota_exhausted_when_wham_usage_returns_payment_required() {
     let upstream = Router::new().route(
         "/api/admin/endpoints/providers/provider-codex/refresh-quota",
         any(move |_request: Request| async move {
@@ -337,18 +359,31 @@ async fn gateway_marks_codex_key_invalid_when_backend_me_returns_payment_require
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["success"], 0);
     assert_eq!(payload["failed"], 1);
-    assert_eq!(payload["results"][0]["status"], "payment_required");
+    assert_eq!(payload["results"][0]["status"], "quota_exhausted");
     assert_eq!(payload["results"][0]["status_code"], 402);
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["provider_type"],
+        "codex"
+    );
+    assert_eq!(
+        payload["results"][0]["quota_snapshot"]["exhausted"],
+        json!(true)
+    );
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-codex-a".to_string()])
         .await
         .expect("keys should read");
     assert_eq!(reloaded.len(), 1);
-    assert!(reloaded[0].oauth_invalid_at_unix_secs.is_some());
+    assert_eq!(reloaded[0].oauth_invalid_at_unix_secs, None);
+    assert_eq!(reloaded[0].oauth_invalid_reason, None);
     assert_eq!(
-        reloaded[0].oauth_invalid_reason.as_deref(),
-        Some("[ACCOUNT_BLOCK] payment required")
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.get("codex"))
+            .and_then(|value| value.get("primary_used_percent")),
+        Some(&json!(100.0))
     );
 
     gateway_handle.abort();
@@ -1345,7 +1380,7 @@ async fn gateway_reports_codex_quota_runtime_failures_locally_without_falling_ba
     assert!(payload["results"][0]["message"]
         .as_str()
         .expect("message should be string")
-        .contains("backend-api/me 请求执行失败: execution runtime returned HTTP 500"));
+        .contains("wham/usage 请求执行失败: execution runtime returned HTTP 500"));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let reloaded = provider_catalog_repository

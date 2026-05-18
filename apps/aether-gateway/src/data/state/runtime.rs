@@ -37,7 +37,8 @@ use super::{
 use aether_data_contracts::repository::usage::{
     PendingUsageCleanupSummary, ProviderApiKeyWindowUsageRequest,
     StoredProviderApiKeyWindowUsageSummary, StoredUsageDailySummary, UsageAuditListQuery,
-    UsageCleanupSummary, UsageCleanupWindow, UsageDailyHeatmapQuery,
+    UsageCleanupExecutionMode, UsageCleanupSummary, UsageCleanupTargets, UsageCleanupWindow,
+    UsageDailyHeatmapQuery,
 };
 use aether_runtime_state::RuntimeQueueStore;
 use aether_video_tasks_core::read_data_backed_video_task_response;
@@ -980,11 +981,13 @@ impl GatewayDataState {
         window: &UsageCleanupWindow,
         batch_size: usize,
         auto_delete_expired_keys: bool,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<UsageCleanupSummary, DataLayerError> {
         match &self.usage_writer {
             Some(repository) => {
                 repository
-                    .cleanup_usage(window, batch_size, auto_delete_expired_keys)
+                    .cleanup_usage(window, batch_size, auto_delete_expired_keys, targets, mode)
                     .await
             }
             None => Ok(UsageCleanupSummary::default()),
@@ -994,10 +997,16 @@ impl GatewayDataState {
     pub(crate) async fn preview_usage_cleanup(
         &self,
         window: &UsageCleanupWindow,
+        targets: UsageCleanupTargets,
+        mode: UsageCleanupExecutionMode,
     ) -> Result<aether_data_contracts::repository::usage::UsageCleanupPreviewCounts, DataLayerError>
     {
         match &self.usage_writer {
-            Some(repository) => repository.preview_usage_cleanup(window).await,
+            Some(repository) => {
+                repository
+                    .preview_usage_cleanup(window, targets, mode)
+                    .await
+            }
             None => {
                 Ok(aether_data_contracts::repository::usage::UsageCleanupPreviewCounts::default())
             }

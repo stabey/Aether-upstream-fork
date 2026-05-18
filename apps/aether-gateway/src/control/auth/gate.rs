@@ -127,15 +127,12 @@ async fn balance_capacity_rejection(
     let wallet_is_unlimited = wallet
         .as_ref()
         .is_some_and(|wallet| wallet.limit_mode.eq_ignore_ascii_case("unlimited"));
-    let (available_usd, require_cost_estimate) = match quota.as_ref() {
-        Some(quota) if !quota.allow_wallet_overage => (Some(quota.remaining_usd.max(0.0)), true),
-        Some(_) if wallet_is_unlimited => (None, false),
-        Some(quota) => (
-            Some(quota.remaining_usd.max(0.0) + wallet_available_usd.unwrap_or(0.0)),
-            true,
-        ),
-        None if wallet_is_unlimited => (None, false),
-        None => (wallet_available_usd, false),
+    let available_usd = match quota.as_ref() {
+        Some(quota) if !quota.allow_wallet_overage => Some(quota.remaining_usd.max(0.0)),
+        Some(_) if wallet_is_unlimited => None,
+        Some(quota) => Some(quota.remaining_usd.max(0.0) + wallet_available_usd.unwrap_or(0.0)),
+        None if wallet_is_unlimited => None,
+        None => wallet_available_usd,
     };
     let Some(available_usd) = available_usd else {
         return Ok(None);
@@ -146,24 +143,12 @@ async fn balance_capacity_rejection(
         }));
     }
     let Some(requested_model) = requested_model else {
-        return if require_cost_estimate {
-            Ok(Some(GatewayLocalAuthRejection::BalanceDenied {
-                remaining: Some(available_usd),
-            }))
-        } else {
-            Ok(None)
-        };
+        return Ok(None);
     };
     let Some(estimated_cost_usd) =
         estimate_request_cost_upper_bound_usd(state, decision, requested_model, body).await?
     else {
-        return if require_cost_estimate {
-            Ok(Some(GatewayLocalAuthRejection::BalanceDenied {
-                remaining: Some(available_usd),
-            }))
-        } else {
-            Ok(None)
-        };
+        return Ok(None);
     };
     if estimated_cost_usd > available_usd + DAILY_QUOTA_EPSILON_USD {
         return Ok(Some(GatewayLocalAuthRejection::BalanceDenied {
@@ -478,10 +463,15 @@ mod tests {
     use std::sync::Arc;
 
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
-    use aether_data_contracts::repository::billing::StoredBillingModelContext;
+    use aether_data::repository::wallet::StoredWalletSnapshot;
+    use aether_data_contracts::repository::billing::{
+        BillingReadRepository, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
+    };
     use aether_data_contracts::repository::candidate_selection::{
         StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
     };
+    use aether_data_contracts::DataLayerError;
+    use async_trait::async_trait;
     use axum::body::Bytes;
     use axum::http::{HeaderMap, Uri};
     use serde_json::json;
@@ -588,6 +578,25 @@ mod tests {
             .with_data_state_for_tests(data)
     }
 
+    fn state_with_quota_and_wallet(
+        quota: UserDailyQuotaAvailabilityRecord,
+        context: StoredBillingModelContext,
+    ) -> AppState {
+        let candidate_repository =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+                sample_row(),
+            ]));
+        let billing_repository = Arc::new(FixedBillingReadRepository { quota, context });
+        let data = GatewayDataState::with_minimal_candidate_selection_and_billing_for_tests(
+            candidate_repository,
+            billing_repository,
+        );
+        AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data)
+            .with_auth_wallets_for_tests(vec![sample_wallet("user-1", 30.0)])
+    }
+
     fn state_with_model_mapping() -> AppState {
         state_with_rows(vec![sample_row()])
     }
@@ -627,6 +636,72 @@ mod tests {
             model_tiered_pricing,
         )
         .expect("billing context should build")
+    }
+
+    fn sample_wallet(user_id: &str, balance: f64) -> StoredWalletSnapshot {
+        StoredWalletSnapshot::new(
+            format!("wallet-{user_id}"),
+            Some(user_id.to_string()),
+            None,
+            balance,
+            0.0,
+            "finite".to_string(),
+            "USD".to_string(),
+            "active".to_string(),
+            balance,
+            0.0,
+            0.0,
+            0.0,
+            100,
+        )
+        .expect("wallet should build")
+    }
+
+    fn quota_availability(
+        remaining_usd: f64,
+        allow_wallet_overage: bool,
+    ) -> UserDailyQuotaAvailabilityRecord {
+        UserDailyQuotaAvailabilityRecord {
+            has_active_daily_quota: true,
+            total_quota_usd: remaining_usd,
+            used_usd: 0.0,
+            remaining_usd,
+            allow_wallet_overage,
+        }
+    }
+
+    #[derive(Debug)]
+    struct FixedBillingReadRepository {
+        quota: UserDailyQuotaAvailabilityRecord,
+        context: StoredBillingModelContext,
+    }
+
+    #[async_trait]
+    impl BillingReadRepository for FixedBillingReadRepository {
+        async fn find_model_context(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _global_model_name: &str,
+        ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+            Ok(Some(self.context.clone()))
+        }
+
+        async fn find_model_context_by_model_id(
+            &self,
+            _provider_id: &str,
+            _provider_api_key_id: Option<&str>,
+            _model_id: &str,
+        ) -> Result<Option<StoredBillingModelContext>, DataLayerError> {
+            Ok(Some(self.context.clone()))
+        }
+
+        async fn find_user_daily_quota_availability(
+            &self,
+            _user_id: &str,
+        ) -> Result<Option<UserDailyQuotaAvailabilityRecord>, DataLayerError> {
+            Ok(Some(self.quota.clone()))
+        }
     }
 
     #[tokio::test]
@@ -700,6 +775,108 @@ mod tests {
                 model: "gpt-5.2".to_string(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn positive_balance_allows_unbounded_output_request_without_cost_estimate() {
+        let context = billing_context_with_pricing(
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 1.0,
+                    "output_price_per_1m": 2.0
+                }]
+            })),
+            None,
+            None,
+            None,
+        );
+        for allow_wallet_overage in [false, true] {
+            let state = state_with_quota_and_wallet(
+                quota_availability(50.0, allow_wallet_overage),
+                context.clone(),
+            );
+            let decision = decision_with_allowed_models(vec!["gpt-5".to_string()]);
+            let uri: Uri = "/v1/chat/completions".parse().expect("uri should parse");
+            let body = Bytes::from_static(
+                br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            );
+
+            let rejection = request_model_local_rejection(
+                &state,
+                Some(&decision),
+                &uri,
+                &json_headers(),
+                &body,
+            )
+            .await
+            .expect("quota rejection should resolve");
+
+            assert_eq!(rejection, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn positive_balance_still_denies_known_cost_above_available_capacity() {
+        let context = billing_context_with_pricing(
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 0.0,
+                    "output_price_per_1m": 60.0
+                }]
+            })),
+            None,
+            None,
+            None,
+        );
+        let state = state_with_quota_and_wallet(quota_availability(50.0, false), context);
+        let decision = decision_with_allowed_models(vec!["gpt-5".to_string()]);
+        let uri: Uri = "/v1/chat/completions".parse().expect("uri should parse");
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1000000}"#,
+        );
+
+        let rejection =
+            request_model_local_rejection(&state, Some(&decision), &uri, &json_headers(), &body)
+                .await
+                .expect("quota rejection should resolve");
+
+        assert_eq!(
+            rejection,
+            Some(GatewayLocalAuthRejection::BalanceDenied {
+                remaining: Some(50.0),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_overage_policy_extends_known_cost_capacity_when_enabled() {
+        let context = billing_context_with_pricing(
+            Some(json!({
+                "tiers": [{
+                    "up_to": null,
+                    "input_price_per_1m": 0.0,
+                    "output_price_per_1m": 70.0
+                }]
+            })),
+            None,
+            None,
+            None,
+        );
+        let state = state_with_quota_and_wallet(quota_availability(50.0, true), context);
+        let decision = decision_with_allowed_models(vec!["gpt-5".to_string()]);
+        let uri: Uri = "/v1/chat/completions".parse().expect("uri should parse");
+        let body = Bytes::from_static(
+            br#"{"model":"gpt-5","messages":[{"role":"user","content":"hi"}],"max_tokens":1000000}"#,
+        );
+
+        let rejection =
+            request_model_local_rejection(&state, Some(&decision), &uri, &json_headers(), &body)
+                .await
+                .expect("quota rejection should resolve");
+
+        assert_eq!(rejection, None);
     }
 
     #[test]

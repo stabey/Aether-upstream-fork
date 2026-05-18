@@ -4,6 +4,8 @@ import { cachedRequest, buildCacheKey } from '@/utils/cache'
 import type { BillingSummary } from './auth'
 import type { ApiKeyInstallSession, InstallSessionTargetSystem, InstallTargetCli } from './me'
 
+const SYSTEM_DATA_IMPORT_TIMEOUT_MS = 10 * 60 * 1000
+
 function extractConflictPayload(error: unknown): ManualUsageCleanupConflict | null {
   if (!axios.isAxiosError(error) || error.response?.status !== 409) {
     return null
@@ -310,15 +312,35 @@ export interface ManualUsageCleanupSummary {
   records_deleted: number
 }
 
-export interface ManualUsageCleanupResponse {
+export type ManualUsageCleanupMode = 'policy' | 'older_than_days' | 'before_now'
+export type ManualUsageCleanupTarget = 'detail_body' | 'compressed_body' | 'headers' | 'records'
+
+export interface ManualUsageCleanupTargets {
+  detail_body: boolean
+  compressed_body: boolean
+  headers: boolean
+  records: boolean
+  expired_keys: boolean
+}
+
+export interface ManualUsageCleanupRequest {
+  mode?: ManualUsageCleanupMode
+  older_than_days?: number
+  targets?: ManualUsageCleanupTarget[]
+}
+
+export interface ManualUsageCleanupTaskResponse {
   message: string
+  mode: ManualUsageCleanupMode
   requested_older_than_days: number | null
-  summary: ManualUsageCleanupSummary
-  total_affected: number
+  targets: ManualUsageCleanupTargets
+  task: CleanupRunRecord
 }
 
 export interface ManualUsageCleanupPreview {
+  mode: ManualUsageCleanupMode
   requested_older_than_days: number | null
+  targets: ManualUsageCleanupTargets
   effective_cutoffs: {
     detail: string
     compressed: string
@@ -834,7 +856,8 @@ export const adminApi = {
   async importConfig(data: ConfigImportRequest): Promise<ConfigImportResponse> {
     const response = await apiClient.post<ConfigImportResponse>(
       '/api/admin/system/config/import',
-      data
+      data,
+      { timeout: SYSTEM_DATA_IMPORT_TIMEOUT_MS }
     )
     return response.data
   },
@@ -849,7 +872,8 @@ export const adminApi = {
   async importUsers(data: UsersImportRequest): Promise<UsersImportResponse> {
     const response = await apiClient.post<UsersImportResponse>(
       '/api/admin/system/users/import',
-      data
+      data,
+      { timeout: SYSTEM_DATA_IMPORT_TIMEOUT_MS }
     )
     return response.data
   },
@@ -864,7 +888,8 @@ export const adminApi = {
   async importAggregateData(data: AggregateImportRequest): Promise<AggregateImportResponse> {
     const response = await apiClient.post<AggregateImportResponse>(
       '/api/admin/system/data/import',
-      data
+      data,
+      { timeout: SYSTEM_DATA_IMPORT_TIMEOUT_MS }
     )
     return response.data
   },
@@ -1218,14 +1243,20 @@ export const adminApi = {
   },
 
   async runManualUsageCleanup(
-    params: { older_than_days?: number } = {}
-  ): Promise<ManualUsageCleanupResponse | ManualUsageCleanupConflict> {
-    const body: Record<string, number> = {}
+    params: ManualUsageCleanupRequest = {}
+  ): Promise<ManualUsageCleanupTaskResponse | ManualUsageCleanupConflict> {
+    const body: ManualUsageCleanupRequest = {}
+    if (params.mode) {
+      body.mode = params.mode
+    }
     if (typeof params.older_than_days === 'number') {
       body.older_than_days = params.older_than_days
     }
+    if (params.targets?.length) {
+      body.targets = params.targets
+    }
     try {
-      const response = await apiClient.post<ManualUsageCleanupResponse>(
+      const response = await apiClient.post<ManualUsageCleanupTaskResponse>(
         '/api/admin/system/cleanup/usage/manual',
         body
       )
@@ -1240,11 +1271,17 @@ export const adminApi = {
   },
 
   async previewManualUsageCleanup(
-    params: { older_than_days?: number } = {}
+    params: ManualUsageCleanupRequest = {}
   ): Promise<ManualUsageCleanupPreview> {
-    const query: Record<string, number> = {}
+    const query: Record<string, string | number> = {}
+    if (params.mode) {
+      query.mode = params.mode
+    }
     if (typeof params.older_than_days === 'number') {
       query.older_than_days = params.older_than_days
+    }
+    if (params.targets?.length) {
+      query.targets = params.targets.join(',')
     }
     const response = await apiClient.get<ManualUsageCleanupPreview>(
       '/api/admin/system/cleanup/usage/preview',

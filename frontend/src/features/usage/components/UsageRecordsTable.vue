@@ -306,7 +306,10 @@
     </div>
 
     <!-- 桌面端表格视图 -->
-    <Table :class="['hidden md:table table-fixed w-full', desktopTableMinWidthClass]">
+    <Table
+      class="hidden md:table table-fixed w-full"
+      :class="[desktopTableMinWidthClass]"
+    >
       <colgroup v-if="isAdmin">
         <col v-if="isColumnVisible('time')" class="w-[8%]">
         <col v-if="isColumnVisible('user')" class="w-[12%]">
@@ -366,7 +369,8 @@
           </TableHead>
           <SortableTableHead
             v-if="isColumnVisible('model')"
-            :class="['h-12 font-semibold', isAdmin ? 'w-[14%]' : 'w-[22%]']"
+            class="h-12 font-semibold"
+            :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
             column-key="model"
             :sortable="false"
             :filter-active="filterModel !== '__all__'"
@@ -404,7 +408,8 @@
           </SortableTableHead>
           <SortableTableHead
             v-if="isColumnVisible('api_format')"
-            :class="['h-12 font-semibold', isAdmin ? 'w-[15%]' : 'w-[14%]']"
+            class="h-12 font-semibold"
+            :class="[isAdmin ? 'w-[15%]' : 'w-[14%]']"
             column-key="api_format"
             :sortable="false"
             :filter-active="filterApiFormat !== '__all__'"
@@ -543,7 +548,8 @@
           </TableCell>
           <TableCell
             v-if="isColumnVisible('model')"
-            :class="['font-medium py-4', isAdmin ? 'w-[14%]' : 'w-[22%]']"
+            class="font-medium py-4"
+            :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
             :title="getModelTooltip(record)"
           >
             <div
@@ -631,7 +637,8 @@
           </TableCell>
           <TableCell
             v-if="isColumnVisible('api_format')"
-            :class="['py-4', isAdmin ? 'w-[15%]' : 'w-[14%]']"
+            class="py-4"
+            :class="[isAdmin ? 'w-[15%]' : 'w-[14%]']"
             :title="getApiFormatTooltip(record)"
           >
             <!-- 有格式转换或同族格式差异：两行显示 -->
@@ -731,8 +738,8 @@
             </div>
             <div class="mt-0.5 grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums text-muted-foreground">
               <span
+                class="justify-self-end whitespace-nowrap text-right"
                 :class="[
-                  'justify-self-end whitespace-nowrap text-right',
                   hasPositiveTokens(getRecordCacheReadTokens(record)) ? 'text-foreground/70' : ''
                 ]"
               >
@@ -742,8 +749,8 @@
                 /
               </span>
               <span
+                class="justify-self-start whitespace-nowrap text-left"
                 :class="[
-                  'justify-self-start whitespace-nowrap text-left',
                   hasPositiveTokens(getRecordCacheCreationTokens(record)) ? 'text-foreground/70' : ''
                 ]"
               >
