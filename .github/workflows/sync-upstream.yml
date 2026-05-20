@@ -1,0 +1,28 @@
+name: Sync master with upstream
+
+on:
+  schedule:
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fast-forward master to upstream/main
+        run: |
+          git remote add upstream https://github.com/fawney19/Aether.git
+          git fetch upstream main
+          git checkout master
+          git merge --ff-only upstream/main
+          git push origin master
