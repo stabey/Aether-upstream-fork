@@ -518,13 +518,20 @@ WHERE request_id = ?
                     continue;
                 }
 
-                let error_message = stale_pending_error_message(&row.status, timeout_minutes);
+                let candidate_info =
+                    latest_failed_candidate_mysql(&mut tx, &row.request_id).await?;
+                let (status_code, error_message) = resolve_stale_pending_failure(
+                    candidate_info.as_ref(),
+                    &row.status,
+                    timeout_minutes,
+                );
+                let status_code_i64 = i64::from(status_code);
                 if row.billing_status == "pending" {
                     sqlx::query(
                         r#"
 UPDATE `usage`
 SET status = 'failed',
-    status_code = 504,
+    status_code = ?,
     error_message = ?,
     billing_status = 'void',
     finalized_at = ?,
@@ -533,6 +540,7 @@ SET status = 'failed',
 WHERE request_id = ?
 "#,
                     )
+                    .bind(status_code_i64)
                     .bind(&error_message)
                     .bind(to_i64(now_unix_secs, "usage finalized_at")?)
                     .bind(&row.request_id)
@@ -550,11 +558,12 @@ WHERE request_id = ?
                         r#"
 UPDATE `usage`
 SET status = 'failed',
-    status_code = 504,
+    status_code = ?,
     error_message = ?
 WHERE request_id = ?
 "#,
                     )
+                    .bind(status_code_i64)
                     .bind(&error_message)
                     .bind(&row.request_id)
                     .execute(&mut *tx)
@@ -685,6 +694,67 @@ ON DUPLICATE KEY UPDATE
 
 fn stale_pending_error_message(status: &str, timeout_minutes: u64) -> String {
     format!("请求超时: 状态 '{status}' 超过 {timeout_minutes} 分钟未完成")
+}
+
+struct FailedCandidateCleanupInfo {
+    status_code: Option<u16>,
+    error_message: Option<String>,
+}
+
+fn resolve_stale_pending_failure(
+    candidate: Option<&FailedCandidateCleanupInfo>,
+    status: &str,
+    timeout_minutes: u64,
+) -> (u16, String) {
+    match candidate {
+        Some(info) => (
+            info.status_code.unwrap_or(502),
+            info.error_message
+                .clone()
+                .unwrap_or_else(|| stale_pending_error_message(status, timeout_minutes)),
+        ),
+        None => (504, stale_pending_error_message(status, timeout_minutes)),
+    }
+}
+
+async fn latest_failed_candidate_mysql(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    request_id: &str,
+) -> Result<Option<FailedCandidateCleanupInfo>, DataLayerError> {
+    let row = sqlx::query(
+        r#"
+SELECT status_code, error_message
+FROM request_candidates
+WHERE request_id = ?
+  AND status IN ('failed', 'cancelled')
+ORDER BY
+  COALESCE(finished_at, started_at, created_at) DESC,
+  retry_index DESC,
+  candidate_index DESC
+LIMIT 1
+"#,
+    )
+    .bind(request_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_sql_err()?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let status_code = row
+        .try_get::<Option<i64>, _>("status_code")
+        .map_sql_err()?
+        .and_then(|value| u16::try_from(value).ok());
+    let error_message = row
+        .try_get::<Option<String>, _>("error_message")
+        .map_sql_err()?
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok(Some(FailedCandidateCleanupInfo {
+        status_code,
+        error_message,
+    }))
 }
 
 fn bind_upsert<'q>(
