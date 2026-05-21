@@ -89,24 +89,17 @@ impl AppState {
     fn usage_worker_queue_for(
         runtime_state: &Arc<RuntimeState>,
     ) -> Option<Arc<dyn RuntimeQueueStore>> {
-        if runtime_state.is_redis() {
-            let queue: Arc<dyn RuntimeQueueStore> = runtime_state.clone();
-            Some(queue)
-        } else {
-            None
-        }
+        let queue: Arc<dyn RuntimeQueueStore> = runtime_state.clone();
+        Some(queue)
     }
 
-    fn spawn_scheduler_affinity_redis_write(
+    fn spawn_scheduler_affinity_runtime_write(
         &self,
         cache_key: &str,
         target: &SchedulerAffinityTarget,
         ttl: Duration,
         epoch: u64,
     ) {
-        if self.runtime_state.is_memory() {
-            return;
-        }
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -1088,7 +1081,7 @@ impl AppState {
         if self.scheduler_affinity_epoch() != epoch {
             return false;
         }
-        self.spawn_scheduler_affinity_redis_write(cache_key, &target, ttl, epoch);
+        self.spawn_scheduler_affinity_runtime_write(cache_key, &target, ttl, epoch);
         self.scheduler_affinity_cache.insert_for_epoch(
             cache_key.to_string(),
             target,

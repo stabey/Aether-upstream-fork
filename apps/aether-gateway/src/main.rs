@@ -497,6 +497,7 @@ impl GatewayUsageArgs {
     fn to_config(&self) -> UsageRuntimeConfig {
         UsageRuntimeConfig {
             enabled: true,
+            queue_terminal_events: true,
             stream_key: self.queue_stream_key.trim().to_string(),
             consumer_group: self.queue_group.trim().to_string(),
             dlq_stream_key: self.queue_dlq_stream_key.trim().to_string(),

@@ -1194,6 +1194,7 @@ async fn admin_monitoring_redis_keys_returns_local_payload_without_redis() {
     assert_eq!(payload["data"]["available"], json!(true));
     assert_eq!(payload["data"]["backend"], json!("memory"));
     assert_eq!(payload["data"]["total_keys"], json!(0));
+    assert_eq!(payload["data"]["diagnostics"], serde_json::Value::Null);
 }
 
 #[tokio::test]
