@@ -222,6 +222,7 @@ async fn execute_chatgpt_web_image(
         &uploads,
     )
     .await?;
+    spawn_chatgpt_web_image_quota_sync_after_request(state, plan, &base_url, token.as_str());
     filter_uploaded_asset_ids(&mut summary, &uploads);
 
     let mut downloaded = resolve_and_download_images(
@@ -269,7 +270,6 @@ async fn execute_chatgpt_web_image(
     let body = if let Some(failure) = summary.failure.as_ref().filter(|_| downloaded.is_empty()) {
         build_failed_sse(&request, failure)
     } else if let Some(image) = downloaded.into_iter().next() {
-        spawn_chatgpt_web_image_quota_refresh_after_success(state, plan, &base_url, token.as_str());
         build_success_sse(&request, &image, report_context)
     } else {
         build_failed_sse(
@@ -945,7 +945,7 @@ async fn execute_subrequest(
         .await
 }
 
-fn spawn_chatgpt_web_image_quota_refresh_after_success(
+fn spawn_chatgpt_web_image_quota_sync_after_request(
     state: &AppState,
     plan: &ExecutionPlan,
     base_url: &str,
@@ -964,16 +964,16 @@ fn spawn_chatgpt_web_image_quota_refresh_after_success(
     let base_url = base_url.to_string();
     let token = token.to_string();
     tokio::spawn(async move {
-        if let Err(err) = apply_chatgpt_web_image_quota_success_delta(&state, &plan).await {
+        if let Err(err) = apply_chatgpt_web_image_quota_request_delta(&state, &plan).await {
             warn!(
-                event_name = "chatgpt_web_image_quota_success_delta_failed",
+                event_name = "chatgpt_web_image_quota_request_delta_failed",
                 log_type = "ops",
                 request_id = %plan.request_id,
                 candidate_id = ?plan.candidate_id,
                 provider_id = %plan.provider_id,
                 key_id = %plan.key_id,
                 error = %err,
-                "gateway failed to persist ChatGPT-Web image quota success delta"
+                "gateway failed to persist ChatGPT-Web image quota request delta"
             );
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -988,13 +988,13 @@ fn spawn_chatgpt_web_image_quota_refresh_after_success(
                 provider_id = %plan.provider_id,
                 key_id = %plan.key_id,
                 error = %err,
-                "gateway failed to refresh ChatGPT-Web image quota after a successful generation"
+                "gateway failed to refresh ChatGPT-Web image quota after a generation request"
             );
         }
     });
 }
 
-async fn apply_chatgpt_web_image_quota_success_delta(
+async fn apply_chatgpt_web_image_quota_request_delta(
     state: &AppState,
     plan: &ExecutionPlan,
 ) -> Result<bool, String> {
@@ -1010,51 +1010,23 @@ async fn apply_chatgpt_web_image_quota_success_delta(
         return Ok(false);
     };
 
-    let Some(mut metadata) = latest_key
+    let mut metadata = latest_key
         .upstream_metadata
         .as_ref()
         .and_then(Value::as_object)
         .and_then(|metadata| metadata.get("chatgpt_web"))
         .and_then(Value::as_object)
         .cloned()
-    else {
-        return Ok(false);
-    };
+        .unwrap_or_default();
 
     let now_unix_secs = current_unix_secs();
-    if chatgpt_web_image_quota_u64(metadata.get("image_quota_reset_at"))
-        .is_some_and(|reset_at| reset_at <= now_unix_secs)
-    {
+    if !apply_chatgpt_web_image_quota_request_delta_to_metadata(
+        &mut metadata,
+        latest_key.status_snapshot.as_ref(),
+        now_unix_secs,
+    ) {
         return Ok(false);
     }
-
-    let Some(remaining) = chatgpt_web_image_quota_f64(metadata.get("image_quota_remaining"))
-        .filter(|value| *value > 0.0)
-    else {
-        return Ok(false);
-    };
-    let limit = chatgpt_web_image_quota_f64(metadata.get("image_quota_total"))
-        .filter(|value| *value > 0.0)
-        .unwrap_or(remaining);
-    let new_remaining = (remaining - 1.0).max(0.0);
-
-    metadata.insert("image_quota_remaining".to_string(), json!(new_remaining));
-    metadata.insert("image_quota_total".to_string(), json!(limit));
-    metadata.insert(
-        "image_quota_used".to_string(),
-        json!((limit - new_remaining).max(0.0)),
-    );
-    metadata.insert("updated_at".to_string(), json!(now_unix_secs));
-    metadata.insert(
-        "image_quota_last_local_success_at".to_string(),
-        json!(now_unix_secs),
-    );
-    let local_success_count =
-        chatgpt_web_image_quota_u64(metadata.get("image_quota_local_success_count")).unwrap_or(0);
-    metadata.insert(
-        "image_quota_local_success_count".to_string(),
-        json!(local_success_count.saturating_add(1)),
-    );
 
     let updated_upstream_metadata = merge_provider_metadata_object(
         latest_key.upstream_metadata.as_ref(),
@@ -1077,6 +1049,65 @@ async fn apply_chatgpt_web_image_quota_success_delta(
         .await
         .map_err(|err| err.into_message())?
         .is_some())
+}
+
+fn apply_chatgpt_web_image_quota_request_delta_to_metadata(
+    metadata: &mut Map<String, Value>,
+    status_snapshot: Option<&Value>,
+    now_unix_secs: u64,
+) -> bool {
+    let snapshot_window = chatgpt_web_image_quota_snapshot_window(status_snapshot);
+    let limit = chatgpt_web_image_quota_f64(metadata.get("image_quota_total"))
+        .filter(|value| *value > 0.0)
+        .or_else(|| {
+            snapshot_window.and_then(|window| {
+                chatgpt_web_image_quota_f64(window.get("limit_value")).filter(|value| *value > 0.0)
+            })
+        });
+    let used = chatgpt_web_image_quota_f64(metadata.get("image_quota_used")).or_else(|| {
+        snapshot_window.and_then(|window| chatgpt_web_image_quota_f64(window.get("used_value")))
+    });
+    let remaining = chatgpt_web_image_quota_f64(metadata.get("image_quota_remaining"))
+        .or_else(|| {
+            snapshot_window
+                .and_then(|window| chatgpt_web_image_quota_f64(window.get("remaining_value")))
+        })
+        .or_else(|| limit.zip(used).map(|(limit, used)| (limit - used).max(0.0)));
+    let Some(remaining) = remaining else {
+        return false;
+    };
+    let limit = limit.unwrap_or(remaining.max(0.0));
+    let new_remaining = (remaining - 1.0).max(0.0);
+
+    metadata.insert("image_quota_remaining".to_string(), json!(new_remaining));
+    if limit > 0.0 {
+        metadata.insert("image_quota_total".to_string(), json!(limit));
+        metadata.insert(
+            "image_quota_used".to_string(),
+            json!((limit - new_remaining).max(0.0)),
+        );
+    } else if let Some(used) = used {
+        metadata.insert("image_quota_used".to_string(), json!(used + 1.0));
+    }
+    if !metadata.contains_key("image_quota_reset_at") {
+        if let Some(reset_at) =
+            snapshot_window.and_then(|window| chatgpt_web_image_quota_u64(window.get("reset_at")))
+        {
+            metadata.insert("image_quota_reset_at".to_string(), json!(reset_at));
+        }
+    }
+    metadata.insert("updated_at".to_string(), json!(now_unix_secs));
+    metadata.insert(
+        "image_quota_last_local_request_at".to_string(),
+        json!(now_unix_secs),
+    );
+    let local_request_count =
+        chatgpt_web_image_quota_u64(metadata.get("image_quota_local_request_count")).unwrap_or(0);
+    metadata.insert(
+        "image_quota_local_request_count".to_string(),
+        json!(local_request_count.saturating_add(1)),
+    );
+    true
 }
 
 async fn refresh_chatgpt_web_image_quota_after_success(
@@ -1154,11 +1185,6 @@ async fn refresh_chatgpt_web_image_quota_after_success(
         return Ok(false);
     };
     normalize_chatgpt_web_image_quota_limit(&mut metadata, latest_key.upstream_metadata.as_ref());
-    preserve_chatgpt_web_local_success_delta(
-        &mut metadata,
-        latest_key.upstream_metadata.as_ref(),
-        now_unix_secs,
-    );
 
     let mut updated_key = latest_key;
     let updated_upstream_metadata = merge_provider_metadata_object(
@@ -1186,83 +1212,6 @@ async fn refresh_chatgpt_web_image_quota_after_success(
         .await
         .map_err(|err| err.into_message())?
         .is_some())
-}
-
-fn preserve_chatgpt_web_local_success_delta(
-    metadata: &mut Value,
-    existing_upstream_metadata: Option<&Value>,
-    now_unix_secs: u64,
-) {
-    let Some(incoming) = metadata.as_object_mut() else {
-        return;
-    };
-    let Some(existing) = existing_upstream_metadata
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("chatgpt_web"))
-        .and_then(Value::as_object)
-    else {
-        return;
-    };
-    let Some(local_success_at) =
-        chatgpt_web_image_quota_u64(existing.get("image_quota_last_local_success_at"))
-    else {
-        return;
-    };
-    if now_unix_secs.saturating_sub(local_success_at) > 180 {
-        return;
-    }
-
-    let incoming_reset_at = chatgpt_web_image_quota_u64(incoming.get("image_quota_reset_at"));
-    let existing_reset_at = chatgpt_web_image_quota_u64(existing.get("image_quota_reset_at"));
-    if incoming_reset_at.is_some_and(|reset_at| reset_at <= now_unix_secs) {
-        return;
-    }
-    match (incoming_reset_at, existing_reset_at) {
-        (Some(incoming_reset_at), Some(existing_reset_at))
-            if incoming_reset_at != existing_reset_at =>
-        {
-            return;
-        }
-        (Some(_), Some(_)) | (None, None) => {}
-        _ => return,
-    }
-
-    let Some(existing_remaining) =
-        chatgpt_web_image_quota_f64(existing.get("image_quota_remaining"))
-    else {
-        return;
-    };
-    let Some(incoming_remaining) =
-        chatgpt_web_image_quota_f64(incoming.get("image_quota_remaining"))
-    else {
-        return;
-    };
-    if incoming_remaining <= existing_remaining {
-        return;
-    }
-
-    let limit = chatgpt_web_image_quota_f64(incoming.get("image_quota_total"))
-        .filter(|value| *value > 0.0)
-        .or_else(|| {
-            chatgpt_web_image_quota_f64(existing.get("image_quota_total"))
-                .filter(|value| *value > 0.0)
-        })
-        .unwrap_or_else(|| incoming_remaining.max(existing_remaining));
-    incoming.insert(
-        "image_quota_remaining".to_string(),
-        json!(existing_remaining),
-    );
-    incoming.insert("image_quota_total".to_string(), json!(limit));
-    incoming.insert(
-        "image_quota_used".to_string(),
-        json!((limit - existing_remaining).max(0.0)),
-    );
-    if let Some(value) = existing.get("image_quota_last_local_success_at").cloned() {
-        incoming.insert("image_quota_last_local_success_at".to_string(), value);
-    }
-    if let Some(value) = existing.get("image_quota_local_success_count").cloned() {
-        incoming.insert("image_quota_local_success_count".to_string(), value);
-    }
 }
 
 fn build_chatgpt_web_image_quota_refresh_plan(
@@ -1348,6 +1297,46 @@ fn merge_provider_metadata_object(
         .unwrap_or_default();
     merged.insert(section_key.to_string(), section_value);
     Some(Value::Object(merged))
+}
+
+fn chatgpt_web_image_quota_snapshot_window(
+    status_snapshot: Option<&Value>,
+) -> Option<&Map<String, Value>> {
+    let quota = status_snapshot
+        .and_then(Value::as_object)
+        .and_then(|snapshot| snapshot.get("quota"))
+        .and_then(Value::as_object)?;
+    if quota
+        .get("provider_type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().eq_ignore_ascii_case("chatgpt_web"))
+    {
+        return None;
+    }
+    quota
+        .get("windows")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|window| {
+            window
+                .get("code")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("image_gen"))
+        })
+        .or_else(|| {
+            quota
+                .get("windows")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(Value::as_object)
+                .find(|window| {
+                    window
+                        .get("scope")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value.trim().eq_ignore_ascii_case("account"))
+                })
+        })
 }
 
 fn chatgpt_web_image_quota_f64(value: Option<&Value>) -> Option<f64> {
@@ -2588,32 +2577,53 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_web_image_quota_refresh_preserves_recent_local_success_delta() {
-        let mut metadata = json!({
-            "updated_at": 1_000u64,
-            "image_quota_remaining": 25.0,
-            "image_quota_total": 25.0,
-            "image_quota_used": 0.0,
-            "image_quota_reset_at": 2_000u64
-        });
-        let existing = json!({
-            "chatgpt_web": {
-                "updated_at": 995u64,
-                "image_quota_remaining": 24.0,
-                "image_quota_total": 25.0,
-                "image_quota_used": 1.0,
-                "image_quota_reset_at": 2_000u64,
-                "image_quota_last_local_success_at": 998u64,
-                "image_quota_local_success_count": 1u64
-            }
-        });
+    fn chatgpt_web_image_quota_request_delta_decrements_remaining_count() {
+        let mut metadata = Map::from_iter([
+            ("image_quota_remaining".to_string(), json!(25.0)),
+            ("image_quota_total".to_string(), json!(25.0)),
+            ("image_quota_used".to_string(), json!(0.0)),
+            ("image_quota_reset_at".to_string(), json!(2_000u64)),
+        ]);
 
-        preserve_chatgpt_web_local_success_delta(&mut metadata, Some(&existing), 1_000);
+        assert!(apply_chatgpt_web_image_quota_request_delta_to_metadata(
+            &mut metadata,
+            None,
+            1_000,
+        ));
 
         assert_eq!(metadata["image_quota_remaining"], json!(24.0));
         assert_eq!(metadata["image_quota_total"], json!(25.0));
         assert_eq!(metadata["image_quota_used"], json!(1.0));
-        assert_eq!(metadata["image_quota_last_local_success_at"], json!(998u64));
+        assert_eq!(metadata["image_quota_local_request_count"], json!(1u64));
+    }
+
+    #[test]
+    fn chatgpt_web_image_quota_request_delta_can_use_status_snapshot() {
+        let mut metadata = Map::new();
+        let status_snapshot = json!({
+            "quota": {
+                "provider_type": "chatgpt_web",
+                "windows": [{
+                    "code": "image_gen",
+                    "scope": "account",
+                    "remaining_value": 19.0,
+                    "limit_value": 25.0,
+                    "used_value": 6.0,
+                    "reset_at": 2_000u64
+                }]
+            }
+        });
+
+        assert!(apply_chatgpt_web_image_quota_request_delta_to_metadata(
+            &mut metadata,
+            Some(&status_snapshot),
+            1_000,
+        ));
+
+        assert_eq!(metadata["image_quota_remaining"], json!(18.0));
+        assert_eq!(metadata["image_quota_total"], json!(25.0));
+        assert_eq!(metadata["image_quota_used"], json!(7.0));
+        assert_eq!(metadata["image_quota_reset_at"], json!(2_000u64));
     }
 
     async fn start_mock_chatgpt_web() -> (String, tokio::task::JoinHandle<()>) {
