@@ -1313,6 +1313,9 @@ mod tests {
     use crate::fetch_models_from_transports;
     use crate::transport::ModelFetchTransportRuntime;
 
+    type RouteResult = Result<(u16, Value), String>;
+    type ModelFetchRoute = (String, RouteResult);
+
     struct TestRuntime {
         executed_urls: Arc<Mutex<Vec<String>>>,
         response_body: Value,
@@ -1321,7 +1324,7 @@ mod tests {
 
     struct RoutingTestRuntime {
         executed_urls: Arc<Mutex<Vec<String>>>,
-        routes: Vec<(String, Result<(u16, Value), String>)>,
+        routes: Vec<ModelFetchRoute>,
     }
 
     #[async_trait]
