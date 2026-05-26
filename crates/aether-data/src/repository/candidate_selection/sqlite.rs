@@ -539,6 +539,24 @@ fn push_key_auth_channel_sql_filter(
         r#" = 'gemini:generate_content'
     )
     OR (
+      LOWER(TRIM(p.provider_type)) = 'grok'
+      AND LOWER(TRIM(pak.auth_type)) = 'oauth'
+      AND "#,
+    );
+    builder.push_bind(api_format.clone());
+    builder.push(
+        r#" IN ('openai:chat', 'openai:responses', 'claude:messages', 'openai:image')
+    )
+    OR (
+      LOWER(TRIM(p.provider_type)) = 'windsurf'
+      AND LOWER(TRIM(pak.auth_type)) IN ('oauth', 'api_key', 'bearer')
+      AND "#,
+    );
+    builder.push_bind(api_format.clone());
+    builder.push(
+        r#" = 'openai:chat'
+    )
+    OR (
       LOWER(TRIM(p.provider_type)) = 'vertex_ai'
       AND (
         (
@@ -565,9 +583,11 @@ fn push_key_auth_channel_sql_filter(
         'claude_code',
         'codex',
         'gemini_cli',
+        'grok',
         'vertex_ai',
         'antigravity',
-        'kiro'
+        'kiro',
+        'windsurf'
       )
       AND LOWER(TRIM(pak.auth_type)) <> 'oauth'
     )
@@ -1170,13 +1190,13 @@ mod tests {
             rows.iter()
                 .map(|row| row.key_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["key-1"]
+            vec!["key-windsurf-oauth", "key-1"]
         );
         assert_eq!(
-            rows[0].global_model_mappings,
+            rows[1].global_model_mappings,
             Some(vec!["alias-global".to_string()])
         );
-        assert_eq!(rows[0].global_model_supports_streaming, Some(true));
+        assert_eq!(rows[1].global_model_supports_streaming, Some(true));
 
         let requested = repository
             .list_for_exact_api_format_and_requested_model_page(
@@ -1190,6 +1210,25 @@ mod tests {
             .await
             .expect("requested model rows should load");
         assert_eq!(requested.len(), 1);
+
+        let windsurf_requested = repository
+            .list_for_exact_api_format_and_requested_model_page(
+                &StoredRequestedModelCandidateRowsQuery {
+                    api_format: "openai:chat".to_string(),
+                    requested_model_name: "claude-opus-4-7".to_string(),
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("windsurf oauth rows should load");
+        assert_eq!(
+            windsurf_requested
+                .iter()
+                .map(|row| row.key_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["key-windsurf-oauth"]
+        );
 
         let pool_keys = repository
             .list_pool_key_rows_for_group(&StoredPoolKeyCandidateRowsQuery {
@@ -1252,12 +1291,25 @@ INSERT INTO providers (
 )
 VALUES ('provider-chatgpt-web', 'ChatGPT Web', 'chatgpt_web', 20, 1, 1, 1);
 
+INSERT INTO providers (
+  id, name, provider_type, provider_priority, is_active, created_at, updated_at
+)
+VALUES ('provider-windsurf', 'Windsurf', 'windsurf', 15, 1, 1, 1);
+
 INSERT INTO provider_endpoints (
   id, provider_id, name, base_url, api_format, is_active, created_at, updated_at
 )
 VALUES (
   'endpoint-chatgpt-web', 'provider-chatgpt-web', 'ChatGPT Web Image',
   'https://chatgpt.com', 'openai:image', 1, 1, 1
+);
+
+INSERT INTO provider_endpoints (
+  id, provider_id, name, base_url, api_format, is_active, created_at, updated_at
+)
+VALUES (
+  'endpoint-windsurf', 'provider-windsurf', 'Windsurf Chat',
+  'https://server.codeium.com', 'openai:chat', 1, 1, 1
 );
 
 INSERT INTO provider_api_keys (
@@ -1268,12 +1320,20 @@ VALUES
   ('key-chatgpt-web-bearer', 'provider-chatgpt-web', 'Bearer', 'bearer', '["openai:image"]', 20, 1, 1, 1),
   ('key-chatgpt-web-api-key', 'provider-chatgpt-web', 'API Key', 'api_key', '["openai:image"]', 30, 1, 1, 1);
 
+INSERT INTO provider_api_keys (
+  id, provider_id, name, auth_type, api_formats, internal_priority, is_active, created_at, updated_at
+)
+VALUES (
+  'key-windsurf-oauth', 'provider-windsurf', 'OAuth', 'oauth', '["openai:chat"]', 10, 1, 1, 1
+);
+
 INSERT INTO global_models (
   id, name, config, is_active, created_at, updated_at
 )
 VALUES
   ('global-1', 'gpt-5', '{"model_mappings":["alias-global"],"streaming":true}', 1, 1, 1),
-  ('global-image-1', 'gpt-image-2', NULL, 1, 1, 1);
+  ('global-image-1', 'gpt-image-2', NULL, 1, 1, 1),
+  ('global-windsurf-1', 'claude-opus-4-7', '{"streaming":true}', 1, 1, 1);
 
 INSERT INTO models (
   id, provider_id, global_model_id, provider_model_name, provider_model_mappings,
@@ -1287,6 +1347,10 @@ VALUES (
 (
   'model-chatgpt-web-image', 'provider-chatgpt-web', 'global-image-1', 'gpt-image-2',
   NULL, 1, 1, 1, 1, 1
+),
+(
+  'model-windsurf-opus', 'provider-windsurf', 'global-windsurf-1', 'claude-opus-4-7',
+  NULL, NULL, 1, 1, 1, 1
 );
 "#,
         )

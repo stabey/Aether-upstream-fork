@@ -828,13 +828,7 @@ async fn handle_admin_provider_oauth_windsurf_browser_device_poll(
         };
         callback_token.to_string()
     } else {
-        let token = token.unwrap_or_default();
-        if windsurf_raw_api_key(token).is_none() {
-            return Ok(windsurf_browser_poll_error_response(
-                "浏览器授权请提交包含 state 的回调 URL；纯 token 请使用导入授权",
-            ));
-        }
-        token.to_string()
+        token.unwrap_or_default().to_string()
     };
 
     let mut raw_credentials = serde_json::Map::new();

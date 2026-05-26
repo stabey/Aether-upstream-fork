@@ -81,41 +81,55 @@ impl WindsurfProviderOAuthAdapter {
         }
 
         let mut errors = Vec::new();
-        for (url, source) in [
-            (WINDSURF_REGISTER_USER_URL, "new"),
-            (WINDSURF_REGISTER_USER_LEGACY_URL, "legacy"),
+        for attempt in [
+            RegisterUserAttempt {
+                url: WINDSURF_REGISTER_USER_URL,
+                source: "new",
+                body: RegisterUserBody::ProtoOneTimeToken,
+            },
+            RegisterUserAttempt {
+                url: WINDSURF_REGISTER_USER_LEGACY_URL,
+                source: "legacy",
+                body: RegisterUserBody::LegacyJsonFirebaseToken,
+            },
         ] {
+            let (headers, content_type, json_body, body_bytes) = attempt.body.request_parts(token);
             let response = executor
                 .execute(OAuthHttpRequest {
-                    request_id: format!("provider-oauth:windsurf-register:{source}"),
+                    request_id: format!("provider-oauth:windsurf-register:{}", attempt.source),
                     method: reqwest::Method::POST,
-                    url: url.to_string(),
-                    headers: json_connect_headers(),
-                    content_type: Some("application/json".to_string()),
-                    json_body: Some(json!({ "firebase_id_token": token })),
-                    body_bytes: None,
+                    url: attempt.url.to_string(),
+                    headers,
+                    content_type: Some(content_type.to_string()),
+                    json_body,
+                    body_bytes,
                     network: ctx.network.clone(),
                 })
                 .await;
             match response {
                 Ok(response) if (200..300).contains(&response.status_code) => {
-                    let payload = response
-                        .json_body
-                        .or_else(|| serde_json::from_str::<Value>(&response.body_text).ok())
-                        .ok_or_else(|| {
-                            OAuthError::invalid_response("RegisterUser response is not json")
+                    let payload =
+                        parse_windsurf_register_user_payload(&response).ok_or_else(|| {
+                            OAuthError::invalid_response(
+                                "RegisterUser response missing apiKey/sessionToken",
+                            )
                         })?;
-                    if let Some(api_key) = string_any(&payload, &["api_key", "apiKey"]) {
+                    if let Some(credential) = windsurf_register_user_credential(&payload) {
                         let mut auth_config = Map::new();
                         auth_config
                             .insert("provider_type".to_string(), json!(WINDSURF_PROVIDER_TYPE));
                         auth_config.insert("auth_method".to_string(), json!("token"));
-                        auth_config.insert("register_source".to_string(), json!(source));
+                        auth_config.insert("register_source".to_string(), json!(attempt.source));
                         insert_secret_fingerprint(&mut auth_config, "id_token_fingerprint", token);
                         insert_secret_fingerprint(
                             &mut auth_config,
+                            "register_token_fingerprint",
+                            token,
+                        );
+                        insert_secret_fingerprint(
+                            &mut auth_config,
                             "credential_fingerprint",
-                            &api_key,
+                            &credential,
                         );
                         auth_config.insert("updated_at".to_string(), json!(current_unix_secs()));
                         copy_optional_string(&payload, &mut auth_config, "name", &["name"]);
@@ -171,19 +185,20 @@ impl WindsurfProviderOAuthAdapter {
                             );
                         }
                         return Ok(provider_token_set(
-                            &api_key,
+                            &credential,
                             Value::Object(auth_config),
                             None,
                         ));
                     }
-                    errors.push(format!("{source}=missing api_key"));
+                    errors.push(format!("{}=missing credential", attempt.source));
                 }
                 Ok(response) => errors.push(format!(
-                    "{source}=HTTP {} {}",
+                    "{}=HTTP {} {}",
+                    attempt.source,
                     response.status_code,
                     truncate_body(&response.body_text)
                 )),
-                Err(error) => errors.push(format!("{source}={error}")),
+                Err(error) => errors.push(format!("{}={error}", attempt.source)),
             }
         }
 
@@ -322,6 +337,46 @@ impl WindsurfProviderOAuthAdapter {
             "WindsurfPostAuth failed: {}",
             post_auth_errors.join(" | ")
         )))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegisterUserAttempt {
+    url: &'static str,
+    source: &'static str,
+    body: RegisterUserBody,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RegisterUserBody {
+    ProtoOneTimeToken,
+    LegacyJsonFirebaseToken,
+}
+
+impl RegisterUserBody {
+    fn request_parts(
+        self,
+        token: &str,
+    ) -> (
+        BTreeMap<String, String>,
+        &'static str,
+        Option<Value>,
+        Option<Vec<u8>>,
+    ) {
+        match self {
+            Self::ProtoOneTimeToken => (
+                register_user_proto_headers(),
+                "application/proto",
+                None,
+                Some(proto_string_field_body(1, token)),
+            ),
+            Self::LegacyJsonFirebaseToken => (
+                json_connect_headers(),
+                "application/json",
+                Some(json!({ "firebase_id_token": token })),
+                None,
+            ),
+        }
     }
 }
 
@@ -577,6 +632,30 @@ fn json_connect_headers() -> BTreeMap<String, String> {
     headers
 }
 
+fn register_user_proto_headers() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("connect-protocol-version".to_string(), "1".to_string()),
+        ("content-type".to_string(), "application/proto".to_string()),
+        ("user-agent".to_string(), "connect-es/1.5.0".to_string()),
+    ])
+}
+
+fn proto_string_field_body(field_number: u32, value: &str) -> Vec<u8> {
+    let mut body = Vec::with_capacity(value.len() + 8);
+    push_proto_varint(((field_number as u64) << 3) | 2, &mut body);
+    push_proto_varint(value.len() as u64, &mut body);
+    body.extend_from_slice(value.as_bytes());
+    body
+}
+
+fn push_proto_varint(mut value: u64, target: &mut Vec<u8>) {
+    while value >= 0x80 {
+        target.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    target.push(value as u8);
+}
+
 fn proto_headers() -> BTreeMap<String, String> {
     let mut headers = windsurf_browser_headers();
     headers.insert("content-type".to_string(), "application/proto".to_string());
@@ -587,6 +666,63 @@ fn proto_headers() -> BTreeMap<String, String> {
         "https://windsurf.com/account/login".to_string(),
     );
     headers
+}
+
+fn parse_windsurf_register_user_payload(
+    response: &crate::network::OAuthHttpResponse,
+) -> Option<Value> {
+    let payload = response
+        .json_body
+        .clone()
+        .or_else(|| serde_json::from_str::<Value>(&response.body_text).ok());
+    if payload
+        .as_ref()
+        .and_then(windsurf_register_user_credential)
+        .is_some()
+    {
+        return payload;
+    }
+
+    let session_token = extract_windsurf_session_token_from_text(&response.body_text)?;
+    let account_id = extract_windsurf_raw_match(&response.body_text, "account-");
+    let primary_org_id = extract_windsurf_raw_match(&response.body_text, "org-");
+    let api_server_url = extract_windsurf_http_url(&response.body_text);
+    let mut payload = Map::new();
+    payload.insert("sessionToken".to_string(), json!(session_token));
+    if let Some(account_id) = account_id {
+        payload.insert("accountId".to_string(), json!(account_id));
+    }
+    if let Some(primary_org_id) = primary_org_id {
+        payload.insert("primaryOrgId".to_string(), json!(primary_org_id));
+    }
+    if let Some(api_server_url) = api_server_url {
+        payload.insert("apiServerUrl".to_string(), json!(api_server_url));
+    }
+    Some(Value::Object(payload))
+}
+
+fn windsurf_register_user_credential(payload: &Value) -> Option<String> {
+    string_any(
+        payload,
+        &[
+            "api_key",
+            "apiKey",
+            "session_token",
+            "sessionToken",
+            "access_token",
+            "accessToken",
+        ],
+    )
+    .or_else(|| {
+        string_any(payload, &["token"]).and_then(|token| {
+            if windsurf_raw_api_key(&token).is_some() {
+                Some(token)
+            } else {
+                None
+            }
+        })
+    })
+    .or_else(|| extract_windsurf_session_token_from_text(&payload.to_string()))
 }
 
 fn parse_windsurf_post_auth_payload(response: &crate::network::OAuthHttpResponse) -> Option<Value> {
@@ -626,11 +762,22 @@ fn extract_windsurf_session_token_from_text(value: &str) -> Option<String> {
 
 fn extract_windsurf_raw_match(value: &str, prefix: &str) -> Option<String> {
     let start = value.find(prefix)?;
-    let matched = value[start..]
+    let suffix_start = start + prefix.len();
+    let suffix = value[suffix_start..]
         .chars()
         .take_while(|ch| ch.is_ascii_hexdigit() || *ch == '-')
         .collect::<String>();
-    (matched.len() > prefix.len()).then_some(matched)
+    (!suffix.is_empty()).then(|| format!("{prefix}{suffix}"))
+}
+
+fn extract_windsurf_http_url(value: &str) -> Option<String> {
+    let start = value.find("https://")?;
+    let matched = value[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_graphic() && !matches!(ch, '"' | '\'' | '<' | '>' | '\\'))
+        .collect::<String>();
+    let matched = matched.trim_matches(|ch| matches!(ch, ',' | ';' | ')' | ']' | '}' | '.'));
+    (!matched.is_empty()).then_some(matched.to_string())
 }
 
 fn copy_optional_string(
@@ -722,6 +869,8 @@ fn looks_like_sensitive_secret(value: &str) -> bool {
     let value = value.trim();
     value.starts_with("devin-session-token$")
         || value.starts_with("sk-")
+        || value.starts_with("ott$")
+        || value.starts_with("auth1_")
         || (value.len() > 80 && value.split('.').count() == 3)
 }
 
@@ -736,6 +885,8 @@ fn contains_sensitive_marker(value: &str) -> bool {
         "sessiontoken",
         "firebase_id_token",
         "idtoken",
+        "ott$",
+        "auth1_",
         "secret",
     ]
     .iter()
@@ -755,8 +906,8 @@ fn secret_fingerprint(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        secret_fingerprint, truncate_body, WindsurfProviderOAuthAdapter, AUTH1_PASSWORD_LOGIN_URL,
-        WINDSURF_POST_AUTH_URL, WINDSURF_REGISTER_USER_URL,
+        proto_string_field_body, secret_fingerprint, truncate_body, WindsurfProviderOAuthAdapter,
+        AUTH1_PASSWORD_LOGIN_URL, WINDSURF_POST_AUTH_URL, WINDSURF_REGISTER_USER_URL,
     };
     use crate::network::{OAuthHttpExecutor, OAuthHttpRequest, OAuthHttpResponse};
     use crate::provider::{
@@ -769,6 +920,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingExecutor {
         requests: Arc<Mutex<Vec<OAuthHttpRequest>>>,
+        raw_register_body: Option<String>,
         raw_post_auth_body: Option<String>,
     }
 
@@ -783,11 +935,18 @@ mod tests {
                 .expect("requests lock")
                 .push(request.clone());
             if request.url == WINDSURF_REGISTER_USER_URL {
+                if let Some(body_text) = self.raw_register_body.clone() {
+                    return Ok(OAuthHttpResponse {
+                        status_code: 200,
+                        body_text,
+                        json_body: None,
+                    });
+                }
                 return Ok(OAuthHttpResponse {
                     status_code: 200,
-                    body_text: r#"{"apiKey":"sk-ws-01-registered","name":"Alice","email":"alice@example.com","accountId":"acct-1","primaryOrgId":"org-1","planName":"Pro","apiServerUrl":"https://server.codeium.com"}"#.to_string(),
+                    body_text: r#"{"sessionToken":"devin-session-token$registered","name":"Alice","email":"alice@example.com","accountId":"acct-1","primaryOrgId":"org-1","planName":"Pro","apiServerUrl":"https://server.codeium.com"}"#.to_string(),
                     json_body: Some(json!({
-                        "apiKey": "sk-ws-01-registered",
+                        "sessionToken": "devin-session-token$registered",
                         "name": "Alice",
                         "email": "alice@example.com",
                         "accountId": "acct-1",
@@ -881,8 +1040,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchanges_show_auth_token_with_register_user() {
+    async fn exchanges_show_auth_token_with_register_user_proto() {
         let executor = RecordingExecutor::default();
+        let adapter = WindsurfProviderOAuthAdapter;
+        let one_time_token = "ott$browser-token";
+        let result = adapter
+            .import_credentials(
+                &executor,
+                &ctx(),
+                ProviderOAuthImportInput {
+                    provider_type: "windsurf".to_string(),
+                    name: None,
+                    refresh_token: None,
+                    raw_credentials: Some(json!({
+                        "token": one_time_token,
+                        "email": "alice@example.com"
+                    })),
+                    network: crate::network::OAuthNetworkContext::provider_operation(None),
+                },
+            )
+            .await
+            .expect("token should register");
+
+        assert_eq!(
+            result.token_set.access_token,
+            "devin-session-token$registered"
+        );
+        assert_eq!(result.auth_config["auth_method"], json!("token"));
+        assert_eq!(result.auth_config["register_source"], json!("new"));
+        assert!(result.auth_config.get("id_token").is_none());
+        assert_eq!(
+            result.auth_config["id_token_fingerprint"],
+            json!(secret_fingerprint(one_time_token))
+        );
+        assert_eq!(
+            result.auth_config["register_token_fingerprint"],
+            json!(secret_fingerprint(one_time_token))
+        );
+        assert_eq!(
+            result.auth_config["credential_fingerprint"],
+            json!(secret_fingerprint("devin-session-token$registered"))
+        );
+        assert_eq!(result.auth_config["email"], json!("alice@example.com"));
+        assert_eq!(result.auth_config["email_verified"], json!(true));
+        assert_eq!(result.auth_config["account_id"], json!("acct-1"));
+        assert_eq!(result.auth_config["primary_org_id"], json!("org-1"));
+        assert_eq!(result.auth_config["plan_name"], json!("Pro"));
+        let requests = executor.requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].content_type.as_deref(),
+            Some("application/proto")
+        );
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("connect-protocol-version")
+                .map(String::as_str),
+            Some("1")
+        );
+        let expected_body = proto_string_field_body(1, one_time_token);
+        assert_eq!(
+            requests[0].body_bytes.as_ref().map(|body| body.as_slice()),
+            Some(expected_body.as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn exchanges_show_auth_token_from_raw_register_user_body() {
+        let executor = RecordingExecutor {
+            raw_register_body: Some(
+                "\u{0}\u{bd}\u{1}devin-session-token$raw-register\u{12}account-2d9e\u{1a}org-4a5b\u{22}https://server.self-serve.windsurf.com".to_string(),
+            ),
+            ..RecordingExecutor::default()
+        };
         let adapter = WindsurfProviderOAuthAdapter;
         let result = adapter
             .import_credentials(
@@ -893,41 +1124,24 @@ mod tests {
                     name: None,
                     refresh_token: None,
                     raw_credentials: Some(json!({
-                        "token": "firebase-id-token",
+                        "token": "ott$raw-body-token",
                         "email": "alice@example.com"
                     })),
                     network: crate::network::OAuthNetworkContext::provider_operation(None),
                 },
             )
             .await
-            .expect("token should register");
+            .expect("raw register body should import");
 
-        assert_eq!(result.token_set.access_token, "sk-ws-01-registered");
-        assert_eq!(result.auth_config["auth_method"], json!("token"));
-        assert_eq!(result.auth_config["register_source"], json!("new"));
-        assert!(result.auth_config.get("id_token").is_none());
         assert_eq!(
-            result.auth_config["id_token_fingerprint"],
-            json!(secret_fingerprint("firebase-id-token"))
+            result.token_set.access_token,
+            "devin-session-token$raw-register"
         );
+        assert_eq!(result.auth_config["account_id"], json!("account-2d9e"));
+        assert_eq!(result.auth_config["primary_org_id"], json!("org-4a5b"));
         assert_eq!(
-            result.auth_config["credential_fingerprint"],
-            json!(secret_fingerprint("sk-ws-01-registered"))
-        );
-        assert_eq!(result.auth_config["email"], json!("alice@example.com"));
-        assert_eq!(result.auth_config["email_verified"], json!(true));
-        assert_eq!(result.auth_config["account_id"], json!("acct-1"));
-        assert_eq!(result.auth_config["primary_org_id"], json!("org-1"));
-        assert_eq!(result.auth_config["plan_name"], json!("Pro"));
-        let requests = executor.requests.lock().expect("requests lock");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0]
-                .json_body
-                .as_ref()
-                .and_then(|body| body.get("firebase_id_token"))
-                .and_then(serde_json::Value::as_str),
-            Some("firebase-id-token")
+            result.auth_config["api_server_url"],
+            json!("https://server.self-serve.windsurf.com")
         );
     }
 

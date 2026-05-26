@@ -225,7 +225,7 @@ fn windsurf_register_user_execution_result(request_id: &str) -> serde_json::Valu
         },
         "body": {
             "json_body": {
-                "apiKey": "devin-session-token$registered",
+                "sessionToken": "devin-session-token$registered",
                 "name": "Windsurf User",
                 "apiServerUrl": "https://server.codeium.com"
             }
@@ -431,7 +431,7 @@ async fn gateway_rejects_generic_oauth_start_for_windsurf_provider() {
 }
 
 #[tokio::test]
-async fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_callback_token() {
+async fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_token() {
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
     let execution_runtime = Router::new().route(
@@ -521,7 +521,7 @@ async fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_callback_
         "/api/admin/provider-oauth/providers/provider-windsurf/device-poll",
         Some(json!({
             "session_id": "session-windsurf",
-            "callback_url": "https://windsurf.com/show-auth-token?token=firebase-id-token&state=session-windsurf&provider=google"
+            "token": "ott$browser-token"
         })),
     )
     .await;
@@ -590,14 +590,22 @@ async fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_callback_
             .expect("register plan should execute");
         assert_eq!(register_plan.method, "POST");
         assert_eq!(
-            register_plan
-                .body
-                .json_body
-                .as_ref()
-                .and_then(|body| body.get("firebase_id_token"))
-                .and_then(serde_json::Value::as_str),
-            Some("firebase-id-token")
+            register_plan.content_type.as_deref(),
+            Some("application/proto")
         );
+        assert!(register_plan.body.json_body.is_none());
+        let encoded_body = register_plan
+            .body
+            .body_bytes_b64
+            .as_deref()
+            .expect("register body should be bytes");
+        use base64::Engine as _;
+        let body_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded_body)
+            .expect("register body should decode");
+        let mut expected_body = vec![0x0a, "ott$browser-token".len() as u8];
+        expected_body.extend_from_slice(b"ott$browser-token");
+        assert_eq!(body_bytes, expected_body);
         assert_eq!(
             register_plan
                 .proxy
@@ -661,7 +669,7 @@ async fn gateway_rejects_windsurf_callback_state_mismatch_and_missing_token() {
         "/api/admin/provider-oauth/providers/provider-windsurf/device-poll",
         Some(json!({
             "session_id": "session-windsurf",
-            "callback_url": "https://windsurf.com/show-auth-token?token=firebase-id-token&state=wrong-state"
+            "callback_url": "https://windsurf.com/show-auth-token?token=ott$wrong-state&state=wrong-state"
         })),
     )
     .await;

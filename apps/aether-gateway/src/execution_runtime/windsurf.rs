@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Error as IoError;
+use std::io::{Error as IoError, Read, Seek, SeekFrom};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -18,9 +18,9 @@ use aether_provider_transport::windsurf::cascade::{
     build_get_trajectory_steps_request, build_get_user_status_request, build_heartbeat_request,
     build_initialize_panel_state_request, build_send_cascade_message_request_with_options,
     build_start_cascade_request, build_update_panel_state_with_user_status_request,
-    build_update_workspace_trust_request, extract_grpc_frames, extract_user_status_bytes,
-    grpc_frame, parse_generator_metadata, parse_start_cascade_response, parse_trajectory_status,
-    parse_trajectory_steps, CascadeImage, CascadeUsage, SendCascadeMessageOptions,
+    build_update_workspace_trust_request, extract_user_status_bytes, parse_generator_metadata,
+    parse_start_cascade_response, parse_trajectory_status, parse_trajectory_steps, CascadeImage,
+    CascadeUsage, SendCascadeMessageOptions,
 };
 use aether_provider_transport::windsurf::models::resolve_windsurf_model;
 use aether_provider_transport::windsurf::{GET_CHAT_MESSAGE_PATH, WINDSURF_ENVELOPE_NAME};
@@ -32,7 +32,7 @@ use regex::Regex;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::ndjson::encode_stream_frame_ndjson;
@@ -51,6 +51,7 @@ const CASCADE_TEXT_STALL: Duration = Duration::from_secs(45);
 const CASCADE_THINKING_STALL: Duration = Duration::from_secs(120);
 const SSE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const LS_READY_TIMEOUT: Duration = Duration::from_secs(25);
+const WINDOWS_LS_READY_TIMEOUT: Duration = Duration::from_secs(90);
 const GRPC_SHORT_TIMEOUT: Duration = Duration::from_secs(5);
 const GRPC_STATUS_TIMEOUT: Duration = Duration::from_secs(10);
 const GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
@@ -1175,13 +1176,19 @@ async fn ensure_windsurf_language_server(
     let mut command = Command::new(&binary_path);
     command
         .arg(format!("--api_server_url={}", codeium_api_url()))
+        .arg("--run_child")
         .arg(format!("--server_port={port}"))
         .arg(format!("--csrf_token={DEFAULT_CSRF_TOKEN}"))
         .arg(format!("--register_user_url={DEFAULT_REGISTER_USER_URL}"))
         .arg(format!("--codeium_dir={}", data_dir.display()))
         .arg(format!("--database_dir={}", data_dir.join("db").display()))
-        .arg("--detect_proxy=false")
-        .env_clear()
+        .arg("--detect_proxy=false");
+
+    if !cfg!(target_os = "windows") {
+        command.env_clear();
+    }
+
+    command
         .envs(language_server_env(proxy_url.as_deref()))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1194,7 +1201,8 @@ async fn ensure_windsurf_language_server(
         ))
     })?;
 
-    if let Err(err) = wait_language_server_ready(port).await {
+    if let Err(err) = wait_language_server_ready(port, &mut child, stderr_log_path.as_deref()).await
+    {
         let _ = child.kill();
         return Err(err);
     }
@@ -1382,7 +1390,7 @@ async fn windsurf_warmup_unary(
         Err(err) if is_windsurf_cascade_transport_error(&err) => Err(err),
         Err(err) => {
             if stage == "UpdateWorkspaceTrust" {
-                error!(
+                warn!(
                     event_name = "windsurf_workspace_trust_update_failed",
                     log_type = "ops",
                     port,
@@ -1515,44 +1523,39 @@ async fn windsurf_grpc_unary(
 ) -> Result<Vec<u8>, ExecutionRuntimeTransportError> {
     let url = format!("http://127.0.0.1:{port}{LS_SERVICE}/{method}");
     let client = reqwest::Client::builder()
-        .http2_prior_knowledge()
+        .http1_only()
         .timeout(timeout)
         .build()
         .map_err(ExecutionRuntimeTransportError::ClientBuild)?;
     let response = client
         .post(url)
-        .header("content-type", "application/grpc")
-        .header("te", "trailers")
-        .header("user-agent", "grpc-node/1.108.2")
+        .header("content-type", "application/proto")
+        .header("connect-protocol-version", "1")
+        .header("user-agent", "connect-es/1.5.0")
         .header("x-codeium-csrf-token", csrf_token)
-        .body(grpc_frame(&payload))
+        .body(payload)
         .send()
         .await
         .map_err(|err| {
             ExecutionRuntimeTransportError::UpstreamRequest(format!(
-                "Windsurf gRPC {method} request failed: {}",
+                "Windsurf Connect {method} request failed: {}",
                 super::transport::format_upstream_request_error(&err)
             ))
         })?;
     let status = response.status();
     let body = response.bytes().await.map_err(|err| {
         ExecutionRuntimeTransportError::UpstreamRequest(format!(
-            "Windsurf gRPC {method} response read failed: {}",
+            "Windsurf Connect {method} response read failed: {}",
             super::transport::format_upstream_request_error(&err)
         ))
     })?;
     if !status.is_success() {
         return Err(ExecutionRuntimeTransportError::UpstreamRequest(format!(
-            "Windsurf gRPC {method} returned HTTP {status}: {}",
+            "Windsurf Connect {method} returned HTTP {status}: {}",
             String::from_utf8_lossy(&body)
         )));
     }
-    let frames = extract_grpc_frames(&body);
-    if frames.is_empty() {
-        Ok(body.to_vec())
-    } else {
-        Ok(frames.concat())
-    }
+    Ok(body.to_vec())
 }
 
 fn detect_windsurf_request(
@@ -3900,10 +3903,27 @@ fn port_is_free(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
-async fn wait_language_server_ready(port: u16) -> Result<(), ExecutionRuntimeTransportError> {
+async fn wait_language_server_ready(
+    port: u16,
+    child: &mut Child,
+    stderr_log_path: Option<&Path>,
+) -> Result<(), ExecutionRuntimeTransportError> {
+    let timeout = if cfg!(target_os = "windows") {
+        WINDOWS_LS_READY_TIMEOUT
+    } else {
+        LS_READY_TIMEOUT
+    };
     let started = Instant::now();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    while started.elapsed() < LS_READY_TIMEOUT {
+    while started.elapsed() < timeout {
+        if let Ok(Some(status)) = child.try_wait() {
+            let stderr_tail = stderr_log_path
+                .and_then(|path| read_log_tail(path, 8 * 1024))
+                .unwrap_or_else(|| "<stderr log unavailable>".to_string());
+            return Err(ExecutionRuntimeTransportError::UpstreamRequest(format!(
+                "Windsurf language server exited before port {port} became ready with status {status}; stderr tail: {stderr_tail}"
+            )));
+        }
         if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
             debug!(
                 event_name = "windsurf_language_server_port_ready",
@@ -3915,10 +3935,28 @@ async fn wait_language_server_ready(port: u16) -> Result<(), ExecutionRuntimeTra
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    let child_status = child.try_wait().ok().flatten();
+    let stderr_tail = stderr_log_path
+        .and_then(|path| read_log_tail(path, 8 * 1024))
+        .unwrap_or_else(|| "<stderr log unavailable>".to_string());
     Err(ExecutionRuntimeTransportError::UpstreamRequest(format!(
-        "Windsurf language server port {port} was not ready after {}ms",
-        LS_READY_TIMEOUT.as_millis()
+        "Windsurf language server port {port} was not ready after {}ms{}; stderr tail: {stderr_tail}",
+        timeout.as_millis(),
+        child_status
+            .map(|status| format!(" (child status: {status})"))
+            .unwrap_or_default()
     )))
+}
+
+fn read_log_tail(path: &Path, max_bytes: usize) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len() as i64;
+    let max_bytes = max_bytes.max(1) as i64;
+    let start = len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start as u64)).ok()?;
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).to_string())
 }
 
 fn language_server_data_dir(key: &str) -> PathBuf {
@@ -3982,8 +4020,32 @@ fn language_server_env(proxy_url: Option<&str>) -> BTreeMap<String, String> {
             }
         }
     }
+    if cfg!(target_os = "windows") {
+        for key in [
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "SystemRoot",
+            "WINDIR",
+            "ComSpec",
+        ] {
+            if let Ok(value) = std::env::var(key) {
+                if !value.trim().is_empty() {
+                    env.insert(key.to_string(), value);
+                }
+            }
+        }
+    }
     if !env.contains_key("HOME") {
         env.insert("HOME".to_string(), home_dir().display().to_string());
+    }
+    if cfg!(target_os = "windows") && !env.contains_key("USERPROFILE") {
+        if let Some(home) = std::env::var_os("USERPROFILE")
+            .or_else(|| std::env::var_os("HOME"))
+            .filter(|value| !value.is_empty())
+        {
+            env.insert("USERPROFILE".to_string(), PathBuf::from(home).display().to_string());
+        }
     }
     if let Some(proxy_url) = proxy_url.filter(|value| !value.trim().is_empty()) {
         for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
@@ -4001,9 +4063,15 @@ fn codeium_api_url() -> String {
 }
 
 fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        return PathBuf::from(home);
+    }
+    if cfg!(target_os = "windows") {
+        if let Some(home) = std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()) {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(".")
 }
 
 fn first_string(body: &Value, keys: &[&str]) -> Option<String> {
