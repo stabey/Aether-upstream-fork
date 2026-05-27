@@ -25,11 +25,11 @@ pub use formats::shared::model_directives::{
     apply_model_directive_overrides_from_request, claude_model_uses_adaptive_effort,
     extract_gemini_model_from_path, gemini_model_uses_thinking_level, model_directive_base_model,
     normalize_model_directive_model, parse_model_directive, ModelDirective, ModelOverride,
-    ReasoningEffort,
+    ReasoningEffort, ServiceTier,
 };
 pub use formats::shared::request::{
     endpoint_config_forces_upstream_stream_policy, enforce_request_body_stream_field,
-    resolve_upstream_is_stream_from_endpoint_config,
+    resolve_upstream_is_stream_from_endpoint_config, UPSTREAM_IS_STREAM_KEY,
 };
 pub use protocol::canonical::{
     canonical_request_unknown_block_count, canonical_response_unknown_block_count,

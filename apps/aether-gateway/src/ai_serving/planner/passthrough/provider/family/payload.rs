@@ -11,7 +11,8 @@ use crate::ai_serving::planner::materialization_policy::{
     build_local_candidate_persistence_policy, LocalCandidatePersistencePolicyKind,
 };
 use crate::ai_serving::planner::report_context::{
-    build_local_execution_report_context, LocalExecutionReportContextParts,
+    build_local_execution_report_context, insert_native_client_envelope_name,
+    LocalExecutionReportContextParts,
 };
 use crate::ai_serving::planner::spec_metadata::local_same_format_provider_spec_metadata;
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
@@ -55,9 +56,14 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
     let Some(resolved) = resolve_local_same_format_provider_candidate_payload_parts(
         state, parts, trace_id, body_json, input, &attempt, spec,
     )
-    .await
+    .await?
     else {
         return Ok(None);
+    };
+    let original_request_body_json = if resolved.request_redacted {
+        Some(&resolved.provider_request_body)
+    } else {
+        Some(body_json)
     };
 
     let prompt_cache_key = resolved
@@ -89,6 +95,11 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         extra_fields.insert(
             "envelope_name".to_string(),
             json!(super::super::ANTIGRAVITY_ENVELOPE_NAME),
+        );
+        insert_native_client_envelope_name(
+            &mut extra_fields,
+            super::super::ANTIGRAVITY_ENVELOPE_NAME,
+            parts.uri.path(),
         );
     }
     let provider_api_format = resolved.provider_api_format.clone();
@@ -124,7 +135,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
                 request_path: Some(parts.uri.path()),
                 request_query_string: parts.uri.query(),
                 request_origin: Some(crate::ai_serving::request_origin_from_parts(parts)),
-                original_request_body_json: Some(body_json),
+                original_request_body_json,
                 original_request_body_base64: None,
                 client_session_affinity: input.client_session_affinity.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
@@ -158,6 +169,7 @@ pub(crate) async fn maybe_build_local_same_format_provider_decision_payload_for_
         provider_request_headers,
         provider_request_body,
         transport_profile: _,
+        request_redacted: _,
     } = resolved;
 
     let mut decision = build_ai_execution_decision_response(AiExecutionDecisionResponseParts {

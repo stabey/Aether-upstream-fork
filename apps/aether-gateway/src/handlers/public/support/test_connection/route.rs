@@ -14,6 +14,8 @@ use super::{
     provider_catalog_key_supports_format, query_param_value, AppState, GatewayPublicRequestContext,
 };
 
+const DEFAULT_NON_STREAM_TOTAL_TIMEOUT_MS: u64 = 300_000;
+
 pub(super) async fn maybe_build_local_test_connection_route_response(
     state: &AppState,
     request_context: &GatewayPublicRequestContext,
@@ -287,12 +289,10 @@ pub(super) async fn maybe_build_local_test_connection_route_response(
     for (name, value) in &provider_request_headers {
         upstream_request = upstream_request.header(name, value);
     }
-    if let Some(total_ms) =
-        crate::provider_transport::resolve_transport_execution_timeouts(&transport)
-            .and_then(|timeouts| timeouts.total_ms.or(timeouts.first_byte_ms))
-    {
-        upstream_request = upstream_request.timeout(Duration::from_millis(total_ms));
-    }
+    let total_ms = crate::provider_transport::resolve_transport_execution_timeouts(&transport)
+        .and_then(|timeouts| timeouts.total_ms)
+        .unwrap_or(DEFAULT_NON_STREAM_TOTAL_TIMEOUT_MS);
+    upstream_request = upstream_request.timeout(Duration::from_millis(total_ms));
 
     let response = match upstream_request.json(&provider_request_body).send().await {
         Ok(response) => response,

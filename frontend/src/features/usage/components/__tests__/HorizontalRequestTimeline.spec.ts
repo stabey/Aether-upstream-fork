@@ -481,4 +481,33 @@ describe('HorizontalRequestTimeline', () => {
     expect(root.textContent).not.toContain('不再重试')
     expect(root.textContent).not.toContain('该错误被标记为敏感上游错误')
   })
+
+  it('keeps the failure message when upstream response only records an empty body state', async () => {
+    const trace = buildTrace([
+      buildCandidate({
+        id: 'cand-empty-body-state',
+        provider_id: 'provider-empty-body-state',
+        provider_name: 'Provider Empty Body State',
+        key_id: 'key-empty-body-state',
+        key_name: 'Empty Body State Key',
+        candidate_index: 0,
+        status: 'failed',
+        error_type: 'stream_missing_terminal_event',
+        error_message: 'execution runtime stream ended before provider terminal event',
+        extra_data: {
+          upstream_response: {
+            body_state: 'none',
+          },
+        },
+      }),
+    ])
+
+    const root = mountTimeline(trace)
+    await nextTick()
+
+    expect(root.textContent).toContain('错误信息')
+    expect(root.textContent).toContain('execution runtime stream ended before provider terminal event')
+    expect(root.querySelector('.error-block .error-json')).toBeNull()
+    expect(root.textContent).not.toContain('"body_state":"none"')
+  })
 })

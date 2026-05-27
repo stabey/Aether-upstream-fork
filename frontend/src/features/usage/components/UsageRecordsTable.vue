@@ -5,27 +5,51 @@
       <TimeRangePicker
         v-model="timeRangeModel"
         :show-granularity="false"
+        class="hidden shrink-0 md:flex"
       />
 
       <!-- 分隔线 -->
       <div class="hidden sm:block h-4 w-px bg-border" />
 
       <!-- 通用搜索 -->
-      <div class="relative">
-        <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground z-10 pointer-events-none" />
-        <Input
-          id="usage-records-search"
-          v-model="localSearch"
-          :placeholder="isAdmin ? '搜索用户/密钥' : '搜索密钥/模型'"
-          class="w-[7.5rem] sm:w-48 h-8 text-xs border-border/60 pl-8"
-        />
+      <div class="order-1 flex w-full items-center gap-2 md:order-none md:w-auto">
+        <div class="relative min-w-0 flex-1 md:w-48 md:flex-none">
+          <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground z-10 pointer-events-none" />
+          <Input
+            id="usage-records-search"
+            v-model="localSearch"
+            :placeholder="isAdmin ? '搜索用户/密钥' : '搜索密钥/模型'"
+            class="h-8 w-full text-xs border-border/60 pl-8"
+          />
+        </div>
+        <Button
+          variant="ghost"
+          size="icon"
+          class="h-8 w-8 shrink-0 md:hidden"
+          :class="autoRefresh ? 'text-primary' : ''"
+          :title="autoRefresh ? '点击关闭自动刷新' : '点击开启自动刷新'"
+          @click="$emit('update:autoRefresh', !autoRefresh)"
+        >
+          <RefreshCcw
+            class="w-3.5 h-3.5"
+            :class="autoRefresh ? 'animate-spin' : ''"
+          />
+        </Button>
       </div>
 
-      <div class="contents md:hidden">
+      <div class="order-3 grid w-full grid-cols-2 gap-2 md:hidden">
+        <!-- 时间范围筛选 -->
+        <TimeRangePicker
+          v-model="timeRangeModel"
+          :show-granularity="false"
+          class="min-w-0"
+          preset-trigger-class="!w-full"
+        />
+
         <!-- 用户筛选（仅管理员可见） -->
         <ServerUserSelector
           v-if="isAdmin"
-          class="flex-1 min-w-0 sm:flex-none sm:w-40"
+          class="min-w-0"
           :model-value="filterUser"
           :initial-users="availableUsers"
           dropdown
@@ -37,7 +61,7 @@
           :model-value="filterModel"
           @update:model-value="$emit('update:filterModel', $event)"
         >
-          <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-40 h-8 text-xs border-border/60">
+          <SelectTrigger class="h-8 w-full min-w-0 text-xs border-border/60">
             <SelectValue placeholder="模型" />
           </SelectTrigger>
           <SelectContent>
@@ -60,7 +84,7 @@
           :model-value="filterProvider"
           @update:model-value="$emit('update:filterProvider', $event)"
         >
-          <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
+          <SelectTrigger class="h-8 w-full min-w-0 text-xs border-border/60">
             <SelectValue placeholder="提供商" />
           </SelectTrigger>
           <SelectContent>
@@ -82,7 +106,7 @@
           :model-value="filterApiFormat"
           @update:model-value="$emit('update:filterApiFormat', $event)"
         >
-          <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-32 h-8 text-xs border-border/60">
+          <SelectTrigger class="h-8 w-full min-w-0 text-xs border-border/60">
             <SelectValue placeholder="格式" />
           </SelectTrigger>
           <SelectContent>
@@ -104,7 +128,7 @@
           :model-value="filterStatus"
           @update:model-value="$emit('update:filterStatus', $event)"
         >
-          <SelectTrigger class="flex-1 min-w-0 sm:flex-none sm:w-28 h-8 text-xs border-border/60">
+          <SelectTrigger class="h-8 w-full min-w-0 text-xs border-border/60">
             <SelectValue placeholder="状态" />
           </SelectTrigger>
           <SelectContent>
@@ -142,9 +166,10 @@
       <!-- 列显示配置（桌面端） -->
       <MultiSelect
         v-model="visibleColumnIds"
+        class="hidden md:block"
         :options="columnSelectOptions"
         placeholder="显示列"
-        trigger-class="hidden md:flex w-40 h-8 text-xs border-border/60"
+        trigger-class="w-40 h-8 text-xs border-border/60"
         dropdown-min-width="14rem"
         :searchable="false"
       />
@@ -156,7 +181,7 @@
       <Button
         variant="ghost"
         size="icon"
-        class="h-8 w-8"
+        class="hidden h-8 w-8 shrink-0 md:inline-flex"
         :class="autoRefresh ? 'text-primary' : ''"
         :title="autoRefresh ? '点击关闭自动刷新' : '点击开启自动刷新'"
         @click="$emit('update:autoRefresh', !autoRefresh)"
@@ -187,7 +212,25 @@
         <!-- 第一行：模型 + 费用 -->
         <div class="flex items-center justify-between gap-2">
           <div class="min-w-0 flex-1">
-            <span class="text-sm font-medium truncate block">{{ record.model }}</span>
+            <div class="flex min-w-0 items-center gap-1">
+              <span class="text-sm font-medium truncate">{{ record.model }}</span>
+              <Badge
+                v-if="getReasoningEffort(record)"
+                variant="outline"
+                class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
+                :title="getReasoningEffortTitle(record)"
+              >
+                {{ getReasoningEffort(record) }}
+              </Badge>
+              <Badge
+                v-if="getFastBadge(record)"
+                variant="outline"
+                class="h-4 rounded-full px-1.5 text-[10px] leading-4 text-foreground flex-shrink-0"
+                :title="getFastBadgeTitle(record)"
+              >
+                fast
+              </Badge>
+            </div>
             <span
               v-if="getActualModel(record)"
               class="text-[11px] text-muted-foreground truncate block"
@@ -236,8 +279,8 @@
             </Badge>
             <Badge
               v-else-if="getStreamModeSegments(record).hasConversion"
-              :variant="getStreamModeSegments(record).client === '流式' ? 'secondary' : 'outline'"
-              :class="getStreamModeSegments(record).client === '流式'
+              :variant="streamBadgeVariant(getStreamModeSegments(record).client === '流式')"
+              :class="(streamBadgeVariant(getStreamModeSegments(record).client === '流式') === 'secondary')
                 ? 'whitespace-nowrap text-[10px] px-1.5 h-4 leading-4 inline-flex items-center gap-0.5'
                 : 'whitespace-nowrap border-border/60 text-muted-foreground text-[10px] px-1.5 h-4 leading-4 inline-flex items-center gap-0.5'"
             >
@@ -247,8 +290,8 @@
             </Badge>
             <Badge
               v-else
-              :variant="getUpstreamStream(record) ? 'secondary' : 'outline'"
-              :class="getUpstreamStream(record)
+              :variant="streamBadgeVariant(getUpstreamStream(record))"
+              :class="(streamBadgeVariant(getUpstreamStream(record)) === 'secondary')
                 ? 'whitespace-nowrap text-[10px] px-1.5 h-4 leading-4 inline-flex items-center'
                 : 'whitespace-nowrap border-border/60 text-muted-foreground text-[10px] px-1.5 h-4 leading-4 inline-flex items-center'"
             >
@@ -556,7 +599,7 @@
               v-if="getActualModel(record)"
               class="flex flex-col text-xs gap-0.5"
             >
-              <div class="flex items-center gap-1 truncate">
+              <div class="flex min-w-0 items-center gap-1">
                 <span class="truncate">{{ record.model }}</span>
                 <svg
                   xmlns="http://www.w3.org/2000/svg"
@@ -570,13 +613,47 @@
                     clip-rule="evenodd"
                   />
                 </svg>
+                <Badge
+                  v-if="getReasoningEffort(record)"
+                  variant="outline"
+                  class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
+                  :title="getReasoningEffortTitle(record)"
+                >
+                  {{ getReasoningEffort(record) }}
+                </Badge>
+                <Badge
+                  v-if="getFastBadge(record)"
+                  variant="outline"
+                  class="h-4 rounded-full px-1.5 text-[10px] leading-4 text-foreground flex-shrink-0"
+                  :title="getFastBadgeTitle(record)"
+                >
+                  fast
+                </Badge>
               </div>
               <span class="text-muted-foreground truncate">{{ getActualModel(record) }}</span>
             </div>
             <span
               v-else
-              class="truncate block"
-            >{{ record.model }}</span>
+              class="flex min-w-0 items-center gap-1"
+            >
+              <span class="truncate">{{ record.model }}</span>
+              <Badge
+                v-if="getReasoningEffort(record)"
+                variant="outline"
+                class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
+                :title="getReasoningEffortTitle(record)"
+              >
+                {{ getReasoningEffort(record) }}
+              </Badge>
+              <Badge
+                v-if="getFastBadge(record)"
+                variant="outline"
+                class="h-4 rounded-full px-1.5 text-[10px] leading-4 text-foreground flex-shrink-0"
+                :title="getFastBadgeTitle(record)"
+              >
+                fast
+              </Badge>
+            </span>
           </TableCell>
           <TableCell
             v-if="isAdmin && isColumnVisible('provider')"
@@ -597,42 +674,20 @@
                   >({{ record.rate_multiplier }}x)</span>
                 </span>
               </div>
-              <!-- 故障转移图标（优先显示） -->
-              <svg
+              <Shuffle
                 v-if="record.has_fallback"
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
+                data-usage-attempt-marker="fallback"
                 class="w-3.5 h-3.5 text-amber-600 dark:text-amber-400 flex-shrink-0"
                 title="此请求发生了 Provider 故障转移"
-              >
-                <path d="m16 3 4 4-4 4" />
-                <path d="M20 7H4" />
-                <path d="m8 21-4-4 4-4" />
-                <path d="M4 17h16" />
-              </svg>
-              <!-- 重试图标（仅在无故障转移时显示） -->
-              <svg
-                v-else-if="record.has_retry"
-                xmlns="http://www.w3.org/2000/svg"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="2"
-                stroke-linecap="round"
-                stroke-linejoin="round"
+                aria-label="发生 Provider 故障转移"
+              />
+              <RefreshCcw
+                v-if="record.has_retry"
+                data-usage-attempt-marker="retry"
                 class="w-3.5 h-3.5 text-blue-600 dark:text-blue-400 flex-shrink-0"
-                title="此请求发生了亲和缓存重试"
-              >
-                <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
-                <path d="M21 21v-5h-5" />
-                <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
-                <path d="M3 3v5h5" />
-              </svg>
+                title="此请求发生了重试"
+                aria-label="发生重试"
+              />
             </div>
           </TableCell>
           <TableCell
@@ -676,7 +731,14 @@
           <TableCell v-if="isColumnVisible('status')" class="text-center py-4 w-[10%]">
             <!-- 优先显示请求状态 -->
             <Badge
-              v-if="getDisplayStatus(record) === 'pending'"
+              v-if="isUsageRecordFailed(record)"
+              variant="destructive"
+              class="whitespace-nowrap"
+            >
+              失败
+            </Badge>
+            <Badge
+              v-else-if="getDisplayStatus(record) === 'pending'"
               variant="outline"
               class="whitespace-nowrap animate-pulse border-muted-foreground/30 text-muted-foreground"
             >
@@ -690,13 +752,6 @@
               传输中
             </Badge>
             <Badge
-              v-else-if="isUsageRecordFailed(record)"
-              variant="destructive"
-              class="whitespace-nowrap"
-            >
-              失败
-            </Badge>
-            <Badge
               v-else-if="record.status === 'cancelled'"
               variant="outline"
               class="whitespace-nowrap border-amber-500/50 text-amber-600 dark:text-amber-400"
@@ -705,8 +760,8 @@
             </Badge>
             <Badge
               v-else-if="getStreamModeSegments(record).hasConversion"
-              :variant="getStreamModeSegments(record).client === '流式' ? 'secondary' : 'outline'"
-              :class="getStreamModeSegments(record).client === '流式'
+              :variant="streamBadgeVariant(getStreamModeSegments(record).client === '流式')"
+              :class="(streamBadgeVariant(getStreamModeSegments(record).client === '流式') === 'secondary')
                 ? 'whitespace-nowrap inline-flex items-center gap-1'
                 : 'whitespace-nowrap border-border/60 text-muted-foreground inline-flex items-center gap-1'"
             >
@@ -716,8 +771,8 @@
             </Badge>
             <Badge
               v-else
-              :variant="getUpstreamStream(record) ? 'secondary' : 'outline'"
-              :class="getUpstreamStream(record)
+              :variant="streamBadgeVariant(getUpstreamStream(record))"
+              :class="(streamBadgeVariant(getUpstreamStream(record)) === 'secondary')
                 ? 'whitespace-nowrap'
                 : 'whitespace-nowrap border-border/60 text-muted-foreground'"
             >
@@ -871,7 +926,7 @@ import {
   SortableTableHead,
   TableFilterMenu,
 } from '@/components/ui'
-import { RefreshCcw, Search } from 'lucide-vue-next'
+import { RefreshCcw, Search, Shuffle } from 'lucide-vue-next'
 import { formatTokens, formatCurrency } from '@/utils/format'
 import { getCacheCreationTokens, getCacheReadTokens, getEffectiveInputTokens } from '../token-normalization'
 import {
@@ -888,7 +943,9 @@ import {
   resolveUsageStreamLabelSegments
 } from '../utils/status'
 import { useRowClick } from '@/composables/useRowClick'
-import { formatApiFormat } from '@/api/endpoints/types/api-format'
+import { useDarkMode } from '@/composables/useDarkMode'
+import { API_FORMAT_ORDER, formatApiFormat } from '@/api/endpoints/types/api-format'
+import { formatClientFamily } from '@/features/usage/utils/clientFamily'
 import type { DateRangeParams, UsageRecord } from '../types'
 import { MultiSelect, TimeRangePicker } from '@/components/common'
 import type { MultiSelectOption } from '@/components/common/MultiSelect.vue'
@@ -1013,20 +1070,11 @@ const emit = defineEmits<{
   'prefetchDetail': [id: string]
 }>()
 
-// 静态常量（放在 defineProps/defineEmits 之后）
-const AVAILABLE_API_FORMATS = [
-  { value: 'openai:chat', label: 'OpenAI Chat' },
-  { value: 'openai:responses', label: 'OpenAI Responses' },
-  { value: 'openai:responses:compact', label: 'OpenAI Responses Compact' },
-  { value: 'openai:video', label: 'OpenAI Video' },
-  { value: 'claude:messages', label: 'Claude Messages' },
-  { value: 'gemini:generate_content', label: 'Gemini Generate Content' },
-  { value: 'gemini:video', label: 'Gemini Video' },
-  { value: 'gemini:files', label: 'Gemini Files' },
-] as const
-
-// 使用模块级常量
-const availableApiFormats = AVAILABLE_API_FORMATS
+// 使用统一 API 格式枚举，避免使用记录筛选项和系统格式列表漂移。
+const availableApiFormats = API_FORMAT_ORDER.map((value) => ({
+  value,
+  label: formatApiFormat(value),
+}))
 
 const adminVisibleColumnIds = useLocalStorage<UsageRecordColumnId[]>(
   'usage-records-visible-columns-admin',
@@ -1111,19 +1159,6 @@ const providerFilterOptions = computed<FilterOption[]>(() => [
     label: provider,
   })),
 ])
-
-function formatClientFamily(value: string | null | undefined): string {
-  const normalized = value?.trim().toLowerCase()
-  if (!normalized) return '-'
-  if (normalized === 'codex') return 'Codex'
-  if (normalized === 'codex_vscode') return 'Codex VS Code'
-  if (normalized === 'claude_code') return 'Claude Code'
-  if (normalized === 'opencode') return 'OpenCode'
-  if (normalized === 'gemini_cli') return 'Gemini CLI'
-  if (normalized === 'openai_js_sdk') return 'OpenAI JS SDK'
-  if (normalized === 'generic') return '通用客户端'
-  return value?.trim() || '-'
-}
 
 const clientFamilyFilterOptions = computed<FilterOption[]>(() => {
   const families = new Set<string>(props.availableClientFamilies)
@@ -1219,6 +1254,15 @@ watch(localSearch, (value) => {
 
 // 使用复用的行点击逻辑
 const { handleMouseDown, shouldTriggerRowClick } = useRowClick()
+const { isDark } = useDarkMode()
+
+// 暗色模式下交换"流式"与"标准"徽章的填充/描边样式
+function streamBadgeVariant(isStream: boolean): 'secondary' | 'outline' {
+  if (isDark.value) {
+    return isStream ? 'outline' : 'secondary'
+  }
+  return isStream ? 'secondary' : 'outline'
+}
 
 function handleRowMouseDown(event: MouseEvent, id: string) {
   handleMouseDown(event)
@@ -1345,12 +1389,39 @@ function getActualModel(record: UsageRecord): string | null {
   return null
 }
 
+function getReasoningEffort(record: UsageRecord): string | null {
+  const effort = record.reasoning_effort?.trim()
+  return effort || null
+}
+
+function getReasoningEffortTitle(record: UsageRecord): string {
+  const effort = getReasoningEffort(record)
+  return effort ? `Reasoning: ${effort}` : ''
+}
+
+function getServiceTier(record: UsageRecord): string | null {
+  const serviceTier = record.service_tier?.trim().toLowerCase()
+  return serviceTier || null
+}
+
+function getFastBadge(record: UsageRecord): boolean {
+  return getServiceTier(record) === 'priority'
+}
+
+function getFastBadgeTitle(record: UsageRecord): string {
+  const serviceTier = getServiceTier(record)
+  return serviceTier ? `Service tier: ${serviceTier}` : ''
+}
+
 // 获取模型列的 tooltip
 function getModelTooltip(record: UsageRecord): string {
   const actualModel = getActualModel(record)
+  const reasoningEffort = getReasoningEffort(record)
+  const fastSuffix = getFastBadge(record) ? '\nService tier: priority' : ''
+  const suffix = `${reasoningEffort ? `\nReasoning: ${reasoningEffort}` : ''}${fastSuffix}`
   if (actualModel) {
-    return `${record.model} -> ${actualModel}`
+    return `${record.model} -> ${actualModel}${suffix}`
   }
-  return record.model
+  return `${record.model}${suffix}`
 }
 </script>

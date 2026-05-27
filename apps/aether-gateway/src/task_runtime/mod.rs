@@ -17,6 +17,8 @@ use crate::{AppState, GatewayError};
 
 pub(crate) const TASK_KEY_PROVIDER_DELETE: &str = "admin.provider.delete";
 pub(crate) const TASK_KEY_PROVIDER_OAUTH_BATCH_IMPORT: &str = "admin.provider.oauth.batch_import";
+pub(crate) const TASK_KEY_SYSTEM_S3_BACKUP: &str = "system.s3.backup";
+pub(crate) const TASK_KEY_SYSTEM_S3_BACKUP_WORKER: &str = "system.s3.backup.worker";
 pub(crate) const TASK_KEY_USAGE_QUEUE_WORKER: &str = "usage.queue.worker";
 pub(crate) const TASK_KEY_USAGE_COUNTER_FLUSH: &str = "usage.counter.flush.worker";
 pub(crate) const TASK_KEY_VIDEO_TASK_POLLER: &str = "video.task.poller";
@@ -36,6 +38,7 @@ pub(crate) const TASK_KEY_PROXY_NODE_METRICS_CLEANUP: &str =
     "maintenance.proxy.node.metrics.cleanup";
 pub(crate) const TASK_KEY_PROXY_UPGRADE_ROLLOUT: &str = "maintenance.proxy.upgrade.rollout";
 pub(crate) const TASK_KEY_PROVIDER_CHECKIN: &str = "maintenance.provider.checkin";
+pub(crate) const TASK_KEY_PROVIDER_QUOTA_ALERT: &str = "maintenance.provider.quota_alert";
 pub(crate) const TASK_KEY_USAGE_CLEANUP: &str = "maintenance.usage.cleanup";
 pub(crate) const TASK_KEY_WALLET_DAILY_USAGE_AGG: &str = "maintenance.wallet.daily.usage.agg";
 pub(crate) const TASK_KEY_STATS_DAILY_AGG: &str = "maintenance.stats.daily.agg";
@@ -60,6 +63,22 @@ const TASK_DEFINITIONS: &[TaskDefinition] = &[
         TaskKind::OnDemand,
         "manual",
         false,
+        true,
+        RETRY_ONCE,
+    ),
+    TaskDefinition::new(
+        TASK_KEY_SYSTEM_S3_BACKUP,
+        TaskKind::Scheduled,
+        "manual",
+        false,
+        true,
+        RETRY_ONCE,
+    ),
+    TaskDefinition::new(
+        TASK_KEY_SYSTEM_S3_BACKUP_WORKER,
+        TaskKind::Daemon,
+        "daemon",
+        true,
         true,
         RETRY_ONCE,
     ),
@@ -201,6 +220,14 @@ const TASK_DEFINITIONS: &[TaskDefinition] = &[
     ),
     TaskDefinition::new(
         TASK_KEY_PROVIDER_CHECKIN,
+        TaskKind::Scheduled,
+        "interval",
+        true,
+        true,
+        RETRY_ONCE,
+    ),
+    TaskDefinition::new(
+        TASK_KEY_PROVIDER_QUOTA_ALERT,
         TaskKind::Scheduled,
         "interval",
         true,

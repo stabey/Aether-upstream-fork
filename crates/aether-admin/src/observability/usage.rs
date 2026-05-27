@@ -1,5 +1,6 @@
 use crate::observability::stats::{aggregate_usage_stats, parse_bounded_u32, round_to};
 use aether_ai_formats::api::request_path_implies_stream_request;
+use aether_ai_formats::UPSTREAM_IS_STREAM_KEY;
 use aether_billing::{
     normalize_input_tokens_for_billing, normalize_total_input_context_for_cache_hit_rate,
 };
@@ -1052,7 +1053,7 @@ fn admin_usage_upstream_is_stream(item: &StoredRequestUsageAudit) -> bool {
     item.request_metadata
         .as_ref()
         .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("upstream_is_stream"))
+        .and_then(|metadata| metadata.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .or_else(|| admin_usage_headers_stream_flag(item.response_headers.as_ref()))
         .or_else(|| admin_usage_infer_upstream_stream_from_captured_bodies(item))
@@ -1092,10 +1093,58 @@ fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str>
     if normalized.contains("geminicli") || normalized.contains("gemini-cli") {
         return Some("gemini_cli");
     }
+    if normalized.contains("qwencode") {
+        return Some("qwen_code");
+    }
+    if normalized.contains("roo-code") || normalized.contains("roocode") {
+        return Some("roo_code");
+    }
+    if normalized.contains("kilo-code") || normalized.contains("kilocode") {
+        return Some("kilocode");
+    }
+    if normalized.contains("cherrystudio") || normalized.contains("cherry-studio") {
+        return Some("cherrystudio");
+    }
+    if normalized.contains("openui-agent-manager") || normalized.contains("openui") {
+        return Some("openui");
+    }
+    if normalized.contains("cursor") {
+        return Some("cursor");
+    }
+    if normalized.contains("windsurf") {
+        return Some("windsurf");
+    }
+    if normalized.contains("continue") {
+        return Some("continue");
+    }
+    if normalized.contains("cline") {
+        return Some("cline");
+    }
+    if normalized.contains("aider") {
+        return Some("aider");
+    }
+    if normalized.contains("langchain") {
+        return Some("langchain");
+    }
+    if normalized.contains("llamaindex") || normalized.contains("llama-index") {
+        return Some("llamaindex");
+    }
     if normalized.starts_with("openai/js") {
         return Some("openai_js_sdk");
     }
-    None
+    if normalized.starts_with("openai/python") {
+        return Some("openai_python_sdk");
+    }
+    if normalized.starts_with("anthropic/js") || normalized.contains("anthropic-sdk-typescript") {
+        return Some("anthropic_js_sdk");
+    }
+    if normalized.starts_with("anthropic/python") || normalized.contains("anthropic-sdk-python") {
+        return Some("anthropic_python_sdk");
+    }
+    if normalized.contains("/js ") || normalized.contains("/python ") {
+        return Some("sdk");
+    }
+    Some("unknown")
 }
 
 pub fn admin_usage_client_family(item: &StoredRequestUsageAudit) -> Option<&str> {
@@ -1172,6 +1221,12 @@ fn admin_usage_active_request_json(
     value["has_format_conversion"] = json!(item.has_format_conversion);
     if let Some(target_model) = item.target_model.as_ref() {
         value["target_model"] = json!(target_model);
+    }
+    if let Some(reasoning_effort) = item.provider_reasoning_effort() {
+        value["reasoning_effort"] = json!(reasoning_effort);
+    }
+    if let Some(service_tier) = item.provider_service_tier() {
+        value["service_tier"] = json!(service_tier);
     }
     if let Some(image_progress) = image_progress {
         value["image_progress"] = image_progress.clone();
@@ -1256,7 +1311,10 @@ pub fn admin_usage_record_json(
         .as_object_mut()
         .expect("admin usage record payload should be an object");
     object.insert("is_stream".to_string(), json!(item.is_stream));
-    object.insert("upstream_is_stream".to_string(), json!(upstream_is_stream));
+    object.insert(
+        UPSTREAM_IS_STREAM_KEY.to_string(),
+        json!(upstream_is_stream),
+    );
     object.insert(
         "client_requested_stream".to_string(),
         json!(client_is_stream),
@@ -1283,6 +1341,12 @@ pub fn admin_usage_record_json(
         "request_path_and_query",
         admin_usage_metadata_string(item, "request_path_and_query"),
     );
+    if let Some(reasoning_effort) = item.provider_reasoning_effort() {
+        object.insert("reasoning_effort".to_string(), json!(reasoning_effort));
+    }
+    if let Some(service_tier) = item.provider_service_tier() {
+        object.insert("service_tier".to_string(), json!(service_tier));
+    }
     payload
 }
 
@@ -2600,6 +2664,32 @@ mod tests {
         );
 
         assert_eq!(record["client_family"], "codex");
+    }
+
+    #[test]
+    fn admin_usage_record_includes_provider_reasoning_effort() {
+        let item = StoredRequestUsageAudit {
+            provider_request_body: Some(json!({
+                "reasoning": { "effort": "xhigh" },
+                "service_tier": "priority"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(record["reasoning_effort"], "xhigh");
+        assert_eq!(active["reasoning_effort"], "xhigh");
+        assert_eq!(record["service_tier"], "priority");
+        assert_eq!(active["service_tier"], "priority");
     }
 
     #[test]

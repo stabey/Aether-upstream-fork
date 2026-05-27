@@ -153,10 +153,16 @@
                     <Label class="text-xs text-muted-foreground">自定义路径</Label>
                     <Input
                       :model-value="getDisplayedPath(endpoint)"
-                      :placeholder="getDefaultPath(endpoint.api_format, endpoint.base_url) || '留空使用默认'"
-                      :disabled="isFixedProvider"
+                      :placeholder="getEndpointDefaultPath(endpoint) || '留空使用默认'"
                       @update:model-value="(v) => updateEndpointField(endpoint.id, 'path', v)"
                     />
+                    <p
+                      v-if="getEndpointDefaultPath(endpoint)"
+                      class="text-[10px] text-muted-foreground truncate"
+                      :title="getEndpointDefaultPath(endpoint)"
+                    >
+                      当前默认路径：{{ getEndpointDefaultPath(endpoint) }}
+                    </p>
                   </div>
                 </div>
                 <!-- 保存/撤销按钮（URL/路径有修改时显示） -->
@@ -963,6 +969,13 @@
                   size="sm"
                   :placeholder="newEndpointDefaultPath || '留空使用默认'"
                 />
+                <p
+                  v-if="newEndpointDefaultPath"
+                  class="text-[10px] text-muted-foreground truncate"
+                  :title="newEndpointDefaultPath"
+                >
+                  当前默认路径：{{ newEndpointDefaultPath }}
+                </p>
               </div>
             </div>
           </div>
@@ -1859,10 +1872,11 @@ function getDefaultPath(apiFormat: string, baseUrl?: string): string {
   })
 }
 
+function getEndpointDefaultPath(endpoint: ProviderEndpoint): string {
+  return getDefaultPath(endpoint.api_format, getEndpointEditState(endpoint.id)?.url ?? endpoint.base_url)
+}
+
 function getDisplayedPath(endpoint: ProviderEndpoint): string {
-  if (isFixedProvider.value) {
-    return getDefaultPath(endpoint.api_format, endpoint.base_url)
-  }
   return getEndpointEditState(endpoint.id)?.path ?? (endpoint.custom_path || '')
 }
 
@@ -3199,13 +3213,13 @@ async function saveEndpoint(endpoint: ProviderEndpoint) {
 
   savingEndpointId.value = endpoint.id
   try {
-    // 仅提交变更字段，避免 fixed provider 因 base_url/custom_path 被锁定而更新失败
+    // 仅提交变更字段；fixed provider 锁定 base_url，但允许覆盖 custom_path。
     const payload: Record<string, unknown> = {}
 
     if (!isFixedProvider.value) {
       if (state.url !== endpoint.base_url) payload.base_url = state.url
-      if (state.path !== (endpoint.custom_path || '')) payload.custom_path = state.path || null
     }
+    if (state.path !== (endpoint.custom_path || '')) payload.custom_path = state.path || null
 
     if (hasRulesChanges(endpoint)) payload.header_rules = rulesToHeaderRules(state.rules)
     if (hasResponseHeaderRulesChanges(endpoint)) {

@@ -1166,7 +1166,6 @@ impl AppState {
 
         latest_key.encrypted_api_key = Some(encrypted_api_key);
         latest_key.encrypted_auth_config = encrypted_auth_config;
-        latest_key.is_active = true;
         latest_key.expires_at_unix_secs = entry.expires_at_unix_secs;
         let (oauth_invalid_at_unix_secs, oauth_invalid_reason) =
             local_oauth_refresh_success_invalid_state(&latest_key);
@@ -1448,12 +1447,7 @@ impl AppState {
                 .map_err(
                     |err| provider_transport::LocalOAuthRefreshError::InvalidResponse {
                         provider_type,
-                        message: match err {
-                            GatewayError::UpstreamUnavailable { message, .. }
-                            | GatewayError::ControlUnavailable { message, .. }
-                            | GatewayError::Client { message, .. }
-                            | GatewayError::Internal(message) => message,
-                        },
+                        message: err.into_message(),
                     },
                 )?;
         let response_body_text = local_oauth_execution_body_text(&result);

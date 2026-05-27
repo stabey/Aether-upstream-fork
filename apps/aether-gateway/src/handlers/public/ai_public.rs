@@ -52,6 +52,12 @@ const OPENAI_RERANK_TOP_N_DETAIL: &str = "Rerank request top_n must be a positiv
 const OPENAI_RERANK_CHAT_PAYLOAD_DETAIL: &str =
     "Rerank request must use query/documents, not chat messages";
 const OPENAI_RERANK_STREAM_UNSUPPORTED_DETAIL: &str = "Rerank requests do not support streaming";
+const ANTIGRAVITY_USER_SETTINGS_MISSING_BODY_DETAIL: &str =
+    "Antigravity setUserSettings request body is required";
+const ANTIGRAVITY_USER_SETTINGS_INVALID_JSON_DETAIL: &str =
+    "Antigravity setUserSettings request JSON body is invalid";
+const ANTIGRAVITY_USER_SETTINGS_INVALID_DETAIL: &str =
+    "Antigravity setUserSettings request must include object userSettings";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenAiImageOperation {
@@ -103,7 +109,9 @@ pub(crate) fn ai_public_local_requires_buffered_body(
                         && request_context.request_path == "/v1/embeddings")
                     || (decision.route_family.as_deref() == Some("openai")
                         && decision.route_kind.as_deref() == Some("rerank")
-                        && request_context.request_path == "/v1/rerank"))
+                        && request_context.request_path == "/v1/rerank")
+                    || (decision.route_family.as_deref() == Some("antigravity")
+                        && decision.route_kind.as_deref() != Some("stream_generate_content")))
         })
 }
 
@@ -129,6 +137,12 @@ pub(crate) async fn maybe_build_local_ai_public_response(
 
     if let Some(response) =
         maybe_build_local_claude_count_tokens_response(request_context, request_body)
+    {
+        return Some(response);
+    }
+
+    if let Some(response) =
+        maybe_build_local_antigravity_v1internal_response(request_context, request_body)
     {
         return Some(response);
     }
@@ -859,6 +873,238 @@ fn maybe_build_local_claude_count_tokens_response(
     };
 
     Some(Json(json!({ "input_tokens": input_tokens })).into_response())
+}
+
+fn maybe_build_local_antigravity_v1internal_response(
+    request_context: &GatewayPublicRequestContext,
+    request_body: Option<&Bytes>,
+) -> Option<Response<Body>> {
+    let decision = request_context.control_decision.as_ref()?;
+    if decision.route_family.as_deref() != Some("antigravity")
+        || request_context.request_method != http::Method::POST
+    {
+        return None;
+    }
+
+    match decision.route_kind.as_deref()? {
+        "load_code_assist" => {
+            Some(Json(build_antigravity_load_code_assist_payload()).into_response())
+        }
+        "fetch_available_models" => {
+            Some(Json(build_antigravity_fetch_available_models_payload()).into_response())
+        }
+        "fetch_user_info" => {
+            Some(Json(build_antigravity_fetch_user_info_payload()).into_response())
+        }
+        "fetch_admin_controls" => Some(Json(json!({})).into_response()),
+        "list_experiments" => Some(
+            Json(json!({
+                "experimentIds": [],
+                "flags": []
+            }))
+            .into_response(),
+        ),
+        "record_code_assist_metrics" => Some(Json(json!({})).into_response()),
+        "set_user_settings" => Some(build_antigravity_set_user_settings_response(request_body)),
+        "stream_generate_content" => None,
+        _ => None,
+    }
+}
+
+fn build_antigravity_set_user_settings_response(request_body: Option<&Bytes>) -> Response<Body> {
+    let Some(request_body) = request_body else {
+        return build_ai_public_error_response(
+            http::StatusCode::BAD_REQUEST,
+            ANTIGRAVITY_USER_SETTINGS_MISSING_BODY_DETAIL,
+        );
+    };
+    let payload = match serde_json::from_slice::<Value>(request_body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            return build_ai_public_error_response(
+                http::StatusCode::BAD_REQUEST,
+                ANTIGRAVITY_USER_SETTINGS_INVALID_JSON_DETAIL,
+            );
+        }
+    };
+    let Some(user_settings) = payload
+        .get("userSettings")
+        .filter(|value| value.is_object())
+        .cloned()
+    else {
+        return build_ai_public_error_response(
+            http::StatusCode::BAD_REQUEST,
+            ANTIGRAVITY_USER_SETTINGS_INVALID_DETAIL,
+        );
+    };
+
+    Json(json!({ "userSettings": user_settings })).into_response()
+}
+
+fn build_antigravity_load_code_assist_payload() -> Value {
+    json!({
+        "allowedTiers": [
+            antigravity_free_tier_payload(true),
+            antigravity_standard_tier_payload()
+        ],
+        "cloudaicompanionProject": "aether-antigravity-local",
+        "currentTier": antigravity_free_tier_payload(false),
+        "gcpManaged": false,
+        "paidTier": antigravity_paid_tier_payload(),
+        "upgradeSubscriptionUri": "https://codeassist.google.com/upgrade"
+    })
+}
+
+fn antigravity_free_tier_payload(include_default_marker: bool) -> Value {
+    if include_default_marker {
+        json!({
+            "id": "free-tier",
+            "name": "Antigravity",
+            "description": "Gemini-powered code suggestions and chat in multiple IDEs",
+            "privacyNotice": {
+                "showNotice": false
+            },
+            "isDefault": true
+        })
+    } else {
+        json!({
+            "id": "free-tier",
+            "name": "Antigravity",
+            "description": "Gemini-powered code suggestions and chat in multiple IDEs",
+            "privacyNotice": {
+                "showNotice": false
+            },
+            "upgradeSubscriptionUri": "https://codeassist.google.com/upgrade",
+            "upgradeSubscriptionText": "Upgrade for higher Antigravity request limits",
+            "upgradeSubscriptionType": "GDP_HELIUM"
+        })
+    }
+}
+
+fn antigravity_standard_tier_payload() -> Value {
+    json!({
+        "id": "standard-tier",
+        "name": "Antigravity",
+        "description": "Unlimited coding assistant with the most powerful Gemini models",
+        "userDefinedCloudaicompanionProject": true,
+        "privacyNotice": {},
+        "usesGcpTos": true
+    })
+}
+
+fn antigravity_paid_tier_payload() -> Value {
+    json!({
+        "id": "g1-pro-tier",
+        "name": "Google AI Pro",
+        "description": "Google AI Pro",
+        "upgradeSubscriptionUri": "https://antigravity.google/g1-upgrade",
+        "upgradeSubscriptionText": "Upgrade for the highest Antigravity request limits"
+    })
+}
+
+fn build_antigravity_fetch_user_info_payload() -> Value {
+    json!({
+        "regionCode": "US",
+        "userSettings": build_antigravity_default_user_settings_payload()
+    })
+}
+
+fn build_antigravity_default_user_settings_payload() -> Value {
+    json!({
+        "preferredModelId": "gemini-3.1-flash-lite"
+    })
+}
+
+fn build_antigravity_fetch_available_models_payload() -> Value {
+    json!({
+        "models": {
+            "gemini-3.5-flash-low": antigravity_model_payload("gemini-3.5-flash-low", "Gemini 3.5 Flash Low"),
+            "gemini-3-flash-agent": antigravity_model_payload("gemini-3-flash-agent", "Gemini 3 Flash Agent"),
+            "gemini-3.1-flash-lite": antigravity_model_payload("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite"),
+            "gemini-3.1-pro-low": antigravity_model_payload("gemini-3.1-pro-low", "Gemini 3.1 Pro Low"),
+            "gemini-3-flash": antigravity_model_payload("gemini-3-flash", "Gemini 3 Flash"),
+            "gemini-2.5-flash": antigravity_model_payload("gemini-2.5-flash", "Gemini 2.5 Flash"),
+            "gemini-2.5-flash-lite": antigravity_model_payload("gemini-2.5-flash-lite", "Gemini 2.5 Flash Lite"),
+            "gemini-2.5-flash-thinking": antigravity_model_payload("gemini-2.5-flash-thinking", "Gemini 2.5 Flash Thinking"),
+            "gemini-2.5-pro": antigravity_model_payload("gemini-2.5-pro", "Gemini 2.5 Pro"),
+            "gemini-3.1-flash-image": antigravity_model_payload("gemini-3.1-flash-image", "Gemini 3.1 Flash Image"),
+            "tab_flash_lite_preview": antigravity_model_payload("tab_flash_lite_preview", "Tab Flash Lite Preview"),
+            "tab_jump_flash_lite_preview": antigravity_model_payload("tab_jump_flash_lite_preview", "Tab Jump Flash Lite Preview"),
+            "models/proactive-observer": antigravity_model_payload("models/proactive-observer", "Proactive Observer")
+        },
+        "agentModelSorts": [
+            {
+                "displayName": "Recommended",
+                "groups": [
+                    {
+                        "modelIds": [
+                            "gemini-3.1-flash-lite",
+                            "gemini-3-flash-agent",
+                            "gemini-3.1-pro-low",
+                            "gemini-3.5-flash-low"
+                        ]
+                    }
+                ]
+            }
+        ],
+        "audioTranscriptionModelIds": ["models/proactive-observer"],
+        "commandModelIds": ["gemini-3-flash"],
+        "commitMessageModelIds": ["gemini-3.1-flash-lite"],
+        "defaultAgentModelId": "gemini-3.1-flash-lite",
+        "deprecatedModelIds": {},
+        "experimentIds": [],
+        "imageGenerationModelIds": ["gemini-3.1-flash-image"],
+        "mqueryModelIds": ["gemini-3.1-flash-lite"],
+        "tabModelIds": ["tab_flash_lite_preview", "tab_jump_flash_lite_preview"],
+        "tieredModelIds": {
+            "flash": ["gemini-3-flash-agent"],
+            "flashLite": ["gemini-3.1-flash-lite"],
+            "pro": ["gemini-3.1-pro-low"]
+        },
+        "webSearchModelIds": ["gemini-3.1-flash-lite"]
+    })
+}
+
+fn antigravity_model_payload(id: &str, display_name: &str) -> Value {
+    let model = match id {
+        "gemini-2.5-flash" => "MODEL_GOOGLE_GEMINI_2_5_FLASH",
+        "gemini-2.5-flash-lite" => "MODEL_GOOGLE_GEMINI_2_5_FLASH_LITE",
+        "gemini-2.5-flash-thinking" => "MODEL_GOOGLE_GEMINI_2_5_FLASH_THINKING",
+        "gemini-2.5-pro" => "MODEL_GOOGLE_GEMINI_2_5_PRO",
+        "gemini-3-flash" => "MODEL_PLACEHOLDER_M18",
+        "gemini-3-flash-agent" => "MODEL_PLACEHOLDER_M132",
+        "gemini-3.1-flash-image" => "MODEL_PLACEHOLDER_M21",
+        "gemini-3.1-flash-lite" => "MODEL_PLACEHOLDER_M50",
+        "gemini-3.1-pro-low" => "MODEL_PLACEHOLDER_M36",
+        "gemini-3.5-flash-low" => "MODEL_PLACEHOLDER_M20",
+        "models/proactive-observer" => "MODEL_PLACEHOLDER_M70",
+        "tab_flash_lite_preview" => "MODEL_PLACEHOLDER_M19",
+        "tab_jump_flash_lite_preview" => "MODEL_PLACEHOLDER_M28",
+        _ => "MODEL_PLACEHOLDER_M20",
+    };
+    json!({
+        "apiProvider": "API_PROVIDER_GOOGLE_GEMINI",
+        "displayName": display_name,
+        "maxOutputTokens": 65536,
+        "maxTokens": 1048576,
+        "minThinkingBudget": 32,
+        "model": model,
+        "modelProvider": "MODEL_PROVIDER_GOOGLE",
+        "recommended": id == "gemini-3.1-flash-lite",
+        "supportedMimeTypes": {
+            "application/json": true,
+            "application/pdf": true,
+            "image/jpeg": true,
+            "image/png": true,
+            "text/markdown": true,
+            "text/plain": true
+        },
+        "supportsImages": true,
+        "supportsThinking": true,
+        "supportsVideo": true,
+        "thinkingBudget": 4000,
+        "tokenizerType": "LLAMA_WITH_SPECIAL"
+    })
 }
 
 async fn maybe_build_local_gemini_video_operations_response(

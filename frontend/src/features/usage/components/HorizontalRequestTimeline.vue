@@ -542,6 +542,7 @@ import { ChevronLeft, ChevronRight, ExternalLink } from 'lucide-vue-next'
 import { requestTraceApi, type RequestTrace, type CandidateRecord, type ImageProgress } from '@/api/requestTrace'
 import { log } from '@/utils/logger'
 import { parseApiError } from '@/utils/errorParser'
+import { formatTokens } from '@/utils/format'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { resolveTimelineFinalStatus } from '../utils/status'
@@ -629,7 +630,7 @@ const usageData = computed(() => props.usageData)
 
 // 格式化数字
 const formatNumber = (num: number): string => {
-  return num.toLocaleString('zh-CN')
+  return formatTokens(num)
 }
 
 // 获取最终状态标签
@@ -1219,13 +1220,16 @@ const normalizeUpstreamResponseDisplay = (value: unknown): Record<string, unknow
   const body = raw.body
   const bodyRef = readStringField(raw, 'body_ref') ?? readStringField(raw, 'bodyRef')
   const bodyState = readStringField(raw, 'body_state') ?? readStringField(raw, 'bodyState')
+  const meaningfulBodyState = bodyState && bodyState.toLowerCase() !== 'none'
+    ? bodyState
+    : ''
 
   if (
     statusCode == null &&
     !hasRenderableValue(headers) &&
     !hasRenderableValue(body) &&
     !bodyRef &&
-    !bodyState
+    !meaningfulBodyState
   ) {
     return null
   }
@@ -1235,7 +1239,7 @@ const normalizeUpstreamResponseDisplay = (value: unknown): Record<string, unknow
   if (hasRenderableValue(headers)) data.headers = headers
   if (hasRenderableValue(body)) data.body = body
   if (bodyRef) data.body_ref = bodyRef
-  if (bodyState) data.body_state = bodyState
+  if (meaningfulBodyState) data.body_state = meaningfulBodyState
 
   return data
 }
@@ -1352,15 +1356,22 @@ const currentAttemptKeyFormatsDisplay = computed(() => {
     .map(format => formatApiFormat(format))
     .join(' / ')
 })
+const SKIP_REASON_LABELS: Record<string, string> = {
+  auth_api_key_concurrency_limit_reached: '调用方 API Key 并发已达上限',
+  api_key_concurrency_limit_reached: '调用方 API Key 并发已达上限',
+  pool_key_lease_busy: '池内账号正被其他请求占用',
+  provider_concurrency_limit_reached: '上游提供商并发已达上限',
+  provider_key_concurrency_limit_reached: '上游账号并发已达上限',
+  provider_request_body_build_failed: '上游请求体转换失败',
+  provider_request_body_missing: '无法构建上游请求体',
+}
 const currentAttemptSkipReasonDisplay = computed(() => {
   const attempt = currentAttempt.value
   if (!attempt?.skip_reason) return ''
 
-  if (attempt.skip_reason === 'provider_request_body_build_failed') {
-    return '上游请求体转换失败'
-  }
-  if (attempt.skip_reason === 'provider_request_body_missing') {
-    return '无法构建上游请求体'
+  const skipReasonLabel = SKIP_REASON_LABELS[attempt.skip_reason]
+  if (skipReasonLabel) {
+    return skipReasonLabel
   }
 
   if (attempt.skip_reason !== 'transport_unsupported') {

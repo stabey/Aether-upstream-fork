@@ -19,8 +19,10 @@ pub(super) struct AdminProviderOAuthBatchImportRequest {
 
 #[derive(Debug, Clone)]
 pub(super) struct AdminProviderOAuthBatchImportEntry {
+    pub parse_error: Option<String>,
     pub refresh_token: Option<String>,
     pub access_token: Option<String>,
+    pub raw_credentials: Option<serde_json::Value>,
     pub expires_at: Option<u64>,
     pub account_id: Option<String>,
     pub account_user_id: Option<String>,
@@ -72,6 +74,26 @@ fn coerce_admin_provider_oauth_import_str(value: Option<&serde_json::Value>) -> 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn json_import_expiry_value(value: Option<&serde_json::Value>) -> Option<u64> {
+    let value = value?;
+    json_u64_value(Some(value)).or_else(|| {
+        value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .and_then(|value| u64::try_from(value.timestamp()).ok())
+    })
+}
+
+fn json_import_expiry_from_keys(
+    object: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<u64> {
+    keys.iter()
+        .find_map(|key| json_import_expiry_value(object.get(*key)))
 }
 
 fn grok_cookie_value(raw: &str, name: &str) -> Option<String> {
@@ -141,8 +163,10 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     access_token.as_deref(),
                 );
                 Some(AdminProviderOAuthBatchImportEntry {
+                    parse_error: None,
                     refresh_token,
                     access_token,
+                    raw_credentials: None,
                     expires_at: None,
                     account_id: None,
                     account_user_id: None,
@@ -160,6 +184,8 @@ fn extract_admin_provider_oauth_batch_import_entry(
             }
         }
         serde_json::Value::Object(object) => {
+            let is_grok = provider_type.trim().eq_ignore_ascii_case("grok");
+            let is_windsurf = provider_type.trim().eq_ignore_ascii_case("windsurf");
             let refresh_token = coerce_admin_provider_oauth_import_str(
                 object
                     .get("refresh_token")
@@ -170,12 +196,8 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     .get("access_token")
                     .or_else(|| object.get("accessToken")),
             );
-            let grok_token_alias = if provider_type.trim().eq_ignore_ascii_case("grok") {
-                object.get("token")
-            } else {
-                None
-            };
-            let grok_cookie = if provider_type.trim().eq_ignore_ascii_case("grok") {
+            let grok_token_alias = if is_grok { object.get("token") } else { None };
+            let grok_cookie = if is_grok {
                 coerce_admin_provider_oauth_import_str(
                     object.get("cookie").or_else(|| object.get("cookieHeader")),
                 )
@@ -186,6 +208,8 @@ fn extract_admin_provider_oauth_batch_import_entry(
                 object
                     .get("sso_token")
                     .or_else(|| object.get("ssoToken"))
+                    .or_else(|| object.get("session_token"))
+                    .or_else(|| object.get("sessionToken"))
                     .or(grok_token_alias),
             )
             .or_else(|| {
@@ -198,11 +222,45 @@ fn extract_admin_provider_oauth_batch_import_entry(
                 refresh_token.as_deref(),
                 access_token.as_deref().or(session_token.as_deref()),
             );
-            if refresh_token.is_none() && access_token.is_none() {
+            let windsurf_api_key = is_windsurf
+                .then(|| {
+                    coerce_admin_provider_oauth_import_str(
+                        object.get("api_key").or_else(|| object.get("apiKey")),
+                    )
+                })
+                .flatten();
+            let windsurf_token = is_windsurf
+                .then(|| {
+                    coerce_admin_provider_oauth_import_str(
+                        object
+                            .get("token")
+                            .or_else(|| object.get("auth_token"))
+                            .or_else(|| object.get("authToken")),
+                    )
+                })
+                .flatten();
+            let windsurf_password = is_windsurf
+                .then(|| coerce_admin_provider_oauth_import_str(object.get("password")))
+                .flatten();
+            let raw_credentials = if is_windsurf
+                && (windsurf_api_key.is_some()
+                    || windsurf_token.is_some()
+                    || windsurf_password.is_some())
+            {
+                Some(item.clone())
+            } else {
+                None
+            };
+            if refresh_token.is_none() && access_token.is_none() && raw_credentials.is_none() {
                 return None;
             }
+            let refresh_token = if is_windsurf {
+                refresh_token.or(windsurf_api_key).or(windsurf_token)
+            } else {
+                refresh_token
+            };
             let expires_at =
-                json_u64_value(object.get("expires_at").or_else(|| object.get("expiresAt")));
+                json_import_expiry_from_keys(object, &["expires_at", "expiresAt", "expired"]);
             let account_id = coerce_admin_provider_oauth_import_str(
                 object
                     .get("account_id")
@@ -285,8 +343,10 @@ fn extract_admin_provider_oauth_batch_import_entry(
                     .or_else(|| object.get("impersonate")),
             );
             Some(AdminProviderOAuthBatchImportEntry {
+                parse_error: None,
                 refresh_token,
                 access_token,
+                raw_credentials,
                 expires_at,
                 account_id,
                 account_user_id,
@@ -316,14 +376,17 @@ pub(super) fn parse_admin_provider_oauth_batch_import_entries(
     }
 
     if raw.starts_with('[') {
-        if let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(raw)
-        {
-            return items
-                .iter()
-                .filter_map(|item| {
-                    extract_admin_provider_oauth_batch_import_entry(provider_type, item)
-                })
-                .collect();
+        match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Array(items)) => {
+                return items
+                    .iter()
+                    .filter_map(|item| {
+                        extract_admin_provider_oauth_batch_import_entry(provider_type, item)
+                    })
+                    .collect();
+            }
+            Ok(_) => {}
+            Err(error) => return vec![parse_error_entry(format!("JSON 数组解析失败: {error}"))],
         }
     }
 
@@ -340,21 +403,59 @@ pub(super) fn parse_admin_provider_oauth_batch_import_entries(
     raw.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| {
-            if line.starts_with('{') {
-                return serde_json::from_str::<serde_json::Value>(line)
-                    .ok()
-                    .and_then(|value| {
-                        extract_admin_provider_oauth_batch_import_entry(provider_type, &value)
-                    });
+        .filter_map(|token| {
+            if is_json_like_batch_line(token) {
+                match serde_json::from_str::<serde_json::Value>(token) {
+                    Ok(value @ serde_json::Value::Object(_)) => {
+                        return extract_admin_provider_oauth_batch_import_entry(
+                            provider_type,
+                            &value,
+                        );
+                    }
+                    Ok(_) => {
+                        return Some(parse_error_entry(
+                            "JSON 行必须是账号对象，不能作为 raw token 导入".to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        return Some(parse_error_entry(format!("JSON 行解析失败: {error}")));
+                    }
+                }
             }
 
             extract_admin_provider_oauth_batch_import_entry(
                 provider_type,
-                &serde_json::Value::String(line.to_string()),
+                &serde_json::Value::String(token.to_string()),
             )
         })
         .collect()
+}
+
+fn parse_error_entry(error: String) -> AdminProviderOAuthBatchImportEntry {
+    AdminProviderOAuthBatchImportEntry {
+        parse_error: Some(error),
+        refresh_token: None,
+        access_token: None,
+        raw_credentials: None,
+        expires_at: None,
+        account_id: None,
+        account_user_id: None,
+        plan_type: None,
+        pool_tier: None,
+        user_id: None,
+        email: None,
+        account_name: None,
+        sso_rw_token: None,
+        cf_cookies: None,
+        cf_clearance: None,
+        user_agent: None,
+        browser_profile: None,
+    }
+}
+
+fn is_json_like_batch_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with('{') || line.starts_with('[')
 }
 
 pub(super) fn apply_admin_provider_oauth_batch_import_hints(
@@ -541,6 +642,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_common_chatgpt_web_json_aliases() {
+        let entries = parse_admin_provider_oauth_batch_import_entries(
+            "chatgpt_web",
+            r#"[{"session_token":"session-1","expired":"2030-01-01T00:00:00Z","chatgpt_account_id":"acc-1","chatgpt_plan_type":"plus"}]"#,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].refresh_token, None);
+        assert_eq!(entries[0].access_token.as_deref(), Some("session-1"));
+        assert_eq!(entries[0].expires_at, Some(1_893_456_000));
+        assert_eq!(entries[0].account_id.as_deref(), Some("acc-1"));
+        assert_eq!(entries[0].plan_type.as_deref(), Some("plus"));
+    }
+
+    #[test]
     fn parses_plain_jwt_line_as_access_token() {
         let token = unsigned_jwt(json!({
             "iss": "https://auth.openai.com",
@@ -632,5 +748,116 @@ mod tests {
         assert_eq!(entries[0].cf_clearance.as_deref(), Some("cf-1"));
         assert_eq!(entries[0].user_id.as_deref(), Some("user-1"));
         assert_eq!(entries[0].pool_tier.as_deref(), Some("heavy"));
+    }
+
+    #[test]
+    fn parses_windsurf_json_credentials_for_native_import() {
+        let entries = parse_admin_provider_oauth_batch_import_entries(
+            "windsurf",
+            r#"[
+                {"api_key":"devin-session-token$abc","email":"a@example.com"},
+                {"token":"firebase-id-token","name":"Browser Login"},
+                {"email":"b@example.com","password":"secret"},
+                {"access_token":"devin-session-token$alias","email":"c@example.com"}
+            ]"#,
+        );
+
+        assert_eq!(entries.len(), 4);
+        assert_eq!(
+            entries[0].refresh_token.as_deref(),
+            Some("devin-session-token$abc")
+        );
+        assert_eq!(entries[0].email.as_deref(), Some("a@example.com"));
+        assert_eq!(
+            entries[0]
+                .raw_credentials
+                .as_ref()
+                .and_then(|value| value.get("api_key")),
+            Some(&json!("devin-session-token$abc"))
+        );
+        assert_eq!(
+            entries[1]
+                .raw_credentials
+                .as_ref()
+                .and_then(|value| value.get("token")),
+            Some(&json!("firebase-id-token"))
+        );
+        assert_eq!(
+            entries[2]
+                .raw_credentials
+                .as_ref()
+                .and_then(|value| value.get("password")),
+            Some(&json!("secret"))
+        );
+        assert_eq!(
+            entries[3].access_token.as_deref(),
+            Some("devin-session-token$alias")
+        );
+    }
+
+    #[test]
+    fn parses_windsurf_json_lines_credentials_for_native_import() {
+        let entries = parse_admin_provider_oauth_batch_import_entries(
+            "windsurf",
+            r#"{"api_key":"devin-session-token$abc","email":"a@example.com"}
+{"token":"firebase-id-token","name":"Browser Login"}
+{"email":"b@example.com","password":"secret"}"#,
+        );
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0]
+                .raw_credentials
+                .as_ref()
+                .and_then(|value| value.get("api_key")),
+            Some(&json!("devin-session-token$abc"))
+        );
+        assert_eq!(
+            entries[1]
+                .raw_credentials
+                .as_ref()
+                .and_then(|value| value.get("token")),
+            Some(&json!("firebase-id-token"))
+        );
+        assert_eq!(
+            entries[2]
+                .raw_credentials
+                .as_ref()
+                .and_then(|value| value.get("password")),
+            Some(&json!("secret"))
+        );
+    }
+
+    #[test]
+    fn invalid_json_line_is_parse_error_not_token() {
+        let entries = parse_admin_provider_oauth_batch_import_entries(
+            "windsurf",
+            r#"{"email":"b@example.com","password":"secret""#,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].parse_error.is_some());
+        assert!(entries[0].refresh_token.is_none());
+        assert!(entries[0].access_token.is_none());
+        assert!(entries[0].raw_credentials.is_none());
+    }
+
+    #[test]
+    fn json_like_line_after_token_is_parse_error_not_token() {
+        let entries = parse_admin_provider_oauth_batch_import_entries(
+            "windsurf",
+            "devin-session-token$abc\n[not-json",
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].parse_error.is_none());
+        assert_eq!(
+            entries[0].refresh_token.as_deref(),
+            Some("devin-session-token$abc")
+        );
+        assert!(entries[1].parse_error.is_some());
+        assert!(entries[1].refresh_token.is_none());
+        assert!(entries[1].access_token.is_none());
+        assert!(entries[1].raw_credentials.is_none());
     }
 }

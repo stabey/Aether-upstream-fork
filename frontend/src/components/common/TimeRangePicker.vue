@@ -3,7 +3,7 @@
     <Select
       v-model="selectedPreset"
     >
-      <SelectTrigger class="h-8 w-32 text-xs border-border/60">
+      <SelectTrigger :class="['h-8 w-32 text-xs border-border/60', presetTriggerClass]">
         <SelectValue placeholder="选择时间段" />
       </SelectTrigger>
       <SelectContent :searchable="false">
@@ -91,6 +91,7 @@ const props = withDefaults(defineProps<{
   showGranularity?: boolean
   allowHourly?: boolean
   presetOptions?: SelectablePreset[]
+  presetTriggerClass?: string
 }>(), {
   presetOptions: () => ['today', 'yesterday', 'last7days', 'last30days', 'last90days', 'custom']
 })

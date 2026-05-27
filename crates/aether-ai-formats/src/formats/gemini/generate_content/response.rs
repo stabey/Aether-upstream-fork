@@ -63,7 +63,10 @@ pub fn from_raw(body_json: &Value) -> Option<CanonicalResponse> {
             role: CanonicalRole::Assistant,
             content,
             stop_reason,
-            extensions: Default::default(),
+            extensions: gemini_extensions(
+                candidate_object,
+                &["index", "content", "finishReason", "finish_reason"],
+            ),
         });
     }
     outputs.retain(gemini_response_output_has_visible_content);
@@ -161,7 +164,7 @@ fn canonical_to_gemini_response(
     let mut candidates = Vec::new();
     for output in outputs {
         let parts = canonical_blocks_to_gemini_parts(&output.content)?;
-        candidates.push(json!({
+        let mut candidate = json!({
             "index": output.index,
             "content": {
                 "role": "model",
@@ -170,7 +173,15 @@ fn canonical_to_gemini_response(
             "finishReason": canonical_stop_reason_to_gemini(
                 output.stop_reason.as_ref().or(canonical.stop_reason.as_ref())
             ),
-        }));
+        });
+        if let Some(candidate_object) = candidate.as_object_mut() {
+            if let Some(gemini) = output.extensions.get("gemini").and_then(Value::as_object) {
+                for (key, value) in gemini {
+                    candidate_object.entry(key.clone()).or_insert(value.clone());
+                }
+            }
+        }
+        candidates.push(candidate);
     }
 
     let mut response = Map::new();

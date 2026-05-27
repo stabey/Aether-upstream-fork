@@ -26,8 +26,9 @@ pub(crate) use self::catalog::{
     default_provider_key_status_snapshot, effective_catalog_encryption_key,
     encrypt_catalog_secret_with_fallbacks, masked_catalog_api_key, parse_catalog_auth_config_json,
     provider_catalog_key_supports_format, provider_key_health_summary,
-    provider_key_status_snapshot_payload, sync_provider_key_oauth_status_snapshot,
-    sync_provider_key_quota_status_snapshot, take_secret_prefix, take_secret_suffix,
+    provider_key_health_summary_at, provider_key_status_snapshot_payload,
+    sync_provider_key_oauth_status_snapshot, sync_provider_key_quota_status_snapshot,
+    take_secret_prefix, take_secret_suffix,
 };
 pub(crate) use self::email_templates::{
     admin_email_template_definition, admin_email_template_html_key,
@@ -38,7 +39,8 @@ pub(crate) use self::external_models::OFFICIAL_EXTERNAL_MODEL_PROVIDERS;
 pub(crate) use self::normalize::{
     deserialize_optional_json_patch, deserialize_optional_string_list_patch, ip_rules_allow,
     json_ip_rules_allow, normalize_feature_settings, normalize_ip_rules, normalize_json_array,
-    normalize_json_object, normalize_string_list, parse_json_ip_rules,
+    normalize_json_object, normalize_string_list, normalize_user_self_feature_settings_update,
+    parse_json_ip_rules,
 };
 pub(crate) use self::payloads::{
     InternalGatewayAuthContextRequest, InternalGatewayExecuteRequest,

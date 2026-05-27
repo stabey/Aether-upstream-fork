@@ -1,7 +1,5 @@
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aether_contracts::ResolvedTransportProfile;
 use serde_json::{json, Value};
@@ -15,11 +13,14 @@ use crate::ai_serving::planner::common::{
     endpoint_config_forces_body_stream_field, enforce_provider_body_stream_policy,
     request_requires_body_stream_field, OPENAI_CHAT_STREAM_PLAN_KIND,
 };
+use crate::ai_serving::planner::redaction::{
+    request_identity_response_encoding_when_redacted, resolve_provider_chat_pii_redaction,
+};
 use crate::ai_serving::planner::standard::{
     apply_codex_openai_responses_special_body_edits, apply_codex_openai_responses_special_headers,
-    build_cross_format_openai_chat_request_body, build_cross_format_openai_chat_upstream_url,
-    build_local_openai_chat_request_body, build_local_openai_chat_upstream_url,
-    request_body_build_failure_extra_data,
+    apply_deepseek_tool_call_thinking_compat, build_cross_format_openai_chat_request_body,
+    build_cross_format_openai_chat_upstream_url, build_local_openai_chat_request_body,
+    build_local_openai_chat_upstream_url, request_body_build_failure_extra_data,
 };
 use crate::ai_serving::transport::auth::resolve_local_openai_bearer_auth;
 use crate::ai_serving::transport::kiro::{
@@ -28,6 +29,12 @@ use crate::ai_serving::transport::kiro::{
     KIRO_ENVELOPE_NAME,
 };
 use crate::ai_serving::transport::local_openai_chat_transport_unsupported_reason;
+use crate::ai_serving::transport::windsurf::{
+    build_windsurf_cascade_headers, build_windsurf_cascade_request_body,
+    build_windsurf_cascade_upstream_url, is_windsurf_provider_transport,
+    local_windsurf_request_transport_unsupported_reason_with_network,
+    resolve_windsurf_cascade_auth, WINDSURF_ENVELOPE_NAME,
+};
 use crate::ai_serving::transport::{
     build_grok_browser_headers, build_grok_upstream_url, build_kiro_cross_format_upstream_url,
     build_openai_image_headers, build_openai_image_upstream_url,
@@ -41,13 +48,7 @@ use crate::ai_serving::{
     LocalResolvedOAuthRequestAuth,
 };
 use crate::ai_serving::{ConversionMode, ExecutionStrategy};
-use crate::privacy::{
-    build_redaction_session_config, read_chat_pii_redaction_runtime_config,
-    try_mask_chat_request_json_with_cache_options, MaskChatRequestOptions, RedactionMaskError,
-    RedactionSessionSlot, RedisRedactionMappingCache,
-};
 use crate::{AppState, GatewayError};
-use tracing::warn;
 
 use super::support::{
     mark_skipped_local_openai_chat_candidate,
@@ -81,100 +82,6 @@ fn is_grok_text_provider_api_format(provider_api_format: &str) -> bool {
     )
 }
 
-fn request_identity_response_encoding_when_redacted(
-    headers: &mut BTreeMap<String, String>,
-    redacted: bool,
-) {
-    if redacted {
-        headers.insert("accept-encoding".to_string(), "identity".to_string());
-    }
-}
-
-struct ProviderChatRequestRedaction<'a> {
-    body_json: Cow<'a, Value>,
-    redacted: bool,
-}
-
-impl<'a> ProviderChatRequestRedaction<'a> {
-    fn disabled(body_json: &'a Value, _parts: &http::request::Parts) -> Self {
-        Self {
-            body_json: Cow::Borrowed(body_json),
-            redacted: false,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ChatPiiRedactionFeatureSettings {
-    enabled: Option<bool>,
-    inject_model_instruction: Option<bool>,
-}
-
-impl ChatPiiRedactionFeatureSettings {
-    fn merge_from_value(&mut self, value: Option<&Value>) {
-        let Some(settings) = value
-            .and_then(Value::as_object)
-            .and_then(|features| features.get("chat_pii_redaction"))
-            .and_then(Value::as_object)
-        else {
-            return;
-        };
-        if let Some(enabled) = settings.get("enabled").and_then(Value::as_bool) {
-            self.enabled = Some(enabled);
-        }
-        if let Some(inject_model_instruction) = settings
-            .get("inject_model_instruction")
-            .and_then(Value::as_bool)
-        {
-            self.inject_model_instruction = Some(inject_model_instruction);
-        }
-    }
-
-    fn effective_enabled(self) -> bool {
-        self.enabled.unwrap_or(false)
-    }
-
-    fn effective_inject_model_instruction(self) -> bool {
-        self.inject_model_instruction.unwrap_or(true)
-    }
-}
-
-async fn resolve_chat_pii_redaction_feature_settings(
-    state: &AppState,
-    input: &LocalOpenAiChatDecisionInput,
-) -> Result<ChatPiiRedactionFeatureSettings, GatewayError> {
-    let user_settings = state
-        .read_user_feature_settings(&input.auth_context.user_id)
-        .await
-        .map_err(|err| {
-            warn!(
-                error = ?err,
-                "gateway failed to read user chat pii redaction feature settings"
-            );
-            GatewayError::Internal("chat pii redaction setup failed".to_string())
-        })?;
-    let key_settings = state
-        .read_auth_api_key_feature_settings(
-            &input.auth_context.user_id,
-            &input.auth_context.api_key_id,
-            input.auth_context.api_key_is_standalone,
-        )
-        .await
-        .map_err(|err| {
-            warn!(
-
-                error = ?err,
-                "gateway failed to read api key chat pii redaction feature settings"
-            );
-            GatewayError::Internal("chat pii redaction setup failed".to_string())
-        })?;
-
-    let mut settings = ChatPiiRedactionFeatureSettings::default();
-    settings.merge_from_value(user_settings.as_ref());
-    settings.merge_from_value(key_settings.as_ref());
-    Ok(settings)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
     state: &AppState,
@@ -203,9 +110,15 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             Some(&input.requested_model),
         )
         .await;
-    let redaction =
-        resolve_provider_chat_request_redaction(state, parts, body_json, input, candidate_id)
-            .await?;
+    let redaction = resolve_provider_chat_pii_redaction(
+        state,
+        parts,
+        body_json,
+        &input.auth_context,
+        "openai:chat",
+        candidate_id,
+    )
+    .await?;
     let body_json = redaction.body_json.as_ref();
     let effective_headers = input.effective_headers(&parts.headers);
     let is_grok = transport
@@ -334,6 +247,25 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
         }));
     }
 
+    if provider_api_format == "openai:chat" && is_windsurf_provider_transport(transport) {
+        return build_windsurf_openai_chat_payload_parts(
+            state,
+            parts,
+            trace_id,
+            body_json,
+            input,
+            eligible,
+            candidate_index,
+            candidate_id,
+            decision_kind,
+            report_kind,
+            transport,
+            upstream_is_stream,
+            redaction.redacted,
+        )
+        .await;
+    }
+
     if provider_api_format == "openai:chat" {
         if let Some(skip_reason) = local_openai_chat_transport_unsupported_reason(transport) {
             mark_skipped_local_openai_chat_candidate(
@@ -378,7 +310,7 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             }
         };
 
-        let Some(provider_request_body) = build_local_openai_chat_request_body(
+        let Some(mut provider_request_body) = build_local_openai_chat_request_body(
             body_json,
             &prepared_candidate.mapped_model,
             upstream_is_stream,
@@ -404,6 +336,13 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             .await;
             return Ok(None);
         };
+        apply_deepseek_tool_call_thinking_compat(
+            &mut provider_request_body,
+            transport.provider.provider_type.as_str(),
+            transport.endpoint.base_url.as_str(),
+            "openai:chat",
+            Some(body_json),
+        );
 
         let Some(upstream_url) = build_local_openai_chat_upstream_url(parts, transport) else {
             mark_skipped_local_openai_chat_candidate_with_failure_diagnostic(
@@ -682,6 +621,13 @@ pub(crate) async fn resolve_local_openai_chat_candidate_payload_parts(
             request_requires_body_stream_field(body_json, force_body_stream_field),
         );
     }
+    apply_deepseek_tool_call_thinking_compat(
+        &mut provider_request_body,
+        transport.provider.provider_type.as_str(),
+        transport.endpoint.base_url.as_str(),
+        provider_api_format.as_str(),
+        Some(body_json),
+    );
 
     if let Some(kiro_auth) = kiro_auth.as_ref() {
         return Ok(build_kiro_openai_chat_cross_format_payload_parts(
@@ -909,7 +855,11 @@ async fn resolve_openai_chat_to_openai_image_payload_parts(
     let upstream_url = if is_chatgpt_web {
         chatgpt_web_image_internal_url(&transport.endpoint.base_url)
     } else {
-        build_openai_image_upstream_url(transport, parts.uri.query())
+        build_openai_image_upstream_url(
+            transport,
+            Some("/v1/images/generations"),
+            parts.uri.query(),
+        )
     };
     let Some(mut provider_request_headers) =
         build_openai_image_headers(ProviderOpenAiImageHeadersInput {
@@ -1250,6 +1200,181 @@ fn chatgpt_web_image_internal_url(base_url: &str) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn build_windsurf_openai_chat_payload_parts(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    body_json: &serde_json::Value,
+    input: &LocalOpenAiChatDecisionInput,
+    eligible: &EligibleLocalExecutionCandidate,
+    candidate_index: u32,
+    candidate_id: &str,
+    decision_kind: &str,
+    report_kind: &str,
+    transport: &Arc<GatewayProviderTransportSnapshot>,
+    upstream_is_stream: bool,
+    request_redacted: bool,
+) -> Result<Option<LocalOpenAiChatCandidatePayloadParts>, GatewayError> {
+    let planner_state = crate::ai_serving::PlannerAppState::new(state);
+    let candidate = &eligible.candidate;
+    if let Some(skip_reason) =
+        local_windsurf_request_transport_unsupported_reason_with_network(transport)
+    {
+        mark_skipped_local_openai_chat_candidate(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            skip_reason,
+        )
+        .await;
+        return Ok(None);
+    }
+
+    let prepared_candidate = match prepare_header_authenticated_candidate(
+        planner_state,
+        transport,
+        candidate,
+        resolve_windsurf_cascade_auth(transport)
+            .or_else(|| resolve_local_openai_bearer_auth(transport)),
+        OauthPreparationContext {
+            trace_id,
+            api_format: "openai:chat",
+            operation: "openai_chat_windsurf_cascade",
+        },
+    )
+    .await
+    {
+        Ok(prepared) => prepared,
+        Err(skip_reason) => {
+            mark_skipped_local_openai_chat_candidate(
+                state,
+                input,
+                trace_id,
+                candidate,
+                candidate_index,
+                candidate_id,
+                skip_reason,
+            )
+            .await;
+            return Ok(None);
+        }
+    };
+
+    let Some(provider_request_body) = build_windsurf_cascade_request_body(
+        body_json,
+        &prepared_candidate.mapped_model,
+        &prepared_candidate.auth_value,
+        transport.endpoint.body_rules.as_ref(),
+        Some(&parts.headers),
+        upstream_is_stream,
+    ) else {
+        mark_skipped_local_openai_chat_candidate_with_failure_diagnostic(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "provider_request_body_build_failed",
+            CandidateFailureDiagnostic::envelope_build_failed(
+                "openai:chat",
+                "openai:chat",
+                "openai_chat_windsurf_cascade",
+            ),
+        )
+        .await;
+        return Ok(None);
+    };
+
+    let Some(upstream_url) = build_windsurf_cascade_upstream_url(
+        transport.endpoint.base_url.as_str(),
+        parts.uri.query(),
+    ) else {
+        mark_skipped_local_openai_chat_candidate_with_failure_diagnostic(
+            state,
+            input,
+            trace_id,
+            candidate,
+            candidate_index,
+            candidate_id,
+            "upstream_url_missing",
+            CandidateFailureDiagnostic::upstream_url_missing(
+                "openai:chat",
+                "openai:chat",
+                "openai_chat_windsurf_url",
+            ),
+        )
+        .await;
+        return Ok(None);
+    };
+
+    let mut provider_request_headers = match build_windsurf_cascade_headers(
+        &parts.headers,
+        &provider_request_body,
+        body_json,
+        transport.endpoint.header_rules.as_ref(),
+        &prepared_candidate.auth_header,
+        &prepared_candidate.auth_value,
+        upstream_is_stream,
+    ) {
+        Some(headers) => headers,
+        None => {
+            mark_skipped_local_openai_chat_candidate_with_failure_diagnostic(
+                state,
+                input,
+                trace_id,
+                candidate,
+                candidate_index,
+                candidate_id,
+                "transport_header_rules_apply_failed",
+                CandidateFailureDiagnostic::header_rules_apply_failed(
+                    "openai:chat",
+                    "openai:chat",
+                    "openai_chat_windsurf_headers",
+                ),
+            )
+            .await;
+            return Ok(None);
+        }
+    };
+    request_identity_response_encoding_when_redacted(
+        &mut provider_request_headers,
+        request_redacted,
+    );
+
+    let (execution_strategy, conversion_mode) =
+        ai_local_execution_contract_for_formats("openai:chat", "openai:chat");
+    let resolved_report_kind =
+        if decision_kind == OPENAI_CHAT_STREAM_PLAN_KIND || !upstream_is_stream {
+            report_kind.to_string()
+        } else {
+            "openai_chat_sync_finalize".to_string()
+        };
+
+    Ok(Some(LocalOpenAiChatCandidatePayloadParts {
+        client_api_format: "openai:chat".to_string(),
+        auth_header: prepared_candidate.auth_header,
+        auth_value: prepared_candidate.auth_value,
+        mapped_model: prepared_candidate.mapped_model,
+        provider_api_format: "openai:chat".to_string(),
+        provider_request_body,
+        provider_request_headers,
+        upstream_url,
+        execution_strategy,
+        conversion_mode,
+        report_kind: resolved_report_kind,
+        envelope_name: Some(WINDSURF_ENVELOPE_NAME),
+        transport: Arc::clone(transport),
+        request_redacted,
+        transport_profile: None,
+        image_request_summary: None,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn build_kiro_openai_chat_cross_format_payload_parts(
     state: &AppState,
     parts: &http::request::Parts,
@@ -1387,90 +1512,6 @@ async fn build_kiro_openai_chat_cross_format_payload_parts(
         transport_profile: None,
         image_request_summary: None,
     })
-}
-
-async fn resolve_provider_chat_request_redaction<'a>(
-    state: &AppState,
-    parts: &http::request::Parts,
-    body_json: &'a Value,
-    input: &LocalOpenAiChatDecisionInput,
-    candidate_id: &str,
-) -> Result<ProviderChatRequestRedaction<'a>, GatewayError> {
-    if parts.uri.path() != "/v1/chat/completions" {
-        return Ok(ProviderChatRequestRedaction::disabled(body_json, parts));
-    }
-    let Some(slot) = parts.extensions.get::<RedactionSessionSlot>() else {
-        return Ok(ProviderChatRequestRedaction::disabled(body_json, parts));
-    };
-    let runtime_config = read_chat_pii_redaction_runtime_config(state)
-        .await
-        .map_err(|err| {
-            warn!(
-                error = ?err,
-                "gateway failed to read chat pii redaction runtime config"
-            );
-            GatewayError::Internal("chat pii redaction setup failed".to_string())
-        })?;
-    if !runtime_config.enabled {
-        return Ok(ProviderChatRequestRedaction::disabled(body_json, parts));
-    }
-    let feature_settings = resolve_chat_pii_redaction_feature_settings(state, input).await?;
-    if !feature_settings.effective_enabled() {
-        return Ok(ProviderChatRequestRedaction::disabled(body_json, parts));
-    }
-    let Some(hmac_key) = state.encryption_key().map(str::as_bytes).map(Vec::from) else {
-        warn!("gateway chat pii redaction is enabled but encryption key is unavailable");
-        return Err(GatewayError::Internal(
-            "chat pii redaction setup failed".to_string(),
-        ));
-    };
-    let body_bytes = serde_json::to_vec(body_json).map_err(|err| {
-        warn!(
-            error = ?err,
-            "gateway failed to serialize provider chat pii redaction body"
-        );
-        GatewayError::Internal("chat pii redaction setup failed".to_string())
-    })?;
-    let now_unix_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let cache = RedisRedactionMappingCache::new(state.runtime_state.as_ref());
-    let masked = try_mask_chat_request_json_with_cache_options(
-        &body_bytes,
-        build_redaction_session_config(hmac_key, &runtime_config, now_unix_secs),
-        MaskChatRequestOptions::runtime(feature_settings.effective_inject_model_instruction()),
-        Some(&cache),
-    )
-    .await
-    .map_err(redaction_mask_error_to_gateway_error)?;
-    if !masked.redacted {
-        return Ok(ProviderChatRequestRedaction {
-            body_json: Cow::Borrowed(body_json),
-            redacted: false,
-        });
-    }
-    let masked_body_json = serde_json::from_slice::<Value>(&masked.body).map_err(|err| {
-        warn!(
-            error = ?err,
-            "gateway failed to decode redacted provider chat pii body"
-        );
-        GatewayError::Internal("chat pii redaction setup failed".to_string())
-    })?;
-    slot.put_for_candidate(candidate_id, masked.session);
-    Ok(ProviderChatRequestRedaction {
-        body_json: Cow::Owned(masked_body_json),
-        redacted: true,
-    })
-}
-
-fn redaction_mask_error_to_gateway_error(error: RedactionMaskError) -> GatewayError {
-    match error {
-        RedactionMaskError::Limit(limit) => GatewayError::Client {
-            status: limit.client_status(),
-            message: limit.safe_message().to_string(),
-        },
-    }
 }
 
 #[cfg(test)]

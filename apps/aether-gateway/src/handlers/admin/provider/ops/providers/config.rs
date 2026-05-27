@@ -1,4 +1,7 @@
-use super::support::{AdminProviderOpsSaveConfigRequest, ADMIN_PROVIDER_OPS_SENSITIVE_FIELDS};
+use super::support::{
+    AdminProviderOpsQuotaAlertConfigRequest, AdminProviderOpsSaveConfigRequest,
+    ADMIN_PROVIDER_OPS_SENSITIVE_FIELDS,
+};
 use crate::handlers::admin::request::AdminAppState;
 use crate::GatewayError;
 use aether_admin::provider::ops as admin_provider_ops_pure;
@@ -7,6 +10,10 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const PROVIDER_OPS_QUOTA_ALERT_DEFAULT_FETCH_INTERVAL_SECS: u64 = 30;
+const PROVIDER_OPS_QUOTA_ALERT_MIN_FETCH_INTERVAL_SECS: u64 = 30;
+const PROVIDER_OPS_QUOTA_ALERT_MAX_FETCH_INTERVAL_SECS: u64 = 86_400;
 
 pub(super) fn admin_provider_ops_config_object(
     provider: &StoredProviderCatalogProvider,
@@ -250,9 +257,6 @@ pub(super) fn build_admin_provider_ops_saved_config_value(
     provider: &StoredProviderCatalogProvider,
     payload: AdminProviderOpsSaveConfigRequest,
 ) -> Result<serde_json::Value, String> {
-    let architecture_id =
-        admin_provider_ops_pure::normalize_architecture_id(payload.architecture_id.as_str())
-            .to_string();
     let auth_type = payload.connector.auth_type.trim().to_string();
     if auth_type.is_empty() || !admin_provider_ops_is_supported_auth_type(auth_type.as_str()) {
         return Err("connector.auth_type 必须是合法的认证类型".to_string());
@@ -260,7 +264,7 @@ pub(super) fn build_admin_provider_ops_saved_config_value(
 
     let merged_credentials = admin_provider_ops_merge_credentials(
         state,
-        architecture_id.as_str(),
+        payload.architecture_id.as_str(),
         provider,
         payload.connector.credentials,
     );
@@ -279,9 +283,10 @@ pub(super) fn build_admin_provider_ops_saved_config_value(
             )
         })
         .collect::<serde_json::Map<String, serde_json::Value>>();
+    let quota_alert = normalize_admin_provider_ops_quota_alert(payload.quota_alert)?;
 
     Ok(json!({
-        "architecture_id": architecture_id,
+        "architecture_id": payload.architecture_id,
         "base_url": payload.base_url,
         "connector": {
             "auth_type": auth_type,
@@ -290,7 +295,46 @@ pub(super) fn build_admin_provider_ops_saved_config_value(
         },
         "actions": actions,
         "schedule": payload.schedule,
+        "quota_alert": quota_alert,
     }))
+}
+
+fn normalize_admin_provider_ops_quota_alert(
+    request: Option<AdminProviderOpsQuotaAlertConfigRequest>,
+) -> Result<serde_json::Value, String> {
+    let Some(request) = request else {
+        return Ok(default_admin_provider_ops_quota_alert());
+    };
+    let threshold_amount = request.threshold_amount.unwrap_or(0.0);
+    if threshold_amount < 0.0 {
+        return Err("quota_alert.threshold_amount 必须大于等于 0".to_string());
+    }
+    let fetch_interval_seconds = request
+        .fetch_interval_seconds
+        .unwrap_or(PROVIDER_OPS_QUOTA_ALERT_DEFAULT_FETCH_INTERVAL_SECS);
+    if !(PROVIDER_OPS_QUOTA_ALERT_MIN_FETCH_INTERVAL_SECS
+        ..=PROVIDER_OPS_QUOTA_ALERT_MAX_FETCH_INTERVAL_SECS)
+        .contains(&fetch_interval_seconds)
+    {
+        return Err(format!(
+            "quota_alert.fetch_interval_seconds 必须在 {} 到 {} 秒之间",
+            PROVIDER_OPS_QUOTA_ALERT_MIN_FETCH_INTERVAL_SECS,
+            PROVIDER_OPS_QUOTA_ALERT_MAX_FETCH_INTERVAL_SECS
+        ));
+    }
+    Ok(json!({
+        "enabled": request.enabled,
+        "threshold_amount": threshold_amount,
+        "fetch_interval_seconds": fetch_interval_seconds,
+    }))
+}
+
+fn default_admin_provider_ops_quota_alert() -> serde_json::Value {
+    json!({
+        "enabled": false,
+        "threshold_amount": 0.0,
+        "fetch_interval_seconds": PROVIDER_OPS_QUOTA_ALERT_DEFAULT_FETCH_INTERVAL_SECS,
+    })
 }
 
 pub(super) fn resolve_admin_provider_ops_base_url(
@@ -331,16 +375,14 @@ pub(super) fn build_admin_provider_ops_config_payload(
         });
     };
     let connector = admin_provider_ops_connector_object(provider_ops_config);
-    let architecture_id = provider_ops_config
-        .get("architecture_id")
-        .and_then(serde_json::Value::as_str)
-        .map(admin_provider_ops_pure::normalize_architecture_id)
-        .unwrap_or("generic_api");
 
     json!({
         "provider_id": provider_id,
         "is_configured": true,
-        "architecture_id": architecture_id,
+        "architecture_id": provider_ops_config
+            .get("architecture_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("generic_api"),
         "base_url": resolve_admin_provider_ops_base_url(
             provider,
             endpoints,
@@ -361,5 +403,10 @@ pub(super) fn build_admin_provider_ops_config_payload(
                 connector.and_then(|connector| connector.get("credentials")),
             ),
         },
+        "quota_alert": provider_ops_config
+            .get("quota_alert")
+            .filter(|value| value.is_object())
+            .cloned()
+            .unwrap_or_else(default_admin_provider_ops_quota_alert),
     })
 }

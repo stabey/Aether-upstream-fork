@@ -42,7 +42,7 @@ use crate::clock::current_unix_ms;
 use crate::dispatch::refs::dispatch_ref_for_local_candidate;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
 use crate::orchestration::{local_attempt_slot_count, ExecutionAttemptIdentity};
-use crate::scheduler::candidate::API_KEY_CONCURRENCY_LIMIT_SKIP_REASON;
+use crate::scheduler::candidate::is_auth_api_key_concurrency_limit_skip_reason;
 use crate::scheduler::config::SchedulerSchedulingMode;
 use crate::{AppState, GatewayError};
 
@@ -988,7 +988,7 @@ fn page_is_exact_auth_api_key_concurrency_limited(
         && page
             .skipped_candidates
             .iter()
-            .all(|skipped| skipped.skip_reason == API_KEY_CONCURRENCY_LIMIT_SKIP_REASON)
+            .all(|skipped| is_auth_api_key_concurrency_limit_skip_reason(skipped.skip_reason))
 }
 
 async fn pop_attempt_from_items(

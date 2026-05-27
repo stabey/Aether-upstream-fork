@@ -7,12 +7,11 @@ use url::Url;
 pub fn build_openai_chat_url(upstream_base_url: &str, query: Option<&str>) -> String {
     let (trimmed, base_query) = split_base_url_query(upstream_base_url);
     let trimmed = trimmed.trim_end_matches('/');
-    let mut url =
-        if trimmed.ends_with("/v1") || google_openai_compat_base_includes_api_root(trimmed) {
-            format!("{trimmed}/chat/completions")
-        } else {
-            format!("{trimmed}/v1/chat/completions")
-        };
+    let mut url = if openai_compatible_base_includes_api_root(trimmed) {
+        format!("{trimmed}/chat/completions")
+    } else {
+        format!("{trimmed}/v1/chat/completions")
+    };
     append_merged_query(&mut url, base_query, None, query, &[]);
     url
 }
@@ -31,7 +30,7 @@ pub fn build_openai_responses_url(
     };
     let mut url = if is_codex_cli_backend_url(trimmed)
         || trimmed.ends_with("/codex")
-        || trimmed.ends_with("/v1")
+        || openai_compatible_base_includes_api_root(trimmed)
     {
         format!("{trimmed}{suffix}")
     } else {
@@ -39,6 +38,43 @@ pub fn build_openai_responses_url(
     };
     append_merged_query(&mut url, base_query, None, query, &[]);
     url
+}
+
+pub fn build_openai_image_url(
+    upstream_base_url: &str,
+    request_path: Option<&str>,
+    query: Option<&str>,
+) -> String {
+    let (trimmed, base_query) = split_base_url_query(upstream_base_url);
+    let trimmed = trimmed.trim_end_matches('/');
+    let suffix = openai_image_path_suffix(request_path);
+    let mut url = if openai_image_base_includes_operation_path(trimmed) {
+        trimmed.to_string()
+    } else if openai_compatible_base_includes_api_root(trimmed) {
+        format!("{trimmed}{suffix}")
+    } else {
+        format!("{trimmed}/v1{suffix}")
+    };
+    append_merged_query(&mut url, base_query, None, query, &[]);
+    url
+}
+
+fn openai_image_path_suffix(request_path: Option<&str>) -> &'static str {
+    match request_path
+        .map(str::trim)
+        .map(|value| value.trim_end_matches('/'))
+    {
+        Some("/v1/images/edits") | Some("/images/edits") => "/images/edits",
+        _ => "/images/generations",
+    }
+}
+
+fn openai_image_base_includes_operation_path(base_url: &str) -> bool {
+    let path = Url::parse(base_url)
+        .ok()
+        .map(|url| url.path().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| base_url.trim_end_matches('/').to_string());
+    path.ends_with("/images/generations") || path.ends_with("/images/edits")
 }
 
 pub fn build_claude_messages_url(upstream_base_url: &str, query: Option<&str>) -> String {
@@ -163,6 +199,46 @@ pub fn build_passthrough_path_url(
     Some(url)
 }
 
+pub fn build_bigmodel_coding_models_url(upstream_base_url: &str) -> Option<String> {
+    let (trimmed_base_url, base_query) = split_base_url_query(upstream_base_url);
+    let trimmed_base_url = trimmed_base_url.trim_end_matches('/');
+    if trimmed_base_url.is_empty() || !bigmodel_coding_models_base_is_supported(trimmed_base_url) {
+        return None;
+    }
+
+    let path = Url::parse(trimmed_base_url)
+        .ok()
+        .map(|url| url.path().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| trimmed_base_url.trim_end_matches('/').to_string());
+    let mut url = if path.ends_with("/models") {
+        trimmed_base_url.to_string()
+    } else {
+        format!("{trimmed_base_url}/models")
+    };
+    append_merged_query(&mut url, base_query, None, None, &[]);
+    Some(url)
+}
+
+pub fn build_openai_compatible_models_url(upstream_base_url: &str) -> Option<String> {
+    if let Some(url) = build_bigmodel_coding_models_url(upstream_base_url) {
+        return Some(url);
+    }
+
+    let (trimmed_base_url, base_query) = split_base_url_query(upstream_base_url);
+    let trimmed_base_url = trimmed_base_url.trim_end_matches('/');
+    if trimmed_base_url.is_empty() {
+        return None;
+    }
+
+    let mut url = if openai_compatible_base_includes_api_root(trimmed_base_url) {
+        format!("{trimmed_base_url}/models")
+    } else {
+        format!("{trimmed_base_url}/v1/models")
+    };
+    append_merged_query(&mut url, base_query, None, None, &[]);
+    Some(url)
+}
+
 pub fn build_gemini_files_passthrough_url(
     upstream_base_url: &str,
     path: &str,
@@ -215,6 +291,61 @@ pub(crate) fn google_openai_compat_base_includes_api_root(base_url: &str) -> boo
     }
 
     false
+}
+
+pub fn openai_compatible_base_includes_api_root(base_url: &str) -> bool {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    trimmed.ends_with("/v1")
+        || google_openai_compat_base_includes_api_root(trimmed)
+        || bigmodel_coding_base_includes_api_root(trimmed)
+        || openai_compatible_base_includes_unversioned_api_root(trimmed)
+}
+
+pub fn v1_compatible_base_includes_api_root(base_url: &str) -> bool {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    trimmed.ends_with("/v1") || openai_compatible_base_includes_unversioned_api_root(trimmed)
+}
+
+pub fn openai_compatible_base_includes_unversioned_api_root(base_url: &str) -> bool {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    let path = Url::parse(trimmed)
+        .ok()
+        .map(|url| url.path().trim_end_matches('/').to_ascii_lowercase())
+        .unwrap_or_else(|| {
+            trimmed
+                .split_once('/')
+                .map(|(_, path)| format!("/{path}"))
+                .unwrap_or_default()
+                .trim_end_matches('/')
+                .to_ascii_lowercase()
+        });
+    !path.is_empty()
+}
+
+fn bigmodel_coding_base_includes_api_root(base_url: &str) -> bool {
+    let Ok(parsed) = Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(|value| value.to_ascii_lowercase()) else {
+        return false;
+    };
+    host == "open.bigmodel.cn" && parsed.path().trim_end_matches('/') == "/api/coding/paas/v4"
+}
+
+fn bigmodel_coding_models_base_is_supported(base_url: &str) -> bool {
+    let Ok(parsed) = Url::parse(base_url.trim()) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str().map(|value| value.to_ascii_lowercase()) else {
+        return false;
+    };
+    if host != "open.bigmodel.cn" {
+        return false;
+    }
+    matches!(
+        parsed.path().trim_end_matches('/'),
+        "/api/coding/paas/v4" | "/api/coding/paas/v4/models"
+    )
 }
 
 fn looks_like_vertex_ai_host(host: &str) -> bool {
@@ -306,8 +437,9 @@ fn merge_query_string(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_gemini_content_url, build_gemini_files_passthrough_url,
-        build_gemini_video_predict_long_running_url, build_openai_chat_url,
+        build_bigmodel_coding_models_url, build_claude_messages_url, build_gemini_content_url,
+        build_gemini_files_passthrough_url, build_gemini_video_predict_long_running_url,
+        build_openai_chat_url, build_openai_compatible_models_url, build_openai_image_url,
         build_openai_responses_url, build_passthrough_path_url,
         normalize_gemini_content_action_path,
     };
@@ -342,6 +474,102 @@ mod tests {
     }
 
     #[test]
+    fn openai_urls_preserve_bigmodel_coding_api_root() {
+        assert_eq!(
+            build_openai_chat_url(
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                Some("trace=1")
+            ),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions?trace=1"
+        );
+        assert_eq!(
+            build_openai_responses_url("https://open.bigmodel.cn/api/coding/paas/v4", None, false),
+            "https://open.bigmodel.cn/api/coding/paas/v4/responses"
+        );
+    }
+
+    #[test]
+    fn openai_urls_preserve_unversioned_api_root() {
+        assert_eq!(
+            build_openai_chat_url("https://proxy.example.com/api", Some("trace=1")),
+            "https://proxy.example.com/api/chat/completions?trace=1"
+        );
+        assert_eq!(
+            build_openai_chat_url("https://proxy.example.com/openai", None),
+            "https://proxy.example.com/openai/chat/completions"
+        );
+        assert_eq!(
+            build_openai_chat_url("https://proxy.example.com", None),
+            "https://proxy.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            build_openai_responses_url("https://proxy.example.com/api", None, false),
+            "https://proxy.example.com/api/responses"
+        );
+        assert_eq!(
+            build_openai_image_url(
+                "https://proxy.example.com/api",
+                Some("/v1/images/generations"),
+                None
+            ),
+            "https://proxy.example.com/api/images/generations"
+        );
+    }
+
+    #[test]
+    fn claude_messages_url_preserves_v1_and_unversioned_api_roots() {
+        assert_eq!(
+            build_claude_messages_url("https://api.anthropic.example/v1", Some("trace=1")),
+            "https://api.anthropic.example/v1/messages?trace=1"
+        );
+        assert_eq!(
+            build_claude_messages_url("https://proxy.example.com/api", None),
+            "https://proxy.example.com/api/v1/messages"
+        );
+        assert_eq!(
+            build_claude_messages_url("https://proxy.example.com/anthropic", None),
+            "https://proxy.example.com/anthropic/v1/messages"
+        );
+        assert_eq!(
+            build_claude_messages_url("https://api.anthropic.example", None),
+            "https://api.anthropic.example/v1/messages"
+        );
+    }
+
+    #[test]
+    fn bigmodel_coding_models_url_uses_models_resource() {
+        assert_eq!(
+            build_bigmodel_coding_models_url(
+                "https://open.bigmodel.cn/api/coding/paas/v4?tenant=demo"
+            )
+            .as_deref(),
+            Some("https://open.bigmodel.cn/api/coding/paas/v4/models?tenant=demo")
+        );
+        assert_eq!(
+            build_bigmodel_coding_models_url("https://open.bigmodel.cn/api/coding/paas/v4/models")
+                .as_deref(),
+            Some("https://open.bigmodel.cn/api/coding/paas/v4/models")
+        );
+    }
+
+    #[test]
+    fn openai_compatible_models_url_preserves_unversioned_api_root() {
+        assert_eq!(
+            build_openai_compatible_models_url("https://proxy.example.com/api?tenant=demo")
+                .as_deref(),
+            Some("https://proxy.example.com/api/models?tenant=demo")
+        );
+        assert_eq!(
+            build_openai_compatible_models_url("https://proxy.example.com/openai").as_deref(),
+            Some("https://proxy.example.com/openai/models")
+        );
+        assert_eq!(
+            build_openai_compatible_models_url("https://proxy.example.com").as_deref(),
+            Some("https://proxy.example.com/v1/models")
+        );
+    }
+
+    #[test]
     fn openai_responses_url_preserves_codex_path_prefix() {
         assert_eq!(
             build_openai_responses_url("https://tiger.bookapi.cc/codex", None, false),
@@ -350,6 +578,22 @@ mod tests {
         assert_eq!(
             build_openai_responses_url("https://tiger.bookapi.cc/codex?tenant=demo", None, true),
             "https://tiger.bookapi.cc/codex/responses/compact?tenant=demo"
+        );
+    }
+
+    #[test]
+    fn openai_image_url_uses_images_surface() {
+        assert_eq!(
+            build_openai_image_url(
+                "https://api.openai.example/v1?tenant=demo",
+                Some("/v1/images/generations"),
+                Some("trace=1")
+            ),
+            "https://api.openai.example/v1/images/generations?tenant=demo&trace=1"
+        );
+        assert_eq!(
+            build_openai_image_url("https://api.openai.example", Some("/v1/images/edits"), None),
+            "https://api.openai.example/v1/images/edits"
         );
     }
 

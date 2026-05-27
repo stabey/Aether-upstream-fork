@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, defineComponent, h, nextTick, type App } from 'vue'
+import { createMemoryHistory, createRouter } from 'vue-router'
 
 import LoginDialog from '../LoginDialog.vue'
 
@@ -11,6 +12,9 @@ const authStoreMock = vi.hoisted(() => ({
 }))
 
 const routerPushMock = vi.hoisted(() => vi.fn())
+const routeMock = vi.hoisted(() => ({
+  query: {},
+}))
 const toastMocks = vi.hoisted(() => ({
   success: vi.fn(),
   warning: vi.fn(),
@@ -26,11 +30,16 @@ const oauthApiMocks = vi.hoisted(() => ({
   getProviders: vi.fn(),
 }))
 
-vi.mock('vue-router', () => ({
-  useRouter: () => ({
-    push: routerPushMock,
-  }),
-}))
+vi.mock('vue-router', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('vue-router')>()
+  return {
+    ...actual,
+    useRoute: () => routeMock,
+    useRouter: () => ({
+      push: routerPushMock,
+    }),
+  }
+})
 
 vi.mock('@/stores/auth', () => ({
   useAuthStore: () => authStoreMock,
@@ -152,11 +161,27 @@ async function settle() {
   }
 }
 
+async function createDuplicatedNavigationFailure(path: string) {
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      {
+        path,
+        component: defineComponent({ setup: () => () => null }),
+      },
+    ],
+  })
+
+  await router.push(path)
+  return router.push(path)
+}
+
 beforeEach(() => {
   authStoreMock.loading = false
   authStoreMock.error = ''
   authStoreMock.canAccessAdmin = false
   authStoreMock.login.mockReset()
+  routeMock.query = {}
   routerPushMock.mockReset()
   toastMocks.success.mockReset()
   toastMocks.warning.mockReset()
@@ -236,5 +261,27 @@ describe('LoginDialog password manager contract', () => {
     expect(routerPushMock).toHaveBeenCalledWith('/admin/dashboard')
     expect(sessionStorage.getItem('redirectPath')).toBeNull()
     expect(toastMocks.success).toHaveBeenCalledWith('登录成功，正在跳转...')
+  })
+
+  it('treats duplicated router navigation after successful auth as a completed login', async () => {
+    authStoreMock.login.mockResolvedValue(true)
+    routerPushMock.mockResolvedValue(await createDuplicatedNavigationFailure('/dashboard'))
+    const root = mountLoginDialog()
+    await settle()
+
+    const form = root.querySelector('form')
+    const username = root.querySelector<HTMLInputElement>('input[name="username"]')
+    const password = root.querySelector<HTMLInputElement>('input[name="password"]')
+
+    username!.value = 'user@example.com'
+    password!.value = 'secret-from-manager'
+    form!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await settle()
+
+    expect(authStoreMock.login).toHaveBeenCalledWith('user@example.com', 'secret-from-manager', 'local')
+    expect(routerPushMock).toHaveBeenCalledWith('/dashboard')
+    expect(toastMocks.error).not.toHaveBeenCalled()
+    expect(toastMocks.success).toHaveBeenCalledWith('登录成功，正在跳转...')
+    expect(root.querySelector('[data-testid="dialog"]')).toBeNull()
   })
 })

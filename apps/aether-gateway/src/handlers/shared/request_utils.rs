@@ -221,7 +221,6 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("endpoints_manage"), http::Method::POST, Some("create_endpoint"))
                 | (Some("endpoints_manage"), http::Method::POST, Some("batch_delete_keys"))
                 | (Some("endpoints_manage"), http::Method::POST, Some("refresh_quota"))
-                | (Some("endpoints_manage"), http::Method::POST, Some("query_key_balance"))
                 | (Some("endpoints_manage"), http::Method::PUT, Some("update_key"))
                 | (Some("endpoints_manage"), http::Method::PUT, Some("update_endpoint"))
                 | (Some("modules_manage"), http::Method::PUT, Some("set_enabled"))
@@ -255,6 +254,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("system_manage"), http::Method::PUT, Some("config_set"))
                 | (Some("system_manage"), http::Method::PUT, Some("email_template_set"))
                 | (Some("system_manage"), http::Method::POST, Some("email_template_preview"))
+                | (
+                    Some("system_manage"),
+                    http::Method::POST,
+                    Some("important_notification_test"),
+                )
                 | (
                     Some("provider_models_manage"),
                     http::Method::POST,

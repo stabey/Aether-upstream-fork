@@ -16,15 +16,47 @@ use crate::{AppState, GatewayError};
 use super::super::GatewayControlDecision;
 use super::credentials::{
     build_auth_context_cache_key, current_unix_secs, extract_request_credentials,
-    extract_trusted_admin_headers,
+    extract_trusted_admin_headers, hash_api_key,
 };
 use super::gate::GatewayLocalAuthRejection;
 use super::principal::derive_principal_candidate;
-use super::types::{GatewayPrincipalCandidate, GatewayTrustedAuthHeaders};
+use super::types::{
+    GatewayCredentialCarrier, GatewayPrincipalCandidate, GatewayTrustedAuthHeaders,
+};
 use crate::headers::header_value_str;
 
 const AUTH_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(60);
 const AUTH_CONTEXT_CACHE_MAX_ENTRIES: usize = 256;
+
+#[derive(Debug, Clone, Deserialize)]
+struct AntigravityBearerBridgeConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    auth_user_id: String,
+    #[serde(default)]
+    auth_api_key_id: String,
+    #[serde(default)]
+    bearer_sha256_allowlist: Vec<String>,
+    #[serde(default)]
+    allow_unverified_google_bearer: bool,
+}
+
+impl AntigravityBearerBridgeConfig {
+    fn bearer_validation_mode(&self, raw_bearer: &str) -> Option<&'static str> {
+        if !self.bearer_sha256_allowlist.is_empty() {
+            let bearer_hash = hash_api_key(raw_bearer);
+            return self
+                .bearer_sha256_allowlist
+                .iter()
+                .any(|allowed| allowed.trim().eq_ignore_ascii_case(&bearer_hash))
+                .then_some("sha256_allowlist");
+        }
+
+        self.allow_unverified_google_bearer
+            .then_some("explicit_unverified")
+    }
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct GatewayControlAuthContext {
@@ -607,12 +639,115 @@ pub(super) async fn resolve_data_backed_auth_context(
                 .await,
             ))
         }
-        Some(
-            GatewayPrincipalCandidate::DeferredBearerToken { .. }
-            | GatewayPrincipalCandidate::DeferredCookieHeader { .. },
-        ) => Ok(None),
+        Some(GatewayPrincipalCandidate::DeferredBearerToken { raw, carrier }) => {
+            if let Some(auth_context) = resolve_antigravity_bearer_bridge_auth_context(
+                state,
+                signature,
+                raw.as_str(),
+                carrier,
+                now_unix_secs,
+            )
+            .await?
+            {
+                return Ok(Some(auth_context));
+            }
+            Ok(None)
+        }
+        Some(GatewayPrincipalCandidate::DeferredCookieHeader { .. }) => Ok(None),
         None => Ok(None),
     }
+}
+
+async fn resolve_antigravity_bearer_bridge_auth_context(
+    state: &AppState,
+    auth_endpoint_signature: &str,
+    raw_bearer: &str,
+    carrier: GatewayCredentialCarrier,
+    now_unix_secs: u64,
+) -> Result<Option<GatewayControlAuthContext>, GatewayError> {
+    if carrier != GatewayCredentialCarrier::AuthorizationBearer
+        || !auth_endpoint_signature
+            .trim()
+            .eq_ignore_ascii_case("antigravity:v1internal")
+    {
+        return Ok(None);
+    }
+
+    let Some(config_value) = state
+        .read_system_config_json_value(crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if config_value.is_null() {
+        return Ok(None);
+    }
+    let config: AntigravityBearerBridgeConfig =
+        serde_json::from_value(config_value).map_err(|err| {
+            GatewayError::Internal(format!(
+                "{} invalid: {err}",
+                crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY
+            ))
+        })?;
+    if !config.enabled {
+        return Ok(None);
+    }
+    let Some(validation_mode) = config.bearer_validation_mode(raw_bearer) else {
+        return Ok(None);
+    };
+    let user_id = config.auth_user_id.trim();
+    let api_key_id = config.auth_api_key_id.trim();
+    if user_id.is_empty() || api_key_id.is_empty() {
+        return Err(GatewayError::Internal(format!(
+            "{} requires auth_user_id and auth_api_key_id",
+            crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY
+        )));
+    }
+
+    let snapshot = state
+        .data
+        .read_auth_api_key_snapshot(user_id, api_key_id, now_unix_secs)
+        .await
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    let Some(snapshot) = snapshot else {
+        return Ok(Some(GatewayControlAuthContext {
+            user_id: user_id.to_string(),
+            api_key_id: api_key_id.to_string(),
+            username: None,
+            api_key_name: None,
+            balance_remaining: None,
+            access_allowed: false,
+            user_rate_limit: None,
+            api_key_rate_limit: None,
+            api_key_is_standalone: false,
+            admin_bypass_limits: false,
+            local_rejection: Some(GatewayLocalAuthRejection::InvalidApiKey),
+            allowed_models: None,
+            ip_rules: None,
+        }));
+    };
+
+    let wallet_access = resolve_wallet_auth_gate(state, &snapshot).await?;
+    let auth_context = build_data_backed_auth_context(
+        state,
+        snapshot,
+        auth_endpoint_signature,
+        None,
+        None,
+        wallet_access,
+    )
+    .await;
+    info!(
+        event_name = "antigravity_bearer_bridge_auth_context_resolved",
+        log_type = "event",
+        validation_mode,
+        user_id = auth_context.user_id.as_str(),
+        api_key_id = auth_context.api_key_id.as_str(),
+        access_allowed = auth_context.access_allowed,
+        has_local_rejection = auth_context.local_rejection.is_some(),
+        "resolved Antigravity bearer bridge auth context"
+    );
+    Ok(Some(auth_context))
 }
 
 async fn resolve_trusted_auth_context(
@@ -712,7 +847,12 @@ async fn build_data_backed_auth_context(
         })
     } else if snapshot
         .effective_allowed_api_formats()
-        .is_some_and(|allowed| !contains_api_format_or_alias(allowed, auth_endpoint_signature))
+        .is_some_and(|allowed| {
+            !contains_api_format_or_alias(
+                allowed,
+                auth_gate_api_format(auth_endpoint_signature).as_str(),
+            )
+        })
     {
         Some(GatewayLocalAuthRejection::ApiFormatNotAllowed {
             api_format: auth_endpoint_signature.to_string(),
@@ -745,6 +885,15 @@ fn contains_api_format_or_alias(items: &[String], target: &str) -> bool {
 
 fn normalize_api_format_alias(value: &str) -> String {
     crate::ai_serving::normalize_api_format_alias(value)
+}
+
+fn auth_gate_api_format(auth_endpoint_signature: &str) -> String {
+    let normalized = normalize_api_format_alias(auth_endpoint_signature);
+    if normalized == "antigravity:v1internal" {
+        "gemini:generate_content".to_string()
+    } else {
+        normalized
+    }
 }
 
 fn api_format_matches(left: &str, right: &str) -> bool {
@@ -1253,6 +1402,58 @@ mod tests {
             &headers,
             &uri("/v1/messages"),
             Some("claude:messages"),
+        )
+        .await
+        .expect("resolution should succeed")
+        .expect("auth context should exist");
+
+        assert_eq!(auth_context.local_rejection, None);
+    }
+
+    #[tokio::test]
+    async fn data_backed_auth_context_allows_antigravity_v1internal_for_gemini_generate_content_keys(
+    ) {
+        let api_key = "sk-test-antigravity-v1internal";
+        let mut snapshot = sample_snapshot("key-ant-v1internal", "user-ant-v1internal");
+        snapshot.user_allowed_providers = Some(vec!["antigravity".to_string()]);
+        snapshot.api_key_allowed_providers = Some(vec!["antigravity".to_string()]);
+        snapshot.user_allowed_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+        snapshot.api_key_allowed_api_formats = Some(vec!["gemini:generate_content".to_string()]);
+        let repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+            Some(hash_api_key(api_key)),
+            snapshot,
+        )]));
+        let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider(
+                "provider-antigravity-1",
+                "Antigravity",
+                "antigravity",
+            )],
+            vec![sample_endpoint(
+                "endpoint-antigravity-1",
+                "provider-antigravity-1",
+                "gemini:generate_content",
+            )],
+            Vec::new(),
+        ));
+        let data = GatewayDataState::with_auth_api_key_reader_for_tests(repository)
+            .with_provider_catalog_reader(provider_catalog);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", api_key.parse().unwrap());
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer google-oauth-access-token".parse().unwrap(),
+        );
+
+        let auth_context = resolve_data_backed_auth_context(
+            &state,
+            &headers,
+            &uri("/v1internal:streamGenerateContent?alt=sse"),
+            Some("antigravity:v1internal"),
         )
         .await
         .expect("resolution should succeed")

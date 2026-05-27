@@ -16,11 +16,15 @@ use rsa::RsaPrivateKey;
 use serde_json::{json, Value};
 use sha2::Sha256;
 
-use crate::logic::{extract_error_message, parse_models_response_page, preset_models_for_provider};
+use crate::logic::{
+    aggregate_models_for_cache, extract_error_message, parse_models_response_page,
+    parse_windsurf_model_configs_response, preset_models_for_provider,
+};
 use crate::transport::{
     build_antigravity_fetch_available_models_plan, build_gemini_cli_load_code_assist_plan,
     build_kiro_list_available_models_plan, build_standard_models_fetch_execution_plan,
-    build_vertex_models_fetch_execution_plan, ModelFetchTransportRuntime,
+    build_vertex_models_fetch_execution_plan, build_windsurf_model_configs_execution_plan,
+    ModelFetchTransportRuntime,
 };
 
 const ANTIGRAVITY_SANDBOX_BASE_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
@@ -51,6 +55,7 @@ pub enum ModelFetchStrategyKind {
     Antigravity,
     GeminiCliPreset,
     Kiro,
+    Windsurf,
 }
 
 pub trait ModelFetchStrategy {
@@ -136,6 +141,7 @@ fn select_model_fetch_strategy(
     let kind = match provider_type.as_str() {
         "antigravity" => ModelFetchStrategyKind::Antigravity,
         "vertex_ai" => ModelFetchStrategyKind::Vertex,
+        "windsurf" => ModelFetchStrategyKind::Windsurf,
         _ => ModelFetchStrategyKind::StandardTransport,
     };
     Ok(SelectedModelFetchStrategy {
@@ -176,6 +182,7 @@ async fn execute_model_fetch_strategy(
             .await
         }
         ModelFetchStrategyKind::Kiro => fetch_kiro_models(runtime, first_transport).await,
+        ModelFetchStrategyKind::Windsurf => fetch_windsurf_models(runtime, first_transport).await,
     }
 }
 
@@ -197,7 +204,8 @@ async fn fetch_standard_models(
         }
     }
 
-    Ok(build_success_outcome(all_models, None, has_success).with_errors(errors))
+    let merged_models = aggregate_models_for_cache(&all_models);
+    Ok(build_success_outcome(merged_models, None, has_success).with_errors(errors))
 }
 
 async fn fetch_standard_models_for_transport(
@@ -366,6 +374,25 @@ async fn fetch_kiro_models(
     Ok(build_success_outcome(models, metadata, true))
 }
 
+async fn fetch_windsurf_models(
+    runtime: &(impl ModelFetchTransportRuntime + ?Sized),
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<ModelsFetchOutcome, String> {
+    let plan = build_windsurf_model_configs_execution_plan(runtime, transport).await?;
+    let result = runtime.execute_model_fetch_execution_plan(&plan).await?;
+    if !(200..300).contains(&result.status_code) {
+        return Err(execution_result_error_message(&result));
+    }
+
+    let body_json = execution_result_json_body_allow_empty(&result)?;
+    let (models, metadata) = parse_windsurf_model_configs_response(&body_json, now_unix_secs())?;
+    Ok(build_success_outcome(
+        models.cached_models,
+        Some(metadata),
+        true,
+    ))
+}
+
 async fn fetch_vertex_models(
     runtime: &(impl ModelFetchTransportRuntime + ?Sized),
     transports: &[GatewayProviderTransportSnapshot],
@@ -407,7 +434,7 @@ async fn fetch_vertex_api_key_models(
 
     for base_url in iter_vertex_base_urls(transports) {
         let url = build_vertex_google_list_url(&base_url, api_key, None);
-        let outcome = fetch_vertex_models_from_url(
+        let outcome = match fetch_vertex_models_from_url(
             runtime,
             reference_transport,
             &url,
@@ -416,7 +443,14 @@ async fn fetch_vertex_api_key_models(
             "gemini:generate_content",
             None,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                hard_errors.push(format!("{base_url}: {err}"));
+                continue;
+            }
+        };
         has_success |= outcome.has_success;
         if let Some(error) = outcome.error {
             if is_soft_not_found(&error) {
@@ -481,7 +515,7 @@ async fn fetch_vertex_service_account_models(
             ("anthropic", claude_transport, "claude:messages"),
         ] {
             let url = build_vertex_service_account_list_url(&base, publisher, None);
-            let outcome = fetch_vertex_models_from_url(
+            let outcome = match fetch_vertex_models_from_url(
                 runtime,
                 transport,
                 &url,
@@ -490,7 +524,14 @@ async fn fetch_vertex_service_account_models(
                 api_format,
                 Some(("authorization".to_string(), format!("Bearer {token}"))),
             )
-            .await?;
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    hard_errors.push(format!("{url}: {err}"));
+                    continue;
+                }
+            };
             has_success |= outcome.has_success;
             if let Some(error) = outcome.error {
                 let labeled = format!("{url}: {error}");
@@ -1272,10 +1313,18 @@ mod tests {
     use crate::fetch_models_from_transports;
     use crate::transport::ModelFetchTransportRuntime;
 
+    type RouteResult = Result<(u16, Value), String>;
+    type ModelFetchRoute = (String, RouteResult);
+
     struct TestRuntime {
         executed_urls: Arc<Mutex<Vec<String>>>,
         response_body: Value,
         status_code: u16,
+    }
+
+    struct RoutingTestRuntime {
+        executed_urls: Arc<Mutex<Vec<String>>>,
+        routes: Vec<ModelFetchRoute>,
     }
 
     #[async_trait]
@@ -1310,6 +1359,57 @@ mod tests {
                 headers: BTreeMap::new(),
                 body: Some(ResponseBody {
                     json_body: Some(self.response_body.clone()),
+                    body_bytes_b64: None,
+                }),
+                telemetry: None,
+                error: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ModelFetchTransportRuntime for RoutingTestRuntime {
+        async fn resolve_local_oauth_request_auth(
+            &self,
+            _transport: &GatewayProviderTransportSnapshot,
+        ) -> Result<Option<aether_provider_transport::LocalResolvedOAuthRequestAuth>, String>
+        {
+            Ok(None)
+        }
+
+        async fn resolve_model_fetch_proxy(
+            &self,
+            _transport: &GatewayProviderTransportSnapshot,
+        ) -> Option<aether_contracts::ProxySnapshot> {
+            None
+        }
+
+        async fn execute_model_fetch_execution_plan(
+            &self,
+            plan: &aether_contracts::ExecutionPlan,
+        ) -> Result<ExecutionResult, String> {
+            self.executed_urls
+                .lock()
+                .expect("executed_urls lock")
+                .push(plan.url.clone());
+            let Some((_, route_result)) = self
+                .routes
+                .iter()
+                .find(|(url_part, _)| plan.url.contains(url_part))
+            else {
+                return Err(format!("unexpected models fetch URL {}", plan.url));
+            };
+            let (status_code, response_body) = match route_result {
+                Ok((status_code, response_body)) => (*status_code, response_body.clone()),
+                Err(err) => return Err(err.clone()),
+            };
+            Ok(ExecutionResult {
+                request_id: plan.request_id.clone(),
+                candidate_id: plan.candidate_id.clone(),
+                status_code,
+                headers: BTreeMap::new(),
+                body: Some(ResponseBody {
+                    json_body: Some(response_body),
                     body_bytes_b64: None,
                 }),
                 telemetry: None,
@@ -1413,6 +1513,43 @@ mod tests {
         transport
     }
 
+    fn sample_windsurf_transport() -> GatewayProviderTransportSnapshot {
+        let mut transport = sample_custom_aiplatform_transport();
+        transport.provider.provider_type = "windsurf".to_string();
+        transport.provider.name = "Windsurf".to_string();
+        transport.endpoint.api_format = "openai:chat".to_string();
+        transport.endpoint.api_family = Some("openai".to_string());
+        transport.endpoint.endpoint_kind = Some("chat".to_string());
+        transport.endpoint.base_url = "https://server.codeium.com".to_string();
+        transport.endpoint.custom_path = None;
+        transport.key.auth_type = "oauth".to_string();
+        transport.key.api_formats = Some(vec!["openai:chat".to_string()]);
+        transport.key.decrypted_api_key = "devin-session-token$abc".to_string();
+        transport.key.decrypted_auth_config = Some(r#"{"provider_type":"windsurf"}"#.to_string());
+        transport
+    }
+
+    fn sample_openai_transport(
+        endpoint_id: &str,
+        api_format: &str,
+        base_url: &str,
+    ) -> GatewayProviderTransportSnapshot {
+        let mut transport = sample_custom_aiplatform_transport();
+        transport.provider.provider_type = "custom".to_string();
+        transport.provider.name = "OpenAI Compat".to_string();
+        transport.endpoint.id = endpoint_id.to_string();
+        transport.endpoint.api_format = api_format.to_string();
+        transport.endpoint.api_family = Some("openai".to_string());
+        transport.endpoint.endpoint_kind = api_format
+            .split_once(':')
+            .map(|(_, endpoint_kind)| endpoint_kind.to_string());
+        transport.endpoint.base_url = base_url.to_string();
+        transport.endpoint.custom_path = None;
+        transport.key.api_formats = Some(vec![api_format.to_string()]);
+        transport.key.decrypted_api_key = "openai-secret".to_string();
+        transport
+    }
+
     #[test]
     fn strategy_selection_keeps_codex_on_standard_transport_fetch() {
         let strategy = select_model_fetch_strategy(&[sample_codex_transport()])
@@ -1441,6 +1578,15 @@ mod tests {
 
         assert_eq!(strategy.provider_id(), "kiro");
         assert_eq!(strategy.kind(), ModelFetchStrategyKind::Kiro);
+    }
+
+    #[test]
+    fn strategy_selection_uses_windsurf_model_configs_fetch() {
+        let strategy = select_model_fetch_strategy(&[sample_windsurf_transport()])
+            .expect("strategy should select");
+
+        assert_eq!(strategy.provider_id(), "windsurf");
+        assert_eq!(strategy.kind(), ModelFetchStrategyKind::Windsurf);
     }
 
     #[tokio::test]
@@ -1472,6 +1618,115 @@ mod tests {
             outcome.cached_models[0]["api_formats"][0].as_str(),
             Some("gemini:generate_content")
         );
+    }
+
+    #[tokio::test]
+    async fn standard_transport_merges_successful_endpoint_models_when_one_endpoint_fails() {
+        let executed_urls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = RoutingTestRuntime {
+            executed_urls: Arc::clone(&executed_urls),
+            routes: vec![
+                (
+                    "https://bad.example.com/v1/models".to_string(),
+                    Err("connection reset".to_string()),
+                ),
+                (
+                    "https://chat.example.com/v1/models".to_string(),
+                    Ok((
+                        200,
+                        json!({
+                            "data": [{ "id": "shared-model" }]
+                        }),
+                    )),
+                ),
+                (
+                    "https://responses.example.com/v1/models".to_string(),
+                    Ok((
+                        200,
+                        json!({
+                            "data": [
+                                { "id": "shared-model" },
+                                { "id": "responses-only" }
+                            ]
+                        }),
+                    )),
+                ),
+            ],
+        };
+        let transports = vec![
+            sample_openai_transport("endpoint-bad", "openai:chat", "https://bad.example.com"),
+            sample_openai_transport("endpoint-chat", "openai:chat", "https://chat.example.com"),
+            sample_openai_transport(
+                "endpoint-responses",
+                "openai:responses",
+                "https://responses.example.com",
+            ),
+        ];
+
+        let outcome = fetch_models_from_transports(&runtime, &transports)
+            .await
+            .expect("models fetch should keep successful endpoint results");
+
+        assert!(outcome.has_success);
+        assert_eq!(
+            outcome.fetched_model_ids,
+            vec!["responses-only", "shared-model"]
+        );
+        assert_eq!(outcome.cached_models.len(), 2);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("connection reset"));
+        let shared_model = outcome
+            .cached_models
+            .iter()
+            .find(|model| model.get("id").and_then(Value::as_str) == Some("shared-model"))
+            .expect("shared model should be cached once");
+        assert_eq!(
+            shared_model.get("api_formats"),
+            Some(&json!(["openai:chat", "openai:responses"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn vertex_models_fetch_continues_when_one_base_url_errors() {
+        let executed_urls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = RoutingTestRuntime {
+            executed_urls: Arc::clone(&executed_urls),
+            routes: vec![
+                (
+                    "https://us-central1-aiplatform.googleapis.com/v1beta1/publishers/google/models"
+                        .to_string(),
+                    Err("connect timeout".to_string()),
+                ),
+                (
+                    "https://aiplatform.googleapis.com/v1beta1/publishers/google/models".to_string(),
+                    Ok((
+                        200,
+                        json!({
+                            "models": [{
+                                "name": "publishers/google/models/gemini-3.1-pro-preview"
+                            }]
+                        }),
+                    )),
+                ),
+            ],
+        };
+        let mut failing_transport = sample_custom_aiplatform_transport();
+        failing_transport.endpoint.base_url =
+            "https://us-central1-aiplatform.googleapis.com".to_string();
+        let mut successful_transport = sample_custom_aiplatform_transport();
+        successful_transport.endpoint.id = "endpoint-2".to_string();
+        successful_transport.endpoint.base_url = "https://aiplatform.googleapis.com".to_string();
+
+        let outcome =
+            fetch_models_from_transports(&runtime, &[failing_transport, successful_transport])
+                .await
+                .expect("vertex models fetch should keep successful base URL results");
+
+        assert!(outcome.has_success);
+        assert_eq!(outcome.fetched_model_ids, vec!["gemini-3.1-pro-preview"]);
+        assert_eq!(outcome.cached_models.len(), 1);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(outcome.errors[0].contains("connect timeout"));
     }
 
     #[test]
@@ -1627,6 +1882,60 @@ mod tests {
                     .and_then(|value| value.get("model_id"))
             }),
             Some(&json!("auto"))
+        );
+    }
+
+    #[tokio::test]
+    async fn windsurf_transport_fetches_cascade_model_configs() {
+        let executed_urls = Arc::new(Mutex::new(Vec::new()));
+        let runtime = TestRuntime {
+            executed_urls: Arc::clone(&executed_urls),
+            response_body: json!({
+                "clientModelConfigs": [
+                    {
+                        "modelUid": "claude-sonnet-4-6",
+                        "label": "Claude Sonnet 4.6",
+                        "provider": "anthropic",
+                        "supportsImages": true,
+                        "creditMultiplier": 4
+                    },
+                    {
+                        "modelUid": "gpt-5.4",
+                        "label": "GPT-5.4",
+                        "provider": "openai"
+                    }
+                ],
+                "defaultOverrideModelConfig": {
+                    "modelUid": "claude-sonnet-4-6"
+                }
+            }),
+            status_code: 200,
+        };
+        let outcome = fetch_models_from_transports(&runtime, &[sample_windsurf_transport()])
+            .await
+            .expect("models fetch should succeed");
+
+        let urls = executed_urls.lock().expect("executed_urls lock");
+        assert_eq!(
+            urls.as_slice(),
+            &["https://server.codeium.com/exa.api_server_pb.ApiServerService/GetCascadeModelConfigs"]
+        );
+        assert_eq!(
+            outcome.fetched_model_ids,
+            vec!["claude-sonnet-4-6".to_string(), "gpt-5.4".to_string()]
+        );
+        assert_eq!(outcome.cached_models.len(), 2);
+        assert_eq!(
+            outcome.cached_models[0]["api_formats"],
+            json!(["openai:chat", "openai:responses", "claude:messages"])
+        );
+        assert_eq!(
+            outcome.upstream_metadata.as_ref().and_then(|value| {
+                value
+                    .get("windsurf")
+                    .and_then(|value| value.get("allowed_models_count"))
+            }),
+            Some(&json!(2))
         );
     }
 }

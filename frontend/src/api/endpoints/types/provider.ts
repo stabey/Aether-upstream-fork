@@ -370,6 +370,32 @@ export interface KiroUpstreamMetadata {
   banned_at?: number  // 封禁时间（Unix 时间戳，秒）
 }
 
+// Windsurf 上游配额信息
+export interface WindsurfUpstreamMetadata {
+  updated_at?: number
+  plan_name?: string
+  daily_remaining_percent?: number | null
+  weekly_remaining_percent?: number | null
+  daily_reset_at?: number | null
+  weekly_reset_at?: number | null
+  prompt_used?: number | null
+  prompt_limit?: number | null
+  prompt_remaining?: number | null
+  flex_used?: number | null
+  flex_limit?: number | null
+  flex_remaining?: number | null
+  allowed_models_count?: number | null
+  models?: Array<{
+    model_uid?: string | null
+    label?: string | null
+    provider?: string | null
+    supports_images?: boolean | null
+    credit_multiplier?: number | null
+  }> | null
+  rate_limit?: Record<string, unknown> | null
+  last_error?: string | null
+}
+
 export interface ChatGPTWebUpstreamMetadata {
   updated_at?: number  // Unix 时间戳（秒）
   plan_type?: string | null
@@ -402,46 +428,13 @@ export interface GrokUpstreamMetadata {
   account_user_id?: string | null
 }
 
-export interface BalanceQueryUpstreamMetadata {
-  updated_at?: number
-  architecture_id?: string | null
-  status?: string | null
-  executed_at?: string | null
-  response_time_ms?: number | null
-  total_available?: number | null
-  total_used?: number | null
-  total_granted?: number | null
-  currency?: string | null
-  plan_name?: string | null
-  query_config?: {
-    custom_base_url?: string | null
-    new_api_user_id?: string | null
-    sub2api_credential_kind?: 'api_key' | 'access_token' | 'refresh_token' | string | null
-    custom_endpoint?: string | null
-    custom_method?: 'GET' | 'POST' | string | null
-    custom_currency?: string | null
-    custom_quota_divisor?: number | null
-    custom_balance_path?: string | null
-    custom_used_path?: string | null
-    custom_granted_path?: string | null
-    auto_refresh_interval_minutes?: number | null
-    has_saved_secret?: boolean | null
-  } | null
-  extra?: Record<string, unknown> | null
-}
-
-export interface ProviderKeyBalanceSummary extends BalanceQueryUpstreamMetadata {
-  key_id?: string | null
-  key_name?: string | null
-}
-
 export interface UpstreamMetadata {
   codex?: CodexUpstreamMetadata
   antigravity?: AntigravityUpstreamMetadata
   kiro?: KiroUpstreamMetadata
+  windsurf?: WindsurfUpstreamMetadata
   chatgpt_web?: ChatGPTWebUpstreamMetadata
   grok?: GrokUpstreamMetadata
-  balance_query?: BalanceQueryUpstreamMetadata
 }
 
 // 按格式的健康度数据
@@ -569,7 +562,7 @@ export interface PublicEndpointStatusMonitorResponse {
   formats: PublicEndpointStatusMonitor[]
 }
 
-export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'vertex_ai'
+export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'windsurf' | 'vertex_ai'
 
 export interface ClaudeCodeAdvancedConfig {
   // 会话数量控制：null/undefined 表示不限制
@@ -718,8 +711,8 @@ export interface ProviderWithEndpointsSummary {
   failover_rules?: FailoverRulesConfig | null
   ops_configured: boolean  // 是否配置了扩展操作（余额监控等）
   ops_architecture_id?: string  // 扩展操作使用的架构 ID（如 cubence, anyrouter）
-  key_balance_summary?: ProviderKeyBalanceSummary | null
   kiro_simulated_cache_enabled?: boolean
+  ops_quota_alert_enabled?: boolean
   created_at: string
   updated_at: string
 }

@@ -31,7 +31,7 @@ aether-task-runtime.workspace = true
 aether-usage-runtime.workspace = true
 aether-video-tasks-core.workspace = true
 aether-wallet.workspace = true
-aes-gcm = "0.10"
+aes-gcm.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
 axum = { version = "0.8", features = ["ws"] }
@@ -48,6 +48,7 @@ hmac.workspace = true
 http.workspace = true
 ldap3 = { version = "0.11", default-features = false, features = ["sync", "tls-rustls"] }
 md-5 = "0.10"
+object_store.workspace = true
 parking_lot = "0.12"
 regex.workspace = true
 reqwest.workspace = true
@@ -57,6 +58,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha1 = "0.10"
 sha2 = { workspace = true, features = ["oid"] }
+tar.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

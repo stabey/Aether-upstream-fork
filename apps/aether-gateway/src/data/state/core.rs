@@ -1,5 +1,6 @@
 use aether_data::{DataBackends, DataLayerError, DatabaseDriver};
 use aether_data_contracts::repository::candidate_selection::MinimalCandidateSelectionReadRepository;
+use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
 use aether_runtime_state::RuntimeQueueStore;
 use std::sync::Arc;
 
@@ -99,7 +100,11 @@ impl GatewayDataState {
         let request_candidate_reader = backends.read().request_candidates();
         let request_candidate_writer = backends.write().request_candidates();
         let gemini_file_mapping_writer = backends.write().gemini_file_mappings();
-        let provider_catalog_reader = backends.read().provider_catalog();
+        let provider_catalog_reader = backends.read().provider_catalog().map(|repository| {
+            Arc::new(
+                super::provider_catalog_cache::CachedProviderCatalogReadRepository::new(repository),
+            ) as Arc<dyn ProviderCatalogReadRepository>
+        });
         let provider_catalog_writer = backends.write().provider_catalog();
         let pool_score_reader = backends.read().pool_scores();
         let pool_score_writer = backends.write().pool_scores();
@@ -272,6 +277,12 @@ impl GatewayDataState {
 
     pub(crate) fn clear_minimal_candidate_selection_cache(&self) {
         if let Some(repository) = &self.minimal_candidate_selection_reader {
+            repository.clear_local_cache();
+        }
+    }
+
+    pub(crate) fn clear_provider_catalog_cache(&self) {
+        if let Some(repository) = &self.provider_catalog_reader {
             repository.clear_local_cache();
         }
     }
@@ -508,6 +519,45 @@ impl GatewayDataState {
         match self.backends.as_ref() {
             Some(backends) => backends.purge_admin_system_data(target).await,
             None => Ok(aether_data::repository::system::AdminSystemPurgeSummary::default()),
+        }
+    }
+
+    pub(crate) async fn export_admin_system_usage_aggregates(
+        &self,
+    ) -> Result<aether_data::repository::system::AdminSystemUsageAggregateSnapshot, DataLayerError>
+    {
+        match self.backends.as_ref() {
+            Some(backends) => backends.export_admin_system_usage_aggregates().await,
+            None => {
+                Ok(aether_data::repository::system::AdminSystemUsageAggregateSnapshot::default())
+            }
+        }
+    }
+
+    pub(crate) async fn import_admin_system_usage_aggregates(
+        &self,
+        snapshot: &aether_data::repository::system::AdminSystemUsageAggregateSnapshot,
+        user_id_map: &std::collections::BTreeMap<String, String>,
+        api_key_id_map: &std::collections::BTreeMap<String, String>,
+        mode: aether_data::repository::system::AdminSystemUsageAggregateImportMode,
+    ) -> Result<
+        aether_data::repository::system::AdminSystemUsageAggregateImportSummary,
+        DataLayerError,
+    > {
+        match self.backends.as_ref() {
+            Some(backends) => {
+                backends
+                    .import_admin_system_usage_aggregates(
+                        snapshot,
+                        user_id_map,
+                        api_key_id_map,
+                        mode,
+                    )
+                    .await
+            }
+            None => Ok(
+                aether_data::repository::system::AdminSystemUsageAggregateImportSummary::default(),
+            ),
         }
     }
 

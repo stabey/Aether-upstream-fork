@@ -119,7 +119,8 @@ use aether_data_contracts::repository::pool_scores::{
 };
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogKeyPage,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
+    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
     StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::quota::{
@@ -323,6 +324,7 @@ mod core;
 mod integrations;
 mod models;
 mod pool_scores;
+mod provider_catalog_cache;
 mod referrals;
 mod routing_profiles;
 mod runtime;

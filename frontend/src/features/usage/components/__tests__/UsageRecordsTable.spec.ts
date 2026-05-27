@@ -74,14 +74,15 @@ vi.mock('lucide-vue-next', async () => {
   const { defineComponent, h } = await import('vue')
   const Icon = defineComponent({
     name: 'IconStub',
-    setup() {
-      return () => h('span')
+    setup(_, { attrs }) {
+      return () => h('span', attrs)
     },
   })
 
   return {
     RefreshCcw: Icon,
     Search: Icon,
+    Shuffle: Icon,
     ChevronDown: Icon,
     Check: Icon,
   }
@@ -180,7 +181,8 @@ describe('UsageRecordsTable', () => {
       .filter((element) => element.textContent?.trim() === '100 tps')
     expect(tpsElements.some((element) => element.classList.contains('text-[11px]'))).toBe(false)
 
-    const titles = [...root.querySelectorAll<HTMLElement>('[title]')].map((element) => element.title)
+    const titles = [...root.querySelectorAll<HTMLElement>('[title]')]
+      .map((element) => element.getAttribute('title'))
     expect(titles).toContain([
       '首字: 0.50s',
       '总耗时: 1.00s',
@@ -255,11 +257,57 @@ describe('UsageRecordsTable', () => {
     expect(root.textContent).not.toContain('等待中')
   })
 
+  it('shows failed instead of waiting when an active row has an HTTP error code', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      status: 'pending',
+      status_code: 524,
+      error_message: 'error code: 524',
+      response_time_ms: null,
+      first_byte_time_ms: null,
+    })])
+
+    expect(root.textContent).toContain('失败')
+    expect(root.textContent).not.toContain('等待中')
+  })
+
   it('renders output TPS in the non-admin usage table', () => {
     const root = mountUsageRecordsTable([buildRecord()], { isAdmin: false })
 
     expect(root.textContent).toContain('100 tps')
     expect(root.textContent).toContain('0.50s / 1.00s')
     expect(root.textContent).toContain('gpt-5')
+  })
+
+  it('shows reasoning effort next to the model name', () => {
+    const root = mountUsageRecordsTable([buildRecord({ reasoning_effort: 'xhigh' })])
+
+    expect(root.textContent).toContain('gpt-5')
+    expect(root.textContent).toContain('xhigh')
+  })
+
+  it('shows fast badge for priority service tier', () => {
+    const root = mountUsageRecordsTable([buildRecord({ service_tier: 'priority' })])
+
+    expect(root.textContent).toContain('gpt-5')
+    expect(root.textContent).toContain('fast')
+  })
+
+  it('offers embedding API formats in the usage record filter', () => {
+    const root = mountUsageRecordsTable([buildRecord({ api_format: 'openai:chat' })])
+
+    expect(root.textContent).toContain('OpenAI Embedding')
+    expect(root.textContent).toContain('Gemini Embedding')
+    expect(root.textContent).toContain('Jina Embedding')
+    expect(root.textContent).toContain('Doubao Embedding')
+  })
+
+  it('shows retry and fallback markers together when both flags are set', () => {
+    const root = mountUsageRecordsTable([buildRecord({
+      has_fallback: true,
+      has_retry: true,
+    })])
+
+    expect(root.querySelector('[data-usage-attempt-marker="fallback"]')).not.toBeNull()
+    expect(root.querySelector('[data-usage-attempt-marker="retry"]')).not.toBeNull()
   })
 })

@@ -13,6 +13,7 @@ use super::snapshot::GatewayProviderTransportSnapshot;
 const TUNNEL_BASE_URL_EXTRA_KEY: &str = "tunnel_base_url";
 const TUNNEL_OWNER_INSTANCE_ID_EXTRA_KEY: &str = "tunnel_owner_instance_id";
 const TUNNEL_OWNER_OBSERVED_AT_EXTRA_KEY: &str = "tunnel_owner_observed_at_unix_secs";
+const DEFAULT_PROVIDER_STREAM_FIRST_BYTE_TIMEOUT_SECS: f64 = 30.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportTunnelAttachmentOwner {
@@ -32,26 +33,25 @@ pub trait TransportTunnelAffinityLookup: Send + Sync {
 pub fn resolve_transport_execution_timeouts(
     transport: &GatewayProviderTransportSnapshot,
 ) -> Option<ExecutionTimeouts> {
-    let total_ms = transport
-        .provider
-        .request_timeout_secs
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| (value * 1000.0).round() as u64);
-    let first_byte_ms = transport
-        .provider
-        .stream_first_byte_timeout_secs
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .map(|value| (value * 1000.0).round() as u64);
-
-    if total_ms.is_none() && first_byte_ms.is_none() {
-        return None;
-    }
-
     Some(ExecutionTimeouts {
-        total_ms,
-        first_byte_ms,
+        total_ms: transport
+            .provider
+            .request_timeout_secs
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(timeout_secs_to_ms),
+        first_byte_ms: Some(timeout_secs_to_ms(
+            transport
+                .provider
+                .stream_first_byte_timeout_secs
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(DEFAULT_PROVIDER_STREAM_FIRST_BYTE_TIMEOUT_SECS),
+        )),
         ..ExecutionTimeouts::default()
     })
+}
+
+fn timeout_secs_to_ms(secs: f64) -> u64 {
+    ((secs * 1000.0).round() as u64).max(1)
 }
 
 pub fn resolve_transport_proxy_snapshot(
@@ -338,7 +338,8 @@ mod tests {
         GatewayProviderTransportProvider, GatewayProviderTransportSnapshot,
     };
     use super::{
-        resolve_transport_profile, resolve_transport_profile_id, resolve_transport_proxy_snapshot,
+        resolve_transport_execution_timeouts, resolve_transport_profile,
+        resolve_transport_profile_id, resolve_transport_proxy_snapshot,
         resolve_transport_proxy_snapshot_with_tunnel_affinity, transport_profile_is_configured,
         transport_proxy_is_locally_supported, TransportTunnelAffinityLookup,
         TransportTunnelAttachmentOwner,
@@ -426,6 +427,41 @@ mod tests {
                 decrypted_auth_config: None,
             },
         }
+    }
+
+    #[test]
+    fn transport_execution_timeouts_use_provider_defaults_when_unset() {
+        let transport = sample_transport();
+
+        let timeouts = resolve_transport_execution_timeouts(&transport)
+            .expect("default provider timeouts should resolve");
+
+        assert_eq!(timeouts.total_ms, None);
+        assert_eq!(timeouts.first_byte_ms, Some(30_000));
+    }
+
+    #[test]
+    fn transport_execution_timeouts_preserve_configured_values_independently() {
+        let mut transport = sample_transport();
+        transport.provider.request_timeout_secs = Some(12.0);
+
+        let timeouts = resolve_transport_execution_timeouts(&transport)
+            .expect("provider timeouts should resolve");
+
+        assert_eq!(timeouts.total_ms, Some(12_000));
+        assert_eq!(timeouts.first_byte_ms, Some(30_000));
+    }
+
+    #[test]
+    fn transport_execution_timeouts_preserve_configured_first_byte_value() {
+        let mut transport = sample_transport();
+        transport.provider.stream_first_byte_timeout_secs = Some(7.5);
+
+        let timeouts = resolve_transport_execution_timeouts(&transport)
+            .expect("provider timeouts should resolve");
+
+        assert_eq!(timeouts.total_ms, None);
+        assert_eq!(timeouts.first_byte_ms, Some(7_500));
     }
 
     #[test]

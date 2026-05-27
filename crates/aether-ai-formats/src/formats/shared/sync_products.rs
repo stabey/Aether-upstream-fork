@@ -21,7 +21,10 @@ use serde_json::{json, Map, Value};
 use super::AiSurfaceFinalizeError;
 use crate::formats::gemini::generate_content::stream::GeminiProviderState;
 use crate::formats::shared::model_directives::model_directive_display_model_from_report_context;
-use crate::formats::shared::response::remove_empty_pages_from_tool_arguments;
+use crate::formats::shared::response::{
+    remove_empty_pages_from_tool_arguments, remove_empty_pages_from_tool_input_value,
+    sanitize_claude_read_tool_inputs,
+};
 use crate::formats::shared::stream_core::common::{
     content_part_from_openai_image_generation_item, map_openai_finish_reason_to_gemini,
     parse_json_arguments_value, CanonicalContentPart, CanonicalStreamEvent, CanonicalUsage,
@@ -480,8 +483,13 @@ fn maybe_build_standard_same_format_sync_body(
         return None;
     }
 
+    let mut body_json = body_json.clone();
+    if expected_api_format == "claude:messages" {
+        sanitize_claude_read_tool_inputs(&mut body_json);
+    }
+
     Some(client_body_with_report_context_model(
-        body_json.clone(),
+        body_json,
         report_context,
         &client_api_format,
     ))
@@ -1712,22 +1720,25 @@ pub fn aggregate_openai_responses_stream_sync_response(body: &[u8]) -> Option<Va
             "response.output_text.delta" | "response.outtext.delta" => {
                 let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
                 let content_index = openai_responses_event_content_index(event_object);
-                let delta = match event_object.get("delta") {
-                    Some(Value::String(text)) => text.as_str(),
-                    Some(Value::Object(delta)) => delta
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default(),
-                    _ => "",
-                };
-                if delta.is_empty() {
-                    continue;
+                match event_object.get("delta") {
+                    Some(Value::String(delta)) => {
+                        append_openai_responses_message_text_delta(
+                            message_states.entry(output_index).or_default(),
+                            content_index,
+                            delta,
+                        );
+                    }
+                    Some(Value::Object(delta)) => {
+                        if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                            merge_openai_responses_message_text_delta_object(
+                                message_states.entry(output_index).or_default(),
+                                content_index,
+                                text,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
-                append_openai_responses_message_text_delta(
-                    message_states.entry(output_index).or_default(),
-                    content_index,
-                    delta,
-                );
             }
             "response.output_text.done" => {
                 let output_index = openai_responses_event_output_index(event_object).unwrap_or(0);
@@ -2097,6 +2108,46 @@ fn append_openai_responses_message_text_delta(
         "text".to_string(),
         Value::String(format!("{current}{delta}")),
     );
+    part.entry("annotations".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+}
+
+fn merge_openai_responses_message_text_delta_object(
+    state: &mut OpenAIResponsesSyncMessageState,
+    content_index: usize,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let part = state
+        .parts
+        .entry(content_index)
+        .or_insert_with(default_openai_responses_output_text_part);
+    let Some(part) = part.as_object_mut() else {
+        return;
+    };
+    if !part
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|value| matches!(value, "output_text" | "text"))
+    {
+        return;
+    }
+    let current = part
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let merged = if text.starts_with(current.as_str()) {
+        text.to_string()
+    } else if current == text || current.starts_with(text) {
+        current
+    } else {
+        format!("{current}{text}")
+    };
+    part.insert("type".to_string(), Value::String("output_text".to_string()));
+    part.insert("text".to_string(), Value::String(merged));
     part.entry("annotations".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
 }
@@ -2530,8 +2581,20 @@ pub fn aggregate_claude_stream_sync_response(body: &[u8]) -> Option<Value> {
                 }
             }
             "tool_use" => {
+                let tool_name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(input) = block.get("input") {
+                    let sanitized = remove_empty_pages_from_tool_input_value(&tool_name, input);
+                    if sanitized != *input {
+                        block.insert("input".to_string(), sanitized);
+                    }
+                }
                 if !state.partial_json.is_empty() {
-                    let arguments = remove_empty_pages_from_tool_arguments(&state.partial_json);
+                    let arguments =
+                        remove_empty_pages_from_tool_arguments(&tool_name, &state.partial_json);
                     let input = serde_json::from_str::<Value>(&arguments)
                         .unwrap_or(Value::String(arguments));
                     block.insert("input".to_string(), input);
@@ -3115,6 +3178,59 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_claude_stream_removes_empty_pages_from_start_tool_input() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_read\",\"name\":\"Read\",\"input\":{\"file_path\":\"/tmp/a.txt\",\"limit\":20,\"pages\":\"\"}}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let aggregated =
+            aggregate_claude_stream_sync_response(body.as_bytes()).expect("body should aggregate");
+
+        assert_eq!(
+            aggregated["content"][0]["input"],
+            json!({
+                "file_path": "/tmp/a.txt",
+                "limit": 20,
+            })
+        );
+    }
+
+    #[test]
+    fn aggregates_claude_stream_preserves_empty_pages_for_non_read_tool_input() {
+        let body = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_search\",\"name\":\"Search\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\":\\\"\\\",\\\"pages\\\":\\\"\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+
+        let aggregated =
+            aggregate_claude_stream_sync_response(body.as_bytes()).expect("body should aggregate");
+
+        assert_eq!(aggregated["content"][0]["type"], "tool_use");
+        assert_eq!(
+            aggregated["content"][0]["input"],
+            json!({
+                "query": "",
+                "pages": "",
+            })
+        );
+    }
+
+    #[test]
     fn aggregates_gemini_stream_deltas_media_and_signatures_into_sync_body() {
         let body = concat!(
             "data: {\"responseId\":\"resp_gem_stream_123\",\"modelVersion\":\"gemini-2.5-pro\",\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"rea\",\"thought\":true}]}}]}\n\n",
@@ -3386,6 +3502,67 @@ mod tests {
     }
 
     #[test]
+    fn same_format_claude_sync_body_sanitizes_read_tool_input() {
+        let report_context = json!({
+            "provider_api_format": "claude:messages",
+            "client_api_format": "claude:messages",
+            "needs_conversion": false,
+        });
+        let provider_body_json = json!({
+            "id": "msg_read",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_read",
+                    "name": "Read",
+                    "input": {
+                        "file_path": "/tmp/a.txt",
+                        "limit": 20,
+                        "pages": ""
+                    }
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_search",
+                    "name": "Search",
+                    "input": {
+                        "query": "",
+                        "pages": ""
+                    }
+                }
+            ]
+        });
+
+        let body_json = maybe_build_standard_same_format_sync_body_from_normalized_payload(
+            "claude_chat_sync_finalize",
+            200,
+            Some(&report_context),
+            Some(&provider_body_json),
+            None,
+        )
+        .expect("same-format sync body should succeed")
+        .expect("body should exist");
+
+        assert_eq!(
+            body_json["content"][0]["input"],
+            json!({
+                "file_path": "/tmp/a.txt",
+                "limit": 20,
+            })
+        );
+        assert_eq!(
+            body_json["content"][1]["input"],
+            json!({
+                "query": "",
+                "pages": "",
+            })
+        );
+    }
+
+    #[test]
     fn same_format_sync_response_restores_model_directive_display_model() {
         let report_context = json!({
             "provider_api_format": "openai:responses",
@@ -3619,6 +3796,25 @@ mod tests {
         assert_eq!(result["output"][0]["type"], "message");
         assert_eq!(result["output"][0]["content"][0]["text"], "Hello");
         assert_eq!(result["output"][0]["content"][1]["text"], " world");
+    }
+
+    #[test]
+    fn aggregates_openai_responses_text_snapshot_deltas_without_duplicates() {
+        let body = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":{\"text\":\"Hello\"}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":{\"text\":\"Hello world\"}}\n\n",
+            "event: response.output_text.done\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0,\"text\":\"Hello world\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_snapshot_123\",\"object\":\"response\",\"model\":\"gpt-5\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+
+        let result = aggregate_openai_responses_stream_sync_response(body.as_bytes())
+            .expect("openai-responses stream should aggregate into a sync body");
+
+        assert_eq!(result["output"][0]["content"][0]["text"], "Hello world");
     }
 
     #[test]

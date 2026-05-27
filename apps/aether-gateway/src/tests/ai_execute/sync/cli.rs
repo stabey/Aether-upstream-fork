@@ -1249,12 +1249,12 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
             .headers()
             .get(LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
             .and_then(|value| value.to_str().ok()),
-        Some("api_key_concurrency_limit_reached")
+        Some("auth_api_key_concurrency_limit_reached")
     );
     let payload: serde_json::Value = response.json().await.expect("body should parse");
     assert_eq!(
         payload["error"]["message"],
-        serde_json::Value::String("当前 API Key 并发请求数已达上限，请稍后重试".to_string())
+        serde_json::Value::String("当前调用方 API Key 并发请求数已达上限，请稍后重试".to_string())
     );
 
     let stored_candidates = request_candidate_repository
@@ -1265,7 +1265,7 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
     assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Skipped);
     assert_eq!(
         stored_candidates[0].skip_reason.as_deref(),
-        Some("api_key_concurrency_limit_reached")
+        Some("auth_api_key_concurrency_limit_reached")
     );
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
