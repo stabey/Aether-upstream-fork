@@ -1,4 +1,5 @@
 export { useUsageData } from './useUsageData'
+export { useActiveElapsedDisplayClock } from './useActiveElapsedDisplayClock'
 export { useUsageFilters } from './useUsageFilters'
 export { useUsagePagination } from './useUsagePagination'
 export { getDateRangeFromPeriod, formatDateTime, getSuccessRateColor } from './useDateRange'

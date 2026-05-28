@@ -7,6 +7,7 @@ use crate::tests::{
     build_state_with_execution_runtime_override, json, start_server, AppState, Arc, Body,
     FrontdoorCorsConfig, Mutex, Request, Router, StatusCode, FRONTDOOR_MANIFEST_PATH, READYZ_PATH,
 };
+use aether_contracts::USAGE_SERVER_NOW_UNIX_MS_HEADER;
 use aether_crypto::DEVELOPMENT_ENCRYPTION_KEY;
 use aether_data::repository::auth::InMemoryAuthApiKeySnapshotRepository;
 use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
@@ -113,6 +114,9 @@ async fn gateway_exposes_frontdoor_manifest_without_proxying_upstream() {
     assert!(owned_routes
         .iter()
         .any(|value| value == "/api/public/health/api-formats"));
+    assert!(owned_routes
+        .iter()
+        .any(|value| value == "/api/public/health/models"));
     assert!(owned_routes
         .iter()
         .any(|value| value == "/api/modules/auth-status"));
@@ -437,12 +441,19 @@ async fn gateway_adds_cors_headers_to_proxied_responses() {
             .expect("allow origin header"),
         "http://localhost:3000"
     );
-    assert_eq!(
-        response_headers
-            .get("access-control-expose-headers")
-            .expect("expose headers header"),
-        "*"
-    );
+    let expose_headers = response_headers
+        .get("access-control-expose-headers")
+        .expect("expose headers header")
+        .to_str()
+        .expect("expose headers should be valid ASCII");
+    assert!(expose_headers
+        .split(',')
+        .map(str::trim)
+        .any(|header| header == "*"));
+    assert!(expose_headers
+        .split(',')
+        .map(str::trim)
+        .any(|header| header.eq_ignore_ascii_case(USAGE_SERVER_NOW_UNIX_MS_HEADER)));
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
         1
