@@ -14,7 +14,6 @@ import { createDefaultStats } from '../types'
 import { log } from '@/utils/logger'
 import { getErrorStatus } from '@/types/api-error'
 import { isUsageProviderVisible, normalizeUsageProviderStats } from '../utils/providerStats'
-import { useServerClock } from './useServerClock'
 
 export interface UseUsageDataOptions {
   isAdminPage: Ref<boolean>
@@ -38,6 +37,7 @@ export interface FilterParams {
   api_format?: string
   status?: string
   client_family?: string
+  hideUnknownRecords?: boolean
 }
 
 export function useUsageData(options: UseUsageDataOptions) {
@@ -66,11 +66,6 @@ export function useUsageData(options: UseUsageDataOptions) {
   // 可用的筛选选项（从统计数据获取，而不是从记录中）
   const availableModels = ref<string[]>([])
   const availableProviders = ref<string[]>([])
-  const {
-    serverClockOffsetMs,
-    hasServerClockOffset,
-    updateServerClockOffset,
-  } = useServerClock()
 
   // 增强的模型统计（包含效率分析）
   const enhancedModelStats = computed<EnhancedModelStatsItem[]>(() => {
@@ -219,7 +214,6 @@ export function useUsageData(options: UseUsageDataOptions) {
       if (requestId !== loadStatsRequestId) {
         return false
       }
-      updateServerClockOffset(userData.server_timing)
 
       stats.value = {
         total_requests: userData.total_requests || 0,
@@ -368,12 +362,14 @@ export function useUsageData(options: UseUsageDataOptions) {
         if (filters?.client_family) {
           params.client_family = filters.client_family
         }
+        if (filters?.hideUnknownRecords) {
+          params.hide_unknown = true
+        }
 
         const response = await usageApi.getAllUsageRecords(params)
         if (requestId !== loadRecordsRequestId) {
           return
         }
-        updateServerClockOffset(response.server_timing)
         const nextRecords = (response.records || []) as UsageRecord[]
         currentRecords.value = mergeRecordStatus(currentRecords.value, nextRecords)
         totalRecords.value = response.total || 0
@@ -383,7 +379,6 @@ export function useUsageData(options: UseUsageDataOptions) {
         if (requestId !== loadRecordsRequestId) {
           return
         }
-        updateServerClockOffset(userData.server_timing)
         const nextRecords = (userData.records || []) as UsageRecord[]
         currentRecords.value = mergeRecordStatus(currentRecords.value, nextRecords)
         totalRecords.value = userData.pagination?.total || currentRecords.value.length
@@ -566,8 +561,6 @@ export function useUsageData(options: UseUsageDataOptions) {
     apiFormatStats,
     currentRecords,
     totalRecords,
-    serverClockOffsetMs,
-    hasServerClockOffset,
 
     // 筛选选项
     availableModels,
@@ -579,7 +572,6 @@ export function useUsageData(options: UseUsageDataOptions) {
     // 方法
     loadStats,
     loadRecords,
-    refreshData,
-    updateServerClockOffset
+    refreshData
   }
 }

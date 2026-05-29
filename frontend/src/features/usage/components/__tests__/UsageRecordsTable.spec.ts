@@ -81,6 +81,7 @@ vi.mock('lucide-vue-next', async () => {
 
   return {
     RefreshCcw: Icon,
+    EyeOff: Icon,
     Search: Icon,
     Shuffle: Icon,
     ChevronDown: Icon,
@@ -91,16 +92,8 @@ vi.mock('lucide-vue-next', async () => {
 vi.mock('../ElapsedTimeText.vue', () => ({
   default: defineComponent({
     name: 'ElapsedTimeTextStub',
-    props: {
-      displayNowMs: {
-        type: Number,
-        default: null,
-      },
-    },
-    setup(props) {
-      return () => h('span', {
-        'data-display-now-ms': props.displayNowMs == null ? '' : String(props.displayNowMs),
-      }, 'elapsed')
+    setup() {
+      return () => h('span', 'elapsed')
     },
   }),
 }))
@@ -160,6 +153,7 @@ function mountUsageRecordsTable(records: UsageRecord[], overrides: Record<string
     totalRecords: records.length,
     pageSizeOptions: [20, 50],
     autoRefresh: false,
+    hideUnknownRecords: false,
     ...overrides,
   })
 
@@ -251,16 +245,6 @@ describe('UsageRecordsTable', () => {
     expect(root.querySelector('[data-active-latency-state="waiting-first-byte"]')).toBeNull()
   })
 
-  it('passes the shared display clock to active elapsed text', () => {
-    const root = mountUsageRecordsTable([buildRecord({
-      status: 'streaming',
-      response_time_ms: null,
-      first_byte_time_ms: 500,
-    })], { displayNowMs: 1_779_999_000_000 })
-
-    expect(root.querySelector('[data-display-now-ms="1779999000000"]')).not.toBeNull()
-  })
-
   it('shows failed when Codex image progress fails before the usage record finalizes', () => {
     const root = mountUsageRecordsTable([buildRecord({
       status: 'pending',
@@ -317,6 +301,17 @@ describe('UsageRecordsTable', () => {
     expect(root.textContent).toContain('Gemini Embedding')
     expect(root.textContent).toContain('Jina Embedding')
     expect(root.textContent).toContain('Doubao Embedding')
+  })
+
+  it('emits hide unknown toggle changes', () => {
+    const onUpdateHideUnknownRecords = vi.fn()
+    const root = mountUsageRecordsTable([buildRecord()], {
+      'onUpdate:hideUnknownRecords': onUpdateHideUnknownRecords,
+    })
+
+    root.querySelector<HTMLElement>('[data-usage-hide-unknown-toggle="desktop"]')?.click()
+
+    expect(onUpdateHideUnknownRecords).toHaveBeenCalledWith(true)
   })
 
   it('shows retry and fallback markers together when both flags are set', () => {
