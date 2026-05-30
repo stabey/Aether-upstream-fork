@@ -625,8 +625,15 @@ async fn ai_execute_pii_redaction_unknown_sentinel_like_output_is_not_restored()
     );
 }
 
-#[tokio::test]
-async fn ai_execute_pii_redaction_restores_executed_candidate_session_after_later_candidate_planning(
+#[test]
+fn ai_execute_pii_redaction_restores_executed_candidate_session_after_later_candidate_planning() {
+    run_async_test_on_large_stack(
+        "ai_execute_pii_redaction_restores_executed_candidate_session_after_later_candidate_planning",
+        ai_execute_pii_redaction_restores_executed_candidate_session_after_later_candidate_planning_impl(),
+    );
+}
+
+async fn ai_execute_pii_redaction_restores_executed_candidate_session_after_later_candidate_planning_impl(
 ) {
     let seen_provider_request = Arc::new(Mutex::new(None::<SeenProviderRequest>));
     let seen_provider_request_clone = Arc::clone(&seen_provider_request);
