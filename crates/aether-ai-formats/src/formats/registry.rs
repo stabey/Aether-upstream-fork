@@ -220,7 +220,7 @@ pub fn convert_response_pure(
     let response = parse_response_pure(source_format, body)?;
     validate_response_conversion(source_format, target_format, body, &response)?;
     let value = emit_response_pure(target_format, &response)?;
-    let report = build_request_conversion_report(source_format, target_format, body, &value);
+    let report = build_response_conversion_report(source_format, target_format, body, &value);
     Ok(Converted { value, report })
 }
 
@@ -1655,7 +1655,7 @@ fn validate_openai_responses_to_chat(
 }
 
 fn validate_claude_cross_format_request(body: &Value, target: FormatId) -> Result<(), FormatError> {
-    if value_contains_object_key(body, "cache_control") {
+    if claude_request_contains_provider_cache_control(body) {
         return Err(FormatError::LossyConversionBlocked {
             source_format: FormatId::ClaudeMessages.as_str().to_string(),
             target_format: target.as_str().to_string(),
@@ -2052,19 +2052,71 @@ fn gemini_request_contains_thought_parts(body: &Value) -> bool {
     })
 }
 
-fn value_contains_object_key(value: &Value, key: &str) -> bool {
-    match value {
-        Value::Object(object) => {
-            object.contains_key(key)
-                || object
-                    .values()
-                    .any(|value| value_contains_object_key(value, key))
-        }
-        Value::Array(values) => values
-            .iter()
-            .any(|value| value_contains_object_key(value, key)),
+fn claude_request_contains_provider_cache_control(body: &Value) -> bool {
+    let Some(object) = body.as_object() else {
+        return false;
+    };
+    object.contains_key("cache_control")
+        || claude_system_contains_cache_control(object.get("system"))
+        || claude_messages_contain_cache_control(object.get("messages"))
+        || claude_tools_contain_cache_control(object.get("tools"))
+}
+
+fn claude_system_contains_cache_control(system: Option<&Value>) -> bool {
+    match system {
+        Some(Value::Array(blocks)) => blocks.iter().any(|block| {
+            block
+                .as_object()
+                .is_some_and(|object| object.contains_key("cache_control"))
+        }),
         _ => false,
     }
+}
+
+fn claude_messages_contain_cache_control(messages: Option<&Value>) -> bool {
+    let Some(messages) = messages.and_then(Value::as_array) else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .is_some_and(claude_content_value_contains_cache_control)
+    })
+}
+
+fn claude_content_value_contains_cache_control(content: &Value) -> bool {
+    match content {
+        Value::Array(blocks) => blocks
+            .iter()
+            .any(claude_content_block_contains_cache_control),
+        _ => false,
+    }
+}
+
+fn claude_content_block_contains_cache_control(block: &Value) -> bool {
+    let Some(object) = block.as_object() else {
+        return false;
+    };
+    if object.contains_key("cache_control") {
+        return true;
+    }
+    object
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|block_type| block_type.eq_ignore_ascii_case("tool_result"))
+        && object
+            .get("content")
+            .is_some_and(claude_content_value_contains_cache_control)
+}
+
+fn claude_tools_contain_cache_control(tools: Option<&Value>) -> bool {
+    let Some(tools) = tools.and_then(Value::as_array) else {
+        return false;
+    };
+    tools.iter().any(|tool| {
+        tool.as_object()
+            .is_some_and(|object| object.contains_key("cache_control"))
+    })
 }
 
 fn build_request_conversion_report(
@@ -2098,6 +2150,44 @@ fn build_request_conversion_report(
                     key.clone(),
                     ConversionFieldStatus::Mapped,
                     Some("emitted from canonical field".to_string()),
+                );
+            }
+        }
+    }
+    report
+}
+
+fn build_response_conversion_report(
+    source_format: &str,
+    target_format: &str,
+    body: &Value,
+    output: &Value,
+) -> ConversionReport {
+    let mut report = ConversionReport::new(source_format, target_format);
+    let source = body.as_object();
+    let target = output.as_object();
+    if let Some(source) = source {
+        for key in source.keys() {
+            let status = if target.is_some_and(|target| target.contains_key(key)) {
+                ConversionFieldStatus::Native
+            } else if response_field_has_known_mapping(source_format, target_format, key.as_str()) {
+                ConversionFieldStatus::Mapped
+            } else {
+                ConversionFieldStatus::ExtensionPreserved
+            };
+            report.record(key.clone(), status, None);
+        }
+    }
+    if let Some(target) = target {
+        for key in target.keys() {
+            if source.is_some_and(|source| source.contains_key(key)) {
+                continue;
+            }
+            if response_field_is_target_native(source_format, target_format, key.as_str()) {
+                report.record(
+                    key.clone(),
+                    ConversionFieldStatus::Mapped,
+                    Some("emitted from canonical response field".to_string()),
                 );
             }
         }
@@ -2197,6 +2287,73 @@ fn request_field_is_target_native(source_format: &str, target_format: &str, fiel
             "reasoning_effort"
         )
     )
+}
+
+fn response_field_has_known_mapping(source_format: &str, target_format: &str, field: &str) -> bool {
+    match (
+        normalize_known_format(source_format),
+        normalize_known_format(target_format),
+    ) {
+        (Some(FormatId::OpenAiChat), Some(FormatId::OpenAiResponses)) => {
+            matches!(field, "choices")
+        }
+        (Some(FormatId::OpenAiResponses), Some(FormatId::OpenAiChat)) => {
+            matches!(
+                field,
+                "output" | "status" | "incomplete_details" | "output_text"
+            )
+        }
+        (
+            Some(FormatId::ClaudeMessages),
+            Some(FormatId::OpenAiChat | FormatId::OpenAiResponses),
+        ) => {
+            matches!(field, "content" | "stop_reason" | "stop_sequence")
+        }
+        (
+            Some(FormatId::GeminiGenerateContent),
+            Some(FormatId::OpenAiChat | FormatId::OpenAiResponses),
+        ) => {
+            matches!(field, "candidates" | "usageMetadata" | "usage_metadata")
+        }
+        (
+            Some(FormatId::OpenAiChat | FormatId::OpenAiResponses),
+            Some(FormatId::ClaudeMessages),
+        ) => {
+            matches!(
+                field,
+                "choices" | "output" | "status" | "incomplete_details"
+            )
+        }
+        (
+            Some(FormatId::OpenAiChat | FormatId::OpenAiResponses),
+            Some(FormatId::GeminiGenerateContent),
+        ) => {
+            matches!(
+                field,
+                "choices" | "output" | "status" | "incomplete_details"
+            )
+        }
+        _ => false,
+    }
+}
+
+fn response_field_is_target_native(source_format: &str, target_format: &str, field: &str) -> bool {
+    match (
+        normalize_known_format(source_format),
+        normalize_known_format(target_format),
+    ) {
+        (Some(FormatId::OpenAiChat), Some(FormatId::OpenAiResponses)) => {
+            matches!(field, "output" | "status" | "output_text")
+        }
+        (Some(FormatId::OpenAiResponses), Some(FormatId::OpenAiChat)) => matches!(field, "choices"),
+        (_, Some(FormatId::OpenAiChat)) => matches!(field, "choices"),
+        (_, Some(FormatId::OpenAiResponses)) => {
+            matches!(field, "output" | "status" | "output_text")
+        }
+        (_, Some(FormatId::ClaudeMessages)) => matches!(field, "content" | "stop_reason"),
+        (_, Some(FormatId::GeminiGenerateContent)) => matches!(field, "candidates"),
+        _ => false,
+    }
 }
 
 fn normalize_known_format(format: &str) -> Option<FormatId> {
@@ -2737,6 +2894,37 @@ mod tests {
     }
 
     #[test]
+    fn pure_claude_to_openai_chat_allows_tool_schema_property_named_cache_control() {
+        let body = json!({
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64,
+            "tools": [{
+                "name": "configure_cache",
+                "description": "Configure application cache behavior",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "cache_control": {
+                            "type": "string",
+                            "description": "Application-level cache policy"
+                        }
+                    }
+                }
+            }]
+        });
+
+        let converted = convert_request_pure("claude:messages", "openai:chat", &body)
+            .expect("tool schema property names should not be treated as Claude cache_control")
+            .value;
+
+        assert_eq!(
+            converted["tools"][0]["function"]["parameters"]["properties"]["cache_control"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn pure_openai_chat_to_responses_blocks_lossy_chat_only_fields() {
         let body = json!({
             "model": "gpt-source",
@@ -3057,6 +3245,35 @@ mod tests {
             .value;
 
         assert_eq!(converted["choices"][0]["finish_reason"], "content_filter");
+    }
+
+    #[test]
+    fn pure_response_conversion_reports_response_field_mappings() {
+        let body = json!({
+            "id": "resp_report",
+            "object": "response",
+            "model": "gpt-source",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "id": "msg_report",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "hello"
+                }]
+            }]
+        });
+
+        let converted = convert_response_pure("openai:responses", "openai:chat", &body)
+            .expect("response conversion should succeed");
+
+        assert!(converted.report.fields.iter().any(|field| {
+            field.field == "output" && field.status == super::ConversionFieldStatus::Mapped
+        }));
+        assert!(converted.report.fields.iter().any(|field| {
+            field.field == "choices" && field.status == super::ConversionFieldStatus::Mapped
+        }));
     }
 
     #[test]
