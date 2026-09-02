@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 #![allow(
     dead_code,
     unused_assignments,
@@ -26,6 +27,7 @@
 
 mod admin_api;
 mod ai_serving;
+mod allocator_metrics;
 mod api;
 mod async_task;
 mod audit;
@@ -57,20 +59,28 @@ mod model_fetch;
 mod oauth;
 mod orchestration;
 mod privacy;
+mod process_metrics;
 mod provider_key_auth;
 mod provider_pool_demand;
 pub(crate) use aether_provider_transport as provider_transport;
 mod rate_limit;
+mod request_candidate_queue;
 mod request_candidate_runtime;
+mod request_diagnostics;
 mod roles;
 mod router;
 mod routing;
 mod scheduler;
 mod server_chan_push;
+mod stage_metrics;
 mod state;
 mod system_features;
 mod task_runtime;
+#[cfg(feature = "testkit")]
+pub mod testkit;
+mod tokio_metrics;
 mod tunnel;
+mod upstream_admission;
 mod usage;
 mod video_tasks;
 mod wallet_runtime;
@@ -80,6 +90,7 @@ pub(crate) use self::ai_serving::api::{
     EXECUTION_RUNTIME_SYNC_DECISION_ACTION, GEMINI_FILES_DOWNLOAD_PLAN_KIND,
     OPENAI_VIDEO_CONTENT_PLAN_KIND,
 };
+pub use self::ai_serving::api::{CODEX_CLIENT_ORIGINATOR, CODEX_CLIENT_USER_AGENT};
 pub(crate) use self::ai_serving::{
     AiExecutionDecision, AiExecutionPlanPayload, AiStreamAttempt, AiSyncAttempt,
 };
@@ -92,7 +103,8 @@ pub(crate) use self::execution_runtime::{
 };
 pub use self::execution_runtime::{
     build_execution_runtime_router, build_execution_runtime_router_with_request_concurrency_limit,
-    build_execution_runtime_router_with_request_gates, serve_execution_runtime_tcp,
+    build_execution_runtime_router_with_request_gates,
+    prewarm_direct_h2c_sender_cache_from_env_for_startup, serve_execution_runtime_tcp,
     serve_execution_runtime_unix,
 };
 pub(crate) use self::fallback_metrics::{GatewayFallbackMetricKind, GatewayFallbackReason};
@@ -125,7 +137,8 @@ fn insert_header_if_missing(
     if headers.contains_key(key) {
         return Ok(());
     }
-    let name = HeaderName::from_static(key);
+    let name = HeaderName::from_bytes(key.as_bytes())
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
     let value =
         HeaderValue::from_str(value).map_err(|err| GatewayError::Internal(err.to_string()))?;
     headers.insert(name, value);

@@ -14,6 +14,9 @@ use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadReposi
 use aether_data_contracts::repository::candidate_selection::{
     StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
 };
+use aether_data_contracts::repository::candidates::{
+    RequestCandidateReadRepository, RequestCandidateStatus,
+};
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -21,6 +24,30 @@ use sha2::{Digest, Sha256};
 
 use crate::data::GatewayDataState;
 use crate::tests::next_non_keepalive_chunk;
+
+const LIFECYCLE_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_lifecycle_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(LIFECYCLE_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("lifecycle test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
 
 fn hash_api_key(value: &str) -> String {
     let mut hasher = Sha256::new();
@@ -87,6 +114,7 @@ fn sample_local_openai_candidate_row() -> StoredMinimalCandidateSelectionRow {
             priority: 1,
             api_formats: Some(vec!["openai:chat".to_string()]),
             endpoint_ids: None,
+            operations: None,
         }]),
         model_supports_streaming: Some(true),
         model_is_active: true,
@@ -163,8 +191,15 @@ fn sample_local_openai_key() -> StoredProviderCatalogKey {
     .expect("key transport should build")
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gateway_completes_sync_response_on_local_execution_runtime_path() {
+#[test]
+fn gateway_completes_sync_response_on_local_execution_runtime_path() {
+    run_lifecycle_test(
+        "gateway_completes_sync_response_on_local_execution_runtime_path",
+        gateway_completes_sync_response_on_local_execution_runtime_path_impl,
+    );
+}
+
+async fn gateway_completes_sync_response_on_local_execution_runtime_path_impl() {
     let public_hits = Arc::new(Mutex::new(0usize));
     let public_hits_clone = Arc::clone(&public_hits);
     let upstream = Router::new().route(
@@ -261,8 +296,15 @@ async fn gateway_completes_sync_response_on_local_execution_runtime_path() {
     upstream_handle.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gateway_stops_execution_runtime_stream_when_client_disconnects() {
+#[test]
+fn gateway_stops_execution_runtime_stream_when_client_disconnects() {
+    run_lifecycle_test(
+        "gateway_stops_execution_runtime_stream_when_client_disconnects",
+        gateway_stops_execution_runtime_stream_when_client_disconnects_impl,
+    );
+}
+
+async fn gateway_stops_execution_runtime_stream_when_client_disconnects_impl() {
     let seen_report = Arc::new(Mutex::new(0usize));
     let seen_report_clone = Arc::clone(&seen_report);
     let public_hits = Arc::new(Mutex::new(0usize));
@@ -388,8 +430,121 @@ async fn gateway_stops_execution_runtime_stream_when_client_disconnects() {
     upstream_handle.abort();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error() {
+#[test]
+fn gateway_settles_stream_attempt_when_client_disconnects_before_first_byte() {
+    run_lifecycle_test(
+        "gateway_settles_stream_attempt_when_client_disconnects_before_first_byte",
+        gateway_settles_stream_attempt_when_client_disconnects_before_first_byte_impl,
+    );
+}
+
+async fn gateway_settles_stream_attempt_when_client_disconnects_before_first_byte_impl() {
+    // The execution runtime accepts the plan and then goes quiet, so the attempt
+    // is parked between its `pending` rows and the first upstream byte.
+    let execution_runtime = Router::new().route(
+        "/v1/execute/stream",
+        any(|_request: Request| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            StatusCode::OK
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key("sk-client-openai-stream-precommit-disconnect")),
+        sample_local_openai_auth_snapshot(
+            "api-key-openai-lifecycle-local-1",
+            "user-openai-lifecycle-local-1",
+        ),
+    )]));
+    let candidate_selection_repository =
+        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_local_openai_candidate_row(),
+        ]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_local_openai_provider()],
+        vec![sample_local_openai_endpoint()],
+        vec![sample_local_openai_key()],
+    ));
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
+                    auth_repository,
+                    candidate_selection_repository,
+                    provider_catalog_repository,
+                    Arc::clone(&request_candidate_repository),
+                    DEVELOPMENT_ENCRYPTION_KEY,
+                ),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let request = reqwest::Client::new()
+        .post(format!("{gateway_url}/v1/chat/completions"))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header(
+            http::header::AUTHORIZATION,
+            "Bearer sk-client-openai-stream-precommit-disconnect",
+        )
+        .header(
+            TRACE_ID_HEADER,
+            "trace-openai-chat-stream-precommit-disconnect-123",
+        )
+        .body("{\"model\":\"gpt-5\",\"messages\":[],\"stream\":true}")
+        .send();
+
+    // Drop the in-flight request the way a downstream client does when its own
+    // first-byte timeout fires, before any response header exists.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(750), request)
+            .await
+            .is_err(),
+        "the execution runtime should not have answered before the client gave up"
+    );
+
+    let mut stored_candidates = Vec::new();
+    for _ in 0..200 {
+        stored_candidates = request_candidate_repository
+            .list_by_request_id("trace-openai-chat-stream-precommit-disconnect-123")
+            .await
+            .expect("request candidate trace should read");
+        if stored_candidates
+            .iter()
+            .any(|candidate| candidate.status == RequestCandidateStatus::Cancelled)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    let cancelled = stored_candidates
+        .iter()
+        .find(|candidate| candidate.status == RequestCandidateStatus::Cancelled)
+        .unwrap_or_else(|| {
+            panic!("dropped stream attempt should settle as cancelled: {stored_candidates:?}")
+        });
+    assert_eq!(cancelled.status_code, Some(499));
+    assert_eq!(
+        cancelled.error_type.as_deref(),
+        Some("local_stream_attempt_cancelled")
+    );
+    assert!(cancelled.finished_at_unix_ms.is_some());
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error() {
+    run_lifecycle_test(
+        "gateway_returns_error_body_when_prefetch_detects_embedded_stream_error",
+        gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_impl,
+    );
+}
+
+async fn gateway_returns_error_body_when_prefetch_detects_embedded_stream_error_impl() {
     let public_hits = Arc::new(Mutex::new(0usize));
     let public_hits_clone = Arc::clone(&public_hits);
 

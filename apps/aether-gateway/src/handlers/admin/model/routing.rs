@@ -67,27 +67,14 @@ pub(crate) async fn build_admin_global_model_routing_payload(
             .push(key);
     }
 
-    let scheduling_mode = state
-        .read_system_config_json_value("scheduling_mode")
+    // Effective default scheduling: system-default routing group first, then
+    // legacy system-config keys.
+    let ordering_config = crate::scheduler::config::read_scheduler_ordering_config(state.app())
         .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "cache_affinity".to_string());
-    let priority_mode = state
-        .read_system_config_json_value("provider_priority_mode")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "provider".to_string());
-    let keep_priority_on_conversion = state
-        .read_system_config_json_value("keep_priority_on_conversion")
-        .await
-        .ok()
-        .flatten()
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .unwrap_or_default();
+    let scheduling_mode = ordering_config.scheduling_mode_str().to_string();
+    let priority_mode = ordering_config.priority_mode_str().to_string();
+    let keep_priority_on_conversion = ordering_config.keep_priority_on_conversion;
     let now_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -190,7 +177,10 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                     let payload = json!({
                         "id": key.id,
                         "name": key.name,
-                        "masked_key": state.masked_catalog_api_key(key),
+                        "masked_key": state.masked_catalog_api_key_for_provider(
+                            key,
+                            &provider.provider_type,
+                        ),
                         "is_active": key.is_active,
                         "is_adaptive": is_adaptive,
                         "effective_rpm": effective_rpm,
@@ -252,9 +242,9 @@ pub(crate) async fn build_admin_global_model_routing_payload(
         .iter()
         .map(|provider| provider.id.clone())
         .collect::<Vec<_>>();
-    let active_provider_name_by_id = active_providers
+    let active_provider_metadata_by_id = active_providers
         .into_iter()
-        .map(|provider| (provider.id, provider.name))
+        .map(|provider| (provider.id, (provider.name, provider.provider_type)))
         .collect::<BTreeMap<_, _>>();
     let active_keys = if active_provider_ids.is_empty() {
         Vec::new()
@@ -273,14 +263,14 @@ pub(crate) async fn build_admin_global_model_routing_payload(
         if allowed_models.is_empty() {
             continue;
         }
-        let provider_name = active_provider_name_by_id
+        let (provider_name, provider_type) = active_provider_metadata_by_id
             .get(&key.provider_id)
             .cloned()
             .unwrap_or_default();
         all_keys_whitelist.push(json!({
             "key_id": key.id,
             "key_name": key.name,
-            "masked_key": state.masked_catalog_api_key(&key),
+            "masked_key": state.masked_catalog_api_key_for_provider(&key, &provider_type),
             "provider_id": key.provider_id,
             "provider_name": provider_name,
             "allowed_models": allowed_models,

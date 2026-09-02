@@ -146,6 +146,7 @@ mod tests {
                 global_model_id: "global-model-1".to_string(),
                 global_model_name: "gpt-5".to_string(),
                 selected_provider_model_name: "gpt-5".to_string(),
+                supports_streaming: true,
                 mapping_matched_model: None,
             },
             transport: Arc::new(crate::ai_serving::GatewayProviderTransportSnapshot {
@@ -207,6 +208,7 @@ mod tests {
                 pool_key_index: None,
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
+                sticky_key_attempts: None,
             },
             ranking: None,
         }

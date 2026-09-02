@@ -48,6 +48,8 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
         trace_id: String,
         url: String,
         model: String,
+        client_api_format: String,
+        provider_api_format: String,
         authorization: String,
         accept: String,
         anthropic_version: String,
@@ -129,6 +131,7 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
                 priority: 1,
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -172,7 +175,7 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
         )
         .expect("endpoint should build")
         .with_transport_fields(
-            "https://api.anthropic.example/v1/messages".to_string(),
+            "https://api.anthropic.com/v1".to_string(),
             Some(serde_json::json!([
                 {"action":"set","key":"x-endpoint-tag","value":"claude-code-cli-local"}
             ])),
@@ -311,6 +314,16 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
                         .get("body")
                         .and_then(|value| value.get("json_body"))
                         .and_then(|value| value.get("model"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    client_api_format: payload
+                        .get("client_api_format")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    provider_api_format: payload
+                        .get("provider_api_format")
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
@@ -468,6 +481,7 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::USER_AGENT, "Claude-Code/2.1.0")
         .header(
             http::header::AUTHORIZATION,
             "Bearer sk-client-claude-code-cli-local",
@@ -520,9 +534,17 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://api.anthropic.example/v1/messages"
+        "https://api.anthropic.com/v1/messages"
     );
     assert_eq!(seen_execution_runtime_request.model, "claude-code-upstream");
+    assert_eq!(
+        seen_execution_runtime_request.client_api_format,
+        "claude:messages"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.provider_api_format,
+        "claude:messages"
+    );
     assert_eq!(
         seen_execution_runtime_request.authorization,
         "Bearer sk-upstream-claude-code-oauth"
@@ -534,15 +556,18 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
     );
     assert_eq!(
         seen_execution_runtime_request.anthropic_beta,
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,custom-beta"
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11,context-1m-2025-08-07,custom-beta"
     );
     assert_eq!(seen_execution_runtime_request.x_app, "cli");
     assert_eq!(seen_execution_runtime_request.x_stainless_helper_method, "");
     assert_eq!(
         seen_execution_runtime_request.x_stainless_package_version,
-        "1.0.5"
+        "0.94.0"
     );
-    assert_eq!(seen_execution_runtime_request.user_agent, "Claude-Code/9.9");
+    assert_eq!(
+        seen_execution_runtime_request.user_agent,
+        "claude-cli/2.1.161 (external, cli)"
+    );
     assert_eq!(
         seen_execution_runtime_request.endpoint_tag,
         "claude-code-cli-local"

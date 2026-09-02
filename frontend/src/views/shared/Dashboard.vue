@@ -9,7 +9,7 @@
       >
         <Badge
           :variant="authStore.isAdmin ? 'default' : 'secondary'"
-          class="uppercase tracking-[0.45em] mb-4 self-start"
+          class="mb-4 self-start uppercase tracking-[0.45em]"
         >
           {{ dashboardModeLabel }}
         </Badge>
@@ -19,7 +19,7 @@
           <!-- 加载中骨架屏 -->
           <template v-if="loading">
             <Card
-              v-for="i in 4"
+              v-for="i in statSkeletonCount"
               :key="'skeleton-' + i"
               class="p-5"
             >
@@ -52,10 +52,14 @@
               </div>
               <!-- 内容区域 -->
               <div>
-                <p class="text-[9px] sm:text-[11px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.4em] text-muted-foreground pr-10 sm:pr-14">
+                <p
+                  class="text-[9px] sm:text-[11px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.4em] text-muted-foreground pr-10 sm:pr-14"
+                >
                   {{ stat.name }}
                 </p>
-                <p class="mt-2 sm:mt-4 text-xl sm:text-3xl font-semibold text-foreground">
+                <p
+                  class="mt-2 sm:mt-4 text-xl sm:text-3xl font-semibold text-foreground"
+                >
                   {{ stat.value }}
                 </p>
                 <p
@@ -108,13 +112,19 @@
                 />
               </div>
               <div>
-                <p class="text-[9px] sm:text-[11px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.4em] text-muted-foreground pr-10 sm:pr-14">
+                <p
+                  class="text-[9px] sm:text-[11px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.4em] text-muted-foreground pr-10 sm:pr-14"
+                >
                   {{ placeholder.name }}
                 </p>
-                <p class="mt-2 sm:mt-4 text-xl sm:text-3xl font-semibold text-muted-foreground/50">
+                <p
+                  class="mt-2 sm:mt-4 text-xl sm:text-3xl font-semibold text-muted-foreground/50"
+                >
                   --
                 </p>
-                <p class="mt-0.5 sm:mt-1 text-[10px] sm:text-sm text-muted-foreground/50">
+                <p
+                  class="mt-0.5 sm:mt-1 text-[10px] sm:text-sm text-muted-foreground/50"
+                >
                   暂无数据
                 </p>
               </div>
@@ -140,37 +150,57 @@
           </div>
           <div class="grid grid-cols-2 gap-2 sm:gap-3 xl:grid-cols-4">
             <Card class="relative p-3 sm:p-4 border-book-cloth/30">
-              <Clock class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+              <Clock
+                class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
+              />
               <div class="pr-6">
-                <p class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground">
+                <p
+                  class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground"
+                >
                   平均响应
                 </p>
-                <p class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground">
+                <p
+                  class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground"
+                >
                   {{ systemHealth.avg_response_time }}s
                 </p>
               </div>
             </Card>
             <Card class="relative p-3 sm:p-4 border-kraft/30">
-              <AlertTriangle class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+              <AlertTriangle
+                class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
+              />
               <div class="pr-6">
-                <p class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground">
+                <p
+                  class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground"
+                >
                   错误率
                 </p>
                 <p
                   class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold"
-                  :class="systemHealth.error_rate > 5 ? 'text-destructive' : 'text-foreground'"
+                  :class="
+                    systemHealth.error_rate > 5
+                      ? 'text-destructive'
+                      : 'text-foreground'
+                  "
                 >
                   {{ systemHealth.error_rate }}%
                 </p>
               </div>
             </Card>
             <Card class="relative p-3 sm:p-4 border-book-cloth/25">
-              <Shuffle class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+              <Shuffle
+                class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
+              />
               <div class="pr-6">
-                <p class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground">
+                <p
+                  class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground"
+                >
                   转移次数
                 </p>
-                <p class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground">
+                <p
+                  class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground"
+                >
                   {{ systemHealth.fallback_count }}
                 </p>
               </div>
@@ -179,12 +209,18 @@
               v-if="costStats"
               class="relative p-3 sm:p-4 border-manilla/40"
             >
-              <DollarSign class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+              <DollarSign
+                class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
+              />
               <div class="pr-6">
-                <p class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground">
+                <p
+                  class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground"
+                >
                   本月费用
                 </p>
-                <p class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground">
+                <p
+                  class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground"
+                >
                   {{ formatCurrency(costStats.total_cost) }}
                 </p>
                 <Badge
@@ -201,7 +237,10 @@
 
         <!-- 普通用户：月度统计 -->
         <div
-          v-else-if="!isAdmin && (hasCacheData || (userMonthlyCost !== null && userMonthlyCost > 0))"
+          v-else-if="
+            !isAdmin &&
+              (hasCacheData || (userMonthlyCost !== null && userMonthlyCost > 0))
+          "
           class="mt-6"
         >
           <div class="mb-3 flex items-center justify-between">
@@ -220,12 +259,18 @@
               v-if="cacheStats"
               class="relative p-3 sm:p-4 border-book-cloth/30"
             >
-              <Database class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+              <Database
+                class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
+              />
               <div class="pr-6">
-                <p class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground">
+                <p
+                  class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground"
+                >
                   缓存命中率
                 </p>
-                <p class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground">
+                <p
+                  class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground"
+                >
                   {{ cacheStats.cache_hit_rate || 0 }}%
                 </p>
               </div>
@@ -234,12 +279,18 @@
               v-if="cacheStats"
               class="relative p-3 sm:p-4 border-kraft/30"
             >
-              <Hash class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+              <Hash
+                class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
+              />
               <div class="pr-6">
-                <p class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground">
+                <p
+                  class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground"
+                >
                   缓存读取
                 </p>
-                <p class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground">
+                <p
+                  class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground"
+                >
                   {{ formatTokens(cacheStats.cache_read_tokens) }}
                 </p>
               </div>
@@ -248,12 +299,18 @@
               v-if="cacheStats"
               class="relative p-3 sm:p-4 border-book-cloth/25"
             >
-              <Database class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+              <Database
+                class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
+              />
               <div class="pr-6">
-                <p class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground">
+                <p
+                  class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground"
+                >
                   缓存创建
                 </p>
-                <p class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground">
+                <p
+                  class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground"
+                >
                   {{ formatTokens(cacheStats.cache_creation_tokens) }}
                 </p>
               </div>
@@ -262,12 +319,18 @@
               v-if="userMonthlyCost !== null"
               class="relative p-3 sm:p-4 border-manilla/40"
             >
-              <DollarSign class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground" />
+              <DollarSign
+                class="absolute top-3 right-3 h-3.5 w-3.5 sm:h-4 sm:w-4 text-muted-foreground"
+              />
               <div class="pr-6">
-                <p class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground">
+                <p
+                  class="text-[9px] sm:text-[10px] font-semibold uppercase tracking-[0.2em] sm:tracking-[0.3em] text-muted-foreground"
+                >
                   本月费用
                 </p>
-                <p class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground">
+                <p
+                  class="mt-1.5 sm:mt-2 text-lg sm:text-xl font-semibold text-foreground"
+                >
                   {{ formatCurrency(userMonthlyCost) }}
                 </p>
               </div>
@@ -294,7 +357,9 @@
           </Badge>
         </div>
 
-        <Card class="overflow-hidden p-4 flex flex-col flex-1 min-h-0 h-full max-h-[280px] lg:max-h-none">
+        <Card
+          class="overflow-hidden p-4 flex flex-col flex-1 min-h-0 h-full max-h-[280px] lg:max-h-none"
+        >
           <div
             v-if="loadingAnnouncements"
             class="flex-1 flex items-center justify-center"
@@ -344,7 +409,7 @@
                           ? 'bg-amber-500 dark:bg-amber-400'
                           : announcement.is_read
                             ? 'bg-slate-300 dark:bg-slate-600'
-                            : getAnnouncementDotColor(announcement.type)
+                            : getAnnouncementDotColor(announcement.type),
                       ]"
                     >
                       <span
@@ -359,11 +424,13 @@
                     :class="[
                       announcement.is_pinned
                         ? 'hover:bg-amber-50/50 dark:hover:bg-amber-900/10'
-                        : 'hover:bg-slate-50/50 dark:hover:bg-slate-800/30'
+                        : 'hover:bg-slate-50/50 dark:hover:bg-slate-800/30',
                     ]"
                   >
                     <div class="flex items-center gap-2 mb-1">
-                      <h4 class="text-xs font-medium text-foreground line-clamp-1 flex-1">
+                      <h4
+                        class="text-xs font-medium text-foreground line-clamp-1 flex-1"
+                      >
                         {{ announcement.title }}
                       </h4>
                       <span
@@ -373,7 +440,9 @@
                         置顶
                       </span>
                     </div>
-                    <div class="text-[11px] text-muted-foreground leading-relaxed line-clamp-2 mb-1">
+                    <div
+                      class="text-[11px] text-muted-foreground leading-relaxed line-clamp-2 mb-1"
+                    >
                       {{ getPlainText(announcement.content) }}
                     </div>
                     <div class="text-[10px] text-muted-foreground/70">
@@ -390,7 +459,9 @@
 
     <!-- 趋势图表筛选 -->
     <div class="flex flex-wrap items-center justify-between gap-3">
-      <h3 class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+      <h3
+        class="text-xs font-semibold uppercase tracking-wider text-muted-foreground"
+      >
         统计周期
       </h3>
       <TimeRangePicker
@@ -406,7 +477,9 @@
         v-if="!isAdmin"
         class="p-5"
       >
-        <h4 class="mb-3 text-xs font-semibold text-foreground uppercase tracking-wider">
+        <h4
+          class="mb-3 text-xs font-semibold text-foreground uppercase tracking-wider"
+        >
           每日使用趋势
         </h4>
         <div
@@ -417,10 +490,13 @@
         </div>
         <div
           v-else
-          style="height: 280px;"
+          style="height: 280px"
         >
           <LineChart
-            v-if="dailyUsageTrendChartData.labels && dailyUsageTrendChartData.labels.length > 0"
+            v-if="
+              dailyUsageTrendChartData.labels &&
+                dailyUsageTrendChartData.labels.length > 0
+            "
             :data="dailyUsageTrendChartData"
             :options="dailyUsageTrendChartOptions"
           />
@@ -438,7 +514,9 @@
         v-if="isAdmin"
         class="p-5"
       >
-        <h4 class="mb-3 text-xs font-semibold text-foreground uppercase tracking-wider">
+        <h4
+          class="mb-3 text-xs font-semibold text-foreground uppercase tracking-wider"
+        >
           每日模型成本
         </h4>
         <div
@@ -449,10 +527,13 @@
         </div>
         <div
           v-else
-          style="height: 280px;"
+          style="height: 280px"
         >
           <BarChart
-            v-if="dailyModelCostChartData.labels && dailyModelCostChartData.labels.length > 0"
+            v-if="
+              dailyModelCostChartData.labels &&
+                dailyModelCostChartData.labels.length > 0
+            "
             :data="dailyModelCostChartData"
             :options="dailyModelCostChartOptions"
           />
@@ -470,7 +551,9 @@
         v-if="isAdmin"
         class="p-5"
       >
-        <h4 class="mb-3 text-xs font-semibold text-foreground uppercase tracking-wider">
+        <h4
+          class="mb-3 text-xs font-semibold text-foreground uppercase tracking-wider"
+        >
           提供商成本分布
         </h4>
         <div
@@ -481,10 +564,13 @@
         </div>
         <div
           v-else
-          style="height: 280px;"
+          style="height: 280px"
         >
           <DoughnutChart
-            v-if="providerCostChartData.labels && providerCostChartData.labels.length > 0"
+            v-if="
+              providerCostChartData.labels &&
+                providerCostChartData.labels.length > 0
+            "
             :data="providerCostChartData"
             :options="providerCostChartOptions"
           />
@@ -502,7 +588,9 @@
         v-if="!isAdmin"
         class="p-5"
       >
-        <h4 class="mb-3 text-xs font-semibold text-foreground uppercase tracking-wider">
+        <h4
+          class="mb-3 text-xs font-semibold text-foreground uppercase tracking-wider"
+        >
           每日模型成本
         </h4>
         <div
@@ -513,10 +601,13 @@
         </div>
         <div
           v-else
-          style="height: 280px;"
+          style="height: 280px"
         >
           <BarChart
-            v-if="dailyModelCostChartData.labels && dailyModelCostChartData.labels.length > 0"
+            v-if="
+              dailyModelCostChartData.labels &&
+                dailyModelCostChartData.labels.length > 0
+            "
             :data="dailyModelCostChartData"
             :options="dailyModelCostChartOptions"
           />
@@ -562,7 +653,9 @@
             class="p-4 space-y-2"
           >
             <div class="flex items-center justify-between">
-              <span class="font-medium text-sm">{{ formatDate(stat.date) }}</span>
+              <span class="font-medium text-sm">{{
+                formatDate(stat.date)
+              }}</span>
               <Badge
                 variant="success"
                 class="text-[10px]"
@@ -749,8 +842,10 @@
             :class="getAnnouncementIconColor(selectedAnnouncement.type)"
           />
           <div class="flex-1 min-w-0">
-            <h3 class="text-lg font-semibold text-foreground leading-tight truncate">
-              {{ selectedAnnouncement?.title || '公告详情' }}
+            <h3
+              class="text-lg font-semibold text-foreground leading-tight truncate"
+            >
+              {{ selectedAnnouncement?.title || "公告详情" }}
             </h3>
             <p class="text-xs text-muted-foreground">
               系统公告
@@ -789,13 +884,26 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, computed, onBeforeUnmount, nextTick, watch, markRaw } from 'vue'
-import type { Component } from 'vue'
-import { useAuthStore } from '@/stores/auth'
-import { dashboardApi, type DashboardStat, type DailyStat, type ProviderSummary } from '@/api/dashboard'
-import { getDateRangeFromPeriod } from '@/features/usage/composables'
-import type { DateRangeParams } from '@/features/usage/types'
-import { announcementApi, type Announcement } from '@/api/announcements'
+import {
+  ref,
+  onMounted,
+  computed,
+  onBeforeUnmount,
+  nextTick,
+  watch,
+  markRaw,
+} from "vue";
+import type { Component } from "vue";
+import { useAuthStore } from "@/stores/auth";
+import {
+  dashboardApi,
+  type DashboardStat,
+  type DailyStat,
+  type ProviderSummary,
+} from "@/api/dashboard";
+import { getDateRangeFromPeriod } from "@/features/usage/composables";
+import type { DateRangeParams } from "@/features/usage/types";
+import { announcementApi, type Announcement } from "@/api/announcements";
 import {
   Card,
   Badge,
@@ -808,11 +916,11 @@ import {
   TableRow,
   TableHead,
   TableCell,
-} from '@/components/ui'
-import { TimeRangePicker } from '@/components/common'
-import BarChart from '@/components/charts/BarChart.vue'
-import DoughnutChart from '@/components/charts/DoughnutChart.vue'
-import LineChart from '@/components/charts/LineChart.vue'
+} from "@/components/ui";
+import { TimeRangePicker } from "@/components/common";
+import BarChart from "@/components/charts/BarChart.vue";
+import DoughnutChart from "@/components/charts/DoughnutChart.vue";
+import LineChart from "@/components/charts/LineChart.vue";
 import {
   Users,
   Activity,
@@ -830,694 +938,801 @@ import {
   Clock,
   Database,
   Shuffle,
-} from 'lucide-vue-next'
-import { formatTokens, formatCurrency } from '@/utils/format'
-import { parseDateLike } from '@/utils/date'
-import { marked } from 'marked'
-import { sanitizeMarkdown } from '@/utils/sanitize'
-import type { ChartData, ChartOptions, ChartDataset, TooltipItem } from 'chart.js'
+} from "lucide-vue-next";
+import { formatTokens, formatCurrency } from "@/utils/format";
+import { parseDateLike } from "@/utils/date";
+import { marked } from "marked";
+import { sanitizeMarkdown } from "@/utils/sanitize";
+import type {
+  ChartData,
+  ChartOptions,
+  ChartDataset,
+  TooltipItem,
+} from "chart.js";
 
-const authStore = useAuthStore()
+const authStore = useAuthStore();
 
-type DashboardStatCard = Omit<DashboardStat, 'icon'> & {
-  icon: Component
-}
+type DashboardStatCard = Omit<DashboardStat, "icon"> & {
+  icon: Component;
+};
 
-const statsPanelRef = ref<HTMLElement | null>(null)
-const announcementsHeight = ref<number | null>(null)
-const announcementsTimelineRef = ref<HTMLElement | null>(null)
-const timelineLineStyle = ref<{ top: string; bottom: string }>({ top: '0px', bottom: '0px' })
-const isLargeScreen = ref(false)
+const statsPanelRef = ref<HTMLElement | null>(null);
+const announcementsHeight = ref<number | null>(null);
+const announcementsTimelineRef = ref<HTMLElement | null>(null);
+const timelineLineStyle = ref<{ top: string; bottom: string }>({
+  top: "0px",
+  bottom: "0px",
+});
+const isLargeScreen = ref(false);
 
 const announcementsContainerStyle = computed(() => {
   // 移动端不设置固定高度，让内容自然流动
-  if (!isLargeScreen.value || !announcementsHeight.value) return {}
+  if (!isLargeScreen.value || !announcementsHeight.value) return {};
   // 桌面端设置固定高度，与左侧统计面板保持一致
-  return { height: `${announcementsHeight.value}px` }
-})
+  return { height: `${announcementsHeight.value}px` };
+});
 
 function checkScreenSize() {
-  if (typeof window !== 'undefined') {
-    isLargeScreen.value = window.innerWidth >= 1024 // lg breakpoint
+  if (typeof window !== "undefined") {
+    isLargeScreen.value = window.innerWidth >= 1024; // lg breakpoint
   }
 }
 
-let statsPanelObserver: ResizeObserver | null = null
-let announcementsTimelineObserver: ResizeObserver | null = null
+let statsPanelObserver: ResizeObserver | null = null;
+let announcementsTimelineObserver: ResizeObserver | null = null;
 
 function updateAnnouncementsHeight() {
-  if (typeof window === 'undefined') return
-  const panel = statsPanelRef.value
-  if (!panel) return
-  const { height } = panel.getBoundingClientRect()
-  if (height <= 0) return
-  announcementsHeight.value = Math.round(height)
-  nextTick(() => updateTimelineLine())
+  if (typeof window === "undefined") return;
+  const panel = statsPanelRef.value;
+  if (!panel) return;
+  const { height } = panel.getBoundingClientRect();
+  if (height <= 0) return;
+  announcementsHeight.value = Math.round(height);
+  nextTick(() => updateTimelineLine());
 }
 
 function updateTimelineLine() {
-  if (typeof window === 'undefined') return
-  const container = announcementsTimelineRef.value
-  if (!container) return
-  const items = container.querySelectorAll<HTMLElement>('[data-announcement-item]')
+  if (typeof window === "undefined") return;
+  const container = announcementsTimelineRef.value;
+  if (!container) return;
+  const items = container.querySelectorAll<HTMLElement>(
+    "[data-announcement-item]",
+  );
   if (items.length < 2) {
-    timelineLineStyle.value = { top: '0px', bottom: '0px' }
-    return
+    timelineLineStyle.value = { top: "0px", bottom: "0px" };
+    return;
   }
-  const firstMarker = items[0].querySelector<HTMLElement>('[data-announcement-marker]')
-  const lastMarker = items[items.length - 1].querySelector<HTMLElement>('[data-announcement-marker]')
-  if (!firstMarker || !lastMarker) return
-  const containerRect = container.getBoundingClientRect()
-  const firstRect = firstMarker.getBoundingClientRect()
-  const lastRect = lastMarker.getBoundingClientRect()
-  const topOffset = Math.max(0, firstRect.top + firstRect.height / 2 - containerRect.top)
-  const bottomOffset = Math.max(0, containerRect.bottom - (lastRect.top + lastRect.height / 2))
-  timelineLineStyle.value = { top: `${topOffset}px`, bottom: `${bottomOffset}px` }
+  const firstMarker = items[0].querySelector<HTMLElement>(
+    "[data-announcement-marker]",
+  );
+  const lastMarker = items[items.length - 1].querySelector<HTMLElement>(
+    "[data-announcement-marker]",
+  );
+  if (!firstMarker || !lastMarker) return;
+  const containerRect = container.getBoundingClientRect();
+  const firstRect = firstMarker.getBoundingClientRect();
+  const lastRect = lastMarker.getBoundingClientRect();
+  const topOffset = Math.max(
+    0,
+    firstRect.top + firstRect.height / 2 - containerRect.top,
+  );
+  const bottomOffset = Math.max(
+    0,
+    containerRect.bottom - (lastRect.top + lastRect.height / 2),
+  );
+  timelineLineStyle.value = {
+    top: `${topOffset}px`,
+    bottom: `${bottomOffset}px`,
+  };
 }
 
 function handleWindowResize() {
-  checkScreenSize()
-  updateAnnouncementsHeight()
-  updateTimelineLine()
+  checkScreenSize();
+  updateAnnouncementsHeight();
+  updateTimelineLine();
 }
 
 function setupResizeObserver() {
-  if (typeof window === 'undefined') return
-  const panel = statsPanelRef.value
-  if (!panel || !('ResizeObserver' in window)) return
-  statsPanelObserver = new ResizeObserver(() => updateAnnouncementsHeight())
-  statsPanelObserver.observe(panel)
-  updateAnnouncementsHeight()
+  if (typeof window === "undefined") return;
+  const panel = statsPanelRef.value;
+  if (!panel || !("ResizeObserver" in window)) return;
+  statsPanelObserver = new ResizeObserver(() => updateAnnouncementsHeight());
+  statsPanelObserver.observe(panel);
+  updateAnnouncementsHeight();
 }
 
 function setupTimelineResizeObserver() {
-  if (typeof window === 'undefined' || !('ResizeObserver' in window)) return
-  const container = announcementsTimelineRef.value
-  announcementsTimelineObserver?.disconnect()
-  announcementsTimelineObserver = null
-  if (!container) return
-  announcementsTimelineObserver = new ResizeObserver(() => updateTimelineLine())
-  announcementsTimelineObserver.observe(container)
+  if (typeof window === "undefined" || !("ResizeObserver" in window)) return;
+  const container = announcementsTimelineRef.value;
+  announcementsTimelineObserver?.disconnect();
+  announcementsTimelineObserver = null;
+  if (!container) return;
+  announcementsTimelineObserver = new ResizeObserver(() =>
+    updateTimelineLine(),
+  );
+  announcementsTimelineObserver.observe(container);
 }
 
-const isAdmin = computed(() => authStore.canAccessAdmin)
+const isAdmin = computed(() => authStore.canAccessAdmin);
 const dashboardModeLabel = computed(() => {
-  if (authStore.isAdmin) return 'ADMIN MODE'
-  if (authStore.isAuditAdmin) return 'AUDIT MODE'
-  return 'PERSONAL MODE'
-})
+  if (authStore.isAdmin) return "ADMIN MODE";
+  if (authStore.isAuditAdmin) return "AUDIT MODE";
+  return "PERSONAL MODE";
+});
 
 const statCardBorders = [
-  'border-book-cloth/30 dark:border-book-cloth/25',
-  'border-kraft/30 dark:border-kraft/25',
-  'border-manilla/40 dark:border-manilla/30',
-  'border-book-cloth/25 dark:border-kraft/25'
-]
+  "border-book-cloth/30 dark:border-book-cloth/25",
+  "border-kraft/30 dark:border-kraft/25",
+  "border-manilla/40 dark:border-manilla/30",
+  "border-book-cloth/25 dark:border-kraft/25",
+];
 
 const statCardGlows = [
-  'bg-book-cloth/30',
-  'bg-kraft/30',
-  'bg-manilla/35',
-  'bg-kraft/30'
-]
+  "bg-book-cloth/30",
+  "bg-kraft/30",
+  "bg-manilla/35",
+  "bg-kraft/30",
+];
 
 const getStatIconColor = (_index: number): string => {
-  return 'text-muted-foreground'
-}
+  return "text-muted-foreground";
+};
 
 // 统计数据
-const stats = ref<DashboardStatCard[]>([])
+const stats = ref<DashboardStatCard[]>([]);
 const todayStats = ref<{
-  requests: number
-  tokens: number
-  cost: number
-  actual_cost?: number
-  cache_creation_tokens?: number
-  cache_read_tokens?: number
-}>({ requests: 0, tokens: 0, cost: 0 })
+  requests: number;
+  tokens: number;
+  cost: number;
+  actual_cost?: number;
+  cache_creation_tokens?: number;
+  cache_read_tokens?: number;
+}>({ requests: 0, tokens: 0, cost: 0 });
 
 const systemHealth = ref<{
-  avg_response_time: number
-  error_rate: number
-  error_requests: number
-  fallback_count: number
-  total_requests: number
-} | null>(null)
+  avg_response_time: number;
+  error_rate: number;
+  error_requests: number;
+  fallback_count: number;
+  total_requests: number;
+} | null>(null);
 
 const costStats = ref<{
-  total_cost: number
-  total_actual_cost: number
-  cost_savings: number
-} | null>(null)
+  total_cost: number;
+  total_actual_cost: number;
+  cost_savings: number;
+} | null>(null);
 
 const cacheStats = ref<{
-  cache_creation_tokens: number
-  cache_read_tokens: number
-  cache_creation_cost?: number
-  cache_read_cost?: number
-  cache_hit_rate?: number
-  total_cache_tokens: number
-} | null>(null)
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_cost?: number;
+  cache_read_cost?: number;
+  cache_hit_rate?: number;
+  total_cache_tokens: number;
+} | null>(null);
 
-const userMonthlyCost = ref<number | null>(null)
+const userMonthlyCost = ref<number | null>(null);
 
-const hasCacheData = computed(() =>
-  cacheStats.value && cacheStats.value.total_cache_tokens > 0
-)
+const hasCacheData = computed(
+  () => cacheStats.value && cacheStats.value.total_cache_tokens > 0,
+);
 
 const tokenBreakdown = ref<{
-  input: number
-  output: number
-  cache_creation: number
-  cache_read: number
-} | null>(null)
+  input: number;
+  output: number;
+  cache_creation: number;
+  cache_read: number;
+} | null>(null);
 
-const activeUsers = ref(0)
-const dailyStats = ref<DailyStat[]>([])
-const providerSummary = ref<ProviderSummary[]>([])
-const dailyTimeRange = ref<DateRangeParams>(getDateRangeFromPeriod('last7days'))
+const activeUsers = ref(0);
+const dailyStats = ref<DailyStat[]>([]);
+const providerSummary = ref<ProviderSummary[]>([]);
+const dailyTimeRange = ref<DateRangeParams>(
+  getDateRangeFromPeriod("last7days"),
+);
 // 统计周期
-const loadingDaily = ref(false)
-const loading = ref(false)
-let dailyStatsRequestId = 0
-let dailyStatsLoadPromise: Promise<void> | null = null
-let hasPendingDailyStatsLoad = false
-let dailyStatsDebounceTimer: ReturnType<typeof setTimeout> | null = null
-
+const loadingDaily = ref(false);
+const loading = ref(false);
+let dailyStatsRequestId = 0;
+let dailyStatsLoadPromise: Promise<void> | null = null;
+let hasPendingDailyStatsLoad = false;
+let dailyStatsDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
 // 公告
-const announcements = ref<Announcement[]>([])
-const loadingAnnouncements = ref(false)
-const selectedAnnouncement = ref<Announcement | null>(null)
-const detailDialogOpen = ref(false)
+const announcements = ref<Announcement[]>([]);
+const loadingAnnouncements = ref(false);
+const selectedAnnouncement = ref<Announcement | null>(null);
+const detailDialogOpen = ref(false);
 
 const iconMap: Record<string, Component> = {
-  Users, Activity, TrendingUp, DollarSign, Key, Hash, Zap, Database
-}
+  Users,
+  Activity,
+  TrendingUp,
+  DollarSign,
+  Key,
+  Hash,
+  Zap,
+  Database,
+};
 
 // 空状态占位卡片
 const emptyStatPlaceholders = computed(() => {
   if (isAdmin.value) {
     return [
-      { name: '今日请求', icon: Activity },
-      { name: '今日 Tokens', icon: Hash },
-      { name: '活跃用户', icon: Users },
-      { name: '今日费用', icon: DollarSign }
-    ]
+      { name: "今日请求 / 今日费用", icon: Activity },
+      { name: "今日 Tokens", icon: Hash },
+      { name: "全站 RPM / 全站 TPM", icon: Activity },
+      { name: "在线用户 / 启用用户", icon: Users },
+    ];
   }
   return [
-    { name: '今日请求', icon: Activity },
-    { name: '今日 Tokens', icon: Hash },
-    { name: 'API Keys', icon: Key },
-    { name: '今日费用', icon: DollarSign }
-  ]
-})
+    { name: "今日请求", icon: Activity },
+    { name: "今日 Tokens", icon: Hash },
+    { name: "API Keys", icon: Key },
+    { name: "今日费用", icon: DollarSign },
+  ];
+});
+
+const statSkeletonCount = computed(() => emptyStatPlaceholders.value.length);
 
 const totalStats = computed(() => {
   if (dailyStats.value.length === 0) {
-    return { requests: 0, tokens: 0, cost: 0, avgResponseTime: 0 }
+    return { requests: 0, tokens: 0, cost: 0, avgResponseTime: 0 };
   }
-  const totals = dailyStats.value.reduce((acc, stat) => {
-    acc.requests += stat.requests
-    acc.tokens += stat.tokens
-    acc.cost += stat.cost
-    acc.totalResponseTime += stat.avg_response_time * stat.requests
-    return acc
-  }, { requests: 0, tokens: 0, cost: 0, totalResponseTime: 0 })
+  const totals = dailyStats.value.reduce(
+    (acc, stat) => {
+      acc.requests += stat.requests;
+      acc.tokens += stat.tokens;
+      acc.cost += stat.cost;
+      acc.totalResponseTime += stat.avg_response_time * stat.requests;
+      return acc;
+    },
+    { requests: 0, tokens: 0, cost: 0, totalResponseTime: 0 },
+  );
   return {
     requests: totals.requests,
     tokens: totals.tokens,
     cost: totals.cost,
-    avgResponseTime: totals.requests > 0 ? totals.totalResponseTime / totals.requests : 0
-  }
-})
+    avgResponseTime:
+      totals.requests > 0 ? totals.totalResponseTime / totals.requests : 0,
+  };
+});
 
 // 每日模型成本（堆叠柱状图）
 const MODEL_COLORS = [
-  'rgba(59, 130, 246, 0.8)',   // blue
-  'rgba(239, 68, 68, 0.8)',    // red
-  'rgba(16, 185, 129, 0.8)',   // green
-  'rgba(245, 158, 11, 0.8)',   // amber
-  'rgba(139, 92, 246, 0.8)',   // purple
-  'rgba(6, 182, 212, 0.8)',    // cyan
-  'rgba(132, 204, 22, 0.8)',   // lime
-  'rgba(249, 115, 22, 0.8)'    // orange
-]
+  "rgba(59, 130, 246, 0.8)", // blue
+  "rgba(239, 68, 68, 0.8)", // red
+  "rgba(16, 185, 129, 0.8)", // green
+  "rgba(245, 158, 11, 0.8)", // amber
+  "rgba(139, 92, 246, 0.8)", // purple
+  "rgba(6, 182, 212, 0.8)", // cyan
+  "rgba(132, 204, 22, 0.8)", // lime
+  "rgba(249, 115, 22, 0.8)", // orange
+];
 
-const dailyModelCostChartData = computed<ChartData<'bar'>>(() => {
+const dailyModelCostChartData = computed<ChartData<"bar">>(() => {
   if (dailyStats.value.length === 0) {
-    return { labels: [], datasets: [] }
+    return { labels: [], datasets: [] };
   }
 
   // 收集所有出现过的模型
-  const allModels = new Set<string>()
-  dailyStats.value.forEach(day => {
-    day.model_breakdown?.forEach(mb => allModels.add(mb.model))
-  })
-  const modelList = Array.from(allModels)
+  const allModels = new Set<string>();
+  dailyStats.value.forEach((day) => {
+    day.model_breakdown?.forEach((mb) => allModels.add(mb.model));
+  });
+  const modelList = Array.from(allModels);
 
   // 按总费用降序排列模型
-  const modelTotalCost = new Map<string, number>()
-  dailyStats.value.forEach(day => {
-    day.model_breakdown?.forEach(mb => {
-      modelTotalCost.set(mb.model, (modelTotalCost.get(mb.model) || 0) + mb.cost)
-    })
-  })
-  modelList.sort((a, b) => (modelTotalCost.get(b) || 0) - (modelTotalCost.get(a) || 0))
+  const modelTotalCost = new Map<string, number>();
+  dailyStats.value.forEach((day) => {
+    day.model_breakdown?.forEach((mb) => {
+      modelTotalCost.set(
+        mb.model,
+        (modelTotalCost.get(mb.model) || 0) + mb.cost,
+      );
+    });
+  });
+  modelList.sort(
+    (a, b) => (modelTotalCost.get(b) || 0) - (modelTotalCost.get(a) || 0),
+  );
 
   // 为每个模型创建一个 dataset
-  const datasets: ChartDataset<'bar', number[]>[] = modelList.map((model, index) => ({
-    label: model.replace('claude-', '').replace('gpt-', ''),
-    data: dailyStats.value.map(day => {
-      const found = day.model_breakdown?.find(mb => mb.model === model)
-      return found ? found.cost : 0
+  const datasets: ChartDataset<"bar", number[]>[] = modelList.map(
+    (model, index) => ({
+      label: model.replace("claude-", "").replace("gpt-", ""),
+      data: dailyStats.value.map((day) => {
+        const found = day.model_breakdown?.find((mb) => mb.model === model);
+        return found ? found.cost : 0;
+      }),
+      backgroundColor: MODEL_COLORS[index % MODEL_COLORS.length],
+      borderRadius: 2,
+      stack: "stack0",
+      barPercentage: 0.6,
+      categoryPercentage: 0.7,
     }),
-    backgroundColor: MODEL_COLORS[index % MODEL_COLORS.length],
-    borderRadius: 2,
-    stack: 'stack0',
-    barPercentage: 0.6,
-    categoryPercentage: 0.7
-  }))
+  );
 
   return {
-    labels: dailyStats.value.map(stat => formatDateForChart(stat.date)),
-    datasets
-  }
-})
+    labels: dailyStats.value.map((stat) => formatDateForChart(stat.date)),
+    datasets,
+  };
+});
 
-const dailyModelCostChartOptions = computed<ChartOptions<'bar'>>(() => ({
+const dailyModelCostChartOptions = computed<ChartOptions<"bar">>(() => ({
   responsive: true,
   maintainAspectRatio: false,
   interaction: {
-    mode: 'index',
-    intersect: false
+    mode: "index",
+    intersect: false,
   },
   scales: {
     x: {
       stacked: true,
-      ticks: { font: { size: 10 } }
+      ticks: { font: { size: 10 } },
     },
     y: {
       stacked: true,
-      title: { display: true, text: '费用 ($)', color: 'rgb(107, 114, 128)', font: { size: 10 } },
-      ticks: { font: { size: 10 } }
-    }
+      title: {
+        display: true,
+        text: "费用 ($)",
+        color: "rgb(107, 114, 128)",
+        font: { size: 10 },
+      },
+      ticks: { font: { size: 10 } },
+    },
   },
   plugins: {
     legend: {
       display: true,
-      position: 'bottom',
-      labels: { font: { size: 10 }, boxWidth: 12, padding: 8 }
+      position: "bottom",
+      labels: { font: { size: 10 }, boxWidth: 12, padding: 8 },
     },
     tooltip: {
       callbacks: {
-        label: (context: TooltipItem<'bar'>) => {
-          const value = typeof context.raw === 'number' ? context.raw : 0
-          if (value === 0) return ''
-          return `${context.dataset.label}: $${value.toFixed(4)}`
+        label: (context: TooltipItem<"bar">) => {
+          const value = typeof context.raw === "number" ? context.raw : 0;
+          if (value === 0) return "";
+          return `${context.dataset.label}: $${value.toFixed(4)}`;
         },
-        footer: (items: TooltipItem<'bar'>[]) => {
+        footer: (items: TooltipItem<"bar">[]) => {
           const total = items.reduce((sum, item) => {
-            const val = typeof item.raw === 'number' ? item.raw : 0
-            return sum + val
-          }, 0)
-          return `Total: $${total.toFixed(4)}`
-        }
-      }
-    }
-  }
-}))
+            const val = typeof item.raw === "number" ? item.raw : 0;
+            return sum + val;
+          }, 0);
+          return `Total: $${total.toFixed(4)}`;
+        },
+      },
+    },
+  },
+}));
 
 // 提供商成本分布（环形图）
 const PROVIDER_COLORS = [
-  'rgba(59, 130, 246, 0.8)',   // blue
-  'rgba(239, 68, 68, 0.8)',    // red
-  'rgba(16, 185, 129, 0.8)',   // green
-  'rgba(245, 158, 11, 0.8)',   // amber
-  'rgba(139, 92, 246, 0.8)',   // purple
-  'rgba(6, 182, 212, 0.8)',    // cyan
-  'rgba(132, 204, 22, 0.8)',   // lime
-  'rgba(249, 115, 22, 0.8)'    // orange
-]
+  "rgba(59, 130, 246, 0.8)", // blue
+  "rgba(239, 68, 68, 0.8)", // red
+  "rgba(16, 185, 129, 0.8)", // green
+  "rgba(245, 158, 11, 0.8)", // amber
+  "rgba(139, 92, 246, 0.8)", // purple
+  "rgba(6, 182, 212, 0.8)", // cyan
+  "rgba(132, 204, 22, 0.8)", // lime
+  "rgba(249, 115, 22, 0.8)", // orange
+];
 
-const providerCostChartData = computed<ChartData<'doughnut'>>(() => {
+const providerCostChartData = computed<ChartData<"doughnut">>(() => {
   if (providerSummary.value.length === 0) {
-    return { labels: [], datasets: [] }
+    return { labels: [], datasets: [] };
   }
 
   return {
-    labels: providerSummary.value.map(p => p.provider),
-    datasets: [{
-      data: providerSummary.value.map(p => p.cost),
-      backgroundColor: providerSummary.value.map((_, i) => PROVIDER_COLORS[i % PROVIDER_COLORS.length]),
-      borderWidth: 2,
-      borderColor: 'rgba(255, 255, 255, 0.1)'
-    }]
-  }
-})
+    labels: providerSummary.value.map((p) => p.provider),
+    datasets: [
+      {
+        data: providerSummary.value.map((p) => p.cost),
+        backgroundColor: providerSummary.value.map(
+          (_, i) => PROVIDER_COLORS[i % PROVIDER_COLORS.length],
+        ),
+        borderWidth: 2,
+        borderColor: "rgba(255, 255, 255, 0.1)",
+      },
+    ],
+  };
+});
 
-const providerCostChartOptions = computed<ChartOptions<'doughnut'>>(() => ({
+const providerCostChartOptions = computed<ChartOptions<"doughnut">>(() => ({
   responsive: true,
   maintainAspectRatio: false,
-  cutout: '60%',
+  cutout: "60%",
   plugins: {
     legend: {
-      position: 'right',
+      position: "right",
       labels: {
         font: { size: 10 },
         boxWidth: 12,
-        padding: 8
-      }
+        padding: 8,
+      },
     },
     tooltip: {
       callbacks: {
         label: (context) => {
-          const value = context.raw as number
-          const total = (context.dataset.data as number[]).reduce((a, b) => a + b, 0)
-          const percentage = total > 0 ? ((value / total) * 100).toFixed(1) : '0'
-          return `${context.label}: $${value.toFixed(4)} (${percentage}%)`
-        }
-      }
-    }
-  }
-}))
+          const value = context.raw as number;
+          const total = (context.dataset.data as number[]).reduce(
+            (a, b) => a + b,
+            0,
+          );
+          const percentage =
+            total > 0 ? ((value / total) * 100).toFixed(1) : "0";
+          return `${context.label}: $${value.toFixed(4)} (${percentage}%)`;
+        },
+      },
+    },
+  },
+}));
 
 // 每日使用趋势（折线图）- 普通用户
-const dailyUsageTrendChartData = computed<ChartData<'line'>>(() => {
+const dailyUsageTrendChartData = computed<ChartData<"line">>(() => {
   // 管理员不需要此图表，直接返回空数据
   if (isAdmin.value || dailyStats.value.length === 0) {
-    return { labels: [], datasets: [] }
+    return { labels: [], datasets: [] };
   }
 
   return {
-    labels: dailyStats.value.map(stat => formatDateForChart(stat.date)),
+    labels: dailyStats.value.map((stat) => formatDateForChart(stat.date)),
     datasets: [
       {
-        label: '请求数',
-        data: dailyStats.value.map(stat => stat.requests),
-        borderColor: 'rgba(59, 130, 246, 0.8)',
-        backgroundColor: 'rgba(59, 130, 246, 0.1)',
+        label: "请求数",
+        data: dailyStats.value.map((stat) => stat.requests),
+        borderColor: "rgba(59, 130, 246, 0.8)",
+        backgroundColor: "rgba(59, 130, 246, 0.1)",
         fill: true,
         tension: 0.3,
-        yAxisID: 'y'
+        yAxisID: "y",
       },
       {
-        label: 'Tokens (K)',
-        data: dailyStats.value.map(stat => stat.tokens / 1000),
-        borderColor: 'rgba(16, 185, 129, 0.8)',
-        backgroundColor: 'rgba(16, 185, 129, 0.1)',
+        label: "Tokens (K)",
+        data: dailyStats.value.map((stat) => stat.tokens / 1000),
+        borderColor: "rgba(16, 185, 129, 0.8)",
+        backgroundColor: "rgba(16, 185, 129, 0.1)",
         fill: true,
         tension: 0.3,
-        yAxisID: 'y1'
-      }
-    ]
-  }
-})
+        yAxisID: "y1",
+      },
+    ],
+  };
+});
 
-const dailyUsageTrendChartOptions = computed<ChartOptions<'line'>>(() => {
+const dailyUsageTrendChartOptions = computed<ChartOptions<"line">>(() => {
   // 管理员不需要此图表
   if (isAdmin.value) {
-    return {} as ChartOptions<'line'>
+    return {} as ChartOptions<"line">;
   }
   return {
     responsive: true,
     maintainAspectRatio: false,
     interaction: {
-      mode: 'index',
-      intersect: false
+      mode: "index",
+      intersect: false,
     },
     scales: {
       x: {
-        ticks: { font: { size: 10 } }
+        ticks: { font: { size: 10 } },
       },
       y: {
-        type: 'linear',
+        type: "linear",
         display: true,
-        position: 'left',
-        title: { display: true, text: '请求数', color: 'rgb(107, 114, 128)', font: { size: 10 } },
-        ticks: { font: { size: 10 } }
+        position: "left",
+        title: {
+          display: true,
+          text: "请求数",
+          color: "rgb(107, 114, 128)",
+          font: { size: 10 },
+        },
+        ticks: { font: { size: 10 } },
       },
       y1: {
-        type: 'linear',
+        type: "linear",
         display: true,
-        position: 'right',
-        title: { display: true, text: 'Tokens (K)', color: 'rgb(107, 114, 128)', font: { size: 10 } },
+        position: "right",
+        title: {
+          display: true,
+          text: "Tokens (K)",
+          color: "rgb(107, 114, 128)",
+          font: { size: 10 },
+        },
         ticks: { font: { size: 10 } },
-        grid: { drawOnChartArea: false }
-      }
+        grid: { drawOnChartArea: false },
+      },
     },
     plugins: {
       legend: {
         display: true,
-        position: 'bottom',
-        labels: { font: { size: 10 }, boxWidth: 12, padding: 8 }
+        position: "bottom",
+        labels: { font: { size: 10 }, boxWidth: 12, padding: 8 },
       },
       tooltip: {
         callbacks: {
           label: (context) => {
-            const value = context.raw as number
-            if (context.dataset.label === 'Tokens (K)') {
-              return `${context.dataset.label}: ${value.toFixed(1)}K`
+            const value = context.raw as number;
+            if (context.dataset.label === "Tokens (K)") {
+              return `${context.dataset.label}: ${value.toFixed(1)}K`;
             }
-            return `${context.dataset.label}: ${value}`
-          }
-        }
-      }
-    }
-  }
-})
+            return `${context.dataset.label}: ${value}`;
+          },
+        },
+      },
+    },
+  };
+});
 
 onMounted(async () => {
-  checkScreenSize()
-  setupResizeObserver()
-  if (typeof window !== 'undefined') {
-    window.addEventListener('resize', handleWindowResize)
+  checkScreenSize();
+  setupResizeObserver();
+  if (typeof window !== "undefined") {
+    window.addEventListener("resize", handleWindowResize);
   }
   await Promise.all([
     loadDashboardData(),
+    loadDailyStats(),
     loadAnnouncements(),
-    loadDailyStats()
-  ])
-  await nextTick()
-  setupTimelineResizeObserver()
-  updateAnnouncementsHeight()
-  updateTimelineLine()
-})
+  ]);
+  await nextTick();
+  setupTimelineResizeObserver();
+  updateAnnouncementsHeight();
+  updateTimelineLine();
+});
 
 onBeforeUnmount(() => {
-  if (typeof window !== 'undefined') {
-    window.removeEventListener('resize', handleWindowResize)
+  if (typeof window !== "undefined") {
+    window.removeEventListener("resize", handleWindowResize);
   }
   if (statsPanelObserver && statsPanelRef.value) {
-    statsPanelObserver.unobserve(statsPanelRef.value)
+    statsPanelObserver.unobserve(statsPanelRef.value);
   }
-  statsPanelObserver?.disconnect()
-  statsPanelObserver = null
-  announcementsTimelineObserver?.disconnect()
-  announcementsTimelineObserver = null
+  statsPanelObserver?.disconnect();
+  statsPanelObserver = null;
+  announcementsTimelineObserver?.disconnect();
+  announcementsTimelineObserver = null;
   if (dailyStatsDebounceTimer) {
-    clearTimeout(dailyStatsDebounceTimer)
-    dailyStatsDebounceTimer = null
+    clearTimeout(dailyStatsDebounceTimer);
+    dailyStatsDebounceTimer = null;
   }
-  hasPendingDailyStatsLoad = false
-  dailyStatsLoadPromise = null
-  dailyStatsRequestId += 1
-})
+  hasPendingDailyStatsLoad = false;
+  dailyStatsLoadPromise = null;
+  dailyStatsRequestId += 1;
+});
 
 async function loadDashboardData() {
-  loading.value = true
+  loading.value = true;
   try {
     const statsData = await dashboardApi.getStats({
       timezone: dailyTimeRange.value.timezone,
-      tz_offset_minutes: dailyTimeRange.value.tz_offset_minutes
-    })
-    stats.value = statsData.stats.map(stat => ({
+      tz_offset_minutes: dailyTimeRange.value.tz_offset_minutes,
+    });
+    stats.value = statsData.stats.map((stat) => ({
       ...stat,
-      icon: markRaw(iconMap[stat.icon] || Activity)
-    }))
-    if (statsData.today) todayStats.value = statsData.today
+      icon: markRaw(iconMap[stat.icon] || Activity),
+    }));
+    if (statsData.today) todayStats.value = statsData.today;
     if (isAdmin.value) {
-      if (statsData.system_health) systemHealth.value = statsData.system_health
-      if (statsData.cost_stats) costStats.value = statsData.cost_stats
-      if (statsData.cache_stats) cacheStats.value = statsData.cache_stats
-      if (statsData.token_breakdown) tokenBreakdown.value = statsData.token_breakdown
-      if (statsData.users) activeUsers.value = statsData.users.active
+      if (statsData.system_health) systemHealth.value = statsData.system_health;
+      if (statsData.cost_stats) costStats.value = statsData.cost_stats;
+      if (statsData.cache_stats) cacheStats.value = statsData.cache_stats;
+      if (statsData.token_breakdown)
+        tokenBreakdown.value = statsData.token_breakdown;
+      if (statsData.users) activeUsers.value = statsData.users.active;
     } else {
-      if (statsData.cache_stats) cacheStats.value = statsData.cache_stats
-      if (statsData.token_breakdown) tokenBreakdown.value = statsData.token_breakdown
-      if (statsData.monthly_cost !== undefined) userMonthlyCost.value = statsData.monthly_cost
+      if (statsData.cache_stats) cacheStats.value = statsData.cache_stats;
+      if (statsData.token_breakdown)
+        tokenBreakdown.value = statsData.token_breakdown;
+      if (statsData.monthly_cost !== undefined)
+        userMonthlyCost.value = statsData.monthly_cost;
     }
   } finally {
-    loading.value = false
+    loading.value = false;
   }
 }
 
 async function loadDailyStats() {
   if (dailyStatsLoadPromise) {
-    hasPendingDailyStatsLoad = true
-    return dailyStatsLoadPromise
+    hasPendingDailyStatsLoad = true;
+    return dailyStatsLoadPromise;
   }
-  const requestId = ++dailyStatsRequestId
-  loadingDaily.value = true
+  const requestId = ++dailyStatsRequestId;
+  loadingDaily.value = true;
   dailyStatsLoadPromise = (async () => {
     try {
-      const response = await dashboardApi.getDailyStats(dailyTimeRange.value)
-      if (requestId !== dailyStatsRequestId) return
-      dailyStats.value = response.daily_stats
-      providerSummary.value = response.provider_summary || []
+      const response = await dashboardApi.getDailyStats(dailyTimeRange.value);
+      if (requestId !== dailyStatsRequestId) return;
+      dailyStats.value = response.daily_stats;
+      providerSummary.value = response.provider_summary || [];
     } catch {
-      if (requestId !== dailyStatsRequestId) return
-      dailyStats.value = []
-      providerSummary.value = []
+      if (requestId !== dailyStatsRequestId) return;
+      dailyStats.value = [];
+      providerSummary.value = [];
     } finally {
       if (requestId === dailyStatsRequestId) {
-        loadingDaily.value = false
+        loadingDaily.value = false;
       }
     }
   })().finally(() => {
-    dailyStatsLoadPromise = null
+    dailyStatsLoadPromise = null;
     if (hasPendingDailyStatsLoad) {
-      hasPendingDailyStatsLoad = false
-      void loadDailyStats()
+      hasPendingDailyStatsLoad = false;
+      void loadDailyStats();
     }
-  })
-  return dailyStatsLoadPromise
+  });
+  return dailyStatsLoadPromise;
 }
 
 function scheduleDailyStatsLoad() {
   if (dailyStatsDebounceTimer) {
-    clearTimeout(dailyStatsDebounceTimer)
+    clearTimeout(dailyStatsDebounceTimer);
   }
   dailyStatsDebounceTimer = setTimeout(() => {
-    dailyStatsDebounceTimer = null
-    void loadDailyStats()
-  }, 120)
+    dailyStatsDebounceTimer = null;
+    void loadDailyStats();
+  }, 120);
 }
 
-watch(dailyTimeRange, scheduleDailyStatsLoad, { deep: true })
+watch(dailyTimeRange, scheduleDailyStatsLoad, { deep: true });
 
 function formatDate(dateString: string): string {
-  const date = parseDateLike(dateString)
-  const today = new Date()
-  const yesterday = new Date(today)
-  yesterday.setDate(yesterday.getDate() - 1)
-  if (date.toDateString() === today.toDateString()) return '今天'
-  if (date.toDateString() === yesterday.toDateString()) return '昨天'
-  return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit', weekday: 'short' })
+  const date = parseDateLike(dateString);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return "今天";
+  if (date.toDateString() === yesterday.toDateString()) return "昨天";
+  return date.toLocaleDateString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    weekday: "short",
+  });
 }
 
 function formatDateForChart(dateString: string): string {
-  const date = parseDateLike(dateString)
-  const today = new Date()
-  const yesterday = new Date(today)
-  yesterday.setDate(yesterday.getDate() - 1)
-  if (date.toDateString() === today.toDateString()) return '今天'
-  if (date.toDateString() === yesterday.toDateString()) return '昨天'
-  return date.toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' })
+  const date = parseDateLike(dateString);
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (date.toDateString() === today.toDateString()) return "今天";
+  if (date.toDateString() === yesterday.toDateString()) return "昨天";
+  return date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
 
 function formatResponseTime(seconds: number): string {
-  if (seconds === 0) return '-'
-  if (seconds < 1) return `${(seconds * 1000).toFixed(0)}ms`
-  return `${seconds.toFixed(2)}s`
+  if (seconds === 0) return "-";
+  if (seconds < 1) return `${(seconds * 1000).toFixed(0)}ms`;
+  return `${seconds.toFixed(2)}s`;
 }
 
 // 公告相关
 async function loadAnnouncements() {
-  loadingAnnouncements.value = true
+  loadingAnnouncements.value = true;
   try {
-    const response = await announcementApi.getAnnouncements({ active_only: true, limit: 100 })
-    announcements.value = response.items
+    const response = await announcementApi.getAnnouncements({
+      active_only: true,
+      limit: 100,
+    });
+    announcements.value = response.items;
   } catch {
-    announcements.value = []
+    announcements.value = [];
   } finally {
-    loadingAnnouncements.value = false
-    await nextTick()
-    setupTimelineResizeObserver()
-    updateTimelineLine()
+    loadingAnnouncements.value = false;
+    await nextTick();
+    setupTimelineResizeObserver();
+    updateTimelineLine();
   }
 }
 
-watch(() => announcements.value.length, async () => {
-  await nextTick()
-  setupTimelineResizeObserver()
-  updateTimelineLine()
-})
+watch(
+  () => announcements.value.length,
+  async () => {
+    await nextTick();
+    setupTimelineResizeObserver();
+    updateTimelineLine();
+  },
+);
 
 async function viewAnnouncementDetail(announcement: Announcement) {
   if (!announcement.is_read && !isAdmin.value) {
     try {
-      await announcementApi.markAsRead(announcement.id)
-      announcement.is_read = true
-    } catch { /* 静默忽略标记已读错误 */ }
+      await announcementApi.markAsRead(announcement.id);
+      announcement.is_read = true;
+    } catch {
+      /* 静默忽略标记已读错误 */
+    }
   }
-  selectedAnnouncement.value = announcement
-  detailDialogOpen.value = true
+  selectedAnnouncement.value = announcement;
+  detailDialogOpen.value = true;
 }
 
 function getPlainText(content: string): string {
   const cleaned = content
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/`[^`]*`/g, ' ')
-    .replace(/!\[[^\]]*]\([^)]*\)/g, ' ')
-    .replace(/\[[^\]]*]\(([^)]*)\)/g, '$1')
-    .replace(/[#>*_~]/g, '')
-    .replace(/\n+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-  if (cleaned.length <= 100) return cleaned
-  return `${cleaned.slice(0, 100).trim()}...`
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`[^`]*`/g, " ")
+    .replace(/!\[[^\]]*]\([^)]*\)/g, " ")
+    .replace(/\[[^\]]*]\(([^)]*)\)/g, "$1")
+    .replace(/[#>*_~]/g, "")
+    .replace(/\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (cleaned.length <= 100) return cleaned;
+  return `${cleaned.slice(0, 100).trim()}...`;
 }
 
 function getAnnouncementIcon(type: string) {
   switch (type) {
-    case 'important': return AlertCircle
-    case 'warning': return AlertTriangle
-    case 'maintenance': return Wrench
-    default: return Info
+    case "important":
+      return AlertCircle;
+    case "warning":
+      return AlertTriangle;
+    case "maintenance":
+      return Wrench;
+    default:
+      return Info;
   }
 }
 
 function getAnnouncementIconColor(type: string) {
   switch (type) {
-    case 'important': return 'text-rose-600 dark:text-rose-400'
-    case 'warning': return 'text-amber-600 dark:text-amber-400'
-    case 'maintenance': return 'text-orange-600 dark:text-orange-400'
-    default: return 'text-primary dark:text-primary'
+    case "important":
+      return "text-rose-600 dark:text-rose-400";
+    case "warning":
+      return "text-amber-600 dark:text-amber-400";
+    case "maintenance":
+      return "text-orange-600 dark:text-orange-400";
+    default:
+      return "text-primary dark:text-primary";
   }
 }
 
 function formatAnnouncementDate(dateString: string): string {
-  const date = new Date(dateString)
-  const now = new Date()
-  const diff = now.getTime() - date.getTime()
-  const minutes = Math.floor(diff / (1000 * 60))
-  const hours = Math.floor(diff / (1000 * 60 * 60))
-  const days = Math.floor(diff / (1000 * 60 * 60 * 24))
-  if (minutes < 1) return '刚刚'
-  if (minutes < 60) return `${minutes}分钟前`
-  if (hours < 24) return `${hours}小时前`
-  if (days < 7) return `${days}天前`
-  return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  const date = new Date(dateString);
+  const now = new Date();
+  const diff = now.getTime() - date.getTime();
+  const minutes = Math.floor(diff / (1000 * 60));
+  const hours = Math.floor(diff / (1000 * 60 * 60));
+  const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes}分钟前`;
+  if (hours < 24) return `${hours}小时前`;
+  if (days < 7) return `${days}天前`;
+  return date.toLocaleDateString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function getAnnouncementDotColor(type: string): string {
   switch (type) {
-    case 'important': return 'bg-rose-500 dark:bg-rose-400'
-    case 'warning': return 'bg-amber-500 dark:bg-amber-400'
-    case 'maintenance': return 'bg-orange-500 dark:bg-orange-400'
-    default: return 'bg-emerald-500 dark:bg-emerald-400'
+    case "important":
+      return "bg-rose-500 dark:bg-rose-400";
+    case "warning":
+      return "bg-amber-500 dark:bg-amber-400";
+    case "maintenance":
+      return "bg-orange-500 dark:bg-orange-400";
+    default:
+      return "bg-emerald-500 dark:bg-emerald-400";
   }
 }
 
 function formatFullDate(dateString: string): string {
-  const date = new Date(dateString)
-  return date.toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+  const date = new Date(dateString);
+  return date.toLocaleDateString("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function renderMarkdown(content: string): string {
-  const rawHtml = marked(content) as string
-  return sanitizeMarkdown(rawHtml)
+  const rawHtml = marked(content) as string;
+  return sanitizeMarkdown(rawHtml);
 }
 </script>
 
@@ -1528,24 +1743,86 @@ function renderMarkdown(content: string): string {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.line-clamp-1 { -webkit-line-clamp: 1; }
-.line-clamp-2 { -webkit-line-clamp: 2; }
+.line-clamp-1 {
+  -webkit-line-clamp: 1;
+}
+.line-clamp-2 {
+  -webkit-line-clamp: 2;
+}
 
-.scrollbar-thin::-webkit-scrollbar { width: 5px; }
-.scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
-.scrollbar-thin::-webkit-scrollbar-thumb { background: rgb(203 213 225); border-radius: 2px; }
-.dark .scrollbar-thin::-webkit-scrollbar-thumb { background: rgb(71 85 105); }
-.scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgb(148 163 184); }
-.dark .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgb(100 116 139); }
+.scrollbar-thin::-webkit-scrollbar {
+  width: 5px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgb(203 213 225);
+  border-radius: 2px;
+}
+.dark .scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgb(71 85 105);
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgb(148 163 184);
+}
+.dark .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgb(100 116 139);
+}
 
-:deep(.prose) { color: var(--color-text); }
-:deep(.prose p) { margin-top: 0.75em; margin-bottom: 0.75em; line-height: 1.65; }
-:deep(.prose ul), :deep(.prose ol) { margin-top: 0.75em; margin-bottom: 0.75em; padding-left: 1.5em; }
-:deep(.prose li) { margin-top: 0.25em; margin-bottom: 0.25em; }
-:deep(.prose h1), :deep(.prose h2), :deep(.prose h3), :deep(.prose h4) { margin-top: 1.5em; margin-bottom: 0.75em; font-weight: 600; color: var(--color-text); }
-:deep(.prose code) { background: var(--color-code-background); color: var(--color-code-text); padding: 0.2em 0.4em; border-radius: 4px; font-size: 0.9em; font-weight: 500; }
-:deep(.prose pre) { background: var(--color-code-background); padding: 1em; border-radius: 8px; overflow-x: auto; }
-:deep(.prose a) { color: var(--book-cloth); text-decoration: underline; }
-:deep(.prose blockquote) { border-left: 3px solid var(--book-cloth); padding-left: 1em; margin-left: 0; font-style: italic; color: var(--cloud-dark); }
-:deep(.prose strong) { font-weight: 600; }
+:deep(.prose) {
+  color: var(--color-text);
+}
+:deep(.prose p) {
+  margin-top: 0.75em;
+  margin-bottom: 0.75em;
+  line-height: 1.65;
+}
+:deep(.prose ul),
+:deep(.prose ol) {
+  margin-top: 0.75em;
+  margin-bottom: 0.75em;
+  padding-left: 1.5em;
+}
+:deep(.prose li) {
+  margin-top: 0.25em;
+  margin-bottom: 0.25em;
+}
+:deep(.prose h1),
+:deep(.prose h2),
+:deep(.prose h3),
+:deep(.prose h4) {
+  margin-top: 1.5em;
+  margin-bottom: 0.75em;
+  font-weight: 600;
+  color: var(--color-text);
+}
+:deep(.prose code) {
+  background: var(--color-code-background);
+  color: var(--color-code-text);
+  padding: 0.2em 0.4em;
+  border-radius: 4px;
+  font-size: 0.9em;
+  font-weight: 500;
+}
+:deep(.prose pre) {
+  background: var(--color-code-background);
+  padding: 1em;
+  border-radius: 8px;
+  overflow-x: auto;
+}
+:deep(.prose a) {
+  color: var(--book-cloth);
+  text-decoration: underline;
+}
+:deep(.prose blockquote) {
+  border-left: 3px solid var(--book-cloth);
+  padding-left: 1em;
+  margin-left: 0;
+  font-style: italic;
+  color: var(--cloud-dark);
+}
+:deep(.prose strong) {
+  font-weight: 600;
+}
 </style>

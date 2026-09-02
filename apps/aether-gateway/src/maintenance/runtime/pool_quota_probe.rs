@@ -1255,6 +1255,23 @@ async fn perform_pool_quota_probe_for_provider(
             );
         }
     }
+    if aether_admin::provider::quota::provider_auto_remove_quota_exhausted_keys(
+        provider.config.as_ref(),
+    ) {
+        let auto_removed = admin_state
+            .cleanup_quota_exhausted_provider_catalog_keys(provider, provider_type)
+            .await?;
+        if auto_removed > 0 {
+            summary.auto_removed += auto_removed;
+            info!(
+                event_name = "auto_removed_quota_exhausted",
+                provider_id = %provider_short_id,
+                provider_type,
+                auto_removed,
+                "gateway pool quota probe auto-cleaned quota-exhausted provider keys"
+            );
+        }
+    }
 
     let Some(endpoint) = endpoint_for_probe_with_reconcile(
         state,
@@ -1684,20 +1701,24 @@ pub(crate) fn spawn_pool_quota_probe_worker(
     }
 
     let config = PoolQuotaProbeWorkerConfig::from_env();
-    Some(tokio::spawn(async move {
-        let mut interval = tokio::time::interval(config.scan_interval);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
-        loop {
+    Some(crate::task_runtime::spawn_singleton_worker(
+        state,
+        crate::task_runtime::TASK_KEY_POOL_QUOTA_PROBE,
+        move |state| async move {
+            let mut interval = tokio::time::interval(config.scan_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
-            if let Err(err) = perform_pool_quota_probe_once_with_config(&state, config).await {
-                warn!(
-                    error = ?err,
-                    "gateway pool quota probe worker tick failed"
-                );
+            loop {
+                interval.tick().await;
+                if let Err(err) = perform_pool_quota_probe_once_with_config(&state, config).await {
+                    warn!(
+                        error = ?err,
+                        "gateway pool quota probe worker tick failed"
+                    );
+                }
             }
-        }
-    }))
+        },
+    ))
 }
 
 #[cfg(test)]

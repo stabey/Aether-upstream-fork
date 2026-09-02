@@ -29,8 +29,7 @@ async fn build_usage_counter_health_payload(
     let now_unix_secs = chrono::Utc::now().timestamp().max(0) as u64;
     let snapshot = state
         .as_ref()
-        .data
-        .read_usage_counter_health()
+        .read_cached_usage_counter_health()
         .await
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
     Ok(build_admin_usage_counter_health_payload(
@@ -259,6 +258,11 @@ pub(super) async fn maybe_build_local_admin_stats_analytics_response(
                     "has_format_conversion",
                 ),
                 slow_threshold_ms,
+                include_timeline: query_param_optional_bool(
+                    request_context.query_string(),
+                    "include_timeline",
+                )
+                .unwrap_or(true),
             })
             .await?;
         return Ok(Some(build_admin_stats_provider_performance_response(

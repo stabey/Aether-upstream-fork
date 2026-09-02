@@ -4,7 +4,8 @@ use aether_data_contracts::repository::global_models::{
     StoredAdminProviderModel, UpsertAdminProviderModelRecord,
 };
 use aether_data_contracts::repository::provider_catalog::{
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    ProviderCatalogUpstreamMetadataNamespaceUpdate, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{ModelFetchAssociationStore, ModelFetchTransportRuntime};
 use async_trait::async_trait;
@@ -42,9 +43,30 @@ pub(crate) trait ModelFetchRuntimeState:
         plan: &ExecutionPlan,
     ) -> Result<ExecutionResult, GatewayError>;
 
-    async fn update_provider_catalog_key(
+    async fn read_recent_codex_catalog_client_version(
         &self,
-        key: &StoredProviderCatalogKey,
+        _provider_id: &str,
+        _key_id: &str,
+    ) -> Option<String> {
+        None
+    }
+
+    async fn update_provider_catalog_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<(), GatewayError>;
+
+    async fn update_provider_catalog_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[ProviderCatalogUpstreamMetadataNamespaceUpdate],
+        updated_at_unix_secs: Option<u64>,
     ) -> Result<(), GatewayError>;
 
     async fn write_upstream_models_cache(

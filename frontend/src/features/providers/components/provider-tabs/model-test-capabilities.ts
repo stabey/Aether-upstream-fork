@@ -1,4 +1,7 @@
-import { normalizeApiFormatAlias } from '@/api/endpoints/types/api-format'
+import {
+  apiFormatPermissionCovers,
+  normalizeApiFormatAlias,
+} from '@/api/endpoints/types/api-format'
 import type { ModelTestCapabilities, OpenAiImageModelTestCapability } from '@/api/endpoints/types'
 
 export type ModelTestEndpointSource = {
@@ -21,6 +24,8 @@ export type ModelTestKeySource = {
 }
 
 const MODEL_TEST_UNSUPPORTED_API_FORMATS = new Set([
+  'openai:realtime',
+  'codex:live',
   'openai:video',
   'gemini:video',
   'gemini:files',
@@ -71,7 +76,7 @@ export function modelTestKeySupportsEndpoint(
   const keyFormats = normalizeModelTestStringList(key.api_formats)
   if (keyFormats.length === 0) return true
 
-  return keyFormats.some(format => normalizeApiFormatAlias(format) === endpointFormat)
+  return keyFormats.some(format => apiFormatPermissionCovers(format, endpointFormat))
 }
 
 export function isModelTestableEndpoint(

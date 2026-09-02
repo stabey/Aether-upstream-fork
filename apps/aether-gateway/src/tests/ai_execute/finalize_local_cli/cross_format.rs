@@ -1,9 +1,9 @@
 use super::{
     any, build_router_with_execution_runtime_override, build_router_with_state,
-    build_state_with_execution_runtime_override, json, start_server, to_bytes, Arc, Body, Bytes,
-    HeaderName, HeaderValue, Json, Mutex, Request, Response, Router, StatusCode,
-    CONTROL_EXECUTED_HEADER, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER,
-    TRACE_ID_HEADER,
+    build_state_with_execution_runtime_override, json, run_finalize_local_cli_test, start_server,
+    to_bytes, Arc, Body, Bytes, HeaderName, HeaderValue, Json, Mutex, Request, Response, Router,
+    StatusCode, CONTROL_EXECUTED_HEADER, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
+    EXECUTION_PATH_HEADER, TRACE_ID_HEADER,
 };
 use crate::data::GatewayDataState;
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
@@ -25,8 +25,15 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use sha2::{Digest, Sha256};
 
-#[tokio::test]
-async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_local_finalize_response(
+#[test]
+fn gateway_executes_openai_responses_cross_format_upstream_stream_via_local_finalize_response() {
+    run_finalize_local_cli_test(
+        "gateway_executes_openai_responses_cross_format_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_responses_cross_format_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_local_finalize_response_impl(
 ) {
     use base64::Engine as _;
 
@@ -106,6 +113,7 @@ async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_loca
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -490,8 +498,16 @@ async fn gateway_executes_openai_responses_cross_format_upstream_stream_via_loca
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_responses_cross_format_function_call_upstream_stream_via_local_finalize_response(
+#[test]
+fn gateway_executes_openai_responses_cross_format_function_call_upstream_stream_via_local_finalize_response(
+) {
+    run_finalize_local_cli_test(
+        "gateway_executes_openai_responses_cross_format_function_call_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_responses_cross_format_function_call_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_responses_cross_format_function_call_upstream_stream_via_local_finalize_response_impl(
 ) {
     use base64::Engine as _;
 
@@ -571,6 +587,7 @@ async fn gateway_executes_openai_responses_cross_format_function_call_upstream_s
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -953,8 +970,16 @@ async fn gateway_executes_openai_responses_cross_format_function_call_upstream_s
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_stream_via_local_finalize_response(
+#[test]
+fn gateway_executes_openai_responses_antigravity_cross_format_upstream_stream_via_local_finalize_response(
+) {
+    run_finalize_local_cli_test(
+        "gateway_executes_openai_responses_antigravity_cross_format_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_responses_antigravity_cross_format_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_stream_via_local_finalize_response_impl(
 ) {
     use base64::Engine as _;
 
@@ -1048,6 +1073,7 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1497,7 +1523,10 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
         seen_remote_execution_runtime_request.url,
         "https://antigravity.googleapis.com/v1internal:streamGenerateContent?alt=sse"
     );
-    assert_eq!(seen_remote_execution_runtime_request.accept, "*/*");
+    assert_eq!(
+        seen_remote_execution_runtime_request.accept,
+        "text/event-stream"
+    );
     assert_eq!(
         seen_remote_execution_runtime_request.authorization,
         "Bearer refreshed-antigravity-cli-access-token"
@@ -1532,7 +1561,7 @@ async fn gateway_executes_openai_responses_antigravity_cross_format_upstream_str
     );
     assert_eq!(
         seen_remote_execution_runtime_request.user_agent,
-        "antigravity"
+        aether_provider_transport::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT
     );
     assert_eq!(seen_remote_execution_runtime_request.request_type, "agent");
     assert_eq!(seen_remote_execution_runtime_request.contents_len, 1);

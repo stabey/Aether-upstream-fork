@@ -10,6 +10,7 @@ const POOL_ALLOWED_SCHEDULING_PRESETS: &[&str] = &[
     "load_balance",
     "single_account",
     "priority_first",
+    "free_team_first",
     "free_first",
     "team_first",
     "plus_first",
@@ -166,8 +167,17 @@ fn parse_pool_score_rules(pool_advanced: &Map<String, Value>) -> PoolMemberScore
 
 fn normalize_pool_preset_mode(preset: &str, raw_mode: Option<&Value>) -> Option<String> {
     match preset {
-        "free_first" | "team_first" | "plus_first" | "pro_first" => {
+        "cache_affinity" => Some(
+            raw_mode
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| matches!(*value, "single_account" | "lru"))
+                .unwrap_or("single_account")
+                .to_string(),
+        ),
+        "free_team_first" | "free_first" | "team_first" | "plus_first" | "pro_first" => {
             let default_mode = match preset {
+                "free_team_first" => "both",
                 "free_first" => "free_only",
                 "team_first" => "team_only",
                 "plus_first" => "plus_only",
@@ -180,6 +190,9 @@ fn normalize_pool_preset_mode(preset: &str, raw_mode: Option<&Value>) -> Option<
                 .filter(|value| !value.is_empty())
                 .map(|value| value.to_ascii_lowercase())
                 .filter(|value| match preset {
+                    "free_team_first" => {
+                        matches!(value.as_str(), "free_only" | "team_only" | "both")
+                    }
                     "free_first" => value == "free_only",
                     "team_first" => value == "team_only",
                     "plus_first" => value == "plus_only",
@@ -458,12 +471,10 @@ pub(crate) fn admin_provider_pool_config_from_config_value(
         rate_limit_cooldown_seconds: pool_advanced
             .get("rate_limit_cooldown_seconds")
             .and_then(json_u64)
-            .filter(|value| *value > 0)
             .unwrap_or(300),
         overload_cooldown_seconds: pool_advanced
             .get("overload_cooldown_seconds")
             .and_then(json_u64)
-            .filter(|value| *value > 0)
             .unwrap_or(30),
         probing_enabled: pool_advanced
             .get("probing_enabled")
@@ -673,6 +684,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_zero_cooldown_seconds_to_disable_error_cooldowns() {
+        let config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "rate_limit_cooldown_seconds": 0,
+                "overload_cooldown_seconds": 0
+            }
+        })))
+        .expect("pool config should parse");
+
+        assert_eq!(config.rate_limit_cooldown_seconds, 0);
+        assert_eq!(config.overload_cooldown_seconds, 0);
+    }
+
+    #[test]
     fn parses_legacy_pool_score_weights_from_pool_advanced() {
         let config = admin_provider_pool_config_from_config_value(Some(&json!({
             "pool_advanced": {
@@ -774,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn retired_free_team_first_preset_is_rejected() {
+    fn legacy_free_team_first_preset_is_preserved() {
         let config = admin_provider_pool_config_from_config_value(Some(&json!({
             "pool_advanced": {
                 "scheduling_presets": [
@@ -785,8 +810,11 @@ mod tests {
         .expect("pool config should parse");
 
         assert_eq!(config.scheduling_presets.len(), 1);
-        assert_eq!(config.scheduling_presets[0].preset, "lru");
-        assert_eq!(config.scheduling_presets[0].mode, None);
+        assert_eq!(config.scheduling_presets[0].preset, "free_team_first");
+        assert_eq!(
+            config.scheduling_presets[0].mode.as_deref(),
+            Some("team_only")
+        );
     }
 
     #[test]

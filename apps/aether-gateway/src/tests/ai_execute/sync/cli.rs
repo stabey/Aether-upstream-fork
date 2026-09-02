@@ -1,11 +1,9 @@
 use super::{
     any, build_router_with_state, build_state_with_execution_runtime_override, json, start_server,
-    to_bytes, Arc, Body, Json, Mutex, Request, Router, StatusCode,
+    to_bytes, wait_until, Arc, Body, Json, Mutex, Request, Router, StatusCode,
     EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER, TRACE_ID_HEADER,
 };
-use crate::constants::{
-    EXECUTION_PATH_LOCAL_API_KEY_CONCURRENCY_LIMITED, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
-};
+use crate::constants::LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER;
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::auth::{
     InMemoryAuthApiKeySnapshotRepository, StoredAuthApiKeySnapshot,
@@ -143,6 +141,7 @@ async fn gateway_executes_openai_responses_sync_via_local_decision_gate_with_loc
                 priority: 1,
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -652,6 +651,7 @@ async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_respons
                 priority: 1,
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -780,6 +780,7 @@ async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_respons
                     "auth_context": {
                         "user_id": "user-openai-cli-local-limit-123",
                         "api_key_id": "key-openai-cli-local-limit-123",
+                        "api_key_concurrent_limit": 1,
                         "access_allowed": true
                     },
                     "public_path": "/v1/responses"
@@ -969,15 +970,15 @@ async fn gateway_waits_for_api_key_concurrency_slot_then_executes_openai_respons
 }
 
 #[test]
-fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync() {
+fn gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_budget_elapses() {
     run_cli_sync_test(
-        "gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync",
-        gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync_impl,
+        "gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_budget_elapses",
+        gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_budget_elapses_impl,
     );
 }
 
-async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_openai_responses_sync_impl(
-) {
+async fn gateway_executes_openai_responses_sync_after_api_key_concurrency_wait_budget_elapses_impl()
+{
     fn hash_api_key(value: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(value.as_bytes());
@@ -1043,6 +1044,7 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
                 priority: 1,
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1126,36 +1128,7 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let public_hits = Arc::new(Mutex::new(0usize));
     let public_hits_clone = Arc::clone(&public_hits);
-    let now_unix_ms = chrono::Utc::now().timestamp_millis().max(0);
-    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
-        aether_data_contracts::repository::candidates::StoredRequestCandidate::new(
-            "cand-pending-openai-cli-local-timeout-1".to_string(),
-            "req-inflight-openai-cli-local-timeout-1".to_string(),
-            Some("user-openai-cli-local-timeout-123".to_string()),
-            Some("key-openai-cli-local-timeout-123".to_string()),
-            Some("alice".to_string()),
-            Some("default".to_string()),
-            0,
-            0,
-            Some("provider-openai-cli-local-timeout-1".to_string()),
-            Some("endpoint-openai-cli-local-timeout-1".to_string()),
-            Some("key-openai-cli-local-timeout-1".to_string()),
-            RequestCandidateStatus::Pending,
-            None,
-            false,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            now_unix_ms,
-            Some(now_unix_ms),
-            None,
-        )
-        .expect("pending candidate should build"),
-    ]));
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
 
     let upstream = Router::new()
         .route(
@@ -1171,6 +1144,7 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
                     "auth_context": {
                         "user_id": "user-openai-cli-local-timeout-123",
                         "api_key_id": "key-openai-cli-local-timeout-123",
+                        "api_key_concurrent_limit": 1,
                         "access_allowed": true
                     },
                     "public_path": "/v1/responses"
@@ -1204,6 +1178,7 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
                 *execution_runtime_hits_inner
                     .lock()
                     .expect("mutex should lock") += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 Json(json!({
                     "request_id": "trace-openai-cli-local-timeout-123",
                     "status_code": 200,
@@ -1265,8 +1240,53 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
     let gateway = build_router_with_state(gateway_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let client = reqwest::Client::new();
+    let first_client = client.clone();
+    let first_gateway_url = gateway_url.clone();
+    let first_request = tokio::spawn(async move {
+        first_client
+            .post(format!("{first_gateway_url}/v1/responses"))
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .header(
+                http::header::AUTHORIZATION,
+                "Bearer sk-client-openai-cli-local-timeout",
+            )
+            .header(
+                TRACE_ID_HEADER,
+                "trace-openai-cli-local-timeout-inflight-123",
+            )
+            .body("{\"model\":\"gpt-5\",\"input\":\"first\",\"store\":false}")
+            .send()
+            .await
+            .expect("inflight request should complete")
+    });
+    wait_until(5_000, || {
+        *execution_runtime_hits.lock().expect("mutex should lock") >= 1
+    })
+    .await;
+    let active_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(5_000);
+    loop {
+        let inflight_candidates = request_candidate_repository
+            .list_by_request_id("trace-openai-cli-local-timeout-inflight-123")
+            .await
+            .expect("inflight request candidate trace should read");
+        if inflight_candidates.iter().any(|candidate| {
+            matches!(
+                candidate.status,
+                RequestCandidateStatus::Pending | RequestCandidateStatus::Streaming
+            ) && candidate.started_at_unix_ms.is_some()
+        }) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < active_deadline,
+            "inflight request candidate did not become active: {inflight_candidates:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
     let started_at = std::time::Instant::now();
-    let response = reqwest::Client::new()
+    let response = client
         .post(format!("{gateway_url}/v1/responses"))
         .header(http::header::CONTENT_TYPE, "application/json")
         .header(
@@ -1281,44 +1301,40 @@ async fn gateway_returns_concurrency_limited_after_wait_budget_expires_for_opena
 
     assert!(
         started_at.elapsed() >= std::time::Duration::from_millis(100),
-        "request should wait for the bounded concurrency window before failing"
+        "request should wait for the bounded concurrency window before retrying"
     );
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response
             .headers()
             .get(EXECUTION_PATH_HEADER)
             .and_then(|value| value.to_str().ok()),
-        Some(EXECUTION_PATH_LOCAL_API_KEY_CONCURRENCY_LIMITED)
+        Some(EXECUTION_PATH_EXECUTION_RUNTIME_SYNC)
     );
     assert_eq!(
         response
             .headers()
             .get(LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER)
             .and_then(|value| value.to_str().ok()),
-        Some("auth_api_key_concurrency_limit_reached")
+        None
     );
     let payload: serde_json::Value = response.json().await.expect("body should parse");
-    assert_eq!(
-        payload["error"]["message"],
-        serde_json::Value::String("当前调用方 API Key 并发请求数已达上限，请稍后重试".to_string())
-    );
+    assert_eq!(payload["model"], "gpt-5-upstream");
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-openai-cli-local-timeout-123")
         .await
         .expect("request candidate trace should read");
     assert_eq!(stored_candidates.len(), 1);
-    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Skipped);
-    assert_eq!(
-        stored_candidates[0].skip_reason.as_deref(),
-        Some("auth_api_key_concurrency_limit_reached")
-    );
+    assert_eq!(stored_candidates[0].status, RequestCandidateStatus::Success);
+    assert_eq!(stored_candidates[0].skip_reason.as_deref(), None);
     assert_eq!(
         *execution_runtime_hits.lock().expect("mutex should lock"),
-        0
+        2
     );
     assert_eq!(*public_hits.lock().expect("mutex should lock"), 0);
+    let first_response = first_request.await.expect("inflight request should join");
+    assert_eq!(first_response.status(), StatusCode::OK);
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -1399,6 +1415,7 @@ async fn gateway_returns_openai_responses_error_for_local_sync_failure_impl() {
                 priority: 1,
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1712,6 +1729,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_cl
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -2118,6 +2136,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_sy
                 priority: 1,
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -2503,6 +2522,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_claude_ch
                 priority: 1,
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -2891,6 +2911,7 @@ async fn gateway_returns_openai_responses_error_for_local_cross_format_gemini_ch
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -3210,6 +3231,9 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
         model: String,
         authorization: String,
         x_client_request_id: String,
+        session_id: String,
+        thread_id: String,
+        prompt_cache_key: String,
         stream_present: bool,
         plan_stream: bool,
     }
@@ -3285,6 +3309,7 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
                 priority: 1,
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -3496,6 +3521,25 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    session_id: payload
+                        .get("headers")
+                        .and_then(|value| value.get("session-id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    thread_id: payload
+                        .get("headers")
+                        .and_then(|value| value.get("thread-id"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    prompt_cache_key: payload
+                        .get("body")
+                        .and_then(|value| value.get("json_body"))
+                        .and_then(|value| value.get("prompt_cache_key"))
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
                     stream_present: payload
                         .get("body")
                         .and_then(|value| value.get("json_body"))
@@ -3633,7 +3677,16 @@ async fn gateway_executes_codex_cli_sync_via_local_decision_gate_after_oauth_ref
     );
     assert_eq!(
         seen_execution_runtime_request.x_client_request_id,
-        "trace-codex-cli-local-123"
+        seen_execution_runtime_request.thread_id
+    );
+    assert_eq!(
+        seen_execution_runtime_request.session_id,
+        seen_execution_runtime_request.thread_id
+    );
+    assert!(seen_execution_runtime_request.prompt_cache_key.is_empty());
+    assert_ne!(
+        seen_execution_runtime_request.thread_id,
+        seen_execution_runtime_request.trace_id
     );
     assert!(seen_execution_runtime_request.stream_present);
     assert!(seen_execution_runtime_request.plan_stream);

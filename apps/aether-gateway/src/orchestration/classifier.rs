@@ -54,6 +54,248 @@ impl LocalFailoverClassification {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalTransportFailoverClassification {
+    StopTransportError,
+    RetryTransportError,
+}
+
+impl LocalTransportFailoverClassification {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::StopTransportError => "stop_transport_error",
+            Self::RetryTransportError => "retry_transport_error",
+        }
+    }
+}
+
+pub(crate) const fn classify_local_transport_error(
+    policy: &LocalFailoverPolicy,
+) -> LocalTransportFailoverClassification {
+    if policy.stop_on_transport_errors {
+        LocalTransportFailoverClassification::StopTransportError
+    } else {
+        LocalTransportFailoverClassification::RetryTransportError
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureRetryAction {
+    Stop,
+    SameCredential,
+    NextCandidate,
+    NextCredential,
+    NextEndpoint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureScope {
+    None,
+    Credential,
+    CredentialModel,
+    Endpoint,
+    Provider,
+}
+
+impl FailureScope {
+    pub(crate) const fn affects_credential(self) -> bool {
+        matches!(self, Self::Credential | Self::CredentialModel)
+    }
+
+    pub(crate) const fn allows_key_wide_effects(self) -> bool {
+        matches!(self, Self::None | Self::Credential)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureTokenAction {
+    None,
+    ForceRefresh,
+    #[allow(dead_code)]
+    Quarantine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FailureDisposition {
+    pub(crate) retry_action: FailureRetryAction,
+    pub(crate) failure_scope: FailureScope,
+    pub(crate) token_action: FailureTokenAction,
+    pub(crate) preserve_upstream_error: bool,
+}
+
+impl FailureDisposition {
+    const fn new(
+        retry_action: FailureRetryAction,
+        failure_scope: FailureScope,
+        token_action: FailureTokenAction,
+        preserve_upstream_error: bool,
+    ) -> Self {
+        Self {
+            retry_action,
+            failure_scope,
+            token_action,
+            preserve_upstream_error,
+        }
+    }
+}
+
+pub(crate) const fn failure_disposition_from_local_classification(
+    classification: LocalFailoverClassification,
+    status_code: u16,
+) -> FailureDisposition {
+    match classification {
+        LocalFailoverClassification::StopStatusCode
+        | LocalFailoverClassification::StopErrorPattern
+        | LocalFailoverClassification::StopExecutionError
+        | LocalFailoverClassification::StopCyberPolicy => FailureDisposition::new(
+            FailureRetryAction::Stop,
+            FailureScope::None,
+            FailureTokenAction::None,
+            true,
+        ),
+        LocalFailoverClassification::UseDefault => FailureDisposition::new(
+            FailureRetryAction::Stop,
+            FailureScope::None,
+            FailureTokenAction::None,
+            status_code >= 400,
+        ),
+        LocalFailoverClassification::RetrySuccessPattern => FailureDisposition::new(
+            FailureRetryAction::NextCandidate,
+            FailureScope::None,
+            FailureTokenAction::None,
+            false,
+        ),
+        LocalFailoverClassification::RetryStatusCode
+        | LocalFailoverClassification::RetryUpstreamFailure => FailureDisposition::new(
+            FailureRetryAction::NextCandidate,
+            FailureScope::None,
+            FailureTokenAction::None,
+            false,
+        ),
+    }
+}
+
+pub(crate) const fn classify_anthropic_failure_disposition(
+    classification: LocalFailoverClassification,
+    status_code: u16,
+) -> FailureDisposition {
+    if matches!(
+        classification,
+        LocalFailoverClassification::StopStatusCode
+            | LocalFailoverClassification::StopErrorPattern
+            | LocalFailoverClassification::StopExecutionError
+            | LocalFailoverClassification::StopCyberPolicy
+    ) {
+        let generic = failure_disposition_from_local_classification(classification, status_code);
+        return match status_code {
+            401 => FailureDisposition::new(
+                generic.retry_action,
+                FailureScope::Credential,
+                FailureTokenAction::ForceRefresh,
+                generic.preserve_upstream_error,
+            ),
+            403 => FailureDisposition::new(
+                generic.retry_action,
+                FailureScope::Credential,
+                FailureTokenAction::None,
+                generic.preserve_upstream_error,
+            ),
+            404 => FailureDisposition::new(
+                generic.retry_action,
+                FailureScope::Endpoint,
+                FailureTokenAction::None,
+                generic.preserve_upstream_error,
+            ),
+            429 => FailureDisposition::new(
+                generic.retry_action,
+                FailureScope::CredentialModel,
+                FailureTokenAction::None,
+                generic.preserve_upstream_error,
+            ),
+            529 => FailureDisposition::new(
+                generic.retry_action,
+                FailureScope::Provider,
+                FailureTokenAction::None,
+                generic.preserve_upstream_error,
+            ),
+            500..=599 => FailureDisposition::new(
+                generic.retry_action,
+                FailureScope::Endpoint,
+                FailureTokenAction::None,
+                generic.preserve_upstream_error,
+            ),
+            _ => generic,
+        };
+    }
+
+    match status_code {
+        400 => FailureDisposition::new(
+            FailureRetryAction::Stop,
+            FailureScope::None,
+            FailureTokenAction::None,
+            true,
+        ),
+        401 => FailureDisposition::new(
+            FailureRetryAction::NextCredential,
+            FailureScope::Credential,
+            FailureTokenAction::ForceRefresh,
+            true,
+        ),
+        403 => FailureDisposition::new(
+            FailureRetryAction::NextCredential,
+            FailureScope::Credential,
+            FailureTokenAction::None,
+            true,
+        ),
+        404 => FailureDisposition::new(
+            FailureRetryAction::NextEndpoint,
+            FailureScope::Endpoint,
+            FailureTokenAction::None,
+            true,
+        ),
+        413 => FailureDisposition::new(
+            FailureRetryAction::Stop,
+            FailureScope::None,
+            FailureTokenAction::None,
+            true,
+        ),
+        429 => FailureDisposition::new(
+            FailureRetryAction::NextCredential,
+            FailureScope::CredentialModel,
+            FailureTokenAction::None,
+            true,
+        ),
+        529 => FailureDisposition::new(
+            FailureRetryAction::NextEndpoint,
+            FailureScope::Provider,
+            FailureTokenAction::None,
+            true,
+        ),
+        500..=599 => FailureDisposition::new(
+            FailureRetryAction::NextEndpoint,
+            FailureScope::Endpoint,
+            FailureTokenAction::None,
+            true,
+        ),
+        _ => failure_disposition_from_local_classification(classification, status_code),
+    }
+}
+
+pub(crate) fn classify_failure_disposition(
+    provider_api_format: &str,
+    classification: LocalFailoverClassification,
+    status_code: u16,
+) -> FailureDisposition {
+    if provider_api_format
+        .trim()
+        .eq_ignore_ascii_case("claude:messages")
+    {
+        classify_anthropic_failure_disposition(classification, status_code)
+    } else {
+        failure_disposition_from_local_classification(classification, status_code)
+    }
+}
+
 pub(crate) fn classify_local_failover(
     policy: &LocalFailoverPolicy,
     input: LocalFailoverInput<'_>,
@@ -92,7 +334,10 @@ pub(crate) fn classify_local_failover(
         return LocalFailoverClassification::RetryStatusCode;
     }
 
-    if should_failover_local_upstream_status(input.status_code) {
+    if should_failover_local_upstream_status(
+        input.status_code,
+        policy.retry_client_errors_by_default,
+    ) {
         return LocalFailoverClassification::RetryUpstreamFailure;
     }
 
@@ -109,8 +354,11 @@ pub(crate) fn local_failover_error_message(response_text: Option<&str>) -> Optio
         .filter(|value| !value.is_empty())
 }
 
-fn should_failover_local_upstream_status(status_code: u16) -> bool {
-    status_code >= 400
+fn should_failover_local_upstream_status(
+    status_code: u16,
+    retry_client_errors_by_default: bool,
+) -> bool {
+    status_code >= 500 || status_code >= 400 && retry_client_errors_by_default
 }
 
 fn local_error_response_has_cyber_policy_code(response_text: Option<&str>) -> bool {
@@ -129,10 +377,7 @@ fn json_value_has_cyber_policy_code(value: &Value, depth: usize) -> bool {
     }
     match value {
         Value::Object(object) => object.iter().any(|(key, value)| {
-            (key == "code"
-                && value
-                    .as_str()
-                    .is_some_and(|code| code.eq_ignore_ascii_case("cyber_policy")))
+            (key.eq_ignore_ascii_case("code") && value.as_str().is_some_and(is_cyber_policy_code))
                 || json_value_has_cyber_policy_code(value, depth + 1)
         }),
         Value::Array(values) => values
@@ -149,6 +394,11 @@ fn json_value_has_cyber_policy_code(value: &Value, depth: usize) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_cyber_policy_code(code: &str) -> bool {
+    let code = code.trim();
+    code.eq_ignore_ascii_case("cyber_policy") || code.eq_ignore_ascii_case("cyber_policy_violation")
 }
 
 fn parse_local_error_response(response_text: Option<&str>) -> ParsedLocalErrorResponse {
@@ -259,7 +509,12 @@ fn local_failover_regex_rule_matches(
 mod tests {
     use std::collections::BTreeSet;
 
-    use super::{classify_local_failover, LocalFailoverClassification, LocalFailoverInput};
+    use super::{
+        classify_anthropic_failure_disposition, classify_local_failover,
+        classify_local_transport_error, failure_disposition_from_local_classification,
+        FailureDisposition, FailureRetryAction, FailureScope, FailureTokenAction,
+        LocalFailoverClassification, LocalFailoverInput, LocalTransportFailoverClassification,
+    };
     use crate::orchestration::{LocalFailoverPolicy, LocalFailoverRegexRule};
 
     #[test]
@@ -272,6 +527,27 @@ mod tests {
         assert_eq!(
             classify_local_failover(&policy, LocalFailoverInput::new(503, None)),
             LocalFailoverClassification::StopStatusCode
+        );
+    }
+
+    #[test]
+    fn classifier_retries_transport_errors_by_default_and_honors_explicit_stop() {
+        assert_eq!(
+            classify_local_transport_error(&LocalFailoverPolicy::default()),
+            LocalTransportFailoverClassification::RetryTransportError
+        );
+
+        let stop_policy = LocalFailoverPolicy {
+            stop_on_transport_errors: true,
+            ..LocalFailoverPolicy::default()
+        };
+        assert_eq!(
+            classify_local_transport_error(&stop_policy),
+            LocalTransportFailoverClassification::StopTransportError
+        );
+        assert_eq!(
+            classify_local_transport_error(&stop_policy).as_str(),
+            "stop_transport_error"
         );
     }
 
@@ -381,6 +657,16 @@ mod tests {
                 &policy,
                 LocalFailoverInput::new(
                     400,
+                    Some(r#"{"error":{"code":"cyber_policy_violation"}}"#)
+                )
+            ),
+            LocalFailoverClassification::StopCyberPolicy
+        );
+        assert_eq!(
+            classify_local_failover(
+                &policy,
+                LocalFailoverInput::new(
+                    400,
                     Some(r#"{"outer":{"error":{"code":"cyber_policy"}}}"#)
                 )
             ),
@@ -397,9 +683,13 @@ mod tests {
 
     #[test]
     fn classifier_retries_cyber_policy_when_policy_disabled() {
+        let policy = LocalFailoverPolicy {
+            stop_cyber_policy_errors: false,
+            ..LocalFailoverPolicy::default()
+        };
         assert_eq!(
             classify_local_failover(
-                &LocalFailoverPolicy::default(),
+                &policy,
                 LocalFailoverInput::new(
                     400,
                     Some(r#"{"error":{"code":"cyber_policy","message":"flagged"}}"#)
@@ -475,6 +765,39 @@ mod tests {
     }
 
     #[test]
+    fn classifier_passes_through_client_errors_when_protocol_default_disables_failover() {
+        let policy = LocalFailoverPolicy {
+            retry_client_errors_by_default: false,
+            ..LocalFailoverPolicy::default()
+        };
+
+        for status_code in [400, 401, 429, 499] {
+            assert_eq!(
+                classify_local_failover(&policy, LocalFailoverInput::new(status_code, None)),
+                LocalFailoverClassification::UseDefault
+            );
+        }
+        assert_eq!(
+            classify_local_failover(&policy, LocalFailoverInput::new(500, None)),
+            LocalFailoverClassification::RetryUpstreamFailure
+        );
+    }
+
+    #[test]
+    fn classifier_explicit_continue_rule_overrides_protocol_client_error_default() {
+        let policy = LocalFailoverPolicy {
+            continue_status_codes: [429].into_iter().collect(),
+            retry_client_errors_by_default: false,
+            ..LocalFailoverPolicy::default()
+        };
+
+        assert_eq!(
+            classify_local_failover(&policy, LocalFailoverInput::new(429, None)),
+            LocalFailoverClassification::RetryStatusCode
+        );
+    }
+
+    #[test]
     fn classifier_keeps_embedded_rate_limit_error_in_success_response_on_default_path() {
         assert_eq!(
             classify_local_failover(
@@ -488,5 +811,139 @@ mod tests {
             ),
             LocalFailoverClassification::UseDefault
         );
+    }
+
+    #[test]
+    fn legacy_classification_preserves_candidate_by_candidate_retry() {
+        assert_eq!(
+            failure_disposition_from_local_classification(
+                LocalFailoverClassification::RetryUpstreamFailure,
+                429,
+            ),
+            FailureDisposition {
+                retry_action: FailureRetryAction::NextCandidate,
+                failure_scope: FailureScope::None,
+                token_action: FailureTokenAction::None,
+                preserve_upstream_error: false,
+            }
+        );
+        assert_eq!(
+            failure_disposition_from_local_classification(
+                LocalFailoverClassification::StopErrorPattern,
+                400,
+            )
+            .retry_action,
+            FailureRetryAction::Stop
+        );
+    }
+
+    #[test]
+    fn anthropic_bad_request_stops_and_preserves_upstream_error() {
+        let disposition = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::RetryUpstreamFailure,
+            400,
+        );
+
+        assert_eq!(disposition.retry_action, FailureRetryAction::Stop);
+        assert_eq!(disposition.failure_scope, FailureScope::None);
+        assert_eq!(disposition.token_action, FailureTokenAction::None);
+        assert!(disposition.preserve_upstream_error);
+    }
+
+    #[test]
+    fn anthropic_auth_failures_refresh_then_rotate_only_when_needed() {
+        let unauthorized = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::RetryUpstreamFailure,
+            401,
+        );
+        assert_eq!(
+            unauthorized.retry_action,
+            FailureRetryAction::NextCredential
+        );
+        assert_eq!(unauthorized.failure_scope, FailureScope::Credential);
+        assert_eq!(unauthorized.token_action, FailureTokenAction::ForceRefresh);
+
+        let forbidden = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::RetryUpstreamFailure,
+            403,
+        );
+        assert_eq!(forbidden.retry_action, FailureRetryAction::NextCredential);
+        assert_eq!(forbidden.failure_scope, FailureScope::Credential);
+        assert_eq!(forbidden.token_action, FailureTokenAction::None);
+    }
+
+    #[test]
+    fn anthropic_rate_limit_rotates_with_credential_model_scope() {
+        let disposition = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::RetryUpstreamFailure,
+            429,
+        );
+
+        assert_eq!(disposition.retry_action, FailureRetryAction::NextCredential);
+        assert_eq!(disposition.failure_scope, FailureScope::CredentialModel);
+        assert!(disposition.failure_scope.affects_credential());
+        assert!(!disposition.failure_scope.allows_key_wide_effects());
+        assert!(disposition.preserve_upstream_error);
+    }
+
+    #[test]
+    fn anthropic_overload_moves_endpoint_without_credential_penalty() {
+        let disposition = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::RetryUpstreamFailure,
+            529,
+        );
+
+        assert_eq!(disposition.retry_action, FailureRetryAction::NextEndpoint);
+        assert_eq!(disposition.failure_scope, FailureScope::Provider);
+        assert!(!disposition.failure_scope.affects_credential());
+        assert!(!disposition.failure_scope.allows_key_wide_effects());
+        assert_eq!(disposition.token_action, FailureTokenAction::None);
+        assert!(disposition.preserve_upstream_error);
+    }
+
+    #[test]
+    fn anthropic_not_found_moves_endpoint_and_oversize_stops() {
+        let not_found = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::RetryUpstreamFailure,
+            404,
+        );
+        assert_eq!(not_found.retry_action, FailureRetryAction::NextEndpoint);
+        assert_eq!(not_found.failure_scope, FailureScope::Endpoint);
+        assert!(not_found.preserve_upstream_error);
+
+        let oversized = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::RetryUpstreamFailure,
+            413,
+        );
+        assert_eq!(oversized.retry_action, FailureRetryAction::Stop);
+        assert_eq!(oversized.failure_scope, FailureScope::None);
+        assert!(oversized.preserve_upstream_error);
+    }
+
+    #[test]
+    fn only_unscoped_and_credential_failures_allow_key_wide_effects() {
+        assert!(FailureScope::None.allows_key_wide_effects());
+        assert!(FailureScope::Credential.allows_key_wide_effects());
+        assert!(!FailureScope::CredentialModel.allows_key_wide_effects());
+        assert!(!FailureScope::Endpoint.allows_key_wide_effects());
+        assert!(!FailureScope::Provider.allows_key_wide_effects());
+    }
+
+    #[test]
+    fn anthropic_explicit_stop_keeps_failure_resource_scope() {
+        let auth = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::StopStatusCode,
+            401,
+        );
+        assert_eq!(auth.retry_action, FailureRetryAction::Stop);
+        assert_eq!(auth.failure_scope, FailureScope::Credential);
+        assert_eq!(auth.token_action, FailureTokenAction::ForceRefresh);
+
+        let overloaded = classify_anthropic_failure_disposition(
+            LocalFailoverClassification::StopStatusCode,
+            529,
+        );
+        assert_eq!(overloaded.retry_action, FailureRetryAction::Stop);
+        assert_eq!(overloaded.failure_scope, FailureScope::Provider);
     }
 }

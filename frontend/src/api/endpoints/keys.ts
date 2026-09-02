@@ -121,17 +121,50 @@ export interface ProviderKeysPageQuery {
   page_size?: number
 }
 
+type ProviderKeysPagePayload = ProviderKeysPageResponse | EndpointAPIKey[]
+
+function normalizeProviderKeysPage(
+  value: ProviderKeysPagePayload,
+  page: number,
+  pageSize: number,
+): ProviderKeysPageResponse {
+  if (Array.isArray(value)) {
+    const start = value.length > pageSize ? (page - 1) * pageSize : 0
+    const keys = value.slice(start, start + pageSize)
+    return {
+      total: value.length,
+      page,
+      page_size: pageSize,
+      keys,
+    }
+  }
+
+  const keys = Array.isArray(value.keys) ? value.keys : []
+  return {
+    total: typeof value.total === 'number' && Number.isFinite(value.total)
+      ? value.total
+      : keys.length,
+    page: typeof value.page === 'number' && Number.isFinite(value.page)
+      ? value.page
+      : page,
+    page_size: typeof value.page_size === 'number' && Number.isFinite(value.page_size)
+      ? value.page_size
+      : pageSize,
+    keys,
+  }
+}
+
 export async function getProviderKeysPage(
   providerId: string,
   params: ProviderKeysPageQuery = {},
 ): Promise<ProviderKeysPageResponse> {
   const page = params.page ?? 1
   const pageSize = params.page_size ?? 20
-  const response = await client.get<ProviderKeysPageResponse>(
+  const response = await client.get<ProviderKeysPagePayload>(
     `/api/admin/endpoints/providers/${providerId}/keys`,
     { params: { page, page_size: pageSize } },
   )
-  return response.data
+  return normalizeProviderKeysPage(response.data, page, pageSize)
 }
 
 export async function getProviderKeys(providerId: string): Promise<EndpointAPIKey[]> {
@@ -281,6 +314,45 @@ export async function refreshProviderQuota(
   const response = await client.post(
     `/api/admin/endpoints/providers/${providerId}/refresh-quota`,
     body,
+    { timeout: 5 * 60 * 1000 },
+  )
+  return response.data
+}
+
+export interface ConsumeCodexResetCreditPayload {
+  idempotency_key: string
+  expected_credential_generation: string | null
+}
+
+export interface ConsumeCodexResetCreditResult {
+  key_id: string
+  status: 'success' | 'noop' | 'unknown' | 'error' | string
+  outcome:
+    | 'reset'
+    | 'already_redeemed'
+    | 'nothing_to_reset'
+    | 'no_credit'
+    | 'historical_replay'
+    | 'credential_changed'
+    | 'unknown'
+    | 'error'
+    | string
+  idempotency_key: string
+  refresh_status?: 'success' | 'failed' | string
+  refresh_error?: string | null
+  metadata?: Record<string, unknown>
+  quota_snapshot?: QuotaStatusSnapshot
+  message?: string
+  status_code?: number
+}
+
+export async function consumeCodexResetCredit(
+  keyId: string,
+  payload: ConsumeCodexResetCreditPayload,
+): Promise<ConsumeCodexResetCreditResult> {
+  const response = await client.post(
+    `/api/admin/endpoints/keys/${keyId}/codex-reset-credit/consume`,
+    payload,
     { timeout: 5 * 60 * 1000 },
   )
   return response.data

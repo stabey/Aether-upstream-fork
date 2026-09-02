@@ -22,8 +22,39 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use sha2::{Digest, Sha256};
 
-#[tokio::test]
-async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_candidate() {
+const STREAM_PROVIDER_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_stream_provider_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(STREAM_PROVIDER_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("stream provider test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_candidate() {
+    run_stream_provider_test(
+        "gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_candidate",
+        gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_candidate_impl,
+    );
+}
+
+async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_candidate_impl() {
     use base64::Engine as _;
 
     #[derive(Debug, Clone)]
@@ -151,6 +182,7 @@ async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_cand
                 priority: 1,
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -484,6 +516,7 @@ async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_cand
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::USER_AGENT, "Claude-Code/2.1.0")
         .header(
             http::header::AUTHORIZATION,
             "Bearer sk-client-kiro-cli-local-stream",
@@ -578,8 +611,16 @@ async fn gateway_executes_kiro_claude_cli_stream_via_local_provider_catalog_cand
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_waiting_for_same_format_prefetch(
+#[test]
+fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_waiting_for_same_format_prefetch(
+) {
+    run_stream_provider_test(
+        "gateway_executes_claude_cli_stream_via_local_decision_gate_without_waiting_for_same_format_prefetch",
+        gateway_executes_claude_cli_stream_via_local_decision_gate_without_waiting_for_same_format_prefetch_impl,
+    );
+}
+
+async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_waiting_for_same_format_prefetch_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
@@ -661,6 +702,7 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
                 priority: 1,
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -887,6 +929,9 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
                     ));
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                        b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_stop\\ndata: {\\\"type\\\":\\\"message_stop\\\"}\\n\\n\"}}\n"
+                    ));
+                    yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
                         b"{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":31,\"ttfb_ms\":11,\"upstream_bytes\":37}}}\n"
                     ));
                     yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
@@ -939,6 +984,7 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
     let mut response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::USER_AGENT, "Claude-Code/2.1.0")
         .header(
             http::header::AUTHORIZATION,
             "Bearer sk-client-claude-cli-local",
@@ -963,7 +1009,7 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
     );
     assert_eq!(
         response.text().await.expect("remaining body should read"),
-        ""
+        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
     );
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -1026,8 +1072,15 @@ async fn gateway_executes_claude_cli_stream_via_local_decision_gate_without_wait
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_local_stream_decision(
+#[test]
+fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_local_stream_decision() {
+    run_stream_provider_test(
+        "gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_local_stream_decision",
+        gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_local_stream_decision_impl,
+    );
+}
+
+async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_local_stream_decision_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
@@ -1115,6 +1168,7 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
                 priority: 1,
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1389,6 +1443,7 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
                 let frames = concat!(
                     "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
                     "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_start\\ndata: {\\\"type\\\":\\\"message_start\\\"}\\n\\n\"}}\n",
+                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_stop\\ndata: {\\\"type\\\":\\\"message_stop\\\"}\\n\\n\"}}\n",
                     "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":31,\"ttfb_ms\":11,\"upstream_bytes\":37}}}\n",
                     "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
                 );
@@ -1441,6 +1496,7 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::USER_AGENT, "Claude-Code/2.1.0")
         .header(
             http::header::AUTHORIZATION,
             "Bearer sk-client-claude-code-cli-local",
@@ -1473,7 +1529,10 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         strip_sse_keepalive_comments(&response.text().await.expect("body should read")),
-        "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+        concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )
     );
 
     let seen_execution_runtime_request = seen_execution_runtime
@@ -1502,14 +1561,17 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     );
     assert_eq!(
         seen_execution_runtime_request.anthropic_beta,
-        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,custom-beta"
+        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05,effort-2025-11-24,context-management-2025-06-27,extended-cache-ttl-2025-04-11,context-1m-2025-08-07,custom-beta"
     );
     assert_eq!(seen_execution_runtime_request.x_app, "cli");
     assert_eq!(
         seen_execution_runtime_request.x_stainless_helper_method,
         "stream"
     );
-    assert_eq!(seen_execution_runtime_request.user_agent, "Claude-Code/9.9");
+    assert_eq!(
+        seen_execution_runtime_request.user_agent,
+        "claude-cli/2.1.161 (external, cli)"
+    );
     assert_eq!(
         seen_execution_runtime_request.endpoint_tag,
         "claude-code-cli-local"
@@ -1558,8 +1620,16 @@ async fn gateway_executes_claude_code_cli_stream_via_local_decision_gate_with_lo
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_stream_decision() {
+#[test]
+fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_stream_decision() {
+    run_stream_provider_test(
+        "gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_stream_decision",
+        gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_stream_decision_impl,
+    );
+}
+
+async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_stream_decision_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
         trace_id: String,
@@ -1640,6 +1710,7 @@ async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_
                 priority: 1,
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1863,6 +1934,7 @@ async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_
                 let frames = concat!(
                     "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
                     "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_start\\ndata: {\\\"type\\\":\\\"message_start\\\"}\\n\\n\"}}\n",
+                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: message_stop\\ndata: {\\\"type\\\":\\\"message_stop\\\"}\\n\\n\"}}\n",
                     "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":31,\"ttfb_ms\":11,\"upstream_bytes\":37}}}\n",
                     "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
                 );
@@ -1927,7 +1999,10 @@ async fn gateway_executes_claude_chat_stream_via_local_decision_gate_with_local_
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         strip_sse_keepalive_comments(&response.text().await.expect("body should read")),
-        "event: message_start\ndata: {\"type\":\"message_start\"}\n\n"
+        concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        )
     );
 
     let seen_execution_runtime_request = seen_execution_runtime

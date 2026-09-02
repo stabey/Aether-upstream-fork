@@ -11,11 +11,12 @@ use aether_admin::provider::{
 use aether_data_contracts::repository::global_models::{
     AdminProviderModelListQuery, StoredAdminProviderModel, UpsertAdminProviderModelRecord,
 };
+use axum::http;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
-fn normalize_provider_model_mappings_api_formats(
+fn normalize_provider_model_mapping_scopes(
     value: Option<serde_json::Value>,
 ) -> Option<serde_json::Value> {
     let Some(mut value) = value else {
@@ -35,6 +36,9 @@ fn normalize_provider_model_mappings_api_formats(
         );
         normalize_provider_model_mapping_string_array_field(object, "endpoint_ids", |value| {
             value.trim().to_string()
+        });
+        normalize_provider_model_mapping_string_array_field(object, "operations", |value| {
+            value.trim().to_ascii_lowercase()
         });
     }
     Some(value)
@@ -155,7 +159,7 @@ impl<'a> AdminAppState<'a> {
             "price_per_request",
         )?;
         let tiered_pricing = normalize_json_object(payload.tiered_pricing, "tiered_pricing")?;
-        let provider_model_mappings = normalize_provider_model_mappings_api_formats(
+        let provider_model_mappings = normalize_provider_model_mapping_scopes(
             normalize_json_array(payload.provider_model_mappings, "provider_model_mappings")?,
         );
         let config = normalize_json_object(payload.config, "config")?;
@@ -241,7 +245,7 @@ impl<'a> AdminAppState<'a> {
             existing.tiered_pricing.clone()
         };
         let provider_model_mappings = if fields.contains("provider_model_mappings") {
-            normalize_provider_model_mappings_api_formats(normalize_json_array(
+            normalize_provider_model_mapping_scopes(normalize_json_array(
                 payload.provider_model_mappings,
                 "provider_model_mappings",
             )?)
@@ -485,8 +489,24 @@ impl<'a> AdminAppState<'a> {
 
     pub(crate) async fn read_admin_external_models_cache(
         &self,
+        request_id: &str,
     ) -> Result<Option<serde_json::Value>, GatewayError> {
-        crate::handlers::admin::model::read_admin_external_models_cache(self).await
+        crate::handlers::admin::model::read_admin_external_models_cache(self, request_id).await
+    }
+
+    pub(crate) async fn build_admin_external_models_config_payload(
+        &self,
+    ) -> Result<serde_json::Value, GatewayError> {
+        crate::handlers::admin::model::build_admin_external_models_config_payload(self).await
+    }
+
+    pub(crate) async fn apply_admin_external_models_config_update(
+        &self,
+        request_body: &axum::body::Bytes,
+    ) -> Result<Result<serde_json::Value, (http::StatusCode, serde_json::Value)>, GatewayError>
+    {
+        crate::handlers::admin::model::apply_admin_external_models_config_update(self, request_body)
+            .await
     }
 
     pub(crate) async fn clear_admin_external_models_cache(

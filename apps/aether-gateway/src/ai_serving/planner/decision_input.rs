@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use aether_ai_serving::{run_ai_authenticated_decision_input, AiAuthenticatedDecisionInputPort};
 use aether_routing_core::{
@@ -10,24 +11,39 @@ use async_trait::async_trait;
 use http::StatusCode;
 use http::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Value};
-use tracing::warn;
 
 use crate::ai_serving::planner::common::extract_standard_requested_model;
-use crate::ai_serving::{ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot, PlannerAppState};
-use crate::client_session_affinity::client_session_affinity_from_request;
+use crate::ai_serving::transport::CodexFingerprintConvergenceContext;
+use crate::ai_serving::{
+    ClientSurface, ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot,
+    GatewayCredentialCarrier, GatewayProviderTransportSnapshot, PlannerAppState,
+    CODEX_RESPONSES_LITE_HEADER,
+};
+use crate::cache::CacheLoadObserver;
+use crate::client_session_affinity::client_session_affinity_from_api_request;
 use crate::clock::current_unix_secs;
 use crate::routing::{
     apply_routing_mutation_plan, build_routing_trace_seed, resolve_gateway_routing_policy,
-    select_gateway_routing_group, GatewayRoutingPolicyInput, GatewayRoutingSelectionError,
-    GatewayRoutingSelectionInput, ROUTING_GROUP_HEADER,
+    resolve_gateway_static_default_routing_policy, select_gateway_routing_group,
+    GatewayRoutingPolicyInput, GatewayRoutingSelectionError, GatewayRoutingSelectionInput,
+    GatewayStaticRoutingPolicyInput, ROUTING_GROUP_HEADER,
 };
+use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::{AiExecutionDecision, AppState, GatewayError};
+
+// Keep normal freshness bounded for cross-node routing changes. Stale values
+// are served while a single background refresh updates the cache.
+const ROUTING_GROUP_SELECTION_CACHE_TTL: Duration = Duration::from_secs(30);
+const ROUTING_GROUP_SELECTION_CACHE_STALE_TTL: Duration = Duration::from_secs(120);
+const CODEX_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+const CODEX_FEDRAMP_HEADER: &str = "x-openai-fedramp";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedLocalDecisionAuthInput {
     pub(crate) auth_context: ExecutionRuntimeAuthContext,
     pub(crate) auth_snapshot: GatewayAuthApiKeySnapshot,
     pub(crate) required_capabilities: Option<serde_json::Value>,
+    pub(crate) model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -37,10 +53,14 @@ pub(crate) struct LocalRequestedModelDecisionInput {
     pub(crate) auth_snapshot: GatewayAuthApiKeySnapshot,
     pub(crate) required_capabilities: Option<serde_json::Value>,
     pub(crate) request_auth_channel: Option<String>,
+    pub(crate) client_surface: Option<ClientSurface>,
+    pub(crate) gateway_credential_carrier: Option<GatewayCredentialCarrier>,
     pub(crate) client_session_affinity: Option<ClientSessionAffinity>,
+    pub(crate) codex_fingerprint_context: Option<CodexFingerprintConvergenceContext>,
     pub(crate) routing_policy: Option<ResolvedRoutingPolicy>,
     pub(crate) routing_trace_seed: Option<RoutingDecisionTrace>,
     pub(crate) routing_context: Option<LocalRoutingRequestContext>,
+    pub(crate) model_directive_policy: crate::system_features::ModelDirectivePolicySnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -81,14 +101,86 @@ impl LocalRequestedModelDecisionInput {
 pub(crate) fn apply_provider_request_routing_policy_to_decision(
     input: &LocalRequestedModelDecisionInput,
     decision: &mut AiExecutionDecision,
+    transport: Option<&GatewayProviderTransportSnapshot>,
 ) -> Result<(), GatewayError> {
-    let Some(context) = input.routing_context.as_ref() else {
-        return Ok(());
-    };
+    apply_provider_request_routing_policy_to_decision_with_websocket_mode(
+        input, decision, transport, false,
+    )
+}
+
+/// Applies provider-request routing mutations while retaining the transport
+/// boundary of a pinned Responses WebSocket continuation. Routing rules may
+/// mutate the body and therefore require a second provider-contract pass; the
+/// pass must use the same explicit continuation mode as the first pass rather
+/// than guessing from JSON fields.
+pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_mode(
+    input: &LocalRequestedModelDecisionInput,
+    decision: &mut AiExecutionDecision,
+    transport: Option<&GatewayProviderTransportSnapshot>,
+    websocket_continuation: bool,
+) -> Result<(), GatewayError> {
     let provider_api_format = decision
         .provider_api_format
-        .as_deref()
-        .unwrap_or(context.client_api_format.as_str());
+        .clone()
+        .or_else(|| {
+            input
+                .routing_context
+                .as_ref()
+                .map(|context| context.client_api_format.clone())
+        })
+        .unwrap_or_default();
+    let provider_type = decision.provider_type.clone().unwrap_or_default();
+    let terminal_provider_model = decision
+        .provider_request_body
+        .as_ref()
+        .and_then(|body| body.get("model"))
+        .and_then(Value::as_str)
+        .or(decision.mapped_model.as_deref())
+        .or(decision.model_name.as_deref())
+        .unwrap_or(input.requested_model.as_str());
+    let model_capabilities = transport.and_then(|transport| {
+        crate::ai_serving::codex_model_capabilities_for_transport(
+            transport,
+            provider_api_format.as_str(),
+            terminal_provider_model,
+            input.requested_model.as_str(),
+        )
+    });
+    crate::ai_serving::apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+        &mut decision.provider_request_headers,
+        decision.provider_request_body.as_ref(),
+        provider_type.as_str(),
+        provider_api_format.as_str(),
+        terminal_provider_model,
+        input.requested_model.as_str(),
+        model_capabilities.as_ref(),
+    );
+
+    let Some(context) = input.routing_context.as_ref() else {
+        // Cache identity headers are projected only at the terminal boundary. Any non-empty
+        // session headers already present here are explicit client or header-rule inputs and stay
+        // authoritative.
+        if let Some(provider_request_body) = decision.provider_request_body.as_ref() {
+            crate::ai_serving::apply_codex_openai_responses_identity_headers(
+                &mut decision.provider_request_headers,
+                provider_request_body,
+                provider_type.as_str(),
+                provider_api_format.as_str(),
+            );
+        }
+        apply_codex_fingerprint_convergence_to_decision(
+            input,
+            decision,
+            transport,
+            provider_api_format.as_str(),
+        );
+        return Ok(());
+    };
+    let provider_body_rules = decision
+        .report_context
+        .as_ref()
+        .and_then(|context| context.get("body_rules"))
+        .cloned();
     let resolved_model = decision
         .mapped_model
         .as_deref()
@@ -99,6 +191,21 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision(
         .clone()
         .unwrap_or(serde_json::Value::Null);
     let mut provider_headers = btree_headers_to_header_map(&decision.provider_request_headers)?;
+    let mut protected_codex_header_names = vec![CODEX_ACCOUNT_ID_HEADER, CODEX_FEDRAMP_HEADER];
+    if provider_type.eq_ignore_ascii_case("codex")
+        && crate::ai_serving::is_openai_responses_family_format(provider_api_format.as_str())
+    {
+        protected_codex_header_names.extend([
+            "x-client-request-id",
+            "accept",
+            "content-encoding",
+            CODEX_RESPONSES_LITE_HEADER,
+        ]);
+    }
+    let protected_codex_headers = protected_codex_header_names
+        .into_iter()
+        .map(|name| (name, provider_headers.get(name).cloned()))
+        .collect::<Vec<_>>();
     let provider_headers_json = headers_to_routing_value(&provider_headers);
     let policy = resolve_gateway_routing_policy(GatewayRoutingPolicyInput {
         group_id: context.group_id.as_deref(),
@@ -107,7 +214,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision(
         selection_source: context.selection_source.as_str(),
         requested_model: input.requested_model.as_str(),
         resolved_model,
-        api_format: provider_api_format,
+        api_format: provider_api_format.as_str(),
         user_id: Some(input.auth_context.user_id.as_str()),
         api_key_id: Some(input.auth_context.api_key_id.as_str()),
         headers: &provider_headers_json,
@@ -116,6 +223,20 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision(
     })?;
     ensure_report_context_routing_trace(input, decision, &policy);
     if policy.mutation_plan.is_empty() {
+        if let Some(provider_request_body) = decision.provider_request_body.as_ref() {
+            crate::ai_serving::apply_codex_openai_responses_identity_headers(
+                &mut decision.provider_request_headers,
+                provider_request_body,
+                provider_type.as_str(),
+                provider_api_format.as_str(),
+            );
+        }
+        apply_codex_fingerprint_convergence_to_decision(
+            input,
+            decision,
+            transport,
+            provider_api_format.as_str(),
+        );
         return Ok(());
     }
     if original_provider_request_body.is_none() && !policy.mutation_plan.body_patch.is_empty() {
@@ -129,17 +250,160 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision(
         &mut provider_headers,
         &policy.mutation_plan,
     )?;
+    for (name, value) in protected_codex_headers {
+        provider_headers.remove(name);
+        if let Some(value) = value {
+            provider_headers.insert(HeaderName::from_static(name), value);
+        }
+    }
+    if original_provider_request_body.is_some() {
+        let provider_model = provider_request_body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(decision.mapped_model.as_deref())
+            .or(decision.model_name.as_deref())
+            .unwrap_or(input.requested_model.as_str())
+            .to_string();
+        let model_capabilities = transport.and_then(|transport| {
+            crate::ai_serving::codex_model_capabilities_for_transport(
+                transport,
+                provider_api_format.as_str(),
+                provider_model.as_str(),
+                input.requested_model.as_str(),
+            )
+        });
+        {
+            let finalization = crate::ai_serving::OpenAiProviderRequestFinalization {
+                source_api_format: context.client_api_format.as_str(),
+                provider_api_format: provider_api_format.as_str(),
+                provider_type: provider_type.as_str(),
+                provider_model: provider_model.as_str(),
+                source_model: input.requested_model.as_str(),
+                body_rules: provider_body_rules.as_ref(),
+                upstream_is_stream: decision.upstream_is_stream,
+                require_body_stream_field: original_provider_request_body
+                    .as_ref()
+                    .is_some_and(|body| body.get("stream").is_some()),
+            };
+            let reasoning_replay_policy = transport
+                .map(|transport| {
+                    crate::ai_serving::openai_responses_reasoning_replay_policy(
+                        transport.provider.provider_type.as_str(),
+                        transport.endpoint.base_url.as_str(),
+                        provider_model.as_str(),
+                    )
+                })
+                .unwrap_or_default();
+            if websocket_continuation {
+                crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy_for_websocket_continuation(
+                    &mut provider_request_body,
+                    finalization,
+                    model_capabilities.as_ref(),
+                    reasoning_replay_policy,
+                )
+            } else {
+                crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
+                    &mut provider_request_body,
+                    finalization,
+                    model_capabilities.as_ref(),
+                    reasoning_replay_policy,
+                )
+            }
+        }
+        .map_err(|violation| GatewayError::Client {
+            status: StatusCode::BAD_REQUEST,
+            message: format!("routing provider_request violates provider contract: {violation:?}"),
+        })?;
+    }
+    let provider_model = provider_request_body
+        .get("model")
+        .and_then(Value::as_str)
+        .or(decision.mapped_model.as_deref())
+        .or(decision.model_name.as_deref())
+        .unwrap_or(input.requested_model.as_str());
+    let mut provider_request_headers = header_map_to_btree_headers(&provider_headers);
+    let model_capabilities = transport.and_then(|transport| {
+        crate::ai_serving::codex_model_capabilities_for_transport(
+            transport,
+            provider_api_format.as_str(),
+            provider_model,
+            input.requested_model.as_str(),
+        )
+    });
+    crate::ai_serving::apply_codex_openai_responses_identity_headers(
+        &mut provider_request_headers,
+        &provider_request_body,
+        provider_type.as_str(),
+        provider_api_format.as_str(),
+    );
+    crate::ai_serving::apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+        &mut provider_request_headers,
+        Some(&provider_request_body),
+        provider_type.as_str(),
+        provider_api_format.as_str(),
+        provider_model,
+        input.requested_model.as_str(),
+        model_capabilities.as_ref(),
+    );
+    crate::ai_serving::apply_codex_openai_compact_terminal_headers(
+        &mut provider_request_headers,
+        provider_type.as_str(),
+        provider_api_format.as_str(),
+    );
+    provider_headers = btree_headers_to_header_map(&provider_request_headers)?;
     decision.provider_request_headers = header_map_to_btree_headers(&provider_headers);
     if original_provider_request_body.is_some() {
         decision.provider_request_body = Some(provider_request_body);
     }
+    apply_codex_fingerprint_convergence_to_decision(
+        input,
+        decision,
+        transport,
+        provider_api_format.as_str(),
+    );
     update_report_context_provider_request_mutation(decision, &policy);
     Ok(())
+}
+
+fn apply_codex_fingerprint_convergence_to_decision(
+    input: &LocalRequestedModelDecisionInput,
+    decision: &mut AiExecutionDecision,
+    transport: Option<&GatewayProviderTransportSnapshot>,
+    provider_api_format: &str,
+) {
+    let (Some(transport), Some(provider_request_body)) =
+        (transport, decision.provider_request_body.as_mut())
+    else {
+        return;
+    };
+    let Some(context) = input.codex_fingerprint_context.as_ref() else {
+        return;
+    };
+    let applied = crate::ai_serving::transport::apply_codex_fingerprint_convergence_with_context(
+        transport,
+        provider_api_format,
+        context,
+        &mut decision.provider_request_headers,
+        provider_request_body,
+    );
+    if applied {
+        decision.prompt_cache_key = provider_request_body
+            .get("prompt_cache_key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+    }
 }
 
 struct GatewayAuthenticatedDecisionInputPort<'a> {
     state: PlannerAppState<'a>,
     now_unix_secs: u64,
+    auth_snapshot_override: Option<GatewayAuthApiKeySnapshot>,
+    model_directive_policy: &'a crate::system_features::ModelDirectivePolicySnapshot,
+    model_directive_base_model: Option<String>,
 }
 
 #[async_trait]
@@ -154,6 +418,17 @@ impl AiAuthenticatedDecisionInputPort for GatewayAuthenticatedDecisionInputPort<
         &self,
         auth_context: &Self::AuthContext,
     ) -> Result<Option<Self::AuthSnapshot>, Self::Error> {
+        if let Some(snapshot) = self.auth_snapshot_override.as_ref() {
+            if snapshot.user_id != auth_context.user_id
+                || snapshot.api_key_id != auth_context.api_key_id
+            {
+                return Err(GatewayError::Internal(
+                    "WebSocket auth snapshot identity does not match its control decision"
+                        .to_string(),
+                ));
+            }
+            return Ok(Some(snapshot.clone()));
+        }
         self.state
             .read_auth_api_key_snapshot(
                 &auth_context.user_id,
@@ -176,6 +451,7 @@ impl AiAuthenticatedDecisionInputPort for GatewayAuthenticatedDecisionInputPort<
                 &auth_context.api_key_id,
                 requested_model,
                 explicit_required_capabilities,
+                self.model_directive_base_model.as_deref(),
             )
             .await)
     }
@@ -190,6 +466,7 @@ impl AiAuthenticatedDecisionInputPort for GatewayAuthenticatedDecisionInputPort<
             auth_context,
             auth_snapshot,
             required_capabilities,
+            model_directive_policy: self.model_directive_policy.clone(),
         }
     }
 }
@@ -204,10 +481,14 @@ pub(crate) fn build_local_requested_model_decision_input(
         auth_snapshot: resolved_input.auth_snapshot,
         required_capabilities: resolved_input.required_capabilities,
         request_auth_channel: None,
+        client_surface: None,
+        gateway_credential_carrier: None,
         client_session_affinity: None,
+        codex_fingerprint_context: None,
         routing_policy: None,
         routing_trace_seed: None,
         routing_context: None,
+        model_directive_policy: resolved_input.model_directive_policy,
     }
 }
 
@@ -218,34 +499,113 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
     body_json: &Value,
     client_api_format: &str,
 ) -> Result<(), GatewayError> {
+    input.codex_fingerprint_context =
+        Some(crate::ai_serving::codex_context::resolve_codex_fingerprint_context(parts, body_json));
     let explicit_group = routing_header_value_str(&parts.headers, ROUTING_GROUP_HEADER);
     let selected_group = match state.routing_group_read_repository() {
         Some(repository) => {
-            let user_group_ids = match state
-                .list_user_groups_for_user(&input.auth_context.user_id)
-                .await
-            {
-                Ok(groups) => groups.into_iter().map(|group| group.id).collect::<Vec<_>>(),
-                Err(error) => {
-                    warn!(
-                        user_id = %input.auth_context.user_id,
-                        error = ?error,
-                        "gateway routing profile user group lookup failed"
-                    );
-                    Vec::new()
-                }
+            // Explicit non-default groups are authorized against principal
+            // bindings, so both selection and its cache key must retain the
+            // caller context. Only the implicit no-binding system-default
+            // path is global and can skip the membership lookup.
+            let principal_context_required = if explicit_group.is_some() {
+                true
+            } else {
+                repository
+                    .has_any_routing_group_binding()
+                    .await
+                    .map_err(|error| {
+                        routing_selection_error(GatewayRoutingSelectionError::Repository(
+                            error.to_string(),
+                        ))
+                    })?
             };
-            let selection = select_gateway_routing_group(
-                repository.as_ref(),
-                GatewayRoutingSelectionInput {
-                    explicit_group: explicit_group.as_deref(),
-                    user_id: Some(input.auth_context.user_id.as_str()),
-                    api_key_id: Some(input.auth_context.api_key_id.as_str()),
-                    user_group_ids: &user_group_ids,
-                },
-            )
-            .await
-            .map_err(routing_selection_error)?;
+            let user_group_ids = if principal_context_required {
+                let user_groups_lookup_started_at = std::time::Instant::now();
+                let user_groups = state
+                    .list_user_groups_for_user(&input.auth_context.user_id)
+                    .await;
+                observe_gateway_stage_ms(
+                    "routing_user_groups_lookup",
+                    user_groups_lookup_started_at.elapsed().as_millis() as u64,
+                );
+                user_groups?
+                    .into_iter()
+                    .map(|group| group.id)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let selection_user_id =
+                principal_context_required.then(|| input.auth_context.user_id.clone());
+            let selection_api_key_id =
+                principal_context_required.then(|| input.auth_context.api_key_id.clone());
+            let selection_cache_key = routing_group_selection_cache_key(
+                explicit_group.as_deref(),
+                selection_user_id.as_deref(),
+                selection_api_key_id.as_deref(),
+                &user_group_ids,
+            );
+            let group_selection_started_at = std::time::Instant::now();
+            let selection = state
+                .routing_group_selection_cache
+                .get_or_load_once_stale_while_revalidating(
+                    selection_cache_key,
+                    ROUTING_GROUP_SELECTION_CACHE_TTL,
+                    ROUTING_GROUP_SELECTION_CACHE_STALE_TTL,
+                    || async {
+                        let selection_load_started_at = std::time::Instant::now();
+                        let selection = select_gateway_routing_group(
+                            repository.as_ref(),
+                            GatewayRoutingSelectionInput {
+                                explicit_group: explicit_group.as_deref(),
+                                user_id: selection_user_id.as_deref(),
+                                api_key_id: selection_api_key_id.as_deref(),
+                                user_group_ids: &user_group_ids,
+                            },
+                        )
+                        .await
+                        .map_err(routing_selection_error)?;
+                        observe_gateway_stage_ms(
+                            "routing_group_selection_load",
+                            selection_load_started_at.elapsed().as_millis() as u64,
+                        );
+                        Ok::<_, GatewayError>(Some(selection))
+                    },
+                    || {
+                        let repository = repository.clone();
+                        let explicit_group = explicit_group.clone();
+                        let user_id = selection_user_id.clone();
+                        let api_key_id = selection_api_key_id.clone();
+                        let user_group_ids = user_group_ids.clone();
+                        async move {
+                            let selection_load_started_at = std::time::Instant::now();
+                            let selection = select_gateway_routing_group(
+                                repository.as_ref(),
+                                GatewayRoutingSelectionInput {
+                                    explicit_group: explicit_group.as_deref(),
+                                    user_id: user_id.as_deref(),
+                                    api_key_id: api_key_id.as_deref(),
+                                    user_group_ids: &user_group_ids,
+                                },
+                            )
+                            .await
+                            .map_err(routing_selection_error)?;
+                            observe_gateway_stage_ms(
+                                "routing_group_selection_load",
+                                selection_load_started_at.elapsed().as_millis() as u64,
+                            );
+                            Ok::<_, GatewayError>(Some(selection))
+                        }
+                    },
+                    CacheLoadObserver::default(),
+                )
+                .await?
+                .unwrap_or_default();
+            observe_gateway_stage_ms(
+                "routing_group_selection",
+                group_selection_started_at.elapsed().as_millis() as u64,
+            );
             selection.group.map(|group| {
                 (
                     Some(group.id),
@@ -271,15 +631,32 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
 
     let Some((group_id, group_version, group_config_json, selection_source)) = selected_group
     else {
-        input.client_session_affinity =
-            client_session_affinity_from_request(&parts.headers, Some(body_json));
+        input.client_session_affinity = client_session_affinity_from_api_request(
+            client_api_format,
+            &parts.headers,
+            Some(body_json),
+        );
         input.routing_policy = None;
         input.routing_trace_seed = None;
         input.routing_context = None;
         return Ok(());
     };
 
+    if try_attach_static_default_routing_policy_to_input(
+        input,
+        parts,
+        body_json,
+        client_api_format,
+        group_id.as_deref(),
+        group_version,
+        &group_config_json,
+        selection_source.as_str(),
+    )? {
+        return Ok(());
+    }
+
     let headers_json = headers_to_routing_value(&parts.headers);
+    let policy_resolve_started_at = std::time::Instant::now();
     let policy = resolve_gateway_routing_policy(GatewayRoutingPolicyInput {
         group_id: group_id.as_deref(),
         group_version,
@@ -294,13 +671,22 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
         body: body_json,
         phase: RoutingRulePhase::ClientRequest,
     })?;
+    observe_gateway_stage_ms(
+        "routing_policy_resolve",
+        policy_resolve_started_at.elapsed().as_millis() as u64,
+    );
     let mut effective_body_json = body_json.clone();
     let mut effective_headers = parts.headers.clone();
+    let mutation_apply_started_at = std::time::Instant::now();
     apply_routing_mutation_plan(
         &mut effective_body_json,
         &mut effective_headers,
         &policy.mutation_plan,
     )?;
+    observe_gateway_stage_ms(
+        "routing_mutation_apply",
+        mutation_apply_started_at.elapsed().as_millis() as u64,
+    );
 
     let mut requested_model_changed = false;
     if let Some(mut mutated_model) = extract_standard_requested_model(&effective_body_json) {
@@ -311,19 +697,27 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
         }
     }
     if requested_model_changed {
+        let model_directive_resolution = input
+            .model_directive_policy
+            .resolve_reasoning(client_api_format, Some(input.requested_model.as_str()));
         input.required_capabilities = PlannerAppState::new(state)
             .resolve_request_candidate_required_capabilities(
                 &input.auth_context.user_id,
                 &input.auth_context.api_key_id,
                 Some(input.requested_model.as_str()),
                 input.required_capabilities.as_ref(),
+                model_directive_resolution.base_model(),
             )
             .await;
     }
 
     let effective_headers_json = headers_to_routing_value(&effective_headers);
-    input.client_session_affinity =
-        client_session_affinity_from_request(&effective_headers, Some(&effective_body_json));
+    input.client_session_affinity = client_session_affinity_from_api_request(
+        client_api_format,
+        &effective_headers,
+        Some(&effective_body_json),
+    );
+    let final_policy_resolve_started_at = std::time::Instant::now();
     let mut final_policy = resolve_gateway_routing_policy(GatewayRoutingPolicyInput {
         group_id: group_id.as_deref(),
         group_version,
@@ -338,6 +732,10 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
         body: &effective_body_json,
         phase: RoutingRulePhase::ClientRequest,
     })?;
+    observe_gateway_stage_ms(
+        "routing_policy_resolve",
+        final_policy_resolve_started_at.elapsed().as_millis() as u64,
+    );
     final_policy.mutation_plan = policy.mutation_plan.clone();
     input.routing_trace_seed = Some(build_routing_trace_seed(&final_policy, client_api_format));
     input.routing_policy = Some(final_policy);
@@ -351,6 +749,49 @@ pub(crate) async fn attach_routing_policy_to_local_requested_model_input(
         effective_headers,
     });
     Ok(())
+}
+
+fn try_attach_static_default_routing_policy_to_input(
+    input: &mut LocalRequestedModelDecisionInput,
+    parts: &http::request::Parts,
+    body_json: &Value,
+    client_api_format: &str,
+    group_id: Option<&str>,
+    group_version: Option<i64>,
+    group_config_json: &Value,
+    selection_source: &str,
+) -> Result<bool, GatewayError> {
+    let static_policy_resolve_started_at = std::time::Instant::now();
+    let Some(policy) =
+        resolve_gateway_static_default_routing_policy(GatewayStaticRoutingPolicyInput {
+            group_id,
+            group_version,
+            group_config_json,
+            selection_source,
+            requested_model: input.requested_model.as_str(),
+            resolved_model: input.requested_model.as_str(),
+        })?
+    else {
+        observe_gateway_stage_ms(
+            "routing_static_policy_resolve",
+            static_policy_resolve_started_at.elapsed().as_millis() as u64,
+        );
+        return Ok(false);
+    };
+    observe_gateway_stage_ms(
+        "routing_static_policy_resolve",
+        static_policy_resolve_started_at.elapsed().as_millis() as u64,
+    );
+
+    input.client_session_affinity = client_session_affinity_from_api_request(
+        client_api_format,
+        &parts.headers,
+        Some(body_json),
+    );
+    input.routing_trace_seed = Some(build_routing_trace_seed(&policy, client_api_format));
+    input.routing_policy = Some(policy);
+    input.routing_context = None;
+    Ok(true)
 }
 
 pub(crate) fn build_local_authenticated_decision_input(
@@ -368,11 +809,44 @@ pub(crate) async fn resolve_local_authenticated_decision_input(
     state: &AppState,
     auth_context: ExecutionRuntimeAuthContext,
     requested_model: Option<&str>,
+    requested_model_api_format: Option<&str>,
     explicit_required_capabilities: Option<&serde_json::Value>,
+    model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
 ) -> Result<Option<ResolvedLocalDecisionAuthInput>, GatewayError> {
+    resolve_local_authenticated_decision_input_with_snapshot(
+        state,
+        auth_context,
+        None,
+        requested_model,
+        requested_model_api_format,
+        explicit_required_capabilities,
+        model_directive_policy,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_local_authenticated_decision_input_with_snapshot(
+    state: &AppState,
+    auth_context: ExecutionRuntimeAuthContext,
+    auth_snapshot_override: Option<GatewayAuthApiKeySnapshot>,
+    requested_model: Option<&str>,
+    requested_model_api_format: Option<&str>,
+    explicit_required_capabilities: Option<&serde_json::Value>,
+    model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
+) -> Result<Option<ResolvedLocalDecisionAuthInput>, GatewayError> {
+    let model_directive_base_model = match (requested_model, requested_model_api_format) {
+        (Some(model), Some(api_format)) => model_directive_policy
+            .resolve_reasoning(api_format, Some(model))
+            .base_model()
+            .map(str::to_owned),
+        _ => None,
+    };
     let port = GatewayAuthenticatedDecisionInputPort {
         state: PlannerAppState::new(state),
         now_unix_secs: current_unix_secs(),
+        auth_snapshot_override,
+        model_directive_policy,
+        model_directive_base_model,
     };
 
     run_ai_authenticated_decision_input(
@@ -385,9 +859,14 @@ pub(crate) async fn resolve_local_authenticated_decision_input(
 }
 
 fn routing_selection_error(error: GatewayRoutingSelectionError) -> GatewayError {
-    GatewayError::Client {
-        status: StatusCode::FORBIDDEN,
-        message: error.to_string(),
+    match error {
+        GatewayRoutingSelectionError::Repository(message) => {
+            GatewayError::Internal(format!("routing group repository lookup failed: {message}"))
+        }
+        error => GatewayError::Client {
+            status: StatusCode::FORBIDDEN,
+            message: error.to_string(),
+        },
     }
 }
 
@@ -408,6 +887,33 @@ fn routing_header_value_str(headers: &http::HeaderMap, key: &str) -> Option<Stri
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn routing_group_selection_cache_key(
+    explicit_group: Option<&str>,
+    user_id: Option<&str>,
+    api_key_id: Option<&str>,
+    user_group_ids: &[String],
+) -> String {
+    let groups = user_group_ids
+        .iter()
+        .map(|value| escape_cache_key_part(value))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "v1|explicit={}|user={}|api_key={}|groups={}",
+        escape_cache_key_part(explicit_group.unwrap_or_default()),
+        escape_cache_key_part(user_id.unwrap_or_default()),
+        escape_cache_key_part(api_key_id.unwrap_or_default()),
+        groups
+    )
+}
+
+fn escape_cache_key_part(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('|', "%7C")
+        .replace(',', "%2C")
 }
 
 fn btree_headers_to_header_map(
@@ -567,6 +1073,7 @@ fn ensure_report_context_routing_trace(
                 endpoint_id: decision.endpoint_id.clone().unwrap_or_default(),
                 model_id,
                 key_id,
+                api_format: decision.provider_api_format.clone(),
                 provider_priority,
                 key_priority,
             },
@@ -595,7 +1102,179 @@ fn ensure_report_context_routing_trace(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use aether_data::repository::routing_profiles::InMemoryRoutingGroupRepository;
+    use aether_data_contracts::repository::routing_profiles::{
+        CreateRoutingGroupBindingRecord, CreateRoutingGroupRecord, RoutingGroupBindingSubject,
+        RoutingGroupWriteRepository,
+    };
+    use aether_provider_transport::snapshot::{
+        GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
+        GatewayProviderTransportProvider,
+    };
+
+    #[test]
+    fn explicit_routing_selection_cache_key_is_principal_specific() {
+        let first = routing_group_selection_cache_key(
+            Some("private"),
+            Some("user-1"),
+            Some("key-1"),
+            &["team-1".to_string()],
+        );
+        let second = routing_group_selection_cache_key(
+            Some("private"),
+            Some("user-2"),
+            Some("key-2"),
+            &["team-2".to_string()],
+        );
+
+        assert_ne!(first, second);
+        assert!(first.contains("user=user-1"));
+        assert!(first.contains("api_key=key-1"));
+        assert!(first.contains("groups=team-1"));
+    }
+
+    #[test]
+    fn routing_repository_failure_maps_to_internal_gateway_error() {
+        let error = routing_selection_error(GatewayRoutingSelectionError::Repository(
+            "sql error: database unavailable".to_string(),
+        ));
+
+        match error {
+            GatewayError::Internal(message) => {
+                assert!(message.contains("routing group repository lookup failed"));
+                assert!(message.contains("database unavailable"));
+            }
+            other => panic!("unexpected routing repository error mapping: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_auth_snapshot_override_does_not_fall_back_to_the_planner_cache() {
+        // AppState::new has no auth snapshot repository. Without the explicit
+        // override this resolver returns None; a WebSocket strong snapshot must
+        // therefore be the exact value used to build the planner input.
+        let state = AppState::new().expect("test state should build");
+        let mut strong_snapshot = sample_auth_snapshot();
+        strong_snapshot.api_key_allowed_models = Some(vec!["gpt-live-only".to_string()]);
+
+        let resolved = resolve_local_authenticated_decision_input_with_snapshot(
+            &state,
+            sample_auth_context(),
+            Some(strong_snapshot.clone()),
+            Some("gpt-live-only"),
+            Some("openai:responses"),
+            None,
+            &Default::default(),
+        )
+        .await
+        .expect("snapshot override should resolve")
+        .expect("the explicit snapshot should replace the missing cached value");
+
+        assert_eq!(resolved.auth_snapshot, strong_snapshot);
+    }
+
+    #[tokio::test]
+    async fn explicit_auth_snapshot_override_rejects_an_identity_mismatch() {
+        let state = AppState::new().expect("test state should build");
+        let mut wrong_snapshot = sample_auth_snapshot();
+        wrong_snapshot.api_key_id = "another-key".to_string();
+
+        let error = resolve_local_authenticated_decision_input_with_snapshot(
+            &state,
+            sample_auth_context(),
+            Some(wrong_snapshot),
+            Some("gpt-live-only"),
+            Some("openai:responses"),
+            None,
+            &Default::default(),
+        )
+        .await
+        .expect_err("a snapshot for another API key must never be injected");
+
+        assert!(matches!(error, GatewayError::Internal(message) if message.contains("identity")));
+    }
+
+    #[tokio::test]
+    async fn explicit_routing_attachment_authorizes_and_caches_per_principal() {
+        let repository = Arc::new(InMemoryRoutingGroupRepository::default());
+        repository
+            .create_routing_group(CreateRoutingGroupRecord {
+                id: "private-group".to_string(),
+                name: "private".to_string(),
+                description: None,
+                enabled: true,
+                is_system_default: false,
+                config_json: json!({}),
+                version: 1,
+                created_at: 1,
+                updated_at: 1,
+                published_at: None,
+            })
+            .await
+            .unwrap();
+        repository
+            .create_routing_group_binding(CreateRoutingGroupBindingRecord {
+                id: "binding-user-1".to_string(),
+                group_id: "private-group".to_string(),
+                subject_type: RoutingGroupBindingSubject::User,
+                subject_id: "user-1".to_string(),
+                is_default: false,
+                allow_explicit_select: true,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+        let state = AppState::new().unwrap().with_data_state_for_tests(
+            crate::data::GatewayDataState::disabled()
+                .with_routing_group_repository_for_tests(repository),
+        );
+        let (parts, _) = http::Request::builder()
+            .header(ROUTING_GROUP_HEADER, "private-group")
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        let mut allowed = sample_decision_input();
+        attach_routing_policy_to_local_requested_model_input(
+            &state,
+            &parts,
+            &mut allowed,
+            &json!({"model": "gpt-5"}),
+            "openai:chat",
+        )
+        .await
+        .expect("bound principal should explicitly select the private group");
+        let policy = allowed
+            .routing_policy
+            .as_ref()
+            .expect("explicit selection should attach routing policy");
+        assert_eq!(policy.group_id.as_deref(), Some("private-group"));
+        assert_eq!(policy.selection_source, "explicit_header");
+
+        let mut denied = sample_decision_input();
+        denied.auth_context.user_id = "user-2".to_string();
+        denied.auth_context.api_key_id = "api-key-2".to_string();
+        let error = attach_routing_policy_to_local_requested_model_input(
+            &state,
+            &parts,
+            &mut denied,
+            &json!({"model": "gpt-5"}),
+            "openai:chat",
+        )
+        .await
+        .expect_err("another principal must not reuse the authorized cache entry");
+        match error {
+            GatewayError::Client { status, message } => {
+                assert_eq!(status, StatusCode::FORBIDDEN);
+                assert!(message.contains("not allowed for this principal"));
+            }
+            other => panic!("unexpected explicit selection error: {other:?}"),
+        }
+    }
 
     fn sample_auth_context() -> ExecutionRuntimeAuthContext {
         ExecutionRuntimeAuthContext {
@@ -645,9 +1324,13 @@ mod tests {
             auth_snapshot: sample_auth_snapshot(),
             required_capabilities: None,
             request_auth_channel: None,
+            client_surface: None,
+            gateway_credential_carrier: None,
             client_session_affinity: None,
+            codex_fingerprint_context: None,
             routing_policy: None,
             routing_trace_seed: None,
+            model_directive_policy: Default::default(),
             routing_context: Some(LocalRoutingRequestContext {
                 group_id: Some("group-1".to_string()),
                 group_version: Some(3),
@@ -696,6 +1379,7 @@ mod tests {
             request_id: Some("trace-1".to_string()),
             candidate_id: Some("candidate-1".to_string()),
             provider_name: Some("provider".to_string()),
+            provider_type: Some("openai".to_string()),
             provider_id: Some("provider-1".to_string()),
             endpoint_id: Some("endpoint-1".to_string()),
             key_id: Some("key-1".to_string()),
@@ -735,9 +1419,131 @@ mod tests {
         }
     }
 
-    fn set_provider_request_rules(input: &mut LocalRequestedModelDecisionInput, actions: Value) {
+    fn sample_codex_transport_with_card() -> GatewayProviderTransportSnapshot {
+        let card = json!({
+            "id": "gpt-future-agent",
+            "slug": "gpt-future-agent",
+            "use_responses_lite": true,
+            "supports_reasoning_summary_parameter": true,
+            "default_reasoning_level": "low",
+            "default_reasoning_summary": "none",
+            "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}]
+        });
+        GatewayProviderTransportSnapshot {
+            provider: GatewayProviderTransportProvider {
+                id: "provider-codex".to_string(),
+                name: "Codex".to_string(),
+                provider_type: "codex".to_string(),
+                website: None,
+                is_active: true,
+                keep_priority_on_conversion: false,
+                enable_format_conversion: true,
+                concurrent_limit: None,
+                max_retries: None,
+                proxy: None,
+                request_timeout_secs: None,
+                stream_first_byte_timeout_secs: None,
+                config: None,
+            },
+            endpoint: GatewayProviderTransportEndpoint {
+                id: "endpoint-codex".to_string(),
+                provider_id: "provider-codex".to_string(),
+                api_format: "openai:responses:compact".to_string(),
+                api_family: Some("openai".to_string()),
+                endpoint_kind: Some("compact".to_string()),
+                is_active: true,
+                base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+                header_rules: None,
+                body_rules: None,
+                max_retries: None,
+                custom_path: None,
+                config: None,
+                format_acceptance_config: None,
+                proxy: None,
+            },
+            key: GatewayProviderTransportKey {
+                id: "key-codex".to_string(),
+                provider_id: "provider-codex".to_string(),
+                name: "Codex key".to_string(),
+                auth_type: "oauth".to_string(),
+                is_active: true,
+                api_formats: Some(vec!["openai:responses:compact".to_string()]),
+                auth_type_by_format: None,
+                allow_auth_channel_mismatch_formats: None,
+                allowed_models: Some(vec!["gpt-future-agent".to_string()]),
+                capabilities: None,
+                rate_multipliers: None,
+                global_priority_by_format: None,
+                expires_at_unix_secs: None,
+                proxy: None,
+                fingerprint: None,
+                upstream_metadata: Some(crate::ai_serving::build_codex_model_catalog_metadata(&[
+                    card,
+                ])),
+                decrypted_api_key: "access-token".to_string(),
+                decrypted_auth_config: None,
+            },
+        }
+    }
+
+    fn sample_codex_fingerprint_transport() -> GatewayProviderTransportSnapshot {
+        let mut transport = sample_codex_transport_with_card();
+        transport.provider.config = Some(json!({
+            "codex": {"fingerprint_convergence_enabled": true}
+        }));
+        transport.endpoint.api_format = "openai:responses".to_string();
+        transport.endpoint.endpoint_kind = Some("responses".to_string());
+        transport.key.api_formats = Some(vec!["openai:responses".to_string()]);
+        transport.key.decrypted_auth_config =
+            Some(json!({"account_id": "account-codex-1"}).to_string());
+        transport
+    }
+
+    fn sample_codex_fingerprint_decision() -> AiExecutionDecision {
+        let prompt_cache_key = "172c39e6-c0a0-5a70-8b63-e0f8e0d185a3";
+        let mut decision = sample_decision();
+        decision.provider_type = Some("codex".to_string());
+        decision.provider_api_format = Some("openai:responses".to_string());
+        decision.client_api_format = Some("openai:responses".to_string());
+        decision.provider_request_headers.extend([
+            ("session-id".to_string(), "spoofed-session".to_string()),
+            ("thread-id".to_string(), "spoofed-thread".to_string()),
+            (
+                "x-codex-turn-metadata".to_string(),
+                json!({
+                    "installation_id": "spoofed-installation",
+                    "session_id": "spoofed-session",
+                    "thread_source": "cli"
+                })
+                .to_string(),
+            ),
+        ]);
+        decision.provider_request_body = Some(json!({
+            "model": "gpt-5",
+            "input": [],
+            "metadata": {},
+            "prompt_cache_key": prompt_cache_key,
+            "client_metadata": {
+                "session_id": "spoofed-session",
+                "thread_id": "spoofed-thread",
+                "caller": "sdk",
+                "x-codex-turn-metadata": json!({
+                    "installation_id": "spoofed-installation",
+                    "session_id": "spoofed-session",
+                    "sandbox": "workspace-write"
+                }).to_string()
+            }
+        }));
+        decision
+    }
+
+    fn set_provider_request_rules(
+        input: &mut LocalRequestedModelDecisionInput,
+        allowed_models: &[&str],
+        actions: Value,
+    ) {
         let config = json!({
-            "allowed_models": ["gpt-5"],
+            "allowed_models": allowed_models,
             "rules": [{
                 "id": "provider-patch",
                 "priority": 1,
@@ -755,11 +1561,132 @@ mod tests {
     }
 
     #[test]
+    fn static_default_routing_policy_attaches_without_request_context() {
+        let request = http::Request::builder()
+            .header("content-type", "application/json")
+            .body(())
+            .expect("request should build");
+        let (parts, _) = request.into_parts();
+        let mut input = LocalRequestedModelDecisionInput {
+            auth_context: sample_auth_context(),
+            requested_model: "mock-model".to_string(),
+            auth_snapshot: sample_auth_snapshot(),
+            required_capabilities: None,
+            request_auth_channel: None,
+            client_surface: None,
+            gateway_credential_carrier: None,
+            client_session_affinity: None,
+            codex_fingerprint_context: None,
+            routing_policy: None,
+            routing_trace_seed: None,
+            model_directive_policy: Default::default(),
+            routing_context: Some(LocalRoutingRequestContext {
+                group_id: Some("stale".to_string()),
+                group_version: Some(1),
+                group_config_json: json!({}),
+                selection_source: "stale".to_string(),
+                client_api_format: "openai:chat".to_string(),
+                effective_body_json: json!({}),
+                effective_headers: HeaderMap::new(),
+            }),
+        };
+        let group_config_json = json!({
+            "default_policy": {
+                "priority_mode": "global_key",
+                "scheduling_mode": "load_balance",
+                "keep_priority_on_conversion": true
+            },
+            "allowed_models": [],
+            "model_policies": [],
+            "rules": []
+        });
+
+        let attached = try_attach_static_default_routing_policy_to_input(
+            &mut input,
+            &parts,
+            &json!({"model": "mock-model"}),
+            "openai:chat",
+            Some("group-1"),
+            Some(4),
+            &group_config_json,
+            "system_default",
+        )
+        .expect("static routing should attach");
+
+        assert!(attached);
+        assert!(input.routing_context.is_none());
+        let policy = input.routing_policy.as_ref().expect("policy should be set");
+        assert_eq!(policy.group_id.as_deref(), Some("group-1"));
+        assert_eq!(policy.group_version, Some(4));
+        assert_eq!(
+            policy.priority_mode,
+            aether_routing_core::RoutingSetPriorityMode::GlobalKey
+        );
+        assert_eq!(
+            policy.scheduling_mode,
+            aether_routing_core::RoutingSchedulingMode::LoadBalance
+        );
+        assert!(policy.keep_priority_on_conversion);
+        assert!(policy.mutation_plan.is_empty());
+        assert!(input.routing_trace_seed.is_some());
+    }
+
+    #[test]
+    fn dynamic_routing_policy_does_not_attach_static_fast_path() {
+        let request = http::Request::builder()
+            .body(())
+            .expect("request should build");
+        let (parts, _) = request.into_parts();
+        let mut input = LocalRequestedModelDecisionInput {
+            auth_context: sample_auth_context(),
+            requested_model: "mock-model".to_string(),
+            auth_snapshot: sample_auth_snapshot(),
+            required_capabilities: None,
+            request_auth_channel: None,
+            client_surface: None,
+            gateway_credential_carrier: None,
+            client_session_affinity: None,
+            codex_fingerprint_context: None,
+            routing_policy: None,
+            routing_trace_seed: None,
+            routing_context: None,
+            model_directive_policy: Default::default(),
+        };
+        let group_config_json = json!({
+            "rules": [{
+                "id": "rule-1",
+                "conditions": {},
+                "actions": [{
+                    "type": "restrict_providers",
+                    "provider_ids": ["provider-1"]
+                }]
+            }]
+        });
+
+        let attached = try_attach_static_default_routing_policy_to_input(
+            &mut input,
+            &parts,
+            &json!({"model": "mock-model"}),
+            "openai:chat",
+            Some("group-1"),
+            Some(4),
+            &group_config_json,
+            "system_default",
+        )
+        .expect("dynamic config should not fail static detection");
+
+        assert!(!attached);
+        assert!(input.routing_policy.is_none());
+        assert!(input.routing_trace_seed.is_none());
+        assert!(input.routing_context.is_none());
+    }
+
+    #[test]
     fn provider_request_routing_policy_mutates_decision_body_headers_and_report_context() {
         let input = sample_decision_input();
         let mut decision = sample_decision();
 
-        apply_provider_request_routing_policy_to_decision(&input, &mut decision)
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
             .expect("provider routing mutation should apply");
 
         assert_eq!(
@@ -789,13 +1716,469 @@ mod tests {
     }
 
     #[test]
+    fn codex_fingerprint_convergence_runs_at_every_provider_routing_success_exit() {
+        let transport = sample_codex_fingerprint_transport();
+        let mut no_context = sample_decision_input();
+        no_context.routing_context = None;
+        let mut empty_mutation = sample_decision_input();
+        empty_mutation
+            .routing_context
+            .as_mut()
+            .expect("routing context")
+            .group_config_json = json!({
+            "allowed_models": ["gpt-5"],
+            "rules": []
+        });
+        let mut with_mutation = sample_decision_input();
+        for input in [&mut no_context, &mut empty_mutation, &mut with_mutation] {
+            input.codex_fingerprint_context = Some(
+                CodexFingerprintConvergenceContext::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    1_756_668_000_000,
+                )
+                .with_original_client_session_id("client-session-1".to_string()),
+            );
+        }
+
+        let mut stable_identity = None;
+        let mut turn_ids = std::collections::BTreeSet::new();
+        for (exit_name, input) in [
+            ("no_context", no_context),
+            ("empty_mutation", empty_mutation),
+            ("with_mutation", with_mutation),
+        ] {
+            let mut decision = sample_codex_fingerprint_decision();
+
+            apply_provider_request_routing_policy_to_decision(
+                &input,
+                &mut decision,
+                Some(&transport),
+            )
+            .unwrap_or_else(|error| panic!("{exit_name} should converge: {error:?}"));
+
+            let session_id = decision.provider_request_headers["session-id"].clone();
+            let thread_id = decision.provider_request_headers["thread-id"].clone();
+            let installation_id =
+                decision.provider_request_headers["x-codex-installation-id"].clone();
+            let window_id = decision.provider_request_headers["x-codex-window-id"].clone();
+            assert_eq!(decision.provider_request_headers["session_id"], session_id);
+            assert_eq!(
+                decision.provider_request_headers["x-client-request-id"],
+                thread_id
+            );
+            assert_eq!(window_id, format!("{thread_id}:0"));
+            assert_eq!(
+                uuid::Uuid::parse_str(&session_id)
+                    .expect("session UUID")
+                    .get_version_num(),
+                4
+            );
+            assert_eq!(
+                uuid::Uuid::parse_str(&thread_id)
+                    .expect("thread UUID")
+                    .get_version_num(),
+                4
+            );
+
+            let body = decision
+                .provider_request_body
+                .as_ref()
+                .expect("request body");
+            assert_eq!(
+                decision.prompt_cache_key.as_deref(),
+                body.get("prompt_cache_key").and_then(Value::as_str)
+            );
+            assert_eq!(
+                body["prompt_cache_key"],
+                "172c39e6-c0a0-5a70-8b63-e0f8e0d185a3"
+            );
+            assert_eq!(body["client_metadata"]["session_id"], session_id);
+            assert_eq!(body["client_metadata"]["thread_id"], thread_id);
+            assert_eq!(body["client_metadata"]["caller"], "sdk");
+            assert_eq!(
+                body["client_metadata"]["x-codex-installation-id"],
+                installation_id
+            );
+            assert_eq!(body["client_metadata"]["x-codex-window-id"], window_id);
+
+            let header_metadata: Value =
+                serde_json::from_str(&decision.provider_request_headers["x-codex-turn-metadata"])
+                    .expect("header turn metadata");
+            let body_metadata: Value = serde_json::from_str(
+                body["client_metadata"]["x-codex-turn-metadata"]
+                    .as_str()
+                    .expect("embedded turn metadata"),
+            )
+            .expect("embedded turn metadata JSON");
+            assert_eq!(header_metadata["thread_source"], "cli");
+            assert_eq!(body_metadata["sandbox"], "workspace-write");
+            assert_eq!(
+                header_metadata["turn_id"],
+                body["client_metadata"]["turn_id"]
+            );
+            assert_eq!(body_metadata["turn_id"], body["client_metadata"]["turn_id"]);
+            assert_eq!(
+                header_metadata["turn_started_at_unix_ms"],
+                body_metadata["turn_started_at_unix_ms"]
+            );
+            let turn_id = body["client_metadata"]["turn_id"]
+                .as_str()
+                .expect("turn ID")
+                .to_string();
+            assert_eq!(
+                uuid::Uuid::parse_str(&turn_id)
+                    .expect("turn UUID")
+                    .get_version_num(),
+                7
+            );
+            turn_ids.insert(turn_id);
+
+            let identity = (installation_id, session_id, thread_id);
+            if let Some(expected) = stable_identity.as_ref() {
+                assert_eq!(&identity, expected, "identity changed at {exit_name}");
+            } else {
+                stable_identity = Some(identity);
+            }
+        }
+        assert_eq!(turn_ids.len(), 3, "each request needs a fresh turn ID");
+    }
+
+    #[test]
+    fn provider_request_routing_policy_cannot_restore_credentials_or_aether_internal_headers() {
+        for header_name in [
+            "authorization",
+            "proxy-authorization",
+            "api-key",
+            "x-api-key",
+            "x-goog-api-key",
+            "cookie",
+            "cookie2",
+            "set-cookie",
+            "x-aether-auth-user-id",
+            "x-aether-control-future",
+        ] {
+            let mut input = sample_decision_input();
+            set_provider_request_rules(
+                &mut input,
+                &["gpt-5"],
+                json!([{
+                    "type": "patch_headers",
+                    "patch": [{
+                        "op": "set",
+                        "name": header_name,
+                        "value": "must-not-reach-upstream"
+                    }]
+                }]),
+            );
+            let mut decision = sample_decision();
+
+            let error =
+                apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
+                    .expect_err("reserved provider header mutation should fail closed");
+
+            assert!(
+                matches!(
+                    &error,
+                    GatewayError::Client {
+                        status: StatusCode::BAD_REQUEST,
+                        ..
+                    }
+                ),
+                "unexpected error for {header_name}: {error:?}"
+            );
+            assert!(
+                !decision
+                    .provider_request_headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case(header_name)),
+                "reserved header reached the provider decision: {header_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_prompt_cache_identity_headers_are_terminal_after_routing_mutations() {
+        let mut input = sample_decision_input();
+        input
+            .routing_context
+            .as_mut()
+            .expect("routing context")
+            .client_api_format = "openai:responses".to_string();
+        set_provider_request_rules(
+            &mut input,
+            &["gpt-5"],
+            json!([{
+                "type": "patch_headers",
+                "patch": [
+                    {"op": "remove", "name": "session-id"},
+                    {"op": "remove", "name": "thread-id"}
+                ]
+            }]),
+        );
+        let identity = "172c39e6-c0a0-5a70-8b63-e0f8e0d185a3";
+        let mut decision = sample_decision();
+        decision.provider_type = Some("codex".to_string());
+        decision.provider_api_format = Some("openai:responses".to_string());
+        decision.client_api_format = Some("openai:responses".to_string());
+        decision.provider_request_body = Some(json!({
+            "model": "gpt-5",
+            "input": [],
+            "prompt_cache_key": identity,
+            "client_metadata": {
+                "session_id": identity,
+                "thread_id": identity
+            }
+        }));
+        assert!(!decision.provider_request_headers.contains_key("session-id"));
+        assert!(!decision.provider_request_headers.contains_key("thread-id"));
+
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
+            .expect("terminal Codex identity contract should be restored");
+
+        assert_eq!(
+            decision
+                .provider_request_headers
+                .get("session-id")
+                .map(String::as_str),
+            Some(identity)
+        );
+        assert_eq!(
+            decision
+                .provider_request_headers
+                .get("thread-id")
+                .map(String::as_str),
+            Some(identity)
+        );
+    }
+
+    #[test]
+    fn codex_prompt_cache_identity_headers_fail_closed_after_body_identity_removal() {
+        let mut input = sample_decision_input();
+        input
+            .routing_context
+            .as_mut()
+            .expect("routing context")
+            .client_api_format = "openai:responses".to_string();
+        set_provider_request_rules(
+            &mut input,
+            &["gpt-5"],
+            json!([{
+                "type": "json_patch_body",
+                "patch": [
+                    {"op": "remove", "path": "/prompt_cache_key"},
+                    {"op": "remove", "path": "/client_metadata"}
+                ]
+            }]),
+        );
+        let identity = "172c39e6-c0a0-5a70-8b63-e0f8e0d185a3";
+        let mut decision = sample_decision();
+        decision.provider_type = Some("codex".to_string());
+        decision.provider_api_format = Some("openai:responses".to_string());
+        decision.client_api_format = Some("openai:responses".to_string());
+        decision.provider_request_body = Some(json!({
+            "model": "gpt-5",
+            "input": [],
+            "prompt_cache_key": identity,
+            "client_metadata": {
+                "session_id": identity,
+                "thread_id": identity
+            }
+        }));
+        assert!(!decision.provider_request_headers.contains_key("session-id"));
+        assert!(!decision.provider_request_headers.contains_key("thread-id"));
+
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
+            .expect("terminal Codex identity contract should fail closed");
+
+        let body = decision.provider_request_body.as_ref().expect("body");
+        assert!(body.get("prompt_cache_key").is_none());
+        assert!(decision.prompt_cache_key.is_none());
+        assert!(body.get("client_metadata").is_none());
+        assert!(!decision.provider_request_headers.contains_key("session-id"));
+        assert!(!decision.provider_request_headers.contains_key("thread-id"));
+    }
+
+    #[test]
+    fn codex_compact_contract_is_terminal_after_routing_mutations() {
+        let mut input = sample_decision_input();
+        input
+            .routing_context
+            .as_mut()
+            .expect("routing context")
+            .client_api_format = "openai:responses:compact".to_string();
+        set_provider_request_rules(
+            &mut input,
+            &["gpt-5"],
+            json!([
+                {
+                    "type": "json_patch_body",
+                    "patch": [
+                        {"op": "add", "path": "/store", "value": true},
+                        {"op": "add", "path": "/top_logprobs", "value": 5},
+                        {"op": "add", "path": "/custom_extension", "value": true},
+                        {"op": "replace", "path": "/input", "value": "routed compact input"},
+                        {"op": "replace", "path": "/tools", "value": [{
+                            "type": "function",
+                            "name": "lookup",
+                            "cache_control": {"type": "ephemeral"}
+                        }]}
+                    ]
+                },
+                {
+                    "type": "patch_headers",
+                    "patch": [
+                        {"op": "set", "name": "chatgpt-account-id", "value": "spoofed"},
+                        {"op": "set", "name": "x-openai-fedramp", "value": "false"},
+                        {"op": "set", "name": "x-client-request-id", "value": "spoofed"},
+                        {"op": "set", "name": "accept", "value": "text/event-stream"},
+                        {"op": "set", "name": "content-encoding", "value": "zstd"}
+                    ]
+                }
+            ]),
+        );
+        let mut decision = sample_decision();
+        decision.provider_type = Some("codex".to_string());
+        decision.provider_api_format = Some("openai:responses:compact".to_string());
+        decision.client_api_format = Some("openai:responses:compact".to_string());
+        decision.provider_request_body = Some(json!({
+            "model": "gpt-5",
+            "input": [],
+            "tools": [{"type": "function", "name": "lookup"}]
+        }));
+        decision
+            .provider_request_headers
+            .insert(CODEX_ACCOUNT_ID_HEADER.to_string(), "account-1".to_string());
+        decision
+            .provider_request_headers
+            .insert(CODEX_FEDRAMP_HEADER.to_string(), "true".to_string());
+
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
+            .expect("terminal contract should accept the projected request");
+
+        let body = decision.provider_request_body.as_ref().expect("body");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "routed compact input"
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
+        for field in ["store", "top_logprobs", "custom_extension"] {
+            assert!(
+                body.get(field).is_none(),
+                "unexpected Compact field: {field}"
+            );
+        }
+        assert_eq!(
+            decision
+                .provider_request_headers
+                .get(CODEX_ACCOUNT_ID_HEADER),
+            Some(&"account-1".to_string())
+        );
+        assert_eq!(
+            decision.provider_request_headers.get(CODEX_FEDRAMP_HEADER),
+            Some(&"true".to_string())
+        );
+        for header in ["x-client-request-id", "accept", "content-encoding"] {
+            assert!(
+                !decision.provider_request_headers.contains_key(header),
+                "unexpected Compact header: {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_responses_lite_contract_is_terminal_after_routing_mutations() {
+        let mut input = sample_decision_input();
+        input.requested_model = "gpt-future-agent".to_string();
+        input
+            .routing_context
+            .as_mut()
+            .expect("routing context")
+            .client_api_format = "openai:responses:compact".to_string();
+        set_provider_request_rules(
+            &mut input,
+            &["gpt-future-agent"],
+            json!([
+                {
+                    "type": "json_patch_body",
+                    "patch": [
+                        {"op": "replace", "path": "/input", "value": "routed compact input"},
+                        {"op": "add", "path": "/instructions", "value": "Routed instructions"},
+                        {"op": "replace", "path": "/tools", "value": [{
+                            "type": "function",
+                            "name": "lookup",
+                            "parameters": {},
+                            "cache_control": {"type": "ephemeral"}
+                        }]},
+                        {"op": "add", "path": "/parallel_tool_calls", "value": true},
+                        {"op": "add", "path": "/reasoning", "value": {
+                            "effort": "high",
+                            "context": "current_turn"
+                        }}
+                    ]
+                },
+                {
+                    "type": "patch_headers",
+                    "patch": [{
+                        "op": "set",
+                        "name": "x-openai-internal-codex-responses-lite",
+                        "value": "false"
+                    }]
+                }
+            ]),
+        );
+        let mut decision = sample_decision();
+        decision.provider_type = Some("codex".to_string());
+        decision.provider_api_format = Some("openai:responses:compact".to_string());
+        decision.client_api_format = Some("openai:responses:compact".to_string());
+        decision.mapped_model = Some("gpt-future-agent".to_string());
+        decision.provider_request_body = Some(json!({
+            "model": "gpt-future-agent",
+            "input": [],
+            "tools": []
+        }));
+        let transport = sample_codex_transport_with_card();
+
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision, Some(&transport))
+            .expect("terminal Lite contract should accept the projected request");
+
+        let body = decision.provider_request_body.as_ref().expect("body");
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "lookup");
+        assert!(body["input"][0]["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(
+            body["input"][1]["content"][0]["text"],
+            "Routed instructions"
+        );
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(
+            body["input"][2]["content"][0]["text"],
+            "routed compact input"
+        );
+        assert!(body.get("tools").is_none());
+        assert!(body.get("instructions").is_none());
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(
+            decision
+                .provider_request_headers
+                .get(CODEX_RESPONSES_LITE_HEADER)
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
     fn provider_request_routing_policy_rejects_body_patch_without_json_body() {
         let input = sample_decision_input();
         let mut decision = sample_decision();
         decision.provider_request_body = None;
         decision.provider_request_body_base64 = Some("AA==".to_string());
 
-        let error = apply_provider_request_routing_policy_to_decision(&input, &mut decision)
+        let error = apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
             .expect_err("provider body patch should reject binary upstream bodies");
 
         match error {
@@ -820,6 +2203,7 @@ mod tests {
         let mut input = sample_decision_input();
         set_provider_request_rules(
             &mut input,
+            &["gpt-5"],
             json!([{
                 "type": "patch_headers",
                 "patch": [{
@@ -833,7 +2217,7 @@ mod tests {
         decision.provider_request_body = None;
         decision.provider_request_body_base64 = Some("AA==".to_string());
 
-        apply_provider_request_routing_policy_to_decision(&input, &mut decision)
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
             .expect("header-only provider routing mutation should apply without JSON body");
 
         assert_eq!(decision.provider_request_body, None);
@@ -865,7 +2249,7 @@ mod tests {
             "priority_slot": 3
         }));
 
-        apply_provider_request_routing_policy_to_decision(&input, &mut decision)
+        apply_provider_request_routing_policy_to_decision(&input, &mut decision, None)
             .expect("provider routing mutation should seed pool trace");
 
         let routing_trace = &decision.report_context.as_ref().unwrap()["routing_trace"];

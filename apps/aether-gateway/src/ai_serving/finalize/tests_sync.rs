@@ -25,12 +25,16 @@ fn test_decision() -> GatewayControlDecision {
         route_class: Some("ai_public".to_string()),
         route_family: Some("openai".to_string()),
         route_kind: Some("compact".to_string()),
+        client_surface: None,
+        api_operation: None,
+        gateway_credential_carrier: None,
         request_auth_channel: None,
         auth_endpoint_signature: Some("openai:responses:compact".to_string()),
         execution_runtime_candidate: true,
         auth_context: None,
         admin_principal: None,
         local_auth_rejection: None,
+        model_directive_policy: Default::default(),
     }
 }
 
@@ -1166,7 +1170,7 @@ fn local_finalize_handles_openai_responses_compact_cross_format_sync_response() 
     assert_eq!(report.report_kind, "openai_responses_compact_sync_success");
     assert_eq!(
         report.client_body_json.expect("client body should exist")["object"],
-        "response"
+        "response.compaction"
     );
 }
 
@@ -1222,7 +1226,7 @@ fn local_finalize_handles_openai_responses_compact_cross_format_function_call_re
         .background_report
         .expect("compact tool-call should downgrade to success report");
     let client_body = report.client_body_json.expect("client body should exist");
-    assert_eq!(client_body["object"], "response");
+    assert_eq!(client_body["object"], "response.compaction");
     assert_eq!(client_body["output"][1]["type"], "function_call");
 }
 
@@ -1437,6 +1441,57 @@ fn local_finalize_handles_openai_responses_cross_format_stream_response_from_gem
         client_body["output"][0]["content"][0]["text"],
         "Hello Gemini CLI"
     );
+}
+
+#[test]
+fn local_finalize_rejects_antigravity_usage_only_gemini_wrapper() {
+    let payload = GatewaySyncReportRequest {
+        trace_id: "trace-antigravity-empty-gemini-wrapper".to_string(),
+        report_kind: "gemini_chat_sync_finalize".to_string(),
+        report_context: Some(json!({
+            "client_api_format": "gemini:generate_content",
+            "provider_api_format": "gemini:generate_content",
+            "model": "gemini-3.5-flash",
+            "mapped_model": "gemini-3-flash-agent",
+            "needs_conversion": false,
+            "has_envelope": true,
+            "envelope_name": "antigravity:v1internal",
+            "upstream_is_stream": true,
+        })),
+        status_code: 200,
+        headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body_json: Some(json!({
+            "chunks": [{
+                "response": {
+                    "responseId": "resp-usage-only",
+                    "modelVersion": "gemini-3-flash-agent",
+                    "usageMetadata": {
+                        "promptTokenCount": 5528,
+                        "totalTokenCount": 5528
+                    }
+                },
+                "metadata": {},
+                "traceId": "trace-antigravity-empty-gemini-wrapper"
+            }],
+            "metadata": {
+                "stream": true,
+                "stored_chunks": 1,
+                "total_chunks": 1
+            }
+        })),
+        client_body_json: None,
+        body_base64: None,
+        telemetry: None,
+    };
+
+    let outcome = maybe_build_local_core_sync_finalize_response(
+        "trace-antigravity-empty-gemini-wrapper",
+        &test_decision(),
+        &payload,
+    )
+    .expect("local finalize should evaluate payload");
+
+    assert!(outcome.is_none());
 }
 
 #[test]
@@ -1739,6 +1794,93 @@ fn local_finalize_handles_openai_chat_cross_format_sync_response_from_openai_res
 }
 
 #[test]
+fn local_finalize_aggregates_openai_responses_capture_envelope_before_chat_conversion() {
+    let payload = GatewaySyncReportRequest {
+        trace_id: "trace-openai-chat-capture-envelope-sync-123".to_string(),
+        report_kind: "openai_chat_sync_finalize".to_string(),
+        report_context: Some(json!({
+            "client_api_format": "openai:chat",
+            "provider_api_format": "openai:responses",
+            "model": "gpt-5.6-luna",
+            "mapped_model": "gpt-5.6-luna",
+            "needs_conversion": true,
+            "has_envelope": false,
+        })),
+        status_code: 200,
+        headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        body_json: Some(json!({
+            "chunks": [
+                {
+                    "type": "response.output_text.delta",
+                    "response_id": "resp_capture_gateway_123",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "Gateway "
+                },
+                {
+                    "type": "response.output_text.done",
+                    "response_id": "resp_capture_gateway_123",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": "Gateway capture"
+                },
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_capture_gateway_123",
+                        "object": "response",
+                        "status": "completed",
+                        "model": "gpt-5.6-luna",
+                        "output": [],
+                        "usage": {
+                            "input_tokens": 2,
+                            "output_tokens": 3,
+                            "total_tokens": 5
+                        }
+                    }
+                }
+            ],
+            "metadata": {}
+        })),
+        client_body_json: None,
+        body_base64: None,
+        telemetry: None,
+    };
+
+    let outcome = maybe_build_local_core_sync_finalize_response(
+        "trace-openai-chat-capture-envelope-sync-123",
+        &test_decision(),
+        &payload,
+    )
+    .expect("capture envelope finalize should succeed")
+    .expect("capture envelope finalize should match");
+
+    let report = outcome
+        .background_report
+        .expect("capture envelope conversion should produce a success report");
+    assert_eq!(report.report_kind, "openai_chat_sync_success");
+    let provider_body = report
+        .body_json
+        .expect("aggregated provider body should exist");
+    assert_eq!(provider_body["id"], "resp_capture_gateway_123");
+    assert_eq!(
+        provider_body["output"][0]["content"][0]["text"],
+        "Gateway capture"
+    );
+    assert!(provider_body.get("chunks").is_none());
+    let client_body = report
+        .client_body_json
+        .expect("converted client body should exist");
+    assert_eq!(
+        client_body["choices"][0]["message"]["content"],
+        "Gateway capture"
+    );
+    assert_eq!(client_body["usage"]["prompt_tokens"], 2);
+    assert_eq!(client_body["usage"]["completion_tokens"], 3);
+    assert_eq!(client_body["usage"]["total_tokens"], 5);
+}
+
+#[test]
 fn local_finalize_handles_claude_chat_cross_format_sync_response_from_openai_chat() {
     let payload = GatewaySyncReportRequest {
         trace_id: "trace-claude-chat-xfmt-openai-sync-123".to_string(),
@@ -1784,12 +1926,16 @@ fn local_finalize_handles_claude_chat_cross_format_sync_response_from_openai_cha
             route_class: Some("ai_public".to_string()),
             route_family: Some("claude".to_string()),
             route_kind: Some("chat".to_string()),
+            client_surface: None,
+            api_operation: None,
+            gateway_credential_carrier: None,
             request_auth_channel: None,
             auth_endpoint_signature: Some("claude:messages".to_string()),
             execution_runtime_candidate: true,
             auth_context: None,
             admin_principal: None,
             local_auth_rejection: None,
+            model_directive_policy: Default::default(),
         },
         &payload,
     )
@@ -1851,12 +1997,16 @@ fn local_finalize_handles_gemini_cli_cross_format_sync_response_from_claude_cli(
             route_class: Some("ai_public".to_string()),
             route_family: Some("gemini".to_string()),
             route_kind: Some("cli".to_string()),
+            client_surface: None,
+            api_operation: None,
+            gateway_credential_carrier: None,
             request_auth_channel: None,
             auth_endpoint_signature: Some("gemini:generate_content".to_string()),
             execution_runtime_candidate: true,
             auth_context: None,
             admin_principal: None,
             local_auth_rejection: None,
+            model_directive_policy: Default::default(),
         },
         &payload,
     )

@@ -42,6 +42,8 @@ export interface ProviderSummaryPageResponse {
   items: ProviderWithEndpointsSummary[]
 }
 
+type ProviderSummaryResponse = ProviderSummaryPageResponse | ProviderWithEndpointsSummary[]
+
 function normalizeProviderSummary(
   provider: ProviderWithEndpointsSummary,
 ): ProviderWithEndpointsSummary {
@@ -49,7 +51,11 @@ function normalizeProviderSummary(
     ...provider,
     chat_pii_redaction: normalizeChatPiiRedactionProvider(provider.chat_pii_redaction),
     pool_advanced: normalizePoolAdvanced(provider.pool_advanced),
+    codex_fingerprint_convergence_enabled: provider.codex_fingerprint_convergence_enabled ?? false,
     kiro_simulated_cache_enabled: provider.kiro_simulated_cache_enabled ?? false,
+    max_transfer_count: provider.max_transfer_count ?? 0,
+    max_transfer_timeout_seconds: provider.max_transfer_timeout_seconds ?? 0,
+    responses_websocket_enabled: provider.responses_websocket_enabled ?? false,
   }
 }
 
@@ -62,16 +68,26 @@ export async function getProvidersSummary(
   return cachedRequest(
     cacheKey,
     async () => {
-      const response = await client.get<ProviderSummaryPageResponse>(
+      const response = await client.get<ProviderSummaryResponse>(
         '/api/admin/providers/summary',
         {
           params,
           timeout: options.timeout,
         },
       )
+      const data = response.data
+      if (Array.isArray(data)) {
+        return {
+          total: data.length,
+          page: params.page ?? 1,
+          page_size: params.page_size ?? data.length,
+          items: data.map(normalizeProviderSummary),
+        }
+      }
+
       return {
-        ...response.data,
-        items: response.data.items.map(normalizeProviderSummary),
+        ...data,
+        items: (data.items ?? []).map(normalizeProviderSummary),
       }
     },
     cacheTtlMs,
@@ -82,8 +98,10 @@ export async function getProvidersSummary(
  * 获取单个 Provider 的详细信息
  */
 export async function getProvider(providerId: string): Promise<ProviderWithEndpointsSummary> {
-  const response = await client.get<ProviderWithEndpointsSummary>(`/api/admin/providers/${providerId}/summary`)
-  return normalizeProviderSummary(response.data)
+  return dedupedRequest(`providers:detail:${providerId}`, async () => {
+    const response = await client.get<ProviderWithEndpointsSummary>(`/api/admin/providers/${providerId}/summary`)
+    return normalizeProviderSummary(response.data)
+  })
 }
 
 /**
@@ -98,6 +116,7 @@ export async function updateProvider(
     website: string
     provider_priority: number
     keep_priority_on_conversion: boolean
+    responses_websocket_enabled: boolean
     billing_type: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
     monthly_quota_usd: number
     quota_reset_day: number
@@ -106,12 +125,15 @@ export async function updateProvider(
     rpm_limit: number | null
     // 请求配置（从 Endpoint 迁移）
     max_retries: number
+    max_transfer_count: number
+    max_transfer_timeout_seconds: number
     proxy: ProxyConfig | null
     cache_ttl_minutes: number  // 0表示不支持缓存，>0表示支持缓存并设置TTL(分钟)
     max_probe_interval_minutes: number
     enable_format_conversion: boolean  // 是否允许格式转换（提供商级别开关）
     is_active: boolean
     claude_code_advanced: ClaudeCodeAdvancedConfig | null
+    codex_fingerprint_convergence_enabled: boolean
     pool_advanced: PoolAdvancedConfig | null
     failover_rules: FailoverRulesConfig | null
     config: ProviderConfig | null
@@ -138,12 +160,16 @@ export async function createProvider(
     quota_expires_at?: string
     provider_priority?: number
     keep_priority_on_conversion?: boolean
+    responses_websocket_enabled?: boolean
     is_active?: boolean
     max_retries?: number
+    max_transfer_count?: number
+    max_transfer_timeout_seconds?: number
     stream_first_byte_timeout?: number | null
     request_timeout?: number | null
     proxy?: ProxyConfig | null
     claude_code_advanced?: ClaudeCodeAdvancedConfig | null
+    codex_fingerprint_convergence_enabled?: boolean
     pool_advanced?: PoolAdvancedConfig | null
     failover_rules?: FailoverRulesConfig | null
     config?: ProviderConfig | null
@@ -371,6 +397,84 @@ export interface ProviderMappingPreviewResponse {
   truncated_models: number
 }
 
+function mappingPreviewRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function mappingPreviewString(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback
+}
+
+function mappingPreviewCount(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : fallback
+}
+
+function normalizeProviderMappingPreview(
+  value: unknown,
+  providerId: string,
+): ProviderMappingPreviewResponse {
+  const source = mappingPreviewRecord(value)
+  const rawKeys = Array.isArray(source.keys) ? source.keys : []
+  const keys = rawKeys.map((rawKey) => {
+    const key = mappingPreviewRecord(rawKey)
+    const rawGlobalModels = Array.isArray(key.matching_global_models)
+      ? key.matching_global_models
+      : []
+
+    return {
+      key_id: mappingPreviewString(key.key_id),
+      key_name: mappingPreviewString(key.key_name),
+      masked_key: mappingPreviewString(key.masked_key, '***'),
+      is_active: key.is_active === true,
+      allowed_models: Array.isArray(key.allowed_models)
+        ? key.allowed_models.filter((item): item is string => typeof item === 'string')
+        : [],
+      matching_global_models: rawGlobalModels.map((rawGlobalModel) => {
+        const globalModel = mappingPreviewRecord(rawGlobalModel)
+        const rawMatchedModels = Array.isArray(globalModel.matched_models)
+          ? globalModel.matched_models
+          : []
+
+        return {
+          global_model_id: mappingPreviewString(globalModel.global_model_id),
+          global_model_name: mappingPreviewString(globalModel.global_model_name),
+          display_name: mappingPreviewString(
+            globalModel.display_name,
+            mappingPreviewString(globalModel.global_model_name),
+          ),
+          is_active: globalModel.is_active === true,
+          matched_models: rawMatchedModels.map((rawMatchedModel) => {
+            const matchedModel = mappingPreviewRecord(rawMatchedModel)
+            return {
+              allowed_model: mappingPreviewString(matchedModel.allowed_model),
+              mapping_pattern: mappingPreviewString(matchedModel.mapping_pattern),
+            }
+          }),
+        }
+      }),
+    }
+  })
+  const inferredMatches = keys.reduce(
+    (total, key) => total + key.matching_global_models.length,
+    0,
+  )
+
+  return {
+    provider_id: mappingPreviewString(source.provider_id, providerId),
+    provider_name: mappingPreviewString(source.provider_name),
+    keys,
+    total_keys: mappingPreviewCount(source.total_keys, keys.length),
+    total_matches: mappingPreviewCount(source.total_matches, inferredMatches),
+    truncated: source.truncated === true,
+    truncated_keys: mappingPreviewCount(source.truncated_keys, 0),
+    truncated_models: mappingPreviewCount(source.truncated_models, 0),
+  }
+}
+
 /**
  * 获取 Provider 映射预览
  */
@@ -379,6 +483,6 @@ export async function getProviderMappingPreview(
 ): Promise<ProviderMappingPreviewResponse> {
   return dedupedRequest(`providers:mapping-preview:${providerId}`, async () => {
     const response = await client.get<ProviderMappingPreviewResponse>(`/api/admin/providers/${providerId}/mapping-preview`)
-    return response.data
+    return normalizeProviderMappingPreview(response.data, providerId)
   })
 }

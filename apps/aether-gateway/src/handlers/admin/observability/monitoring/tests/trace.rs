@@ -236,6 +236,15 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
     usage.provider_api_key_id = Some("provider-key-1".to_string());
     usage.error_message = Some("no local stream plans".to_string());
     usage.response_time_ms = Some(45);
+    usage.request_metadata = Some(json!({
+        "routing_candidate_skip_reason": "provider_request_body_build_failed",
+        "routing_failure_diagnostic": {
+            "kind": "request_body_build",
+            "path": "$.reasoning.summary",
+            "message": "上游请求体语义校验失败",
+            "safe_to_show": true
+        }
+    }));
 
     let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![usage]));
     let data_state =
@@ -268,6 +277,10 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
     assert_eq!(payload["candidates"][0]["id"], json!("routing-cand-1"));
     assert_eq!(payload["candidates"][0]["status"], json!("failed"));
     assert_eq!(
+        payload["candidates"][0]["skip_reason"],
+        json!("provider_request_body_build_failed")
+    );
+    assert_eq!(
         payload["candidates"][0]["error_type"],
         json!("no_local_stream_plans")
     );
@@ -278,6 +291,10 @@ async fn admin_monitoring_trace_request_falls_back_to_usage_routing_snapshot() {
     assert_eq!(
         payload["candidates"][0]["extra_data"]["execution_path"],
         json!("local_execution_runtime_miss")
+    );
+    assert_eq!(
+        payload["candidates"][0]["extra_data"]["failure_diagnostic"]["path"],
+        json!("$.reasoning.summary")
     );
 }
 
@@ -731,6 +748,110 @@ async fn admin_monitoring_trace_request_exposes_failed_candidate_upstream_respon
     );
     assert!(extra.get("client_response").is_none());
     assert!(extra.get("provider_response").is_none());
+}
+
+#[tokio::test]
+async fn admin_monitoring_trace_request_prefers_ref_backed_usage_response_body() {
+    let mut candidate = sample_candidate(
+        "cand-used",
+        "request-ref-body",
+        0,
+        RequestCandidateStatus::Failed,
+        Some(101),
+        Some(33),
+        Some(400),
+    );
+    candidate.extra_data = Some(json!({
+        "upstream_response": {
+            "status_code": 400,
+            "headers": {
+                "content-type": "text/event-stream",
+                "x-request-id": "stale-request-like-body"
+            },
+            "body": {
+                "model": "gpt-5.6-sol",
+                "input": [{"role": "user", "content": "request prompt"}]
+            }
+        }
+    }));
+
+    let request_candidates = Arc::new(InMemoryRequestCandidateRepository::seed(vec![candidate]));
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![sample_provider()],
+        vec![sample_endpoint()],
+        vec![sample_key()],
+    ));
+    let mut usage = sample_usage(
+        "request-ref-body",
+        "provider-1",
+        "OpenAI",
+        0,
+        0.0,
+        "failed",
+        Some(400),
+        100,
+    );
+    usage.candidate_id = Some("cand-used".to_string());
+    usage.response_headers = Some(json!({
+        "content-type": "application/json",
+        "x-request-id": "req_usage-cyber-risk-demo"
+    }));
+    usage.response_body = Some(json!({
+        "error": {
+            "type": "invalid_request",
+            "message": "This content was flagged for possible cybersecurity risk.",
+            "code": 400
+        }
+    }));
+    usage.response_body_state = Some(UsageBodyCaptureState::Reference);
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed_with_detached_bodies(
+        vec![usage],
+    ));
+    let data_state =
+        crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+            request_candidates,
+            usage_repository,
+        )
+        .with_provider_catalog_reader(provider_catalog);
+    let state = AppState::new()
+        .expect("state should build")
+        .with_data_state_for_tests(data_state);
+    let context = request_context(
+        http::Method::GET,
+        "/api/admin/monitoring/trace/request-ref-body",
+    );
+
+    let response = local_monitoring_response(&state, &context)
+        .await
+        .expect("handler should not error")
+        .expect("route should be handled locally");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    let upstream_response = &payload["candidates"][0]["extra_data"]["upstream_response"];
+    assert_eq!(
+        upstream_response["headers"],
+        json!({
+            "content-type": "application/json",
+            "x-request-id": "req_usage-cyber-risk-demo"
+        })
+    );
+    assert_eq!(
+        upstream_response["body"]["error"],
+        json!({
+            "type": "invalid_request",
+            "message": "This content was flagged for possible cybersecurity risk.",
+            "code": 400
+        })
+    );
+    assert!(upstream_response["body"].get("input").is_none());
+    assert_eq!(
+        upstream_response["body_ref"],
+        json!("usage://request/request-ref-body/response_body")
+    );
 }
 
 #[tokio::test]

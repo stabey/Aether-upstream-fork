@@ -279,11 +279,24 @@ async fn gateway_handles_admin_pool_scheduling_presets_locally_with_trusted_admi
     assert_eq!(response.status(), StatusCode::OK);
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     let items = payload.as_array().expect("payload should be an array");
-    assert_eq!(items.len(), 14);
-    assert_eq!(items[0]["name"], "lru");
-    assert_eq!(items[1]["name"], "cache_affinity");
-    assert_eq!(items[8]["name"], "pro_first");
-    assert_eq!(items[13]["name"], "team_first");
+    assert_eq!(items.len(), 15);
+    let preset_names = items
+        .iter()
+        .filter_map(|item| item["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(preset_names.first(), Some(&"lru"));
+    assert_eq!(preset_names.get(1), Some(&"cache_affinity"));
+    assert_eq!(preset_names.last(), Some(&"team_first"));
+
+    let preset_index = |name| {
+        preset_names
+            .iter()
+            .position(|preset_name| *preset_name == name)
+            .unwrap_or_else(|| panic!("missing scheduling preset {name}"))
+    };
+    assert!(preset_index("cost_first") < preset_index("free_team_first"));
+    assert!(preset_index("free_team_first") < preset_index("free_first"));
+    assert!(preset_index("pro_first") < preset_index("team_first"));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -616,6 +629,7 @@ async fn gateway_pool_list_includes_usage_totals_and_nullable_lru_score() {
         "sk-usage",
     );
     key.name = "usage key".to_string();
+    key.concurrent_limit = Some(5);
     key.request_count = Some(1566);
     key.total_tokens = 187_327_321;
     key.total_cost_usd = 93.1319297;
@@ -648,6 +662,7 @@ async fn gateway_pool_list_includes_usage_totals_and_nullable_lru_score() {
     .expect("json body should parse");
     let keys = payload["keys"].as_array().expect("keys should be array");
     assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0]["concurrent_limit"], json!(5));
     assert_eq!(keys[0]["request_count"], json!(1566));
     assert_eq!(keys[0]["total_tokens"], json!(187_327_321u64));
     assert_eq!(keys[0]["total_cost_usd"], json!("93.13192970"));
@@ -1362,6 +1377,18 @@ async fn gateway_pool_list_overrides_stale_codex_cycle_usage_from_usage_facts() 
                         "total_tokens": 700,
                         "total_cost_usd": "0.70000000"
                     }
+                },
+                {
+                    "code": "monthly",
+                    "label": "月",
+                    "scope": "account",
+                    "reset_at": reset_at,
+                    "window_minutes": 43_800,
+                    "usage": {
+                        "request_count": 8,
+                        "total_tokens": 600,
+                        "total_cost_usd": "0.60000000"
+                    }
                 }
             ]
         }
@@ -1441,6 +1468,10 @@ async fn gateway_pool_list_overrides_stale_codex_cycle_usage_from_usage_facts() 
         .iter()
         .find(|window| window["code"] == json!("5h"))
         .expect("5h window should exist");
+    let monthly = windows
+        .iter()
+        .find(|window| window["code"] == json!("monthly"))
+        .expect("monthly window should exist");
 
     assert_eq!(weekly["usage"]["request_count"], json!(3));
     assert_eq!(weekly["usage"]["total_tokens"], json!(2_199));
@@ -1448,6 +1479,9 @@ async fn gateway_pool_list_overrides_stale_codex_cycle_usage_from_usage_facts() 
     assert_eq!(five_hour["usage"]["request_count"], json!(1));
     assert_eq!(five_hour["usage"]["total_tokens"], json!(200));
     assert_eq!(five_hour["usage"]["total_cost_usd"], json!("0.75000000"));
+    assert_eq!(monthly["usage"]["request_count"], json!(3));
+    assert_eq!(monthly["usage"]["total_tokens"], json!(2_199));
+    assert_eq!(monthly["usage"]["total_cost_usd"], json!("11.99000000"));
 }
 
 #[tokio::test]
@@ -3041,7 +3075,7 @@ async fn gateway_pool_plan_free_selector_prefers_upstream_plan_type() {
 }
 
 #[tokio::test]
-async fn gateway_pool_keys_mark_oauth_header_auth() {
+async fn gateway_pool_keys_classify_oauth_credentials() {
     let mut provider = sample_provider("provider-codex", "codex", 10).with_transport_fields(
         true,
         false,
@@ -3072,11 +3106,25 @@ async fn gateway_pool_keys_mark_oauth_header_auth() {
         )
         .expect("auth config should encrypt"),
     );
+    let mut agent_key = sample_key(
+        "key-codex-agent-identity",
+        "provider-codex",
+        "openai:responses",
+        "",
+    );
+    agent_key.auth_type = "oauth".to_string();
+    agent_key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"codex","auth_mode":"agentIdentity","agent_runtime_id":"runtime-1","agent_private_key":"base64-private-key","task_id":"task-1"}"#,
+        )
+        .expect("Agent Identity auth config should encrypt"),
+    );
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         Vec::new(),
-        vec![key],
+        vec![key, agent_key],
     ));
     let state = AppState::new()
         .expect("gateway should build")
@@ -3101,8 +3149,21 @@ async fn gateway_pool_keys_mark_oauth_header_auth() {
     )
     .expect("json body should parse");
     let keys = payload["keys"].as_array().expect("keys should be array");
-    assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0]["oauth_header_auth"], true);
+    assert_eq!(keys.len(), 2);
+    let oauth_header_key = keys
+        .iter()
+        .find(|key| key["key_id"] == "key-codex-oauth-header")
+        .expect("OAuth Header key should exist");
+    assert_eq!(oauth_header_key["oauth_header_auth"], true);
+    assert_eq!(oauth_header_key["agent_identity"], false);
+    let agent_identity_key = keys
+        .iter()
+        .find(|key| key["key_id"] == "key-codex-agent-identity")
+        .expect("Agent Identity key should exist");
+    assert_eq!(agent_identity_key["oauth_header_auth"], false);
+    assert_eq!(agent_identity_key["agent_identity"], true);
+    assert_eq!(agent_identity_key["can_refresh_oauth"], true);
+    assert_eq!(agent_identity_key["can_export_oauth"], false);
 }
 
 #[tokio::test]
@@ -3242,7 +3303,8 @@ async fn gateway_handles_admin_pool_resolve_selection_locally_with_trusted_admin
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
             "search": "alpha",
-            "quick_selectors": ["enabled", "proxy_set"]
+            "status": "available",
+            "quick_selectors": ["proxy_set"]
         }))
         .send()
         .await
@@ -3256,10 +3318,130 @@ async fn gateway_handles_admin_pool_resolve_selection_locally_with_trusted_admin
     assert_eq!(items[0]["key_id"], json!("key-openai-a"));
     assert_eq!(items[0]["key_name"], json!("alpha proxy"));
     assert_eq!(items[0]["auth_type"], json!("api_key"));
+
+    let invalid_status_response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/pool/provider-openai/keys/resolve-selection"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "status": "not-a-status"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(invalid_status_response.status(), StatusCode::BAD_REQUEST);
+    let invalid_status_payload: serde_json::Value = invalid_status_response
+        .json()
+        .await
+        .expect("json body should parse");
+    assert!(invalid_status_payload["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.starts_with("status must be one of:")));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_pool_resolve_selection_matches_list_search_scope_for_status() {
+    let provider = sample_provider("provider-search-scope", "openai", 10);
+    let mut key = sample_key(
+        "key-visible-name",
+        "provider-search-scope",
+        "openai:chat",
+        "sk-search-scope",
+    );
+    key.name = "visible account".to_string();
+    key.note = Some("hidden-note-match".to_string());
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let all_list_response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-search-scope/keys?page=1&page_size=50&search=hidden-note-match&status=all&sort_by=score",
+        None,
+    )
+    .await;
+    assert_eq!(all_list_response.status(), StatusCode::OK);
+    let all_list_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(all_list_response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    assert_eq!(all_list_payload["total"], json!(0));
+
+    let all_selection_response = local_admin_pool_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/pool/provider-search-scope/keys/resolve-selection",
+        Some(json!({
+            "search": "hidden-note-match",
+            "status": "all"
+        })),
+    )
+    .await;
+    assert_eq!(all_selection_response.status(), StatusCode::OK);
+    let all_selection_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(all_selection_response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    assert_eq!(all_selection_payload["total"], json!(0));
+
+    let available_list_response = local_admin_pool_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/pool/provider-search-scope/keys?page=1&page_size=50&search=hidden-note-match&status=available",
+        None,
+    )
+    .await;
+    assert_eq!(available_list_response.status(), StatusCode::OK);
+    let available_list_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(available_list_response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    assert_eq!(available_list_payload["total"], json!(1));
+
+    let available_selection_response = local_admin_pool_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/pool/provider-search-scope/keys/resolve-selection",
+        Some(json!({
+            "search": "hidden-note-match",
+            "status": "available"
+        })),
+    )
+    .await;
+    assert_eq!(available_selection_response.status(), StatusCode::OK);
+    let available_selection_payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(available_selection_response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("json body should parse");
+    assert_eq!(available_selection_payload["total"], json!(1));
+    assert_eq!(
+        available_selection_payload["items"][0]["key_id"],
+        json!("key-visible-name")
+    );
 }
 
 #[tokio::test]
@@ -3403,6 +3585,252 @@ async fn gateway_handles_admin_pool_batch_action_locally_with_trusted_admin_prin
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_batch_updates_shared_pool_key_configuration() {
+    let provider = sample_provider("provider-openai", "openai", 10).with_transport_fields(
+        true,
+        false,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(json!({
+            "pool_advanced": {
+                "enabled": true
+            }
+        })),
+    );
+    let mut first_key = sample_key("key-openai-a", "provider-openai", "openai:chat", "sk-a");
+    first_key.name = "alpha".to_string();
+    first_key.auto_fetch_models = true;
+    first_key.allowed_models = Some(json!(["legacy-model"]));
+    first_key.allow_auth_channel_mismatch_formats = Some(json!(["openai:embedding"]));
+    first_key.learned_rpm_limit = Some(18);
+    let mut second_key = sample_key("key-openai-b", "provider-openai", "openai:chat", "sk-b");
+    second_key.name = "beta".to_string();
+    second_key.allow_auth_channel_mismatch_formats =
+        Some(json!(["openai:chat", "openai:embedding"]));
+    second_key.learned_rpm_limit = Some(24);
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![first_key, second_key],
+    ));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                    &provider_catalog_repository,
+                )),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .patch(format!(
+            "{gateway_url}/api/admin/pool/provider-openai/keys/batch-update"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "key_ids": ["key-openai-b", "key-openai-a", "key-openai-a"],
+            "patch": {
+                "api_formats": ["openai:responses"],
+                "internal_priority": 7,
+                "rpm_limit": null,
+                "concurrent_limit": 6,
+                "auto_fetch_models": false,
+                "allowed_models": ["gpt-5.6-sol", "gpt-5.6-luna"],
+                "locked_models": [],
+                "note": null
+            }
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["affected"], json!(2));
+    assert_eq!(payload["model_sync"], serde_json::Value::Null);
+
+    let stored = provider_catalog_repository
+        .list_keys_by_ids(&["key-openai-a".to_string(), "key-openai-b".to_string()])
+        .await
+        .expect("keys should load");
+    assert_eq!(stored.len(), 2);
+    for key in stored {
+        assert_eq!(key.api_formats, Some(json!(["openai:responses"])));
+        assert_eq!(key.allow_auth_channel_mismatch_formats, Some(json!([])));
+        assert_eq!(key.internal_priority, 7);
+        assert_eq!(key.rpm_limit, None);
+        assert_eq!(key.concurrent_limit, Some(6));
+        assert_eq!(key.learned_rpm_limit, None);
+        assert!(!key.auto_fetch_models);
+        assert_eq!(
+            key.allowed_models,
+            Some(json!(["gpt-5.6-sol", "gpt-5.6-luna"]))
+        );
+        assert_eq!(key.locked_models, None);
+        assert_eq!(key.note, None);
+    }
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_preserves_inherited_fixed_oauth_mismatch_formats_on_batch_update() {
+    let mut provider = sample_provider("provider-gemini-cli", "gemini_cli", 10);
+    provider.provider_type = "gemini_cli".to_string();
+    let mut key = sample_key(
+        "key-gemini-cli-a",
+        "provider-gemini-cli",
+        "gemini:generate_content",
+        "oauth-placeholder",
+    );
+    key.auth_type = "oauth".to_string();
+    key.internal_priority = 3;
+    key.allow_auth_channel_mismatch_formats = Some(json!(["gemini:generate_content"]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                &provider_catalog_repository,
+            )),
+        );
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::PATCH,
+        "/api/admin/pool/provider-gemini-cli/keys/batch-update",
+        Some(json!({
+            "key_ids": ["key-gemini-cli-a"],
+            "patch": {
+                "api_formats": ["openai:responses"],
+                "internal_priority": 9
+            }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let stored = provider_catalog_repository
+        .list_keys_by_ids(&["key-gemini-cli-a".to_string()])
+        .await
+        .expect("key should load");
+    assert_eq!(stored[0].api_formats, None);
+    assert_eq!(
+        stored[0].allow_auth_channel_mismatch_formats,
+        Some(json!(["gemini:generate_content"]))
+    );
+    assert_eq!(stored[0].internal_priority, 9);
+}
+
+#[tokio::test]
+async fn gateway_rejects_explicit_invalid_mismatch_format_without_writing_any_key() {
+    let provider = sample_provider("provider-openai", "openai", 10);
+    let mut first_key = sample_key("key-openai-a", "provider-openai", "openai:chat", "sk-a");
+    first_key.name = "alpha".to_string();
+    first_key.internal_priority = 3;
+    first_key.allow_auth_channel_mismatch_formats = Some(json!(["openai:chat"]));
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![first_key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                &provider_catalog_repository,
+            )),
+        );
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::PATCH,
+        "/api/admin/pool/provider-openai/keys/batch-update",
+        Some(json!({
+            "key_ids": ["key-openai-a"],
+            "patch": {
+                "api_formats": ["openai:responses"],
+                "allow_auth_channel_mismatch_formats": ["openai:embedding"],
+                "internal_priority": 9
+            }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should load");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).expect("response body should be json");
+    assert_eq!(
+        payload["detail"],
+        json!("密钥 alpha 配置无效: allow_auth_channel_mismatch_formats 包含未选择的 API 格式: openai:embedding")
+    );
+
+    let stored = provider_catalog_repository
+        .list_keys_by_ids(&["key-openai-a".to_string()])
+        .await
+        .expect("key should load");
+    assert_eq!(stored[0].api_formats, Some(json!(["openai:chat"])));
+    assert_eq!(
+        stored[0].allow_auth_channel_mismatch_formats,
+        Some(json!(["openai:chat"]))
+    );
+    assert_eq!(stored[0].internal_priority, 3);
+}
+
+#[tokio::test]
+async fn gateway_rejects_pool_batch_update_before_writing_any_key() {
+    let provider = sample_provider("provider-openai", "openai", 10);
+    let mut first_key = sample_key("key-openai-a", "provider-openai", "openai:chat", "sk-a");
+    first_key.internal_priority = 3;
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        Vec::new(),
+        vec![first_key],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                &provider_catalog_repository,
+            )),
+        );
+
+    let response = local_admin_pool_response(
+        &state,
+        http::Method::PATCH,
+        "/api/admin/pool/provider-openai/keys/batch-update",
+        Some(json!({
+            "key_ids": ["key-openai-a", "key-missing"],
+            "patch": { "internal_priority": 9 }
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let stored = provider_catalog_repository
+        .list_keys_by_ids(&["key-openai-a".to_string()])
+        .await
+        .expect("key should load");
+    assert_eq!(stored[0].internal_priority, 3);
 }
 
 #[tokio::test]

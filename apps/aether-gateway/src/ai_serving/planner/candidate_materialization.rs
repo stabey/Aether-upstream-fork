@@ -16,7 +16,7 @@ use aether_scheduler_core::{
 };
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::ai_serving::planner::candidate_affinity_cache::remember_scheduler_affinity_for_candidate_at_epoch;
+use crate::ai_serving::planner::candidate_affinity_cache::remember_scheduler_affinity_for_candidate_with_routing_policy_at_epoch;
 use crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy;
 use crate::ai_serving::planner::candidate_resolution::{
     resolve_and_rank_logical_local_execution_candidates, EligibleLocalExecutionCandidate,
@@ -38,15 +38,21 @@ use crate::ai_serving::planner::pool_scheduler::PoolKeyCursor;
 use crate::ai_serving::planner::runtime_miss::record_local_runtime_candidate_skip_reason;
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
+use crate::cache::{
+    candidate_page_cache_stale_ttl, candidate_page_cache_ttl_from_env,
+    record_candidate_page_resolve_cache_follower_wait, record_candidate_page_resolve_cache_hit,
+    record_candidate_page_resolve_cache_load, record_candidate_page_resolve_cache_miss,
+    CacheLoadObserver, CandidateResolvedPageCacheKey, CandidateResolvedPageSnapshot,
+};
 use crate::clock::current_unix_ms;
 use crate::dispatch::refs::dispatch_ref_for_local_candidate;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
-use crate::orchestration::{local_attempt_slot_count, ExecutionAttemptIdentity};
+use crate::orchestration::{ExecutionAttemptIdentity, POOL_KEY_RETRY_INDEX_STRIDE};
 use crate::scheduler::candidate::is_auth_api_key_concurrency_limit_skip_reason;
 use crate::scheduler::config::SchedulerSchedulingMode;
+use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::{AppState, GatewayError};
 
-const POOL_KEY_RETRY_INDEX_STRIDE: u32 = 100;
 const AUTH_API_KEY_CONCURRENCY_WAIT_BUDGET: Duration = Duration::from_millis(100);
 const AUTH_API_KEY_CONCURRENCY_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -60,6 +66,9 @@ pub(crate) struct LocalExecutionCandidateAttempt {
 
 pub(crate) struct LocalExecutionCandidateAttemptSource<'a> {
     items: VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>,
+    skipped_provider_ids: BTreeSet<String>,
+    skipped_endpoint_ids: BTreeSet<String>,
+    skipped_credential_ids: BTreeSet<String>,
 }
 
 type DecorateSkippedCandidateFn<'a> = Arc<
@@ -71,6 +80,12 @@ pub(crate) trait LocalExecutionAttemptSource<T>: Send {
     async fn next_execution_attempt(&mut self) -> Result<Option<T>, GatewayError>;
 
     async fn drain_execution_attempts(&mut self) -> Result<Vec<T>, GatewayError>;
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError>;
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError>;
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError>;
 }
 
 enum LocalExecutionCandidateAttemptSourceItem<'a> {
@@ -98,19 +113,37 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                 attempts: dispatch_sequence_from_attempts(attempts),
             });
         }
-        Self { items }
+        Self {
+            items,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        }
     }
 
-    pub(crate) async fn next_attempt(&mut self) -> Option<LocalExecutionCandidateAttempt> {
+    pub(crate) async fn next_attempt(
+        &mut self,
+    ) -> Result<Option<LocalExecutionCandidateAttempt>, GatewayError> {
         loop {
-            let front = self.items.front_mut()?;
+            let Some(front) = self.items.front_mut() else {
+                return Ok(None);
+            };
             match front {
                 LocalExecutionCandidateAttemptSourceItem::Static { attempts } => {
+                    if dispatch_sequence_candidate_is_skipped(
+                        attempts,
+                        &self.skipped_provider_ids,
+                        &self.skipped_endpoint_ids,
+                        &self.skipped_credential_ids,
+                    ) {
+                        self.items.pop_front();
+                        continue;
+                    }
                     if let Some(attempt) = next_attempt_from_dispatch_sequence(attempts) {
                         if dispatch_sequence_exhausted(attempts) {
                             self.items.pop_front();
                         }
-                        return Some(attempt);
+                        return Ok(Some(attempt));
                     }
                     self.items.pop_front();
                 }
@@ -120,8 +153,22 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     pending_attempts,
                     pool_exhaustion_persistence,
                 } => {
+                    if self.skipped_provider_ids.contains(cursor.provider_id())
+                        || self.skipped_endpoint_ids.contains(cursor.endpoint_id())
+                    {
+                        self.items.pop_front();
+                        continue;
+                    }
+                    if dispatch_sequence_candidate_is_skipped(
+                        pending_attempts,
+                        &self.skipped_provider_ids,
+                        &self.skipped_endpoint_ids,
+                        &self.skipped_credential_ids,
+                    ) {
+                        *pending_attempts = DispatchSequence::new(Vec::new());
+                    }
                     if let Some(attempt) = next_attempt_from_dispatch_sequence(pending_attempts) {
-                        return Some(attempt);
+                        return Ok(Some(attempt));
                     }
                     let Some(candidate) = cursor.next_key().await else {
                         if let Some(skipped) = cursor.exhausted_group_skipped_candidate() {
@@ -137,6 +184,14 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                         self.items.pop_front();
                         continue;
                     };
+                    if candidate_is_skipped(
+                        &candidate,
+                        &self.skipped_provider_ids,
+                        &self.skipped_endpoint_ids,
+                        &self.skipped_credential_ids,
+                    ) {
+                        continue;
+                    }
                     *pending_attempts = dispatch_sequence_from_attempts(
                         build_unpersisted_local_execution_candidate_attempts(
                             candidate,
@@ -146,11 +201,20 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
                     );
                 }
                 LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } => {
-                    let Some(attempt) = cursor.next_attempt().await else {
+                    for provider_id in &self.skipped_provider_ids {
+                        cursor.skip_provider(provider_id);
+                    }
+                    for endpoint_id in &self.skipped_endpoint_ids {
+                        cursor.skip_endpoint(endpoint_id);
+                    }
+                    for key_id in &self.skipped_credential_ids {
+                        cursor.skip_credential(key_id);
+                    }
+                    let Some(attempt) = cursor.next_attempt().await? else {
                         self.items.pop_front();
                         continue;
                     };
-                    return Some(attempt);
+                    return Ok(Some(attempt));
                 }
             }
         }
@@ -159,6 +223,45 @@ impl<'a> LocalExecutionCandidateAttemptSource<'a> {
     pub(crate) fn drain_static_attempts(&mut self) -> Vec<LocalExecutionCandidateAttempt> {
         self.items.clear();
         Vec::new()
+    }
+
+    pub(crate) fn skip_provider(&mut self, provider_id: &str) {
+        let provider_id = provider_id.trim();
+        if provider_id.is_empty() {
+            return;
+        }
+        self.skipped_provider_ids.insert(provider_id.to_string());
+        for item in &mut self.items {
+            if let LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } = item {
+                cursor.skip_provider(provider_id);
+            }
+        }
+    }
+
+    pub(crate) fn skip_endpoint(&mut self, endpoint_id: &str) {
+        let endpoint_id = endpoint_id.trim();
+        if endpoint_id.is_empty() {
+            return;
+        }
+        self.skipped_endpoint_ids.insert(endpoint_id.to_string());
+        for item in &mut self.items {
+            if let LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } = item {
+                cursor.skip_endpoint(endpoint_id);
+            }
+        }
+    }
+
+    pub(crate) fn skip_credential(&mut self, key_id: &str) {
+        let key_id = key_id.trim();
+        if key_id.is_empty() {
+            return;
+        }
+        self.skipped_credential_ids.insert(key_id.to_string());
+        for item in &mut self.items {
+            if let LocalExecutionCandidateAttemptSourceItem::RequestedModelPage { cursor } = item {
+                cursor.skip_credential(key_id);
+            }
+        }
     }
 }
 
@@ -317,6 +420,7 @@ where
             self.client_session_affinity,
             self.client_api_format,
             self.requested_model,
+            self.routing_policy,
             candidates,
         );
     }
@@ -375,10 +479,6 @@ where
     type Attempt = LocalExecutionCandidateAttempt;
     type ExtraData = Value;
     type Error = Infallible;
-
-    fn attempt_slot_count(&self, candidate: &Self::Candidate) -> u32 {
-        local_attempt_slot_count(&candidate.transport)
-    }
 
     fn build_extra_data(&self, candidate: &Self::Candidate) -> Option<Self::ExtraData> {
         available_candidate_extra_data_with_dispatch_ref(candidate, &self.build_extra_data)
@@ -587,6 +687,7 @@ where
             client_session_affinity,
             client_api_format,
             requested_model,
+            routing_policy,
             &candidates,
         );
     }
@@ -624,7 +725,12 @@ where
     );
 
     (
-        LocalExecutionCandidateAttemptSource { items },
+        LocalExecutionCandidateAttemptSource {
+            items,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        },
         candidate_count,
     )
 }
@@ -691,9 +797,11 @@ pub(crate) async fn build_lazy_requested_model_execution_candidate_attempt_sourc
     G,
 >(
     state: PlannerAppState<'a>,
+    model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
     trace_id: &str,
     client_api_format: &str,
     requested_model: &str,
+    request_operation: Option<&str>,
     require_streaming: bool,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
     client_session_affinity: Option<&ClientSessionAffinity>,
@@ -719,15 +827,20 @@ where
     let record_runtime_miss_diagnostic = persistence_policy.skipped.record_runtime_miss_diagnostic;
     let page_cursor = LocalCandidatePreselectionPageCursor::new(
         state,
+        model_directive_policy,
         client_api_format,
         requested_model,
+        request_operation,
         require_streaming,
         required_capabilities,
         auth_snapshot,
         routing_policy,
         client_session_affinity,
+        request_auth_channel,
         use_api_format_alias_match,
         key_mode,
+        sticky_session_token.is_none(),
+        Some(trace_id),
     )
     .await;
     let mut cursor = RequestedModelAttemptPageCursor {
@@ -750,16 +863,22 @@ where
         decorate_skipped_candidate,
         page_cursor,
         pending_items: VecDeque::new(),
+        skipped_provider_ids: BTreeSet::new(),
+        skipped_endpoint_ids: BTreeSet::new(),
+        skipped_credential_ids: BTreeSet::new(),
         candidate_count: 0,
         next_candidate_index: 0,
         remembered_affinity: false,
         scheduler_cache_affinity_enabled,
         auth_api_key_concurrency_wait_deadline: None,
+        deferred_error: None,
     };
-    cursor.load_next_page().await;
+    if let Err(error) = cursor.load_next_page().await {
+        cursor.deferred_error = Some(error);
+    }
     let candidate_count = cursor.candidate_count;
     let mut items = VecDeque::new();
-    if !cursor.pending_items.is_empty() {
+    if !cursor.pending_items.is_empty() || cursor.deferred_error.is_some() {
         items.push_back(
             LocalExecutionCandidateAttemptSourceItem::RequestedModelPage {
                 cursor: Box::new(cursor),
@@ -767,7 +886,12 @@ where
         );
     }
     (
-        LocalExecutionCandidateAttemptSource { items },
+        LocalExecutionCandidateAttemptSource {
+            items,
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        },
         candidate_count,
     )
 }
@@ -792,39 +916,77 @@ struct RequestedModelAttemptPageCursor<'a> {
     decorate_skipped_candidate: DecorateSkippedCandidateFn<'a>,
     page_cursor: LocalCandidatePreselectionPageCursor<'a>,
     pending_items: VecDeque<LocalExecutionCandidateAttemptSourceItem<'a>>,
+    skipped_provider_ids: BTreeSet<String>,
+    skipped_endpoint_ids: BTreeSet<String>,
+    skipped_credential_ids: BTreeSet<String>,
     candidate_count: usize,
     next_candidate_index: u32,
     remembered_affinity: bool,
     scheduler_cache_affinity_enabled: bool,
     auth_api_key_concurrency_wait_deadline: Option<Instant>,
+    deferred_error: Option<GatewayError>,
 }
 
 impl<'a> RequestedModelAttemptPageCursor<'a> {
-    async fn next_attempt(&mut self) -> Option<LocalExecutionCandidateAttempt> {
+    fn skip_provider(&mut self, provider_id: &str) {
+        self.skipped_provider_ids.insert(provider_id.to_string());
+    }
+
+    fn skip_endpoint(&mut self, endpoint_id: &str) {
+        self.skipped_endpoint_ids.insert(endpoint_id.to_string());
+    }
+
+    fn skip_credential(&mut self, key_id: &str) {
+        self.skipped_credential_ids.insert(key_id.to_string());
+    }
+
+    async fn next_attempt(
+        &mut self,
+    ) -> Result<Option<LocalExecutionCandidateAttempt>, GatewayError> {
+        if let Some(error) = self.deferred_error.take() {
+            return Err(error);
+        }
         loop {
-            if let Some(attempt) = pop_attempt_from_items(&mut self.pending_items).await {
-                return Some(attempt);
+            if let Some(attempt) = pop_attempt_from_items(
+                &mut self.pending_items,
+                &self.skipped_provider_ids,
+                &self.skipped_endpoint_ids,
+                &self.skipped_credential_ids,
+            )
+            .await
+            {
+                return Ok(Some(attempt));
             }
-            if !self.load_next_page().await {
-                return None;
+            if !self.load_next_page().await? {
+                return Ok(None);
             }
         }
     }
 
-    async fn load_next_page(&mut self) -> bool {
+    async fn load_next_page(&mut self) -> Result<bool, GatewayError> {
         loop {
+            let page_started_at = std::time::Instant::now();
             let page = match self.page_cursor.next_page().await {
                 Ok(Some(page)) => page,
-                Ok(None) => return false,
-                Err(error) => {
-                    warn!(
-                        trace_id = %self.trace_id,
-                        error = ?error,
-                        "gateway lazy requested-model candidate page read failed"
+                Ok(None) => {
+                    observe_gateway_stage_ms(
+                        "candidate_page_load",
+                        page_started_at.elapsed().as_millis() as u64,
                     );
-                    return false;
+                    return Ok(false);
+                }
+                Err(error) => {
+                    observe_gateway_stage_ms(
+                        "candidate_page_load",
+                        page_started_at.elapsed().as_millis() as u64,
+                    );
+                    return Err(error);
                 }
             };
+            observe_gateway_stage_ms(
+                "candidate_page_load",
+                page_started_at.elapsed().as_millis() as u64,
+            );
 
             if page_is_exact_auth_api_key_concurrency_limited(&page) {
                 if self.wait_for_auth_api_key_concurrency_retry().await {
@@ -832,24 +994,16 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 }
                 self.persist_final_auth_api_key_concurrency_skips(page.skipped_candidates)
                     .await;
-                return false;
+                return Ok(false);
             }
 
+            let resolve_started_at = std::time::Instant::now();
             let (candidates, resolved_skipped) =
-                resolve_and_rank_logical_local_execution_candidates(
-                    self.state,
-                    page.candidates,
-                    &self.client_api_format,
-                    Some(&self.requested_model),
-                    Some(&self.auth_snapshot),
-                    self.client_session_affinity.as_ref(),
-                    self.required_capabilities.as_ref(),
-                    self.routing_policy.as_ref(),
-                    self.sticky_session_token.as_deref(),
-                    self.request_auth_channel.as_deref(),
-                    self.resolution_mode,
-                )
-                .await;
+                resolve_priority_candidate_page_with_cache(self, page.candidates).await;
+            observe_gateway_stage_ms(
+                "candidate_page_resolve",
+                resolve_started_at.elapsed().as_millis() as u64,
+            );
             let skipped_candidates = page
                 .skipped_candidates
                 .into_iter()
@@ -870,6 +1024,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                     self.client_session_affinity.as_ref(),
                     &self.client_api_format,
                     Some(&self.requested_model),
+                    self.routing_policy.as_ref(),
                     &candidates,
                 );
                 self.remembered_affinity = true;
@@ -899,7 +1054,7 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 .saturating_add(u32::try_from(skipped_candidate_count).unwrap_or(u32::MAX));
             if !items.is_empty() {
                 self.pending_items = items;
-                return true;
+                return Ok(true);
             }
             let skipped_starting_candidate_index = next_candidate_index;
             let skipped_persistence = LocalSkippedCandidatePersistenceContext {
@@ -993,11 +1148,23 @@ fn page_is_exact_auth_api_key_concurrency_limited(
 
 async fn pop_attempt_from_items(
     items: &mut VecDeque<LocalExecutionCandidateAttemptSourceItem<'_>>,
+    skipped_provider_ids: &BTreeSet<String>,
+    skipped_endpoint_ids: &BTreeSet<String>,
+    skipped_credential_ids: &BTreeSet<String>,
 ) -> Option<LocalExecutionCandidateAttempt> {
     loop {
         let front = items.front_mut()?;
         match front {
             LocalExecutionCandidateAttemptSourceItem::Static { attempts } => {
+                if dispatch_sequence_candidate_is_skipped(
+                    attempts,
+                    skipped_provider_ids,
+                    skipped_endpoint_ids,
+                    skipped_credential_ids,
+                ) {
+                    items.pop_front();
+                    continue;
+                }
                 if let Some(attempt) = next_attempt_from_dispatch_sequence(attempts) {
                     if dispatch_sequence_exhausted(attempts) {
                         items.pop_front();
@@ -1012,6 +1179,20 @@ async fn pop_attempt_from_items(
                 pending_attempts,
                 pool_exhaustion_persistence,
             } => {
+                if skipped_provider_ids.contains(cursor.provider_id())
+                    || skipped_endpoint_ids.contains(cursor.endpoint_id())
+                {
+                    items.pop_front();
+                    continue;
+                }
+                if dispatch_sequence_candidate_is_skipped(
+                    pending_attempts,
+                    skipped_provider_ids,
+                    skipped_endpoint_ids,
+                    skipped_credential_ids,
+                ) {
+                    *pending_attempts = DispatchSequence::new(Vec::new());
+                }
                 if let Some(attempt) = next_attempt_from_dispatch_sequence(pending_attempts) {
                     return Some(attempt);
                 }
@@ -1029,6 +1210,14 @@ async fn pop_attempt_from_items(
                     items.pop_front();
                     continue;
                 };
+                if candidate_is_skipped(
+                    &candidate,
+                    skipped_provider_ids,
+                    skipped_endpoint_ids,
+                    skipped_credential_ids,
+                ) {
+                    continue;
+                }
                 *pending_attempts = dispatch_sequence_from_attempts(
                     build_unpersisted_local_execution_candidate_attempts(
                         candidate,
@@ -1060,6 +1249,7 @@ pub(crate) fn remember_first_local_candidate_affinity(
     client_session_affinity: Option<&ClientSessionAffinity>,
     client_api_format: &str,
     requested_model: Option<&str>,
+    routing_policy: Option<&ResolvedRoutingPolicy>,
     candidates: &[EligibleLocalExecutionCandidate],
 ) {
     let Some(first_candidate) = candidates.first() else {
@@ -1069,15 +1259,185 @@ pub(crate) fn remember_first_local_candidate_affinity(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(first_candidate.candidate.global_model_name.as_str());
-    remember_scheduler_affinity_for_candidate_at_epoch(
+    remember_scheduler_affinity_for_candidate_with_routing_policy_at_epoch(
         state,
         auth_snapshot,
         client_session_affinity,
         client_api_format,
         affinity_requested_model,
         &first_candidate.candidate,
+        routing_policy,
         first_candidate.orchestration.scheduler_affinity_epoch,
     );
+}
+
+async fn resolve_priority_candidate_page_with_cache(
+    cursor: &RequestedModelAttemptPageCursor<'_>,
+    page_candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
+) -> (
+    Vec<EligibleLocalExecutionCandidate>,
+    Vec<SkippedLocalExecutionCandidate>,
+) {
+    if !should_cache_resolved_candidate_page(cursor) {
+        return resolve_and_rank_logical_local_execution_candidates(
+            cursor.state,
+            page_candidates,
+            &cursor.client_api_format,
+            Some(&cursor.requested_model),
+            Some(&cursor.auth_snapshot),
+            cursor.client_session_affinity.as_ref(),
+            cursor.required_capabilities.as_ref(),
+            cursor.routing_policy.as_ref(),
+            cursor.sticky_session_token.as_deref(),
+            cursor.request_auth_channel.as_deref(),
+            cursor.resolution_mode,
+        )
+        .await;
+    }
+
+    let key = CandidateResolvedPageCacheKey::new(
+        &cursor.requested_model,
+        cursor.page_cursor.resolved_page_cache_request_operation(),
+        &cursor.client_api_format,
+        true,
+        &cursor.auth_snapshot,
+        cursor.required_capabilities.as_ref(),
+        cursor.routing_policy.as_ref(),
+        cursor.request_auth_channel.as_deref(),
+        cursor.state.app().scheduler_affinity_epoch(),
+        cursor.page_cursor.resolved_page_cache_preselection_mode(),
+        cursor
+            .page_cursor
+            .resolved_page_cache_use_api_format_alias_match(),
+        cursor.client_session_affinity.as_ref(),
+        cursor
+            .page_cursor
+            .resolved_page_cache_model_directive_policy_hash(),
+        cursor.resolution_mode,
+    );
+    let page_candidates_for_fallback = page_candidates;
+    let app = cursor.state.app();
+    let cache = app.candidate_resolved_page_cache.clone();
+    let ttl = candidate_page_cache_ttl_from_env();
+    let stale_ttl = candidate_page_cache_stale_ttl(ttl);
+    // Keep request-owned planner inputs borrowed until the cache tells us a
+    // cold load or stale refresh is actually needed. Fresh hits must not pay
+    // for deep copies of candidate pages and auth/routing snapshots.
+    let client_api_format = cursor.client_api_format.as_str();
+    let requested_model = cursor.requested_model.as_str();
+    let auth_snapshot = &cursor.auth_snapshot;
+    let client_session_affinity = cursor.client_session_affinity.as_ref();
+    let required_capabilities = cursor.required_capabilities.as_ref();
+    let routing_policy = cursor.routing_policy.as_ref();
+    let request_auth_channel = cursor.request_auth_channel.as_deref();
+    let resolution_mode = cursor.resolution_mode;
+    let cached = cache
+        .get_or_load_once_stale_while_revalidating(
+            key,
+            ttl,
+            stale_ttl,
+            || {
+                resolve_candidate_page_snapshot(
+                    (*app).clone(),
+                    page_candidates_for_fallback.clone(),
+                    client_api_format.to_owned(),
+                    requested_model.to_owned(),
+                    auth_snapshot.clone(),
+                    client_session_affinity.cloned(),
+                    required_capabilities.cloned(),
+                    routing_policy.cloned(),
+                    request_auth_channel.map(ToOwned::to_owned),
+                    resolution_mode,
+                )
+            },
+            || {
+                resolve_candidate_page_snapshot(
+                    (*app).clone(),
+                    page_candidates_for_fallback.clone(),
+                    client_api_format.to_owned(),
+                    requested_model.to_owned(),
+                    auth_snapshot.clone(),
+                    client_session_affinity.cloned(),
+                    required_capabilities.cloned(),
+                    routing_policy.cloned(),
+                    request_auth_channel.map(ToOwned::to_owned),
+                    resolution_mode,
+                )
+            },
+            CacheLoadObserver::new()
+                .on_hit(record_candidate_page_resolve_cache_hit)
+                .on_miss(record_candidate_page_resolve_cache_miss)
+                .on_load(record_candidate_page_resolve_cache_load)
+                .on_follower_wait(record_candidate_page_resolve_cache_follower_wait),
+        )
+        .await
+        .unwrap_or(None);
+
+    match cached {
+        Some(snapshot) => (
+            snapshot.candidates.clone(),
+            snapshot.resolved_skipped.clone(),
+        ),
+        None => {
+            if page_candidates_for_fallback.is_empty() {
+                return (Vec::new(), Vec::new());
+            }
+            resolve_and_rank_logical_local_execution_candidates(
+                cursor.state,
+                page_candidates_for_fallback,
+                &cursor.client_api_format,
+                Some(&cursor.requested_model),
+                Some(&cursor.auth_snapshot),
+                cursor.client_session_affinity.as_ref(),
+                cursor.required_capabilities.as_ref(),
+                cursor.routing_policy.as_ref(),
+                cursor.sticky_session_token.as_deref(),
+                cursor.request_auth_channel.as_deref(),
+                cursor.resolution_mode,
+            )
+            .await
+        }
+    }
+}
+
+async fn resolve_candidate_page_snapshot(
+    app: AppState,
+    page_candidates: Vec<SchedulerMinimalCandidateSelectionCandidate>,
+    client_api_format: String,
+    requested_model: String,
+    auth_snapshot: GatewayAuthApiKeySnapshot,
+    client_session_affinity: Option<ClientSessionAffinity>,
+    required_capabilities: Option<Value>,
+    routing_policy: Option<ResolvedRoutingPolicy>,
+    request_auth_channel: Option<String>,
+    resolution_mode: LocalCandidateResolutionMode,
+) -> Result<Option<Arc<CandidateResolvedPageSnapshot>>, GatewayError> {
+    let state = PlannerAppState::new(&app);
+    let (candidates, resolved_skipped) = resolve_and_rank_logical_local_execution_candidates(
+        state,
+        page_candidates,
+        &client_api_format,
+        Some(&requested_model),
+        Some(&auth_snapshot),
+        client_session_affinity.as_ref(),
+        required_capabilities.as_ref(),
+        routing_policy.as_ref(),
+        None,
+        request_auth_channel.as_deref(),
+        resolution_mode,
+    )
+    .await;
+    Ok(Some(Arc::new(CandidateResolvedPageSnapshot {
+        candidates,
+        resolved_skipped,
+    })))
+}
+
+fn should_cache_resolved_candidate_page(cursor: &RequestedModelAttemptPageCursor<'_>) -> bool {
+    cursor.sticky_session_token.is_none()
+        && cursor
+            .page_cursor
+            .should_cache_current_priority_resolved_page()
 }
 
 fn should_persist_available_local_candidate(eligible: &EligibleLocalExecutionCandidate) -> bool {
@@ -1245,7 +1605,8 @@ async fn persist_available_local_execution_candidate_at_index<F>(
 where
     F: Fn(&EligibleLocalExecutionCandidate) -> Option<Value> + Send + Sync,
 {
-    let attempt_slots = local_attempt_slot_count(&candidate.transport).max(1);
+    // Exactly one attempt is materialized per candidate; same-key retries are
+    // derived lazily by the attempt loop after a failure.
     let extra_data = ai_candidate_extra_data_with_ranking(
         available_candidate_base_extra_data_with_dispatch_ref(&candidate, build_extra_data),
         candidate.ranking.as_ref(),
@@ -1260,53 +1621,34 @@ where
         Some(candidate_index),
         extra_data,
     );
-    let should_persist = should_persist_available_local_candidate(&candidate);
-    let mut attempts = Vec::with_capacity(attempt_slots as usize);
-    let mut owned_candidate = Some(candidate);
+    let retry_index = effective_retry_index(0, candidate.orchestration.pool_key_index);
+    let generated_candidate_id = Uuid::new_v4().to_string();
+    let candidate_id = if should_persist_available_local_candidate(&candidate) {
+        state
+            .persist_available_local_candidate(
+                trace_id,
+                context.user_id,
+                context.api_key_id,
+                &candidate.candidate,
+                candidate_index,
+                retry_index,
+                generated_candidate_id.as_str(),
+                context.required_capabilities,
+                extra_data,
+                current_unix_ms(),
+                context.error_context,
+            )
+            .await
+    } else {
+        generated_candidate_id
+    };
 
-    for retry_index in 0..attempt_slots {
-        let candidate_ref = owned_candidate
-            .as_ref()
-            .expect("candidate should remain available until final retry");
-        let generated_candidate_id = Uuid::new_v4().to_string();
-        let candidate_id = if should_persist {
-            state
-                .persist_available_local_candidate(
-                    trace_id,
-                    context.user_id,
-                    context.api_key_id,
-                    &candidate_ref.candidate,
-                    candidate_index,
-                    effective_retry_index(retry_index, candidate_ref.orchestration.pool_key_index),
-                    generated_candidate_id.as_str(),
-                    context.required_capabilities,
-                    extra_data.clone(),
-                    current_unix_ms(),
-                    context.error_context,
-                )
-                .await
-        } else {
-            generated_candidate_id
-        };
-
-        let candidate = if retry_index + 1 == attempt_slots {
-            owned_candidate
-                .take()
-                .expect("final retry should consume owned candidate")
-        } else {
-            candidate_ref.clone()
-        };
-        let retry_index =
-            effective_retry_index(retry_index, candidate.orchestration.pool_key_index);
-        attempts.push(LocalExecutionCandidateAttempt {
-            eligible: candidate,
-            candidate_index,
-            retry_index,
-            candidate_id,
-        });
-    }
-
-    attempts
+    vec![LocalExecutionCandidateAttempt {
+        eligible: candidate,
+        candidate_index,
+        retry_index,
+        candidate_id,
+    }]
 }
 
 fn available_candidate_extra_data_with_dispatch_ref<F>(
@@ -1475,6 +1817,7 @@ fn routing_trace_for_candidate(
                     CandidateKind::Provider => Some(candidate.key_id.clone()),
                     CandidateKind::PoolGroup => None,
                 },
+                api_format: Some(candidate.endpoint_api_format.clone()),
                 provider_priority: candidate.provider_priority,
                 key_priority: candidate
                     .key_global_priority_for_format
@@ -1521,6 +1864,33 @@ fn next_attempt_from_dispatch_sequence(
     Some(attempt)
 }
 
+fn dispatch_sequence_candidate_is_skipped(
+    sequence: &DispatchSequence<LocalExecutionCandidateAttempt>,
+    skipped_provider_ids: &BTreeSet<String>,
+    skipped_endpoint_ids: &BTreeSet<String>,
+    skipped_credential_ids: &BTreeSet<String>,
+) -> bool {
+    sequence.peek_current().is_some_and(|item| {
+        candidate_is_skipped(
+            &item.candidate.eligible,
+            skipped_provider_ids,
+            skipped_endpoint_ids,
+            skipped_credential_ids,
+        )
+    })
+}
+
+fn candidate_is_skipped(
+    candidate: &EligibleLocalExecutionCandidate,
+    skipped_provider_ids: &BTreeSet<String>,
+    skipped_endpoint_ids: &BTreeSet<String>,
+    skipped_credential_ids: &BTreeSet<String>,
+) -> bool {
+    skipped_provider_ids.contains(&candidate.candidate.provider_id)
+        || skipped_endpoint_ids.contains(&candidate.candidate.endpoint_id)
+        || skipped_credential_ids.contains(&candidate.candidate.key_id)
+}
+
 fn dispatch_sequence_exhausted(
     sequence: &mut DispatchSequence<LocalExecutionCandidateAttempt>,
 ) -> bool {
@@ -1531,32 +1901,15 @@ fn build_unpersisted_local_execution_candidate_attempts(
     candidate: EligibleLocalExecutionCandidate,
     candidate_index: u32,
 ) -> VecDeque<LocalExecutionCandidateAttempt> {
-    let attempt_slots = local_attempt_slot_count(&candidate.transport).max(1);
-    let mut attempts = VecDeque::with_capacity(attempt_slots as usize);
-    let mut owned_candidate = Some(candidate);
-
-    for retry_index in 0..attempt_slots {
-        let candidate = if retry_index + 1 == attempt_slots {
-            owned_candidate
-                .take()
-                .expect("final retry should consume owned candidate")
-        } else {
-            owned_candidate
-                .as_ref()
-                .expect("candidate should remain available until final retry")
-                .clone()
-        };
-        let retry_index =
-            effective_retry_index(retry_index, candidate.orchestration.pool_key_index);
-        attempts.push_back(LocalExecutionCandidateAttempt {
-            eligible: candidate,
-            candidate_index,
-            retry_index,
-            candidate_id: Uuid::new_v4().to_string(),
-        });
-    }
-
-    attempts
+    // One attempt per candidate; same-key retries are derived lazily by the
+    // attempt loop after a failure.
+    let retry_index = effective_retry_index(0, candidate.orchestration.pool_key_index);
+    VecDeque::from([LocalExecutionCandidateAttempt {
+        eligible: candidate,
+        candidate_index,
+        retry_index,
+        candidate_id: Uuid::new_v4().to_string(),
+    }])
 }
 
 async fn persist_pool_group_exhaustion_skipped_candidate(
@@ -1802,6 +2155,7 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-5".to_string(),
             selected_provider_model_name: "gpt-5".to_string(),
+            supports_streaming: true,
             mapping_matched_model: None,
         }
     }
@@ -1883,6 +2237,8 @@ mod tests {
                 pool_key_index,
                 pool_key_lease: None,
                 scheduler_affinity_epoch: None,
+                // These tests cover persistence shape, not same-key retries.
+                sticky_key_attempts: Some(1),
             },
             ranking: None,
         }
@@ -1937,7 +2293,8 @@ mod tests {
                 GatewayDataState::with_request_candidate_repository_for_tests(Arc::clone(
                     &repository,
                 )),
-            );
+            )
+            .without_request_candidate_queue_for_tests();
 
         let attempts = persist_available_local_execution_candidates(
             PlannerAppState::new(&app),
@@ -2026,6 +2383,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolved_candidate_page_cache_requires_fixed_order_or_explicit_affinity() {
+        let app = AppState::new().expect("state should build");
+        let auth_snapshot = sample_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::default();
+        let mut page_cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5",
+            None,
+            true,
+            None,
+            &auth_snapshot,
+            None,
+            None,
+            None,
+            false,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
+            true,
+            Some("trace-no-session-affinity"),
+        )
+        .await;
+        page_cursor.mark_priority_page_emitted_for_tests();
+        let cursor = RequestedModelAttemptPageCursor {
+            state: PlannerAppState::new(&app),
+            trace_id: "trace-no-session-affinity".to_string(),
+            client_api_format: "openai:chat".to_string(),
+            requested_model: "gpt-5".to_string(),
+            auth_snapshot: auth_snapshot.clone(),
+            client_session_affinity: None,
+            required_capabilities: None,
+            routing_policy: None,
+            sticky_session_token: None,
+            request_auth_channel: None,
+            skipped_user_id: "user-1".to_string(),
+            skipped_api_key_id: "api-key-1".to_string(),
+            skipped_required_capabilities: None,
+            skipped_error_context: "test skipped",
+            record_runtime_miss_diagnostic: false,
+            resolution_mode: LocalCandidateResolutionMode::Standard,
+            decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
+            page_cursor,
+            pending_items: VecDeque::new(),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+            candidate_count: 0,
+            next_candidate_index: 0,
+            remembered_affinity: false,
+            scheduler_cache_affinity_enabled: false,
+            auth_api_key_concurrency_wait_deadline: None,
+            deferred_error: None,
+        };
+
+        assert!(!should_cache_resolved_candidate_page(&cursor));
+
+        let sticky_cursor = RequestedModelAttemptPageCursor {
+            sticky_session_token: Some("sticky-token".to_string()),
+            ..cursor
+        };
+
+        assert!(!should_cache_resolved_candidate_page(&sticky_cursor));
+
+        let mut page_cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5",
+            None,
+            true,
+            None,
+            &auth_snapshot,
+            None,
+            Some(&ClientSessionAffinity::from_session_key("chat-session-1")),
+            None,
+            false,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
+            true,
+            Some("trace-session-affinity"),
+        )
+        .await;
+        page_cursor.mark_priority_page_emitted_for_tests();
+        let cursor = RequestedModelAttemptPageCursor {
+            client_session_affinity: Some(ClientSessionAffinity::from_session_key(
+                "chat-session-1",
+            )),
+            page_cursor,
+            sticky_session_token: None,
+            ..sticky_cursor
+        };
+
+        assert!(should_cache_resolved_candidate_page(&cursor));
+
+        let fixed_order_app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::disabled().with_system_config_values_for_tests([(
+                    "scheduling_mode".to_string(),
+                    json!("fixed_order"),
+                )]),
+            );
+        let mut page_cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&fixed_order_app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5",
+            None,
+            true,
+            None,
+            &auth_snapshot,
+            None,
+            None,
+            None,
+            false,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
+            true,
+            Some("trace-fixed-order"),
+        )
+        .await;
+        page_cursor.mark_priority_page_emitted_for_tests();
+        let cursor = RequestedModelAttemptPageCursor {
+            state: PlannerAppState::new(&fixed_order_app),
+            trace_id: "trace-fixed-order".to_string(),
+            client_api_format: "openai:chat".to_string(),
+            requested_model: "gpt-5".to_string(),
+            auth_snapshot,
+            client_session_affinity: None,
+            required_capabilities: None,
+            routing_policy: None,
+            sticky_session_token: None,
+            request_auth_channel: None,
+            skipped_user_id: "user-1".to_string(),
+            skipped_api_key_id: "api-key-1".to_string(),
+            skipped_required_capabilities: None,
+            skipped_error_context: "test skipped",
+            record_runtime_miss_diagnostic: false,
+            resolution_mode: LocalCandidateResolutionMode::Standard,
+            decorate_skipped_candidate: Arc::new(identity_skipped_candidate),
+            page_cursor,
+            pending_items: VecDeque::new(),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+            candidate_count: 0,
+            next_candidate_index: 0,
+            remembered_affinity: false,
+            scheduler_cache_affinity_enabled: false,
+            auth_api_key_concurrency_wait_deadline: None,
+            deferred_error: None,
+        };
+
+        assert!(should_cache_resolved_candidate_page(&cursor));
+    }
+
+    #[tokio::test]
     async fn logical_materialization_does_not_persist_pool_group_representative() {
         let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
         let app = AppState::new()
@@ -2042,7 +2555,8 @@ mod tests {
                     Arc::clone(&request_candidate_repository),
                     "test-encryption-key",
                 ),
-            );
+            )
+            .without_request_candidate_queue_for_tests();
         let mut pool_group = sample_eligible("pool-group", None);
         pool_group.kind = LocalExecutionCandidateKind::PoolGroup;
         pool_group.transport = sample_transport(
@@ -2140,7 +2654,8 @@ mod tests {
                 GatewayDataState::with_request_candidate_repository_for_tests(Arc::clone(
                     &repository,
                 )),
-            );
+            )
+            .without_request_candidate_queue_for_tests();
         let mut eligible = sample_eligible("ranked-key", None);
         eligible.ranking = Some(SchedulerRankingOutcome {
             original_index: 1,
@@ -2209,17 +2724,179 @@ mod tests {
                     .into(),
                 ),
             }]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
         };
 
         let first = source
             .next_attempt()
             .await
+            .expect("first attempt read should succeed")
             .expect("first attempt should be available");
         assert_eq!(first.eligible.candidate.key_id, "normal-key");
 
         let remaining = source.drain_static_attempts();
         assert!(remaining.is_empty());
-        assert!(source.next_attempt().await.is_none());
+        assert!(source
+            .next_attempt()
+            .await
+            .expect("remaining attempt read should succeed")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn dynamic_attempt_source_skips_credentials_and_endpoints_across_static_candidates() {
+        let key_a = sample_eligible("key-a", None);
+        let key_b = sample_eligible("key-b", None);
+        let mut key_c = sample_eligible("key-c", None);
+        key_c.candidate.endpoint_id = "endpoint-2".to_string();
+        Arc::make_mut(&mut key_c.transport).endpoint.id = "endpoint-2".to_string();
+
+        let static_item =
+            |candidate, candidate_index| LocalExecutionCandidateAttemptSourceItem::Static {
+                attempts: dispatch_sequence_from_attempts(
+                    build_unpersisted_local_execution_candidate_attempts(
+                        candidate,
+                        candidate_index,
+                    )
+                    .into(),
+                ),
+            };
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items: VecDeque::from([
+                static_item(key_a, 0),
+                static_item(key_b, 1),
+                static_item(key_c, 2),
+            ]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        };
+
+        source.skip_credential("key-a");
+        let key_b_attempt = source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .expect("a different credential should remain");
+        assert_eq!(key_b_attempt.eligible.candidate.key_id, "key-b");
+
+        source.skip_endpoint("endpoint-1");
+        let endpoint_2_attempt = source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .expect("a different endpoint should remain");
+        assert_eq!(endpoint_2_attempt.eligible.candidate.key_id, "key-c");
+        assert_eq!(
+            endpoint_2_attempt.eligible.candidate.endpoint_id,
+            "endpoint-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_attempt_source_filters_skipped_pool_pending_credential() {
+        let app = AppState::new().expect("state should build");
+        let mut pool_group = sample_eligible("pool-group", None);
+        pool_group.kind = LocalExecutionCandidateKind::PoolGroup;
+        pool_group.transport = sample_transport("pool-group", Some(json!({ "pool_advanced": {} })));
+        let pool_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            pool_group,
+            None,
+            Some("gpt-5"),
+            None,
+        );
+        let pool_key_attempts = dispatch_sequence_from_attempts(
+            build_unpersisted_local_execution_candidate_attempts(
+                sample_eligible("pool-key-a", None),
+                0,
+            )
+            .into(),
+        );
+        let mut fallback = sample_eligible("fallback-key", None);
+        fallback.candidate.provider_id = "provider-b".to_string();
+        Arc::make_mut(&mut fallback.transport).provider.id = "provider-b".to_string();
+        Arc::make_mut(&mut fallback.transport).key.provider_id = "provider-b".to_string();
+        let fallback_attempts = dispatch_sequence_from_attempts(
+            build_unpersisted_local_execution_candidate_attempts(fallback, 1).into(),
+        );
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items: VecDeque::from([
+                LocalExecutionCandidateAttemptSourceItem::Pool {
+                    cursor: pool_cursor,
+                    candidate_index: 0,
+                    pending_attempts: pool_key_attempts,
+                    pool_exhaustion_persistence: None,
+                },
+                LocalExecutionCandidateAttemptSourceItem::Static {
+                    attempts: fallback_attempts,
+                },
+            ]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        };
+
+        source.skip_credential("pool-key-a");
+        let attempt = source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .expect("fallback credential should remain");
+
+        assert_eq!(attempt.eligible.candidate.provider_id, "provider-b");
+        assert_eq!(attempt.eligible.candidate.key_id, "fallback-key");
+    }
+
+    #[tokio::test]
+    async fn skipped_provider_discards_pool_cursor_and_continues_with_next_provider() {
+        let app = AppState::new().expect("state should build");
+        let mut pool_group = sample_eligible("pool-group", None);
+        pool_group.kind = LocalExecutionCandidateKind::PoolGroup;
+        pool_group.transport = sample_transport("pool-group", Some(json!({ "pool_advanced": {} })));
+        let pool_cursor = PoolKeyCursor::new(
+            PlannerAppState::new(&app),
+            pool_group,
+            None,
+            Some("gpt-5"),
+            None,
+        );
+
+        let mut fallback = sample_eligible("fallback-key", None);
+        fallback.candidate.provider_id = "provider-b".to_string();
+        Arc::make_mut(&mut fallback.transport).provider.id = "provider-b".to_string();
+        Arc::make_mut(&mut fallback.transport).key.provider_id = "provider-b".to_string();
+        let fallback_attempts = dispatch_sequence_from_attempts(
+            build_unpersisted_local_execution_candidate_attempts(fallback, 1).into(),
+        );
+        let mut source = LocalExecutionCandidateAttemptSource {
+            items: VecDeque::from([
+                LocalExecutionCandidateAttemptSourceItem::Pool {
+                    cursor: pool_cursor,
+                    candidate_index: 0,
+                    pending_attempts: DispatchSequence::new(Vec::new()),
+                    pool_exhaustion_persistence: None,
+                },
+                LocalExecutionCandidateAttemptSourceItem::Static {
+                    attempts: fallback_attempts,
+                },
+            ]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
+        };
+
+        source.skip_provider("provider-1");
+        let attempt = source
+            .next_attempt()
+            .await
+            .expect("candidate source should succeed")
+            .expect("fallback provider should remain");
+
+        assert_eq!(attempt.eligible.candidate.provider_id, "provider-b");
+        assert_eq!(attempt.eligible.candidate.key_id, "fallback-key");
     }
 
     #[tokio::test]
@@ -2239,7 +2916,8 @@ mod tests {
                     Arc::clone(&request_candidate_repository),
                     "test-encryption-key",
                 ),
-            );
+            )
+            .without_request_candidate_queue_for_tests();
         let mut pool_group = sample_eligible("pool-group", None);
         pool_group.kind = LocalExecutionCandidateKind::PoolGroup;
         pool_group.transport = sample_transport(
@@ -2273,9 +2951,16 @@ mod tests {
                 pending_attempts: DispatchSequence::new(Vec::new()),
                 pool_exhaustion_persistence: Some(pool_exhaustion_persistence),
             }]),
+            skipped_provider_ids: BTreeSet::new(),
+            skipped_endpoint_ids: BTreeSet::new(),
+            skipped_credential_ids: BTreeSet::new(),
         };
 
-        assert!(source.next_attempt().await.is_none());
+        assert!(source
+            .next_attempt()
+            .await
+            .expect("pool attempt read should succeed")
+            .is_none());
 
         let stored = app
             .read_request_candidates_by_request_id("trace-dynamic-pool")
@@ -2308,7 +2993,8 @@ mod tests {
                 GatewayDataState::with_request_candidate_repository_for_tests(Arc::clone(
                     &repository,
                 )),
-            );
+            )
+            .without_request_candidate_queue_for_tests();
 
         persist_skipped_local_execution_candidates(
             &app,

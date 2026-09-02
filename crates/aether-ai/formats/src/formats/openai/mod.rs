@@ -1,0 +1,12 @@
+pub mod chat;
+pub mod embedding;
+pub mod image;
+pub(crate) mod namespace;
+pub mod prompt_cache;
+pub mod reasoning;
+pub mod request_contract;
+pub mod rerank;
+pub mod responses;
+pub mod search;
+pub mod shared;
+pub mod video;

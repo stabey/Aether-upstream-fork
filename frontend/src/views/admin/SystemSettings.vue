@@ -83,6 +83,7 @@
             :enable-format-conversion="systemConfig.enable_format_conversion"
             :enable-openai-image-sync-heartbeat="systemConfig.enable_openai_image_sync_heartbeat"
             :enable-standard-text-sync-heartbeat="systemConfig.enable_standard_text_sync_heartbeat"
+            :cyber-continue-failover="systemConfig.cyber_continue_failover"
             :loading="systemConfigLoading || basicConfigLoading"
             :has-changes="hasBasicConfigChanges"
             @save="saveBasicConfig"
@@ -108,21 +109,18 @@
             @update:enable-format-conversion="systemConfig.enable_format_conversion = $event"
             @update:enable-openai-image-sync-heartbeat="systemConfig.enable_openai_image_sync_heartbeat = $event"
             @update:enable-standard-text-sync-heartbeat="systemConfig.enable_standard_text_sync_heartbeat = $event"
+            @update:cyber-continue-failover="systemConfig.cyber_continue_failover = $event"
           />
 
           <!-- 请求记录配置 -->
           <RequestLogSection
             id="section-request-log"
             :request-record-level="systemConfig.request_record_level"
-            :max-request-body-size-k-b="maxRequestBodySizeKB"
-            :max-response-body-size-k-b="maxResponseBodySizeKB"
             :sensitive-headers-str="sensitiveHeadersStr"
             :loading="systemConfigLoading || logConfigLoading"
             :has-changes="hasLogConfigChanges"
             @save="saveLogConfig"
             @update:request-record-level="systemConfig.request_record_level = $event"
-            @update:max-request-body-size-k-b="maxRequestBodySizeKB = $event"
-            @update:max-response-body-size-k-b="maxResponseBodySizeKB = $event"
             @update:sensitive-headers-str="sensitiveHeadersStr = $event"
           />
 
@@ -357,8 +355,6 @@ const {
   hasBasicConfigChanges,
   hasLogConfigChanges,
   hasCleanupConfigChanges,
-  maxRequestBodySizeKB,
-  maxResponseBodySizeKB,
   sensitiveHeadersStr,
   turnstileAllowedHostnamesStr,
   loadSystemConfig,

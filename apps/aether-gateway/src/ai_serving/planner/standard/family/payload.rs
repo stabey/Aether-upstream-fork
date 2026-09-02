@@ -15,7 +15,7 @@ use crate::ai_serving::planner::report_context::{
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
 use crate::ai_serving::planner::{
-    build_ai_execution_decision_response, resolve_transport_request_gzip_policy,
+    build_ai_execution_decision_response, resolve_transport_request_encoding_policy,
     AiExecutionDecisionResponseParts,
 };
 use crate::ai_serving::transport::{
@@ -140,7 +140,9 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
                 original_request_body_json,
                 original_request_body_base64: None,
                 client_session_affinity: input.client_session_affinity.as_ref(),
+                routing_policy: input.routing_policy.as_ref(),
                 scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+                sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
                 client_requested_stream: body_json
                     .get("stream")
                     .and_then(serde_json::Value::as_bool)
@@ -176,7 +178,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         transport_profile: _,
         request_redacted: _,
     } = resolved;
-    let request_gzip = resolve_transport_request_gzip_policy(&transport);
+    let request_encoding = resolve_transport_request_encoding_policy(&transport);
 
     let mut decision = build_ai_execution_decision_response(AiExecutionDecisionResponseParts {
         decision_is_stream: spec_metadata.require_streaming,
@@ -186,6 +188,7 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         request_id: trace_id.to_string(),
         candidate_id: candidate_id.to_string(),
         provider_name: candidate.provider_name.clone(),
+        provider_type: transport.provider.provider_type.clone(),
         provider_id: candidate.provider_id.clone(),
         endpoint_id: candidate.endpoint_id.clone(),
         key_id: candidate.key_id.clone(),
@@ -203,8 +206,8 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         provider_request_body: Some(provider_request_body),
         provider_request_body_base64: None,
         content_type: Some("application/json".to_string()),
-        content_encoding: None,
-        request_gzip,
+        content_encoding: request_encoding.content_encoding,
+        request_gzip: request_encoding.request_gzip,
         proxy,
         transport_profile,
         timeouts,
@@ -213,7 +216,11 @@ pub(super) async fn maybe_build_local_standard_decision_payload_for_candidate(
         report_context: Some(report_context),
         auth_context: input.auth_context.clone(),
     });
-    apply_provider_request_routing_policy_to_decision(input, &mut decision)?;
+    apply_provider_request_routing_policy_to_decision(
+        input,
+        &mut decision,
+        Some(transport.as_ref()),
+    )?;
     Ok(Some(decision))
 }
 
@@ -368,10 +375,14 @@ mod tests {
             auth_snapshot: sample_auth_snapshot(),
             required_capabilities: None,
             request_auth_channel: None,
+            client_surface: None,
+            gateway_credential_carrier: None,
             client_session_affinity: None,
+            codex_fingerprint_context: None,
             routing_policy: None,
             routing_trace_seed: None,
             routing_context: None,
+            model_directive_policy: Default::default(),
         }
     }
 
@@ -475,6 +486,7 @@ mod tests {
             } else {
                 "gpt-4o-upstream".to_string()
             },
+            supports_streaming: true,
             mapping_matched_model: None,
         }
     }

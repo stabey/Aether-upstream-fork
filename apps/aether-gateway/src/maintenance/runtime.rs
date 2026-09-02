@@ -16,6 +16,8 @@ mod cleanup_runs;
 mod config;
 #[path = "runtime/db_maintenance.rs"]
 mod db_maintenance;
+#[path = "runtime/fixed_provider_reconciliation.rs"]
+mod fixed_provider_reconciliation;
 #[path = "runtime/oauth_token_refresh.rs"]
 mod oauth_token_refresh;
 #[path = "runtime/pending_cleanup.rs"]
@@ -71,6 +73,9 @@ pub(crate) use cleanup_runs::{
 };
 use config::*;
 use db_maintenance::*;
+pub(crate) use fixed_provider_reconciliation::{
+    perform_fixed_provider_reconciliation_once, spawn_fixed_provider_reconciliation_task,
+};
 pub(crate) use oauth_token_refresh::{
     perform_oauth_token_refresh_once, OAuthTokenRefreshRunSummary,
 };
@@ -116,6 +121,9 @@ pub(crate) use usage_cleanup::{
     preview_manual_usage_cleanup, ManualUsageCleanupMode, ManualUsageCleanupOptions,
 };
 use usage_counter_flush::*;
+pub(crate) use usage_counter_flush::{
+    UsageCounterFlushRuntimeMetrics, UsageCounterFlushWorkerConfig,
+};
 use wallet_daily_usage::*;
 pub(crate) use workers::*;
 
@@ -136,12 +144,6 @@ const PROXY_NODE_STALE_MIN_GRACE_SECS: u64 = 15;
 const PROXY_NODE_STALE_MISSED_HEARTBEATS: u64 = 3;
 const POOL_MONITOR_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const OAUTH_TOKEN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const USAGE_COUNTER_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
-const USAGE_COUNTER_FLUSH_BATCH_SIZE: usize = 1_000;
-const USAGE_COUNTER_FLUSH_CATCH_UP_BURST_LIMIT: usize = 20;
-const USAGE_COUNTER_DELTA_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-const USAGE_COUNTER_DELTA_CLEANUP_BATCH_SIZE: usize = 5_000;
-const USAGE_COUNTER_DELTA_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const PROVIDER_CHECKIN_CONCURRENCY: usize = 3;
 const PROVIDER_QUOTA_ALERT_CONCURRENCY: usize = 3;
 const PROVIDER_QUOTA_ALERT_INTERVAL: Duration = Duration::from_secs(5);

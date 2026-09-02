@@ -11,6 +11,15 @@ FROM ${NODE_BASE_IMAGE} AS frontend-builder
 ARG AETHER_BUILD_VERSION
 ENV AETHER_BUILD_VERSION=${AETHER_BUILD_VERSION} \
     AETHER_VERSION=${AETHER_BUILD_VERSION}
+WORKDIR /app/aether-vscodex/web
+COPY aether-vscodex/web/package*.json ./
+RUN --mount=type=cache,id=aether-vscodex-npm-cache,target=/root/.npm,sharing=locked \
+    npm config set registry https://registry.npmmirror.com && \
+    npm ci --no-audit --no-fund
+COPY aether-vscodex/public /app/aether-vscodex/public
+COPY aether-vscodex/web/ ./
+RUN npm run build
+
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
 RUN --mount=type=cache,id=aether-npm-cache,target=/root/.npm,sharing=locked \
@@ -60,7 +69,7 @@ COPY --from=gateway-planner /build/recipe.json ./recipe.json
 RUN --mount=type=cache,id=aether-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=aether-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=aether-cargo-target-release-local,target=/build/target,sharing=locked \
-    cargo chef cook --release --locked --package aether-gateway --bin aether-gateway --recipe-path recipe.json
+    cargo chef cook --release --locked --package aether-gateway --bin aether-gateway --features jemalloc --recipe-path recipe.json
 
 COPY Cargo.toml Cargo.lock ./
 COPY apps/ ./apps/
@@ -68,7 +77,7 @@ COPY crates/ ./crates/
 RUN --mount=type=cache,id=aether-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=aether-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=aether-cargo-target-release-local,target=/build/target,sharing=locked \
-    cargo build --release --locked -p aether-gateway && \
+    cargo build --release --locked -p aether-gateway --features jemalloc && \
     cp target/release/aether-gateway /tmp/aether-gateway
 
 # ==================== 最小运行时打包 ====================

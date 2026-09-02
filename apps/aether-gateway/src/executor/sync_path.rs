@@ -1,6 +1,6 @@
 use aether_ai_serving::{
     run_ai_sync_execution_path, AiPlanFallbackReason, AiServingExecutionOutcome,
-    AiSyncExecutionPathPort, AiSyncExecutionStep,
+    AiSyncExecutionPathPort, AiSyncExecutionStep, OriginalRequestPayload,
 };
 use async_trait::async_trait;
 use axum::body::{Body, Bytes};
@@ -19,7 +19,7 @@ use crate::control::GatewayControlDecision;
 use crate::{AppState, GatewayError, GatewayFallbackReason};
 
 use super::{
-    build_direct_plan_bypass_cache_key, execute_sync_plan_and_reports,
+    build_direct_plan_bypass_cache_key, execute_sync_plan_and_reports_with_transfer_tracker,
     maybe_execute_sync_via_local_decision, maybe_execute_sync_via_local_gemini_files_decision,
     maybe_execute_sync_via_local_image_decision,
     maybe_execute_sync_via_local_openai_responses_decision,
@@ -27,6 +27,7 @@ use super::{
     maybe_execute_sync_via_local_standard_decision, maybe_execute_sync_via_local_video_decision,
     maybe_execute_sync_via_plan_fallback, maybe_execute_sync_via_remote_decision,
     parse_local_request_body, should_skip_direct_plan, LocalExecutionRequestOutcome,
+    ProviderTransferTracker,
 };
 
 pub(crate) async fn maybe_execute_via_sync_decision_path(
@@ -49,6 +50,22 @@ pub(crate) async fn maybe_execute_via_sync_decision_path(
     let Some((body_json, body_base64)) = parse_local_request_body(parts, body_bytes) else {
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
+
+    let mut planning_parts = parts.clone();
+    if crate::ai_serving::is_json_request(&planning_parts.headers) {
+        if let Ok(decoded_body) = crate::ai_serving::decoded_request_body_bytes(
+            &planning_parts.headers,
+            body_bytes.as_ref(),
+        ) {
+            planning_parts
+                .extensions
+                .insert(OriginalRequestPayload::from_parsed_json(
+                    body_json.clone(),
+                    decoded_body.as_ref(),
+                ));
+        }
+    }
+    let parts = &planning_parts;
 
     if let Some(stream_plan_kind) = resolve_execution_runtime_stream_plan_kind(parts, decision) {
         if is_matching_stream_request(stream_plan_kind, parts, &body_json, body_base64.as_deref()) {
@@ -73,6 +90,7 @@ pub(crate) async fn maybe_execute_via_sync_decision_path(
         plan_kind,
         bypass_cache_key,
         scheduler_supported: supports_sync_execution_decision_kind(plan_kind),
+        transfer_tracker: ProviderTransferTracker::default(),
     };
 
     Ok(from_ai_serving_outcome(
@@ -91,6 +109,7 @@ struct GatewaySyncExecutionPathPort<'a> {
     plan_kind: &'a str,
     bypass_cache_key: String,
     scheduler_supported: bool,
+    transfer_tracker: ProviderTransferTracker,
 }
 
 #[async_trait]
@@ -116,6 +135,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
                     self.trace_id,
                     self.decision,
                     self.plan_kind,
+                    &self.transfer_tracker,
                 )
                 .await?
             }
@@ -127,6 +147,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
                     self.trace_id,
                     self.decision,
                     self.plan_kind,
+                    &self.transfer_tracker,
                 )
                 .await?
             }
@@ -139,6 +160,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
                     self.trace_id,
                     self.decision,
                     self.plan_kind,
+                    &self.transfer_tracker,
                 )
                 .await?
             }
@@ -150,6 +172,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
                     self.decision,
                     self.body_json,
                     self.plan_kind,
+                    &self.transfer_tracker,
                 )
                 .await?
             }
@@ -161,6 +184,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
                     self.decision,
                     self.body_json,
                     self.plan_kind,
+                    &self.transfer_tracker,
                 )
                 .await?
             }
@@ -172,6 +196,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
                     self.decision,
                     self.body_json,
                     self.plan_kind,
+                    &self.transfer_tracker,
                 )
                 .await?
             }
@@ -183,6 +208,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
                     self.decision,
                     self.body_json,
                     self.plan_kind,
+                    &self.transfer_tracker,
                 )
                 .await?
             }
@@ -196,6 +222,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
                     self.trace_id,
                     self.decision,
                     self.plan_kind,
+                    &self.transfer_tracker,
                 )
                 .await?
             }
@@ -233,6 +260,7 @@ impl AiSyncExecutionPathPort for GatewaySyncExecutionPathPort<'_> {
             self.plan_kind,
             self.bypass_cache_key.clone(),
             gateway_fallback_reason(reason),
+            &self.transfer_tracker,
         )
         .await?;
         Ok(to_ai_serving_outcome(outcome))
@@ -244,7 +272,11 @@ fn to_ai_serving_outcome(
 ) -> AiServingExecutionOutcome<Response<Body>, super::LocalExecutionExhaustion> {
     match outcome {
         LocalExecutionRequestOutcome::Responded(response) => {
-            AiServingExecutionOutcome::Responded(response)
+            if super::is_deferred_upstream_response(&response) {
+                AiServingExecutionOutcome::Deferred(response)
+            } else {
+                AiServingExecutionOutcome::Responded(response)
+            }
         }
         LocalExecutionRequestOutcome::Exhausted(outcome) => {
             AiServingExecutionOutcome::Exhausted(outcome)
@@ -258,6 +290,9 @@ fn from_ai_serving_outcome(
 ) -> LocalExecutionRequestOutcome {
     match outcome {
         AiServingExecutionOutcome::Responded(response) => {
+            LocalExecutionRequestOutcome::Responded(response)
+        }
+        AiServingExecutionOutcome::Deferred(response) => {
             LocalExecutionRequestOutcome::Responded(response)
         }
         AiServingExecutionOutcome::Exhausted(outcome) => {
@@ -342,6 +377,7 @@ async fn maybe_execute_local_video_task_follow_up_sync(
     trace_id: &str,
     decision: &GatewayControlDecision,
     plan_kind: &str,
+    transfer_tracker: &ProviderTransferTracker,
 ) -> Result<LocalExecutionRequestOutcome, GatewayError> {
     if !matches!(
         plan_kind,
@@ -375,7 +411,7 @@ async fn maybe_execute_local_video_task_follow_up_sync(
         return Ok(LocalExecutionRequestOutcome::NoPath);
     };
 
-    execute_sync_plan_and_reports(
+    execute_sync_plan_and_reports_with_transfer_tracker(
         state,
         parts,
         trace_id,
@@ -386,6 +422,7 @@ async fn maybe_execute_local_video_task_follow_up_sync(
             report_kind: follow_up.report_kind,
             report_context: follow_up.report_context,
         }],
+        transfer_tracker,
     )
     .await
 }

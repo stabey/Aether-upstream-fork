@@ -38,6 +38,17 @@ pub fn provider_oauth_pkce_s256(verifier: &str) -> String {
 pub fn parse_provider_oauth_callback_params(callback_url: &str) -> BTreeMap<String, String> {
     let mut merged = BTreeMap::new();
     let raw_callback_url = callback_url.trim();
+    if !raw_callback_url.contains("://") {
+        if let Some((code, state)) = raw_callback_url.split_once('#') {
+            let code = code.trim();
+            let state = state.strip_prefix("state=").unwrap_or(state).trim();
+            if !code.is_empty() && !code.contains('=') && !state.is_empty() {
+                merged.insert("code".to_string(), code.to_string());
+                merged.insert("state".to_string(), state.to_string());
+                return merged;
+            }
+        }
+    }
     let parsed_url = Url::parse(raw_callback_url).or_else(|_| {
         Url::parse(&format!(
             "https://aether.local/{}",
@@ -217,6 +228,14 @@ fn extract_openai_chatgpt_auth_fields_from_object(
         result.insert("user_id".to_string(), json!(user_id));
     }
 
+    if let Some(is_fedramp) = auth
+        .and_then(|value| value.get("chatgpt_account_is_fedramp"))
+        .and_then(Value::as_bool)
+        .or_else(|| source.get("is_fedramp").and_then(Value::as_bool))
+    {
+        result.insert("is_fedramp".to_string(), json!(is_fedramp));
+    }
+
     if let Some(organizations) = auth
         .and_then(|value| value.get("organizations"))
         .and_then(Value::as_array)
@@ -250,8 +269,39 @@ pub fn enrich_admin_provider_oauth_auth_config(
             "plan_type",
             "user_id",
             "account_name",
+            "is_fedramp",
         ],
     );
+
+    if provider_type.trim().eq_ignore_ascii_case("claude_code") {
+        if let Some(organization_uuid) = token_payload_object
+            .get("organization")
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("uuid"))
+            .cloned()
+        {
+            auth_config
+                .entry("org_uuid".to_string())
+                .or_insert(organization_uuid);
+        }
+        if let Some(account) = token_payload_object
+            .get("account")
+            .and_then(Value::as_object)
+        {
+            if let Some(account_uuid) = account.get("uuid").cloned() {
+                auth_config
+                    .entry("account_uuid".to_string())
+                    .or_insert(account_uuid);
+            }
+            if let Some(email) = account.get("email_address").cloned() {
+                auth_config
+                    .entry("email_address".to_string())
+                    .or_insert_with(|| email.clone());
+                auth_config.entry("email".to_string()).or_insert(email);
+            }
+        }
+        return;
+    }
 
     if !provider_type_uses_openai_chatgpt_identity(provider_type) {
         return;
@@ -268,6 +318,7 @@ pub fn enrich_admin_provider_oauth_auth_config(
             "plan_type",
             "user_id",
             "organizations",
+            "is_fedramp",
         ],
     );
 
@@ -288,6 +339,7 @@ pub fn enrich_admin_provider_oauth_auth_config(
                 "plan_type",
                 "user_id",
                 "account_name",
+                "is_fedramp",
             ],
         );
         let chatgpt_claim_fields = extract_openai_chatgpt_auth_fields_from_object(&claims);
@@ -301,6 +353,7 @@ pub fn enrich_admin_provider_oauth_auth_config(
                 "plan_type",
                 "user_id",
                 "organizations",
+                "is_fedramp",
             ],
         );
     }
@@ -396,6 +449,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_provider_oauth_callback_params_reads_raw_claude_code_and_state() {
+        for (input, expected_state) in [
+            ("claude-code#nonce-value", "nonce-value"),
+            ("claude-code#state=nonce-value", "nonce-value"),
+        ] {
+            let params = parse_provider_oauth_callback_params(input);
+            assert_eq!(params.get("code").map(String::as_str), Some("claude-code"));
+            assert_eq!(
+                params.get("state").map(String::as_str),
+                Some(expected_state)
+            );
+        }
+    }
+
+    #[test]
     fn parse_provider_oauth_callback_params_reads_relative_show_auth_token_url() {
         let params = parse_provider_oauth_callback_params(
             "show-auth-token?token=firebase-id-token&state=session-1&provider=google",
@@ -428,6 +496,7 @@ mod tests {
                 "chatgpt_account_user_id": "user-image__acc-image",
                 "chatgpt_plan_type": "plus",
                 "chatgpt_user_id": "user-image",
+                "chatgpt_account_is_fedramp": true,
             },
         }));
         let token_payload = json!({
@@ -445,5 +514,6 @@ mod tests {
         );
         assert_eq!(auth_config.get("plan_type"), Some(&json!("plus")));
         assert_eq!(auth_config.get("user_id"), Some(&json!("user-image")));
+        assert_eq!(auth_config.get("is_fedramp"), Some(&json!(true)));
     }
 }

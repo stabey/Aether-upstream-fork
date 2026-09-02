@@ -49,8 +49,15 @@ where
     }
 }
 
-#[tokio::test]
-async fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response() {
+#[test]
+fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response() {
+    run_kiro_claude_cli_finalize_test(
+        "gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finalize_response_impl() {
     use base64::Engine as _;
 
     #[derive(Debug, Clone)]
@@ -128,6 +135,7 @@ async fn gateway_executes_openai_responses_sync_upstream_stream_via_local_finali
                 priority: 1,
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -643,6 +651,7 @@ async fn gateway_executes_kiro_claude_cli_sync_upstream_stream_via_local_finaliz
                 priority: 1,
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -983,6 +992,7 @@ async fn gateway_executes_kiro_claude_cli_sync_upstream_stream_via_local_finaliz
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/messages"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::USER_AGENT, "Claude-Code/2.1.0")
         .header(
             http::header::AUTHORIZATION,
             "Bearer sk-client-kiro-cli-finalize-local",

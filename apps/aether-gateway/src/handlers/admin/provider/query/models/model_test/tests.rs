@@ -178,6 +178,7 @@ fn provider_query_execution_json_body_decodes_stream_encoded_json_response() {
             "content-type".to_string(),
             "application/json".to_string(),
         )]),
+        response_observation: None,
         body: Some(aether_contracts::ResponseBody {
             json_body: None,
             body_bytes_b64: Some(encoded_body),
@@ -240,6 +241,26 @@ fn provider_query_default_test_request_body_does_not_set_max_tokens() {
         body.get("max_tokens").is_none(),
         "admin model test must not silently force a low max_tokens value"
     );
+}
+
+#[test]
+fn provider_query_default_test_request_bodies_do_not_set_temperature() {
+    let payload = json!({});
+    let default_body = provider_query_build_test_request_body(&payload, "fallback-model");
+    assert!(default_body.get("temperature").is_none());
+
+    for api_format in ["openai:chat", "openai:responses", "claude:messages"] {
+        let body = provider_query_build_test_request_body_for_api_format(
+            &payload,
+            "fallback-model",
+            "/api/admin/provider-query/test-model",
+            api_format,
+        );
+        assert!(
+            body.get("temperature").is_none(),
+            "admin model test must not set temperature for {api_format}"
+        );
+    }
 }
 
 #[test]
@@ -321,6 +342,31 @@ fn provider_query_model_test_empty_selected_key_ids_keep_default_selection() {
 }
 
 #[test]
+fn provider_query_codex_pool_config_injects_recent_refresh() {
+    let raw_config = json!({
+        "pool_advanced": {
+            "scheduling_presets": [{
+                "preset": "cache_affinity",
+                "enabled": true
+            }]
+        }
+    });
+    let config = admin_provider_pool_config_from_config_value(Some(&raw_config))
+        .expect("pool config should parse");
+
+    let normalized = provider_query_ai_pool_scheduling_config(&config, "codex");
+
+    assert_eq!(
+        normalized
+            .scheduling_presets
+            .iter()
+            .map(|preset| preset.preset.as_str())
+            .collect::<Vec<_>>(),
+        ["cache_affinity", "recent_refresh"]
+    );
+}
+
+#[test]
 fn provider_query_standard_test_resolves_codex_responses_upstream_streaming() {
     assert!(provider_query_resolve_standard_test_upstream_is_stream(
         None,
@@ -334,6 +380,11 @@ fn provider_query_standard_test_resolves_codex_responses_upstream_streaming() {
     ));
     assert!(!provider_query_resolve_standard_test_upstream_is_stream(
         None,
+        "codex",
+        "openai:responses:compact",
+    ));
+    assert!(!provider_query_resolve_standard_test_upstream_is_stream(
+        Some(&json!({"upstream_stream_policy": "force_stream"})),
         "codex",
         "openai:responses:compact",
     ));
@@ -386,6 +437,7 @@ fn provider_query_standard_test_aggregates_responses_stream_body() {
         candidate_id: Some("candidate-0".to_string()),
         status_code: 200,
         headers: BTreeMap::new(),
+        response_observation: None,
         body: Some(aether_contracts::ResponseBody {
             json_body: None,
             body_bytes_b64: Some(
@@ -418,6 +470,7 @@ fn provider_query_standard_test_aggregates_responses_image_generation_call() {
         candidate_id: Some("candidate-0".to_string()),
         status_code: 200,
         headers: BTreeMap::new(),
+        response_observation: None,
         body: Some(aether_contracts::ResponseBody {
             json_body: None,
             body_bytes_b64: Some(
@@ -468,6 +521,119 @@ fn provider_query_compact_test_request_body_defaults_to_responses_input() {
     assert_eq!(body["model"], json!("gpt-5.4-mini"));
     assert_eq!(body["input"], json!("hello from compact"));
     assert!(body.get("messages").is_none());
+}
+
+#[test]
+fn provider_query_search_test_request_body_defaults_to_typed_search_input() {
+    let payload = json!({"message": "find current documentation"});
+
+    let client_api_format = provider_query_standard_test_client_api_format("openai:search");
+    let body = provider_query_build_test_request_body_for_api_format(
+        &payload,
+        "gpt-5.6-sol",
+        "/api/admin/provider-query/test-model",
+        client_api_format,
+    );
+
+    assert_eq!(client_api_format, "openai:search");
+    assert!(body["id"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("aether-model-test-")));
+    assert_eq!(body["model"], json!("gpt-5.6-sol"));
+    assert_eq!(body["input"], json!("find current documentation"));
+    assert_eq!(
+        body["commands"]["search_query"][0]["q"],
+        json!("find current documentation")
+    );
+    assert_eq!(body["max_output_tokens"], json!(256));
+    assert!(body.get("messages").is_none());
+    assert!(body.get("stream").is_none());
+}
+
+#[test]
+fn provider_query_search_test_completes_missing_protocol_fields() {
+    let payload = json!({
+        "request_body": {
+            "model": "gpt-5.6-luna",
+            "input": "find release notes"
+        }
+    });
+
+    let body = provider_query_build_test_request_body_for_api_format_with_search_session(
+        &payload,
+        "gpt-5.6-luna",
+        "/api/admin/provider-query/test-model",
+        "openai:search",
+        Some("trace-model-test-1"),
+    );
+
+    assert_eq!(body["id"], json!("aether-model-test-trace-model-test-1"));
+    assert_eq!(
+        body["commands"]["search_query"][0]["q"],
+        json!("find release notes")
+    );
+    assert_eq!(body["max_output_tokens"], json!(256));
+}
+
+#[test]
+fn provider_query_search_test_preserves_a_non_empty_client_session_id() {
+    let payload = json!({
+        "request_body": {
+            "id": "client-search-session",
+            "model": "gpt-5.6-luna",
+            "input": "find release notes"
+        }
+    });
+
+    let body = provider_query_build_test_request_body_for_api_format_with_search_session(
+        &payload,
+        "gpt-5.6-luna",
+        "/api/admin/provider-query/test-model",
+        "openai:search",
+        Some("trace-model-test-1"),
+    );
+
+    assert_eq!(body["id"], json!("client-search-session"));
+}
+
+#[test]
+fn provider_query_search_success_requires_non_empty_output() {
+    fn result(body: Value) -> aether_contracts::ExecutionResult {
+        aether_contracts::ExecutionResult {
+            request_id: "provider-search-test".to_string(),
+            candidate_id: Some("candidate-0".to_string()),
+            status_code: 200,
+            headers: BTreeMap::new(),
+            response_observation: None,
+            body: Some(aether_contracts::ResponseBody {
+                json_body: Some(body),
+                body_bytes_b64: None,
+            }),
+            telemetry: None,
+            error: None,
+        }
+    }
+
+    assert!(provider_query_standard_execution_response_body(
+        "openai:search",
+        &result(json!({})),
+        None,
+    )
+    .is_none());
+    assert!(provider_query_standard_execution_response_body(
+        "openai:search",
+        &result(json!({"output": "  "})),
+        None,
+    )
+    .is_none());
+    assert_eq!(
+        provider_query_standard_execution_response_body(
+            "openai:search",
+            &result(json!({"output": "search result", "encrypted_output": "ciphertext"})),
+            None,
+        ),
+        Some(json!({"output": "search result", "encrypted_output": "ciphertext"}))
+    );
 }
 
 #[test]
@@ -589,6 +755,7 @@ fn provider_query_standard_test_rejects_gemini_success_without_visible_output() 
         candidate_id: Some("candidate-0".to_string()),
         status_code: 200,
         headers: BTreeMap::new(),
+        response_observation: None,
         body: Some(aether_contracts::ResponseBody {
             json_body: Some(json!({
                 "candidates": [{
@@ -630,6 +797,10 @@ fn provider_query_test_adapter_routes_fixed_provider_endpoint_types() {
     );
     assert_eq!(
         provider_query_test_adapter_for_provider_api_format("codex", "openai:responses:compact"),
+        Some(ProviderQueryTestAdapter::Standard)
+    );
+    assert_eq!(
+        provider_query_test_adapter_for_provider_api_format("codex", "openai:search"),
         Some(ProviderQueryTestAdapter::Standard)
     );
     assert_eq!(
@@ -679,6 +850,10 @@ fn provider_query_test_adapter_routes_fixed_provider_endpoint_types() {
         Some(ProviderQueryTestAdapter::Standard)
     );
     assert_eq!(
+        provider_query_test_adapter_for_provider_api_format("custom", "gemini:interactions"),
+        Some(ProviderQueryTestAdapter::Standard)
+    );
+    assert_eq!(
         provider_query_test_adapter_for_provider_api_format(
             "aliyun",
             "aliyun:multimodal_embedding"
@@ -711,6 +886,10 @@ fn provider_query_endpoint_priority_prefers_text_before_cli_and_image() {
     );
     assert_eq!(
         provider_query_model_test_endpoint_priority("codex", "openai:responses:compact"),
+        Some(1)
+    );
+    assert_eq!(
+        provider_query_model_test_endpoint_priority("codex", "openai:search"),
         Some(1)
     );
     assert_eq!(
@@ -993,7 +1172,7 @@ fn provider_query_grok_image_test_allows_multi_generation_count() {
         &parts,
         &body,
         None,
-        provider_query_openai_image_normalize_options("grok"),
+        provider_query_openai_image_normalize_options("grok", Some("grok-imagine-image")),
     )
     .expect("grok image model tests should allow multi-image generation");
     let provider_body = crate::ai_serving::build_openai_image_provider_request_body(&normalized);
@@ -1061,12 +1240,48 @@ fn provider_query_non_grok_image_test_keeps_single_generation_boundary() {
             &parts,
             &body,
             None,
-            provider_query_openai_image_normalize_options("chatgpt_web"),
+            provider_query_openai_image_normalize_options("chatgpt_web", Some("gpt-image-2")),
         )
         .is_none()
     );
     assert_eq!(
-        provider_query_openai_image_normalize_failure_message("chatgpt_web", &body),
+        provider_query_openai_image_normalize_failure_message(
+            "chatgpt_web",
+            Some("gpt-image-2"),
+            &body,
+        ),
+        "Provider request body could not be normalized for openai:image: selected provider supports n=1..1 for generation"
+    );
+}
+
+#[test]
+fn provider_query_dall_e_3_image_test_keeps_single_generation_boundary() {
+    let request = http::Request::builder()
+        .uri("/v1/images/generations")
+        .body(())
+        .expect("request should build");
+    let (parts, _) = request.into_parts();
+    let body = json!({
+        "model": "dall-e-3",
+        "prompt": "draw",
+        "n": 2
+    });
+
+    assert!(
+        crate::ai_serving::normalize_openai_image_request_with_options(
+            &parts,
+            &body,
+            None,
+            provider_query_openai_image_normalize_options("openai", Some("dall-e-3")),
+        )
+        .is_none()
+    );
+    assert_eq!(
+        provider_query_openai_image_normalize_failure_message(
+            "openai",
+            Some("dall-e-3"),
+            &body,
+        ),
         "Provider request body could not be normalized for openai:image: selected provider supports n=1..1 for generation"
     );
 }

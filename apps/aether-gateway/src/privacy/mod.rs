@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::Infallible;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aether_data_contracts::DataLayerError;
 use aether_runtime_state::RuntimeState;
@@ -18,14 +20,13 @@ use crate::GatewayError;
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
 const DEFAULT_REDACTION_TTL_SECONDS: u64 = 300;
-const DEFAULT_MAX_SCANNED_CHAT_TEXT_BYTES: usize = 2 * 1024 * 1024;
-const DEFAULT_MAX_REDACTION_DETECTIONS: usize = 1024;
 const HMAC96_BYTES: usize = 12;
 const DEFAULT_SENTINEL_NAMESPACE: &str = "AETHER";
 const MAX_SENTINEL_NAMESPACE_LEN: usize = 32;
 const DIRECT_RESTORE_SENTINEL_LIMIT: usize = 32;
 const MAX_CACHE_SENTINEL_BYTES: usize = 128;
 const MAX_CACHE_RECORD_BYTES: usize = 512;
+const CHAT_PII_REDACTION_RUNTIME_CONFIG_CACHE_TTL: Duration = Duration::from_secs(5);
 
 static EMAIL_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)[A-Z0-9._%+-]{1,64}@[A-Z0-9.-]{1,253}\.[A-Z]{2,63}")
@@ -79,8 +80,10 @@ static ACCESS_TOKEN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
         .expect("access token regex should compile")
 });
 static SECRET_KEY_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?i)\bsecret[_-]?key\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{20,}"#)
-        .expect("secret key regex should compile")
+    Regex::new(
+        r#"(?i)\b(?:secret|agent[_-]?private)[_-]?key\s*[:=]\s*["']?[A-Za-z0-9._~+/=-]{20,}"#,
+    )
+    .expect("secret key regex should compile")
 });
 static HIGH_ENTROPY_TOKEN_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\b[A-Za-z0-9_-]{32,}\b").expect("api key regex should compile"));
@@ -242,86 +245,28 @@ impl RedactionSessionConfig {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RedactionScanLimits {
-    pub(crate) max_scanned_text_bytes: usize,
-    pub(crate) max_detections: usize,
-}
-
-impl Default for RedactionScanLimits {
-    fn default() -> Self {
-        Self {
-            max_scanned_text_bytes: DEFAULT_MAX_SCANNED_CHAT_TEXT_BYTES,
-            max_detections: DEFAULT_MAX_REDACTION_DETECTIONS,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RedactionLimitError {
-    ScannedTextTooLarge { limit: usize },
-    TooManyDetections { limit: usize },
-}
-
-impl RedactionLimitError {
-    pub(crate) const fn client_status(&self) -> http::StatusCode {
-        match self {
-            Self::ScannedTextTooLarge { .. } => http::StatusCode::PAYLOAD_TOO_LARGE,
-            Self::TooManyDetections { .. } => http::StatusCode::UNPROCESSABLE_ENTITY,
-        }
-    }
-
-    pub(crate) const fn safe_message(&self) -> &'static str {
-        match self {
-            Self::ScannedTextTooLarge { .. } => "chat pii redaction scanned text limit exceeded",
-            Self::TooManyDetections { .. } => "chat pii redaction detection limit exceeded",
-        }
-    }
-}
-
-#[derive(Debug)]
 pub(crate) enum RedactionMaskError {
-    Limit(RedactionLimitError),
+    /// Provider-owned reasoning text cannot be rewritten independently from
+    /// its encrypted continuation state. Reject the request instead of either
+    /// leaking detected sensitive text or corrupting the provider binding.
+    SensitiveOpaqueReasoningState,
 }
 
-impl From<RedactionLimitError> for RedactionMaskError {
-    fn from(error: RedactionLimitError) -> Self {
-        Self::Limit(error)
+impl From<Infallible> for RedactionMaskError {
+    fn from(value: Infallible) -> Self {
+        match value {}
     }
 }
 
-#[derive(Clone, Copy)]
-struct RedactionScanState {
-    limits: RedactionScanLimits,
-    scanned_text_bytes: usize,
-    detections: usize,
-}
+#[derive(Clone, Copy, Default)]
+struct RedactionScanState;
 
 impl RedactionScanState {
-    fn new(limits: RedactionScanLimits) -> Self {
-        Self {
-            limits,
-            scanned_text_bytes: 0,
-            detections: 0,
-        }
-    }
-
-    fn record_scan(&mut self, text: &str) -> Result<(), RedactionLimitError> {
-        self.scanned_text_bytes = self.scanned_text_bytes.saturating_add(text.len());
-        if self.scanned_text_bytes > self.limits.max_scanned_text_bytes {
-            return Err(RedactionLimitError::ScannedTextTooLarge {
-                limit: self.limits.max_scanned_text_bytes,
-            });
-        }
+    fn record_scan(&mut self, _text: &str) -> Result<(), Infallible> {
         Ok(())
     }
 
-    fn record_detections(&mut self, count: usize) -> Result<(), RedactionLimitError> {
-        self.detections = self.detections.saturating_add(count);
-        if self.detections > self.limits.max_detections {
-            return Err(RedactionLimitError::TooManyDetections {
-                limit: self.limits.max_detections,
-            });
-        }
+    fn record_detections(&mut self, _count: usize) -> Result<(), Infallible> {
         Ok(())
     }
 }
@@ -368,11 +313,13 @@ struct MappingKey {
     original: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct RedactionSession {
     config: RedactionSessionConfig,
     mappings: HashMap<MappingKey, RedactionMapping>,
     sentinel_index: HashMap<String, MappingKey>,
     collision_corpus: Vec<String>,
+    preserve_deepseek_opaque_reasoning_state: bool,
 }
 
 impl RedactionSession {
@@ -382,11 +329,47 @@ impl RedactionSession {
             mappings: HashMap::new(),
             sentinel_index: HashMap::new(),
             collision_corpus: Vec::new(),
+            preserve_deepseek_opaque_reasoning_state: false,
         }
+    }
+
+    fn apply_mask_options(&mut self, options: MaskChatRequestOptions) {
+        self.preserve_deepseek_opaque_reasoning_state =
+            options.preserve_deepseek_opaque_reasoning_state;
+    }
+
+    /// Updates the provider-owned reasoning replay policy after the initial
+    /// request has been planned and its upstream binding authenticated.
+    ///
+    /// A new WebSocket chain has to redact its first event before planning, so
+    /// it starts with the conservative OpenAI item-id policy.  Once the
+    /// planner has selected the provider, response restoration must use that
+    /// trusted binding's policy as well; otherwise a DeepSeek opaque reasoning
+    /// item could have a PII sentinel restored inside provider-owned state.
+    pub(crate) fn set_reasoning_replay_policy(
+        &mut self,
+        policy: crate::ai_serving::OpenAiResponsesReasoningReplayPolicy,
+    ) {
+        self.apply_mask_options(
+            MaskChatRequestOptions::runtime().with_reasoning_replay_policy(policy),
+        );
+    }
+
+    fn preserves_deepseek_opaque_reasoning_state(&self) -> bool {
+        self.preserve_deepseek_opaque_reasoning_state
     }
 
     fn set_collision_corpus(&mut self, collision_corpus: Vec<String>) {
         self.collision_corpus = collision_corpus;
+    }
+
+    fn text_has_redaction_candidate(&self, input: &str) -> bool {
+        !select_non_overlapping(detect_candidates_for_session_config(
+            input,
+            &self.config,
+            None,
+        ))
+        .is_empty()
     }
 
     pub(crate) fn redact_text(&mut self, input: &str) -> RedactedText {
@@ -398,7 +381,7 @@ impl RedactionSession {
         &mut self,
         input: &str,
         scan_state: &mut RedactionScanState,
-    ) -> Result<RedactedText, RedactionLimitError> {
+    ) -> Result<RedactedText, Infallible> {
         scan_state.record_scan(input)?;
         self.redact_text_internal(input, Some(scan_state))
     }
@@ -455,7 +438,7 @@ impl RedactionSession {
         &mut self,
         input: &str,
         mut scan_state: Option<&mut RedactionScanState>,
-    ) -> Result<RedactedText, RedactionLimitError> {
+    ) -> Result<RedactedText, Infallible> {
         let candidates = select_non_overlapping(detect_candidates_for_session_config(
             input,
             &self.config,
@@ -696,6 +679,10 @@ impl fmt::Debug for RedactionSession {
             .field("bucket", &self.config.bucket())
             .field("mapping_count", &self.mappings.len())
             .field("type_counts", &counts)
+            .field(
+                "preserve_deepseek_opaque_reasoning_state",
+                &self.preserve_deepseek_opaque_reasoning_state,
+            )
             .finish()
     }
 }
@@ -717,10 +704,53 @@ impl fmt::Debug for MaskedChatRequest {
     }
 }
 
+pub(crate) struct MaskedChatRequestValue {
+    pub(crate) body_json: Option<Value>,
+    pub(crate) session: RedactionSession,
+    pub(crate) redacted: bool,
+}
+
+impl fmt::Debug for MaskedChatRequestValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MaskedChatRequestValue")
+            .field("body_json_owned", &self.body_json.is_some())
+            .field("session", &self.session)
+            .field("redacted", &self.redacted)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct CachedRequestRedaction {
+    pub(crate) body_json: Option<Value>,
+    pub(crate) session: Option<RedactionSession>,
+    pub(crate) redacted: bool,
+}
+
+impl CachedRequestRedaction {
+    pub(crate) fn unredacted() -> Self {
+        Self {
+            body_json: None,
+            session: None,
+            redacted: false,
+        }
+    }
+
+    pub(crate) fn redacted(body_json: Value, session: RedactionSession) -> Self {
+        Self {
+            body_json: Some(body_json),
+            session: Some(session),
+            redacted: true,
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub(crate) struct RedactionSessionSlot {
     session: Arc<Mutex<Option<RedactionSession>>>,
     sessions_by_candidate: Arc<Mutex<HashMap<String, RedactionSession>>>,
+    request_redactions: Arc<Mutex<HashMap<String, CachedRequestRedaction>>>,
 }
 
 impl RedactionSessionSlot {
@@ -746,6 +776,10 @@ impl RedactionSessionSlot {
         self.sessions_by_candidate
             .lock()
             .expect("redaction session candidate slot should lock")
+            .clear();
+        self.request_redactions
+            .lock()
+            .expect("redaction request cache slot should lock")
             .clear();
     }
 
@@ -794,6 +828,25 @@ impl RedactionSessionSlot {
             _ => None,
         }
     }
+
+    pub(crate) fn cached_request_redaction(&self, key: &str) -> Option<CachedRequestRedaction> {
+        self.request_redactions
+            .lock()
+            .expect("redaction request cache slot should lock")
+            .get(key)
+            .cloned()
+    }
+
+    pub(crate) fn put_cached_request_redaction(
+        &self,
+        key: impl Into<String>,
+        redaction: CachedRequestRedaction,
+    ) {
+        self.request_redactions
+            .lock()
+            .expect("redaction request cache slot should lock")
+            .insert(key.into(), redaction);
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -828,20 +881,172 @@ impl Default for ChatPiiRedactionRuntimeConfig {
     }
 }
 
+impl ChatPiiRedactionRuntimeConfig {
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            rules: Vec::new(),
+            ttl_seconds: DEFAULT_REDACTION_TTL_SECONDS,
+            placeholder_prefix: DEFAULT_SENTINEL_NAMESPACE.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ChatPiiRedactionRuntimeConfigCache {
+    value: Mutex<Option<(Instant, ChatPiiRedactionRuntimeConfig)>>,
+    loading_generation: Mutex<Option<u64>>,
+    generation: AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+enum ChatPiiRedactionRuntimeConfigLoadRegistration {
+    Leader(ChatPiiRedactionRuntimeConfigLoadGuard),
+    Follower,
+    Bypass,
+}
+
+struct ChatPiiRedactionRuntimeConfigLoadGuard {
+    cache: ChatPiiRedactionRuntimeConfigCacheHandle,
+    generation: u64,
+    active: bool,
+}
+
+impl ChatPiiRedactionRuntimeConfigLoadGuard {
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Drop for ChatPiiRedactionRuntimeConfigLoadGuard {
+    fn drop(&mut self) {
+        if self.active {
+            self.cache.finish_load(self.generation);
+        }
+    }
+}
+
+impl ChatPiiRedactionRuntimeConfigCache {
+    fn get(&self) -> Option<ChatPiiRedactionRuntimeConfig> {
+        self.value.lock().ok().and_then(|guard| {
+            guard.as_ref().and_then(|(loaded_at, value)| {
+                (loaded_at.elapsed() <= CHAT_PII_REDACTION_RUNTIME_CONFIG_CACHE_TTL)
+                    .then(|| value.clone())
+            })
+        })
+    }
+
+    fn get_stale(&self) -> Option<ChatPiiRedactionRuntimeConfig> {
+        self.value
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|(_, value)| value.clone()))
+    }
+
+    fn insert(&self, value: ChatPiiRedactionRuntimeConfig) {
+        if let Ok(mut guard) = self.value.lock() {
+            *guard = Some((Instant::now(), value));
+        }
+    }
+
+    fn insert_if_generation(&self, generation: u64, value: ChatPiiRedactionRuntimeConfig) {
+        if self.generation.load(Ordering::Acquire) == generation {
+            self.insert(value);
+        }
+    }
+
+    fn register_load(self: &Arc<Self>) -> ChatPiiRedactionRuntimeConfigLoadRegistration {
+        let generation = self.generation.load(Ordering::Acquire);
+        match self.loading_generation.lock() {
+            Ok(mut loading_generation) => {
+                if loading_generation.is_some() {
+                    ChatPiiRedactionRuntimeConfigLoadRegistration::Follower
+                } else {
+                    *loading_generation = Some(generation);
+                    ChatPiiRedactionRuntimeConfigLoadRegistration::Leader(
+                        ChatPiiRedactionRuntimeConfigLoadGuard {
+                            cache: Arc::clone(self),
+                            generation,
+                            active: true,
+                        },
+                    )
+                }
+            }
+            Err(_) => ChatPiiRedactionRuntimeConfigLoadRegistration::Bypass,
+        }
+    }
+
+    fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    fn finish_load(&self, generation: u64) {
+        let finished = self
+            .loading_generation
+            .lock()
+            .map(|mut loading_generation| {
+                if *loading_generation == Some(generation) {
+                    *loading_generation = None;
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if finished {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+pub(crate) type ChatPiiRedactionRuntimeConfigCacheHandle = Arc<ChatPiiRedactionRuntimeConfigCache>;
+
+pub(crate) fn new_chat_pii_redaction_runtime_config_cache(
+) -> ChatPiiRedactionRuntimeConfigCacheHandle {
+    Arc::new(ChatPiiRedactionRuntimeConfigCache::default())
+}
+
+pub(crate) fn clear_chat_pii_redaction_runtime_config_cache(
+    cache: &ChatPiiRedactionRuntimeConfigCacheHandle,
+) {
+    cache.clear();
+}
+
+impl ChatPiiRedactionRuntimeConfigCache {
+    fn clear(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut value) = self.value.lock() {
+            *value = None;
+        }
+        if let Ok(mut loading_generation) = self.loading_generation.lock() {
+            *loading_generation = None;
+        }
+        self.notify.notify_waiters();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MaskChatRequestOptions {
-    pub(crate) scan_limits: RedactionScanLimits,
+    /// This bit is derived from the selected provider configuration, never
+    /// from request JSON. It permits byte-identical handling only for the
+    /// provider-owned, id-less continuation state used by DeepSeek's
+    /// Responses contract.
+    preserve_deepseek_opaque_reasoning_state: bool,
 }
 
 impl MaskChatRequestOptions {
     pub(crate) fn runtime() -> Self {
-        Self {
-            scan_limits: RedactionScanLimits::default(),
-        }
+        Self::default()
     }
 
-    #[cfg(test)]
-    fn with_scan_limits(mut self, scan_limits: RedactionScanLimits) -> Self {
-        self.scan_limits = scan_limits;
+    pub(crate) fn with_reasoning_replay_policy(
+        mut self,
+        policy: crate::ai_serving::OpenAiResponsesReasoningReplayPolicy,
+    ) -> Self {
+        self.preserve_deepseek_opaque_reasoning_state = matches!(
+            policy,
+            crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque
+        );
         self
     }
 }
@@ -850,6 +1055,7 @@ impl MaskChatRequestOptions {
 pub(crate) enum ChatPiiRedactionRequestFormat {
     OpenAiChat,
     OpenAiResponses,
+    OpenAiSearch,
     ClaudeMessages,
 }
 
@@ -858,6 +1064,7 @@ impl ChatPiiRedactionRequestFormat {
         match api_format.trim().to_ascii_lowercase().as_str() {
             "openai:chat" => Some(Self::OpenAiChat),
             "openai:responses" | "openai:responses:compact" => Some(Self::OpenAiResponses),
+            "openai:search" => Some(Self::OpenAiSearch),
             "claude:messages" => Some(Self::ClaudeMessages),
             _ => None,
         }
@@ -1127,13 +1334,76 @@ fn parse_chat_pii_redaction_rules(
 pub(crate) async fn read_chat_pii_redaction_runtime_config(
     state: &crate::AppState,
 ) -> Result<ChatPiiRedactionRuntimeConfig, GatewayError> {
-    let mut config = ChatPiiRedactionRuntimeConfig::default();
-    config.enabled = state
+    let cache = Arc::clone(&state.chat_pii_redaction_runtime_config_cache);
+    if let Some(value) = cache.get() {
+        return Ok(value);
+    }
+    if let Some(value) = cache.get_stale() {
+        if let ChatPiiRedactionRuntimeConfigLoadRegistration::Leader(guard) = cache.register_load()
+        {
+            spawn_chat_pii_redaction_runtime_config_refresh(state.clone(), cache, guard);
+        }
+        return Ok(value);
+    }
+
+    loop {
+        let notified = cache.notified();
+        match cache.register_load() {
+            ChatPiiRedactionRuntimeConfigLoadRegistration::Bypass => {
+                let value = load_chat_pii_redaction_runtime_config(state).await?;
+                cache.insert(value.clone());
+                return Ok(value);
+            }
+            ChatPiiRedactionRuntimeConfigLoadRegistration::Follower => {
+                notified.await;
+                if let Some(value) = cache.get() {
+                    return Ok(value);
+                }
+            }
+            ChatPiiRedactionRuntimeConfigLoadRegistration::Leader(_guard) => {
+                let generation = _guard.generation();
+                let value = load_chat_pii_redaction_runtime_config(state).await?;
+                cache.insert_if_generation(generation, value.clone());
+                return Ok(value);
+            }
+        }
+    }
+}
+
+fn spawn_chat_pii_redaction_runtime_config_refresh(
+    state: crate::AppState,
+    cache: ChatPiiRedactionRuntimeConfigCacheHandle,
+    guard: ChatPiiRedactionRuntimeConfigLoadGuard,
+) {
+    tokio::spawn(async move {
+        let generation = guard.generation();
+        match load_chat_pii_redaction_runtime_config(&state).await {
+            Ok(value) => cache.insert_if_generation(generation, value),
+            Err(err) => {
+                tracing::warn!(
+                    error = ?err,
+                    "gateway failed to refresh chat pii redaction runtime config"
+                );
+            }
+        }
+        drop(guard);
+    });
+}
+
+async fn load_chat_pii_redaction_runtime_config(
+    state: &crate::AppState,
+) -> Result<ChatPiiRedactionRuntimeConfig, GatewayError> {
+    let enabled = state
         .read_system_config_json_value("module.chat_pii_redaction.enabled")
         .await?
         .as_ref()
         .and_then(Value::as_bool)
-        .unwrap_or(config.enabled);
+        .unwrap_or(false);
+    if !enabled {
+        return Ok(ChatPiiRedactionRuntimeConfig::disabled());
+    }
+    let mut config = ChatPiiRedactionRuntimeConfig::default();
+    config.enabled = true;
     config.rules = parse_chat_pii_redaction_rules(
         state
             .read_system_config_json_value("module.chat_pii_redaction.rules")
@@ -1173,7 +1443,7 @@ pub(crate) fn mask_chat_request_json_with_options(
     options: MaskChatRequestOptions,
 ) -> MaskedChatRequest {
     try_mask_chat_request_json_with_options(body, config, options)
-        .expect("default chat redaction limits should not be exceeded")
+        .expect("chat redaction masking should be infallible")
 }
 
 pub(crate) fn mask_chat_request_json(
@@ -1187,7 +1457,7 @@ pub(crate) fn try_mask_chat_request_json_with_options(
     body: &[u8],
     config: RedactionSessionConfig,
     options: MaskChatRequestOptions,
-) -> Result<MaskedChatRequest, RedactionLimitError> {
+) -> Result<MaskedChatRequest, RedactionMaskError> {
     try_mask_chat_pii_request_json_with_options(
         body,
         ChatPiiRedactionRequestFormat::OpenAiChat,
@@ -1217,8 +1487,9 @@ pub(crate) fn try_mask_chat_pii_request_json_with_options(
     format: ChatPiiRedactionRequestFormat,
     config: RedactionSessionConfig,
     options: MaskChatRequestOptions,
-) -> Result<MaskedChatRequest, RedactionLimitError> {
+) -> Result<MaskedChatRequest, RedactionMaskError> {
     let mut session = RedactionSession::new(config);
+    session.apply_mask_options(options);
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return Ok(MaskedChatRequest {
             body: body.to_vec(),
@@ -1228,8 +1499,10 @@ pub(crate) fn try_mask_chat_pii_request_json_with_options(
     };
 
     session.set_collision_corpus(request_collision_corpus(format, &value));
-    let mut scan_state = RedactionScanState::new(options.scan_limits);
-    let redacted = mask_request_value(format, &mut value, &mut session, &mut scan_state, options)?;
+    reject_sensitive_opaque_reasoning_state(format, &value, &session)?;
+    let mut scan_state = RedactionScanState;
+    let redacted = mask_request_value(format, &mut value, &mut session, &mut scan_state, options)
+        .unwrap_or_else(|never| match never {});
 
     if !redacted {
         return Ok(MaskedChatRequest {
@@ -1255,6 +1528,7 @@ pub(crate) async fn try_mask_chat_pii_request_json_with_cache_options(
     cache: Option<&RedisRedactionMappingCache<'_>>,
 ) -> Result<MaskedChatRequest, RedactionMaskError> {
     let mut session = RedactionSession::new(config);
+    session.apply_mask_options(options);
     let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
         return Ok(MaskedChatRequest {
             body: body.to_vec(),
@@ -1264,7 +1538,8 @@ pub(crate) async fn try_mask_chat_pii_request_json_with_cache_options(
     };
 
     session.set_collision_corpus(request_collision_corpus(format, &value));
-    let mut scan_state = RedactionScanState::new(options.scan_limits);
+    reject_sensitive_opaque_reasoning_state(format, &value, &session)?;
+    let mut scan_state = RedactionScanState;
     let redacted = mask_request_value_async(
         format,
         &mut value,
@@ -1291,6 +1566,37 @@ pub(crate) async fn try_mask_chat_pii_request_json_with_cache_options(
     })
 }
 
+pub(crate) async fn try_mask_chat_pii_request_value_with_cache_options(
+    body_json: &Value,
+    format: ChatPiiRedactionRequestFormat,
+    config: RedactionSessionConfig,
+    options: MaskChatRequestOptions,
+    cache: Option<&RedisRedactionMappingCache<'_>>,
+) -> Result<MaskedChatRequestValue, RedactionMaskError> {
+    let mut session = RedactionSession::new(config);
+    session.apply_mask_options(options);
+    let mut value = body_json.clone();
+
+    session.set_collision_corpus(request_collision_corpus(format, &value));
+    reject_sensitive_opaque_reasoning_state(format, &value, &session)?;
+    let mut scan_state = RedactionScanState;
+    let redacted = mask_request_value_async(
+        format,
+        &mut value,
+        &mut session,
+        &mut scan_state,
+        options,
+        cache,
+    )
+    .await?;
+
+    Ok(MaskedChatRequestValue {
+        body_json: redacted.then_some(value),
+        session,
+        redacted,
+    })
+}
+
 fn request_collision_corpus(format: ChatPiiRedactionRequestFormat, value: &Value) -> Vec<String> {
     match format {
         ChatPiiRedactionRequestFormat::OpenAiChat => value
@@ -1299,7 +1605,64 @@ fn request_collision_corpus(format: ChatPiiRedactionRequestFormat, value: &Value
             .map(|messages| chat_message_collision_corpus(messages))
             .unwrap_or_default(),
         ChatPiiRedactionRequestFormat::OpenAiResponses => openai_responses_collision_corpus(value),
+        ChatPiiRedactionRequestFormat::OpenAiSearch => openai_search_collision_corpus(value),
         ChatPiiRedactionRequestFormat::ClaudeMessages => claude_messages_collision_corpus(value),
+    }
+}
+
+fn reject_sensitive_opaque_reasoning_state(
+    format: ChatPiiRedactionRequestFormat,
+    value: &Value,
+    session: &RedactionSession,
+) -> Result<(), RedactionMaskError> {
+    if !session.preserves_deepseek_opaque_reasoning_state() {
+        return Ok(());
+    }
+    if !matches!(
+        format,
+        ChatPiiRedactionRequestFormat::OpenAiResponses
+            | ChatPiiRedactionRequestFormat::OpenAiSearch
+    ) {
+        return Ok(());
+    }
+    let Some(items) = value.get("input").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if items.iter().any(|item| {
+        item.as_object().is_some_and(|object| {
+            openai_responses_object_is_opaque_reasoning_state(object)
+                && opaque_reasoning_state_has_sensitive_text(item, session)
+        })
+    }) {
+        return Err(RedactionMaskError::SensitiveOpaqueReasoningState);
+    }
+    Ok(())
+}
+
+fn opaque_reasoning_state_has_sensitive_text(value: &Value, session: &RedactionSession) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.iter().any(|(key, value)| {
+        // The provider token is ciphertext/high-entropy state. Scanning it as
+        // user text would reject essentially every valid continuation (the
+        // generic API-key detector intentionally matches high-entropy data).
+        // Only this exact top-level protocol field is excluded; every other
+        // known or future string in the opaque item is scanned fail-closed.
+        key != "encrypted_content" && json_value_has_redaction_candidate(value, session)
+    })
+}
+
+fn json_value_has_redaction_candidate(value: &Value, session: &RedactionSession) -> bool {
+    match value {
+        Value::String(text) => session.text_has_redaction_candidate(text),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_value_has_redaction_candidate(value, session)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| json_value_has_redaction_candidate(value, session)),
+        _ => false,
     }
 }
 
@@ -1309,13 +1672,16 @@ fn mask_request_value(
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
     options: MaskChatRequestOptions,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     match format {
         ChatPiiRedactionRequestFormat::OpenAiChat => {
             mask_openai_chat_request_value(value, session, scan_state, options)
         }
         ChatPiiRedactionRequestFormat::OpenAiResponses => {
             mask_openai_responses_request_value(value, session, scan_state)
+        }
+        ChatPiiRedactionRequestFormat::OpenAiSearch => {
+            mask_openai_search_request_value(value, session, scan_state)
         }
         ChatPiiRedactionRequestFormat::ClaudeMessages => {
             mask_claude_messages_request_value(value, session, scan_state)
@@ -1338,6 +1704,9 @@ async fn mask_request_value_async(
         ChatPiiRedactionRequestFormat::OpenAiResponses => {
             mask_openai_responses_request_value_async(value, session, scan_state, cache).await
         }
+        ChatPiiRedactionRequestFormat::OpenAiSearch => {
+            mask_openai_search_request_value_async(value, session, scan_state, cache).await
+        }
         ChatPiiRedactionRequestFormat::ClaudeMessages => {
             mask_claude_messages_request_value_async(value, session, scan_state, cache).await
         }
@@ -1349,7 +1718,7 @@ fn mask_openai_chat_request_value(
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
     options: MaskChatRequestOptions,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let Some(messages) = value.get_mut("messages").and_then(Value::as_array_mut) else {
         return Ok(false);
     };
@@ -1505,6 +1874,31 @@ fn openai_responses_collision_corpus(value: &Value) -> Vec<String> {
     corpus
 }
 
+const OPENAI_SEARCH_COMMAND_TEXT_FIELDS: [(&str, &str); 4] = [
+    ("search_query", "q"),
+    ("image_query", "q"),
+    ("find", "pattern"),
+    ("weather", "location"),
+];
+
+fn openai_search_collision_corpus(value: &Value) -> Vec<String> {
+    let mut corpus = openai_responses_collision_corpus(value);
+    let Some(commands) = value.get("commands").and_then(Value::as_object) else {
+        return corpus;
+    };
+    for (command, field) in OPENAI_SEARCH_COMMAND_TEXT_FIELDS {
+        let Some(entries) = commands.get(command).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(text) = entry.get(field).and_then(Value::as_str) {
+                corpus.push(text.to_string());
+            }
+        }
+    }
+    corpus
+}
+
 fn collect_openai_responses_input_collision_text(value: &Value, corpus: &mut Vec<String>) {
     match value {
         Value::String(text) => corpus.push(text.clone()),
@@ -1563,7 +1957,7 @@ fn collect_openai_responses_content_part_collision_text(part: &Value, corpus: &m
 fn response_textish_type(raw_type: Option<&str>) -> bool {
     matches!(
         raw_type,
-        Some("text" | "input_text" | "output_text" | "summary_text")
+        Some("text" | "input_text" | "output_text" | "summary_text" | "reasoning_text")
     )
 }
 
@@ -1571,7 +1965,7 @@ fn mask_chat_message_value(
     message: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let Some(message) = message.as_object_mut() else {
         return Ok(false);
     };
@@ -1592,7 +1986,7 @@ fn mask_chat_content_value(
     content: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     match content {
         Value::String(text) => mask_json_string(text, session, scan_state),
         Value::Array(parts) => {
@@ -1610,7 +2004,7 @@ fn mask_chat_content_part(
     part: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let Some(part) = part.as_object_mut() else {
         return Ok(false);
     };
@@ -1627,7 +2021,7 @@ fn mask_tool_call_arguments(
     tool_call: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let Some(function) = tool_call.get_mut("function").and_then(Value::as_object_mut) else {
         return Ok(false);
     };
@@ -1641,7 +2035,7 @@ fn mask_claude_messages_request_value(
     value: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let mut redacted = false;
     if let Some(system) = value.get_mut("system") {
         redacted |= mask_claude_text_content_value(system, session, scan_state)?;
@@ -1660,7 +2054,7 @@ fn mask_claude_text_content_value(
     value: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     match value {
         Value::String(text) => mask_json_string(text, session, scan_state),
         Value::Array(parts) => {
@@ -1678,7 +2072,7 @@ fn mask_claude_content_part(
     part: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let Some(part) = part.as_object_mut() else {
         return Ok(false);
     };
@@ -1709,7 +2103,7 @@ fn mask_openai_responses_request_value(
     value: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let mut redacted = false;
     if let Some(Value::String(instructions)) = value.get_mut("instructions") {
         redacted |= mask_json_string(instructions, session, scan_state)?;
@@ -1720,11 +2114,36 @@ fn mask_openai_responses_request_value(
     Ok(redacted)
 }
 
+fn mask_openai_search_request_value(
+    value: &mut Value,
+    session: &mut RedactionSession,
+    scan_state: &mut RedactionScanState,
+) -> Result<bool, Infallible> {
+    let mut redacted = false;
+    if let Some(input) = value.get_mut("input") {
+        redacted |= mask_openai_responses_input_value(input, session, scan_state)?;
+    }
+    let Some(commands) = value.get_mut("commands").and_then(Value::as_object_mut) else {
+        return Ok(redacted);
+    };
+    for (command, field) in OPENAI_SEARCH_COMMAND_TEXT_FIELDS {
+        let Some(entries) = commands.get_mut(command).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(Value::String(text)) = entry.get_mut(field) {
+                redacted |= mask_json_string(text, session, scan_state)?;
+            }
+        }
+    }
+    Ok(redacted)
+}
+
 fn mask_openai_responses_input_value(
     value: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     match value {
         Value::String(text) => mask_json_string(text, session, scan_state),
         Value::Array(items) => {
@@ -1742,10 +2161,20 @@ fn mask_openai_responses_input_item(
     item: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let Some(item) = item.as_object_mut() else {
         return Ok(false);
     };
+    // Some Responses-compatible providers bind the clear-text reasoning
+    // payload to sibling opaque continuation state. The top-level validation
+    // rejects such an item when its text contains sensitive data; a safe item
+    // can then remain byte-identical for provider replay. Unbound reasoning
+    // text still follows the ordinary PII policy below.
+    if session.preserves_deepseek_opaque_reasoning_state()
+        && openai_responses_object_is_opaque_reasoning_state(item)
+    {
+        return Ok(false);
+    }
     let mut redacted = false;
     if let Some(content) = item.get_mut("content") {
         redacted |= mask_openai_responses_content_value(content, session, scan_state)?;
@@ -1767,7 +2196,7 @@ fn mask_openai_responses_content_value(
     content: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     match content {
         Value::String(text) => mask_json_string(text, session, scan_state),
         Value::Array(parts) => {
@@ -1785,7 +2214,7 @@ fn mask_openai_responses_content_part(
     part: &mut Value,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let Some(part) = part.as_object_mut() else {
         return Ok(false);
     };
@@ -1802,7 +2231,7 @@ fn mask_json_string(
     text: &mut String,
     session: &mut RedactionSession,
     scan_state: &mut RedactionScanState,
-) -> Result<bool, RedactionLimitError> {
+) -> Result<bool, Infallible> {
     let redacted = session.redact_text_checked(text, scan_state)?;
     if redacted.matches.is_empty() {
         return Ok(false);
@@ -2005,6 +2434,33 @@ async fn mask_openai_responses_request_value_async(
     Ok(redacted)
 }
 
+async fn mask_openai_search_request_value_async(
+    value: &mut Value,
+    session: &mut RedactionSession,
+    scan_state: &mut RedactionScanState,
+    cache: Option<&RedisRedactionMappingCache<'_>>,
+) -> Result<bool, RedactionMaskError> {
+    let mut redacted = false;
+    if let Some(input) = value.get_mut("input") {
+        redacted |=
+            mask_openai_responses_input_value_async(input, session, scan_state, cache).await?;
+    }
+    let Some(commands) = value.get_mut("commands").and_then(Value::as_object_mut) else {
+        return Ok(redacted);
+    };
+    for (command, field) in OPENAI_SEARCH_COMMAND_TEXT_FIELDS {
+        let Some(entries) = commands.get_mut(command).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            if let Some(Value::String(text)) = entry.get_mut(field) {
+                redacted |= mask_json_string_async(text, session, scan_state, cache).await?;
+            }
+        }
+    }
+    Ok(redacted)
+}
+
 async fn mask_openai_responses_input_value_async(
     value: &mut Value,
     session: &mut RedactionSession,
@@ -2035,6 +2491,11 @@ async fn mask_openai_responses_input_item_async(
     let Some(item) = item.as_object_mut() else {
         return Ok(false);
     };
+    if session.preserves_deepseek_opaque_reasoning_state()
+        && openai_responses_object_is_opaque_reasoning_state(item)
+    {
+        return Ok(false);
+    }
     let mut redacted = false;
     if let Some(content) = item.get_mut("content") {
         redacted |=
@@ -2210,7 +2671,20 @@ fn restore_json_response_body(
     })
 }
 
-fn restore_json_strings(value: &mut Value, session: &RedactionSession) -> bool {
+/// 递归把 JSON 里的占位符换回真实值，只认本 `session` 记录过的映射。
+///
+/// 同步响应体（[`restore_sync_response_body`]）和 Responses WebSocket 的
+/// provider 事件帧（`handlers::proxy::websocket::responses::redaction`）共用它，
+/// 两边因此保持同一套还原语义：未映射的占位符原样保留，`type` / `model` / `id`
+/// 这类协议字段虽然也被遍历，但它们不可能包含本 session 派生出的 sentinel，
+/// 所以不会被改写。
+///
+/// Provider-owned Responses reasoning state is the exception. DeepSeek-style
+/// items bind `reasoning_text` to `encrypted_content` and require both to be
+/// replayed unchanged. Restoring a sentinel in only the text half would make
+/// the client return a different continuation item, so those objects/events
+/// stay opaque even when another response field is restored.
+pub(crate) fn restore_json_strings(value: &mut Value, session: &RedactionSession) -> bool {
     match value {
         Value::String(text) => {
             let restored = session.restore_text(text);
@@ -2228,6 +2702,11 @@ fn restore_json_strings(value: &mut Value, session: &RedactionSession) -> bool {
             restored
         }
         Value::Object(values) => {
+            if session.preserves_deepseek_opaque_reasoning_state()
+                && openai_responses_object_is_opaque_reasoning_state(values)
+            {
+                return false;
+            }
             let mut restored = false;
             for value in values.values_mut() {
                 restored = restore_json_strings(value, session) || restored;
@@ -2236,6 +2715,38 @@ fn restore_json_strings(value: &mut Value, session: &RedactionSession) -> bool {
         }
         _ => false,
     }
+}
+
+fn openai_responses_object_is_opaque_reasoning_state(
+    object: &serde_json::Map<String, Value>,
+) -> bool {
+    let Some(item_type) = object.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    // Never treat a `reasoning_text` content part or delta/done event name by
+    // itself as proof of opaque state: ordinary OpenAI reasoning text may
+    // contain mask placeholders that still need client-side restoration. The
+    // binding evidence is the parent reasoning item carrying provider-owned
+    // encrypted continuation state. Returning here keeps that whole object,
+    // including its nested reasoning_text parts, value-for-value unchanged.
+    let id_is_absent_or_empty = object
+        .get("id")
+        .is_none_or(|id| id.is_null() || id.as_str().is_some_and(|value| value.trim().is_empty()));
+    item_type == "reasoning"
+        && id_is_absent_or_empty
+        && object
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|state| !state.trim().is_empty())
+        && object
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("reasoning_text")
+                        && part.get("text").is_some_and(Value::is_string)
+                })
+            })
 }
 
 fn restore_text_response_body(body: &[u8], session: &RedactionSession) -> RestoredSyncResponseBody {
@@ -2752,6 +3263,7 @@ impl fmt::Debug for RedactionMatch {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct RedactionMapping {
     pub(crate) rule_label: String,
     pub(crate) kind: Option<RedactionKind>,
@@ -3136,7 +3648,13 @@ fn detect_candidates_with_probe(
             is_valid_named_token,
         );
     }
-    if input.contains("secret_key") || input.contains("secret-key") || input.contains("SecretKey") {
+    if input.contains("secret_key")
+        || input.contains("secret-key")
+        || input.contains("SecretKey")
+        || input.contains("agent_private_key")
+        || input.contains("agent-private-key")
+        || input.contains("agentPrivateKey")
+    {
         push_regex_candidates(
             input,
             &SECRET_KEY_REGEX,
@@ -3764,20 +4282,21 @@ fn redacted_sentinel_debug(sentinel: &str) -> String {
 mod tests {
     use super::{
         build_redaction_session_config, detect_candidates_with_probe, mask_chat_request_json,
-        mask_chat_request_json_with_options, parse_chat_pii_redaction_rules,
+        mask_chat_request_json_with_options, parse_chat_pii_redaction_rules, restore_json_strings,
         restore_sync_response_body, try_mask_chat_pii_request_json_with_options,
+        try_mask_chat_pii_request_value_with_cache_options,
         try_mask_chat_request_json_with_cache_options, try_mask_chat_request_json_with_options,
         ChatPiiRedactionRequestFormat, ChatPiiRedactionRuntimeConfig, DetectorProbe, MappingKey,
-        MaskChatRequestOptions, RedactionKind, RedactionLimitError, RedactionMapping,
-        RedactionScanLimits, RedactionSession, RedactionSessionConfig, RedactionSessionSlot,
-        RedisRedactionMappingCache, SentinelMatcher, StreamingResponseRestorer,
+        MaskChatRequestOptions, RedactionKind, RedactionMapping, RedactionMaskError,
+        RedactionSession, RedactionSessionConfig, RedactionSessionSlot, RedisRedactionMappingCache,
+        SentinelMatcher, StreamingResponseRestorer,
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
 
     use aether_runtime_state::{RedisClientConfig, RuntimeState};
-    use aether_testkit::ManagedRedisServer;
-    use serde_json::json;
+    use aether_test_support::ManagedRedisServer;
+    use serde_json::{json, Value};
 
     fn assert_debug_surface_hides_values(debug: &str, originals: &[&str], sentinels: &[String]) {
         for original in originals {
@@ -4019,6 +4538,22 @@ mod tests {
             collision_session.sentinel_for_original("alice@example.com"),
             Some(colliding_literal.as_str())
         );
+    }
+
+    #[test]
+    fn pii_redaction_hides_agent_identity_private_keys() {
+        let private_key =
+            "agent_private_key=MC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut session = session_at(601);
+
+        let redacted = session.redact_text(private_key);
+
+        assert!(!redacted.text.contains(private_key));
+        assert!(redacted.text.contains("<AETHER:SECRET_KEY:"));
+        assert!(redacted
+            .matches
+            .iter()
+            .any(|matched| matched.kind == Some(RedactionKind::SecretKey)));
     }
 
     #[test]
@@ -4426,6 +4961,441 @@ mod tests {
             .as_str()
             .expect("arguments should remain a string")
             .contains("secretValueABCDEF1234567890abcdef"));
+    }
+
+    #[test]
+    fn pii_redaction_preserves_opaque_reasoning_state_while_masking_user_input() {
+        let request = json!({
+            "model": "deepseek-reasoner",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "opaque-state-must-remain-byte-identical",
+                    "future_state": {"version": 2},
+                    "content": [
+                        {
+                            "type": "reasoning_text",
+                            "text": "Provider reasoning state must remain byte-identical"
+                        },
+                        {
+                            "type": "summary_text",
+                            "text": "Bound future text must also remain byte-identical"
+                        }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "Please contact bob@example.net"
+                    }]
+                }
+            ]
+        });
+        let raw = serde_json::to_vec(&request).expect("request should serialize");
+
+        let masked = try_mask_chat_pii_request_json_with_options(
+            &raw,
+            ChatPiiRedactionRequestFormat::OpenAiResponses,
+            test_config(),
+            deepseek_opaque_replay_options(),
+        )
+        .expect("reasoning request should mask");
+
+        assert!(masked.redacted);
+        let masked_json: serde_json::Value =
+            serde_json::from_slice(&masked.body).expect("masked request should stay valid JSON");
+        assert_eq!(
+            masked_json["input"][0]["encrypted_content"],
+            "opaque-state-must-remain-byte-identical"
+        );
+        assert_eq!(
+            masked_json["input"][0]["future_state"],
+            json!({"version": 2})
+        );
+        assert_eq!(
+            masked_json["input"][0]["content"][0]["text"],
+            "Provider reasoning state must remain byte-identical"
+        );
+        assert_eq!(
+            masked_json["input"][0]["content"][1]["text"],
+            "Bound future text must also remain byte-identical",
+            "the complete provider-bound item must remain unchanged"
+        );
+        let user_text = masked_json["input"][1]["content"][0]["text"]
+            .as_str()
+            .expect("user text should remain a string");
+        assert!(!user_text.contains("bob@example.net"));
+        assert!(user_text.contains("<AETHER:EMAIL:"));
+
+        let sentinel = masked
+            .session
+            .sentinel_for_original("bob@example.net")
+            .expect("masked user email should have a sentinel");
+        let provider_response = serde_json::to_vec(&json!({
+            "output": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "provider-bound-state",
+                    "future_state": {"version": 3},
+                    "content": [{
+                        "type": "reasoning_text",
+                        "text": format!("opaque {sentinel}")
+                    }]
+                },
+                {
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": format!("visible {sentinel}")
+                    }]
+                }
+            ]
+        }))
+        .expect("provider response should serialize");
+        let mut headers =
+            BTreeMap::from([("content-type".to_string(), "application/json".to_string())]);
+        let restored =
+            restore_sync_response_body(&mut headers, provider_response.as_slice(), &masked.session)
+                .expect("provider response should restore");
+        let restored_json: serde_json::Value =
+            serde_json::from_slice(&restored.body).expect("restored response should remain JSON");
+        let nested_reasoning_text = restored_json["output"][0]["content"][0].clone();
+        assert_eq!(
+            restored_json["output"][0]["content"][0]["text"],
+            format!("opaque {sentinel}"),
+            "provider-bound reasoning text must remain byte-identical"
+        );
+        assert_eq!(
+            restored_json["output"][0]["encrypted_content"],
+            "provider-bound-state"
+        );
+        assert_eq!(
+            restored_json["output"][0]["future_state"],
+            json!({"version": 3})
+        );
+        assert_eq!(
+            restored_json["output"][1]["content"][0]["text"], "visible bob@example.net",
+            "ordinary assistant output should still be restored"
+        );
+        assert_eq!(
+            nested_reasoning_text,
+            json!({
+                "type": "reasoning_text",
+                "text": format!("opaque {sentinel}")
+            }),
+            "opaque reasoning parts must retain all original fields and values"
+        );
+    }
+
+    #[test]
+    fn pii_redaction_rejects_sensitive_provider_bound_reasoning_state() {
+        let request = json!({
+            "model": "deepseek-reasoner",
+            "input": [{
+                "type": "reasoning",
+                "encrypted_content": "opaque-state-must-remain-byte-identical",
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": "Provider state contains alice@example.com"
+                }]
+            }]
+        });
+        let raw = serde_json::to_vec(&request).expect("request should serialize");
+
+        let error = try_mask_chat_pii_request_json_with_options(
+            &raw,
+            ChatPiiRedactionRequestFormat::OpenAiResponses,
+            test_config(),
+            deepseek_opaque_replay_options(),
+        )
+        .expect_err("sensitive opaque state must fail closed");
+
+        assert_eq!(error, RedactionMaskError::SensitiveOpaqueReasoningState);
+    }
+
+    #[test]
+    fn forged_opaque_reasoning_shape_cannot_opt_out_of_pii_masking() {
+        let request = json!({
+            "model": "client-selected-model",
+            "input": [{
+                "type": "reasoning",
+                "encrypted_content": "client-forged-opaque-state",
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": "Send this to alice@example.com"
+                }]
+            }]
+        });
+        let raw = serde_json::to_vec(&request).expect("request should serialize");
+
+        let masked = try_mask_chat_pii_request_json_with_options(
+            &raw,
+            ChatPiiRedactionRequestFormat::OpenAiResponses,
+            test_config(),
+            MaskChatRequestOptions::runtime(),
+        )
+        .expect("an untrusted reasoning shape should use ordinary masking");
+
+        assert!(masked.redacted);
+        let masked_json: Value =
+            serde_json::from_slice(&masked.body).expect("masked request should remain JSON");
+        let text = masked_json["input"][0]["content"][0]["text"]
+            .as_str()
+            .expect("reasoning text should remain a string");
+        assert!(!text.contains("alice@example.com"));
+        assert!(text.contains("<AETHER:EMAIL:"));
+        assert_eq!(
+            masked_json["input"][0]["encrypted_content"],
+            "client-forged-opaque-state"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_pii_redaction_rejects_sensitive_provider_bound_reasoning_state() {
+        let request = json!({
+            "model": "deepseek-reasoner",
+            "input": [{
+                "type": "reasoning",
+                "encrypted_content": "opaque-state-must-remain-byte-identical",
+                "future_state": {
+                    "nested": {"future_owner": "alice@example.com"}
+                },
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": "Provider state remains byte-identical"
+                }]
+            }]
+        });
+
+        let error = try_mask_chat_pii_request_value_with_cache_options(
+            &request,
+            ChatPiiRedactionRequestFormat::OpenAiResponses,
+            test_config(),
+            deepseek_opaque_replay_options(),
+            None,
+        )
+        .await
+        .expect_err("sensitive future text in opaque state must fail closed");
+
+        assert_eq!(error, RedactionMaskError::SensitiveOpaqueReasoningState);
+    }
+
+    #[test]
+    fn pii_restore_still_restores_unbound_reasoning_text_events() {
+        let masked = try_mask_chat_pii_request_json_with_options(
+            br#"{"model":"gpt","input":"alice@example.com"}"#,
+            ChatPiiRedactionRequestFormat::OpenAiResponses,
+            test_config(),
+            MaskChatRequestOptions::runtime(),
+        )
+        .expect("input should mask");
+        let sentinel = masked
+            .session
+            .sentinel_for_original("alice@example.com")
+            .expect("masked email should have a sentinel");
+        let mut event = json!({
+            "type": "response.reasoning_text.delta",
+            "delta": format!("thinking about {sentinel}")
+        });
+
+        assert!(restore_json_strings(&mut event, &masked.session));
+        assert_eq!(
+            event["delta"], "thinking about alice@example.com",
+            "an event name alone must not be treated as opaque bound state"
+        );
+
+        let mut unbound_part = json!({
+            "type": "reasoning_text",
+            "text": format!("thinking about {sentinel}")
+        });
+        assert!(restore_json_strings(&mut unbound_part, &masked.session));
+        assert_eq!(
+            unbound_part["text"], "thinking about alice@example.com",
+            "a reasoning_text part without encrypted parent state must still restore"
+        );
+
+        let unbound_request = json!({
+            "model": "gpt",
+            "input": [{
+                "type": "reasoning",
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": "unbound alice@example.com"
+                }]
+            }]
+        });
+        let unbound_raw =
+            serde_json::to_vec(&unbound_request).expect("unbound request should serialize");
+        let unbound_masked = try_mask_chat_pii_request_json_with_options(
+            &unbound_raw,
+            ChatPiiRedactionRequestFormat::OpenAiResponses,
+            test_config(),
+            MaskChatRequestOptions::runtime(),
+        )
+        .expect("unbound reasoning request should mask");
+        let unbound_masked_json: Value = serde_json::from_slice(&unbound_masked.body)
+            .expect("masked unbound request should remain JSON");
+        let masked_reasoning_text = unbound_masked_json["input"][0]["content"][0]["text"]
+            .as_str()
+            .expect("unbound reasoning text should remain a string");
+        assert!(!masked_reasoning_text.contains("alice@example.com"));
+        assert!(masked_reasoning_text.contains("<AETHER:EMAIL:"));
+
+        let mut invalid_opaque_item = json!({
+            "type": "reasoning",
+            "encrypted_content": "non-empty-but-unbound",
+            "content": [{
+                "type": "summary_text",
+                "text": format!("thinking about {sentinel}")
+            }]
+        });
+        assert!(restore_json_strings(
+            &mut invalid_opaque_item,
+            &masked.session
+        ));
+        assert_eq!(
+            invalid_opaque_item["content"][0]["text"], "thinking about alice@example.com",
+            "encrypted state without a reasoning_text part must not suppress restoration"
+        );
+
+        let mut identified_reasoning_item = json!({
+            "type": "reasoning",
+            "id": "rs_provider_123",
+            "encrypted_content": "provider-state",
+            "content": [{
+                "type": "reasoning_text",
+                "text": format!("thinking about {sentinel}")
+            }]
+        });
+        assert!(restore_json_strings(
+            &mut identified_reasoning_item,
+            &masked.session
+        ));
+        assert_eq!(
+            identified_reasoning_item["content"][0]["text"], "thinking about alice@example.com",
+            "only id-less DeepSeek-style state may bypass ordinary restoration"
+        );
+
+        let identified_request = json!({
+            "model": "gpt",
+            "input": [{
+                "type": "reasoning",
+                "id": "rs_provider_123",
+                "encrypted_content": "provider-state",
+                "content": [{
+                    "type": "reasoning_text",
+                    "text": "identified alice@example.com"
+                }]
+            }]
+        });
+        let identified_masked = try_mask_chat_pii_request_json_with_options(
+            &serde_json::to_vec(&identified_request).expect("request should serialize"),
+            ChatPiiRedactionRequestFormat::OpenAiResponses,
+            test_config(),
+            MaskChatRequestOptions::runtime(),
+        )
+        .expect("identified reasoning request should mask");
+        let identified_masked_json: Value = serde_json::from_slice(&identified_masked.body)
+            .expect("identified reasoning request should remain JSON");
+        let identified_text = identified_masked_json["input"][0]["content"][0]["text"]
+            .as_str()
+            .expect("identified reasoning text should remain a string");
+        assert!(!identified_text.contains("alice@example.com"));
+        assert!(identified_text.contains("<AETHER:EMAIL:"));
+    }
+
+    #[test]
+    fn pii_redaction_request_masks_openai_search_text_fields() {
+        let request = json!({
+            "id": "session-1",
+            "model": "gpt-5.6",
+            "input": "Find alice@example.com",
+            "commands": {
+                "search_query": [{"q": "Phone +14155552671"}],
+                "image_query": [{"q": "Image for bob@example.com"}],
+                "find": [{"ref_id": "https://example.com/alice@example.com", "pattern": "secret_key=secretValueABCDEF1234567890abcdef"}],
+                "weather": [{"location": "Contact carol@example.com"}],
+                "open": [{"ref_id": "https://example.com/alice@example.com"}]
+            }
+        });
+        let raw = serde_json::to_vec(&request).expect("request should serialize");
+
+        let masked = try_mask_chat_pii_request_json_with_options(
+            &raw,
+            ChatPiiRedactionRequestFormat::OpenAiSearch,
+            test_config(),
+            MaskChatRequestOptions::runtime(),
+        )
+        .expect("search request should mask");
+        let masked_json: Value =
+            serde_json::from_slice(&masked.body).expect("masked request should parse");
+
+        assert!(masked.redacted);
+        assert!(!masked_json["input"]
+            .as_str()
+            .unwrap()
+            .contains("alice@example.com"));
+        assert!(!masked_json["commands"]["search_query"][0]["q"]
+            .as_str()
+            .unwrap()
+            .contains("+14155552671"));
+        assert!(!masked_json["commands"]["image_query"][0]["q"]
+            .as_str()
+            .unwrap()
+            .contains("bob@example.com"));
+        assert!(!masked_json["commands"]["find"][0]["pattern"]
+            .as_str()
+            .unwrap()
+            .contains("secretValueABCDEF1234567890abcdef"));
+        assert!(!masked_json["commands"]["weather"][0]["location"]
+            .as_str()
+            .unwrap()
+            .contains("carol@example.com"));
+        assert_eq!(
+            masked_json["commands"]["open"][0]["ref_id"],
+            "https://example.com/alice@example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn pii_redaction_async_request_masks_openai_search_text_fields() {
+        let request = json!({
+            "id": "session-1",
+            "model": "gpt-5.6",
+            "input": "Find alice@example.com",
+            "commands": {
+                "search_query": [{"q": "Phone +14155552671"}],
+                "find": [{"ref_id": "turn0search0", "pattern": "bob@example.com"}]
+            }
+        });
+
+        let masked = try_mask_chat_pii_request_value_with_cache_options(
+            &request,
+            ChatPiiRedactionRequestFormat::OpenAiSearch,
+            test_config(),
+            MaskChatRequestOptions::runtime(),
+            None,
+        )
+        .await
+        .expect("search request should mask");
+        let masked_json = masked.body_json.expect("masked body should be present");
+
+        assert!(masked.redacted);
+        assert!(!masked_json["input"]
+            .as_str()
+            .unwrap()
+            .contains("alice@example.com"));
+        assert!(!masked_json["commands"]["search_query"][0]["q"]
+            .as_str()
+            .unwrap()
+            .contains("+14155552671"));
+        assert!(!masked_json["commands"]["find"][0]["pattern"]
+            .as_str()
+            .unwrap()
+            .contains("bob@example.com"));
+        assert_eq!(masked_json["commands"]["find"][0]["ref_id"], "turn0search0");
     }
 
     #[test]
@@ -5115,59 +6085,39 @@ mod tests {
     }
 
     #[test]
-    fn pii_redaction_performance_limits_reject_scanned_text_and_detection_overflow() {
-        assert_eq!(
-            RedactionScanLimits::default(),
-            RedactionScanLimits {
-                max_scanned_text_bytes: 2 * 1024 * 1024,
-                max_detections: 1024,
-            }
-        );
-
+    fn pii_redaction_accepts_text_and_detection_counts_above_previous_caps() {
         let large_request = json!({
             "model": "gpt-5",
-            "messages": [{"role": "user", "content": "x".repeat(2 * 1024 * 1024 + 1)}]
+            "messages": [{
+                "role": "user",
+                "content": format!("alice@example.com {}", "x".repeat(2 * 1024 * 1024 + 1))
+            }]
         });
-        let large_err = try_mask_chat_request_json_with_options(
+        let large_masked = try_mask_chat_request_json_with_options(
             &serde_json::to_vec(&large_request).expect("request should serialize"),
             test_config(),
             MaskChatRequestOptions::runtime(),
         )
-        .expect_err("oversized scan should fail closed");
-        assert_eq!(
-            large_err,
-            RedactionLimitError::ScannedTextTooLarge {
-                limit: 2 * 1024 * 1024,
-            }
-        );
-        assert_eq!(
-            large_err.client_status(),
-            http::StatusCode::PAYLOAD_TOO_LARGE
-        );
-        assert!(!large_err.safe_message().contains("alice@example.com"));
+        .expect("text above the previous scan cap should be redacted");
+        assert!(large_masked.redacted);
+        assert_eq!(large_masked.session.mapping_count(), 1);
 
+        let dense_content = (0..1025)
+            .map(|index| format!("user{index}@example.com"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let dense_request = json!({
             "model": "gpt-5",
-            "messages": [{"role": "user", "content": "alice@example.com bob@example.net"}]
+            "messages": [{"role": "user", "content": dense_content}]
         });
-        let dense_err = try_mask_chat_request_json_with_options(
+        let dense_masked = try_mask_chat_request_json_with_options(
             &serde_json::to_vec(&dense_request).expect("request should serialize"),
             test_config(),
-            MaskChatRequestOptions::runtime().with_scan_limits(RedactionScanLimits {
-                max_scanned_text_bytes: 1024,
-                max_detections: 1,
-            }),
+            MaskChatRequestOptions::runtime(),
         )
-        .expect_err("too many detections should fail closed");
-        assert_eq!(
-            dense_err,
-            RedactionLimitError::TooManyDetections { limit: 1 }
-        );
-        assert_eq!(
-            dense_err.client_status(),
-            http::StatusCode::UNPROCESSABLE_ENTITY
-        );
-        assert!(!dense_err.safe_message().contains("alice@example.com"));
+        .expect("detections above the previous cap should be redacted");
+        assert!(dense_masked.redacted);
+        assert_eq!(dense_masked.session.mapping_count(), 1025);
     }
 
     #[tokio::test]
@@ -5550,5 +6500,11 @@ mod tests {
 
     fn test_config() -> RedactionSessionConfig {
         RedactionSessionConfig::new(b"redaction-test-key".to_vec(), 300, 600)
+    }
+
+    fn deepseek_opaque_replay_options() -> MaskChatRequestOptions {
+        MaskChatRequestOptions::runtime().with_reasoning_replay_policy(
+            crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque,
+        )
     }
 }

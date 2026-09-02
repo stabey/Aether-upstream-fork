@@ -9,6 +9,7 @@ use crate::ai_serving::planner::decision_input::{
 };
 use crate::ai_serving::resolve_local_decision_execution_runtime_auth_context;
 use crate::client_session_affinity::client_session_affinity_from_parts;
+use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::{AppState, GatewayError};
 
 pub(crate) async fn resolve_local_openai_chat_decision_input(
@@ -59,11 +60,14 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
         return Ok(None);
     };
 
+    let auth_started_at = std::time::Instant::now();
     let resolved_input = match resolve_local_authenticated_decision_input(
         state,
         auth_context.clone(),
         Some(requested_model.as_str()),
+        decision.auth_endpoint_signature.as_deref(),
         None,
+        &decision.model_directive_policy,
     )
     .await
     {
@@ -106,10 +110,20 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
             return Err(err);
         }
     };
+    observe_gateway_stage_ms(
+        "openai_chat_decision_input_auth",
+        auth_started_at.elapsed().as_millis() as u64,
+    );
 
     let mut input = build_local_requested_model_decision_input(resolved_input, requested_model);
     input.request_auth_channel = decision.request_auth_channel.clone();
+    let affinity_started_at = std::time::Instant::now();
     input.client_session_affinity = client_session_affinity_from_parts(parts, Some(body_json));
+    observe_gateway_stage_ms(
+        "openai_chat_decision_input_affinity",
+        affinity_started_at.elapsed().as_millis() as u64,
+    );
+    let routing_started_at = std::time::Instant::now();
     if let Err(err) = attach_routing_policy_to_local_requested_model_input(
         state,
         parts,
@@ -126,5 +140,9 @@ pub(crate) async fn resolve_local_openai_chat_decision_input(
         );
         return Err(err);
     }
+    observe_gateway_stage_ms(
+        "openai_chat_decision_input_routing",
+        routing_started_at.elapsed().as_millis() as u64,
+    );
     Ok(Some(input))
 }

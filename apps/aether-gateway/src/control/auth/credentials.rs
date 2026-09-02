@@ -71,6 +71,20 @@ pub(super) fn extract_request_credentials(
     }
 }
 
+pub(in crate::control) fn resolve_gateway_credential_carrier(
+    headers: &http::HeaderMap,
+    uri: &Uri,
+    auth_endpoint_signature: &str,
+) -> Option<GatewayCredentialCarrier> {
+    extract_request_credentials(headers, uri, auth_endpoint_signature)
+        .primary
+        .map(|credential| match credential {
+            GatewayPrimaryCredential::ProviderApiKey { carrier, .. }
+            | GatewayPrimaryCredential::BearerToken { carrier, .. }
+            | GatewayPrimaryCredential::CookieHeader { carrier, .. } => carrier,
+        })
+}
+
 fn has_trusted_gateway_marker(headers: &http::HeaderMap) -> bool {
     header_value_str(headers, crate::constants::GATEWAY_HEADER)
         .unwrap_or_default()
@@ -90,6 +104,7 @@ pub(super) fn build_auth_context_cache_key(
     }
 
     let extracted = extract_request_credentials(headers, uri, signature);
+    let trusted_headers = extracted.trusted_headers;
     let bundle = extracted.bundle;
     if bundle.authorization_bearer.is_none()
         && bundle.x_api_key.is_none()
@@ -97,18 +112,41 @@ pub(super) fn build_auth_context_cache_key(
         && bundle.x_goog_api_key.is_none()
         && bundle.query_key.is_none()
         && bundle.cookie_header.is_none()
+        && trusted_headers.is_none()
     {
         return None;
     }
 
+    let (trusted_user_id, trusted_api_key_id, trusted_balance_remaining, trusted_access_allowed) =
+        trusted_headers
+            .map(|trusted| {
+                (
+                    trusted.user_id,
+                    trusted.api_key_id,
+                    trusted
+                        .balance_remaining
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                    trusted
+                        .access_allowed
+                        .map(|value| value.to_string())
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+
     Some(format!(
-        "{signature}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{signature}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         bundle.authorization_bearer.unwrap_or_default(),
         bundle.x_api_key.unwrap_or_default(),
         bundle.api_key.unwrap_or_default(),
         bundle.x_goog_api_key.unwrap_or_default(),
         bundle.query_key.unwrap_or_default(),
         bundle.cookie_header.unwrap_or_default(),
+        trusted_user_id,
+        trusted_api_key_id,
+        trusted_balance_remaining,
+        trusted_access_allowed,
     ))
 }
 
@@ -139,6 +177,19 @@ fn extract_trusted_auth_headers(headers: &http::HeaderMap) -> Option<GatewayTrus
     })
 }
 
+#[cfg(not(test))]
+pub(super) fn extract_trusted_admin_headers(
+    _headers: &http::HeaderMap,
+) -> Option<GatewayTrustedAdminHeaders> {
+    // The public gateway has no authenticated upstream that is allowed to
+    // assert an administrator principal. `x-aether-gateway` is also emitted
+    // on public responses, so it cannot serve as proof that these headers were
+    // produced by a trusted hop. Production requests must authenticate with a
+    // real admin session or management bearer token instead.
+    None
+}
+
+#[cfg(test)]
 pub(super) fn extract_trusted_admin_headers(
     headers: &http::HeaderMap,
 ) -> Option<GatewayTrustedAdminHeaders> {
@@ -192,7 +243,7 @@ fn select_primary_credential(
     if signature.starts_with("claude:") {
         return select_claude_messages_credential(bundle);
     }
-    if signature.starts_with("openai:") {
+    if signature.starts_with("openai:") || signature.starts_with("codex:") {
         return select_openai_credential(bundle);
     }
     if signature.starts_with("aether:") {
@@ -441,6 +492,25 @@ mod tests {
     }
 
     #[test]
+    fn selects_codex_live_bearer_as_provider_api_key() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            "Bearer sk-codex-live".parse().unwrap(),
+        );
+
+        let extracted =
+            extract_request_credentials(&headers, &uri("/v1/live?model=gpt-live"), "codex:live");
+        assert_eq!(
+            extracted.primary,
+            Some(GatewayPrimaryCredential::ProviderApiKey {
+                raw: "sk-codex-live".to_string(),
+                carrier: GatewayCredentialCarrier::AuthorizationBearer,
+            })
+        );
+    }
+
+    #[test]
     fn prefers_claude_chat_x_api_key_over_bearer() {
         let mut headers = http::HeaderMap::new();
         headers.insert(
@@ -549,6 +619,103 @@ mod tests {
         )
         .expect("cache key should exist");
         assert!(cache_key.contains("session=abc123"));
+    }
+
+    #[test]
+    fn cache_key_includes_trusted_auth_headers() {
+        let mut first_headers = http::HeaderMap::new();
+        first_headers.insert(
+            crate::constants::GATEWAY_HEADER,
+            "rust-phase3b".parse().unwrap(),
+        );
+        first_headers.insert(
+            crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
+            "user-1".parse().unwrap(),
+        );
+        first_headers.insert(
+            crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
+            "key-1".parse().unwrap(),
+        );
+        first_headers.insert(
+            crate::constants::TRUSTED_AUTH_BALANCE_HEADER,
+            "1.5".parse().unwrap(),
+        );
+        first_headers.insert(
+            crate::constants::TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
+            "true".parse().unwrap(),
+        );
+
+        let mut second_headers = first_headers.clone();
+        second_headers.insert(
+            crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
+            "user-2".parse().unwrap(),
+        );
+        second_headers.insert(
+            crate::constants::TRUSTED_AUTH_ACCESS_ALLOWED_HEADER,
+            "false".parse().unwrap(),
+        );
+
+        let first = build_auth_context_cache_key(
+            &first_headers,
+            &uri("/v1/chat/completions"),
+            "openai:chat",
+        )
+        .expect("trusted cache key should exist");
+        let second = build_auth_context_cache_key(
+            &second_headers,
+            &uri("/v1/chat/completions"),
+            "openai:chat",
+        )
+        .expect("trusted cache key should exist");
+
+        assert_ne!(first, second);
+        assert!(first.contains("user-1"));
+        assert!(first.contains("key-1"));
+        assert!(first.contains("1.5"));
+        assert!(first.contains("true"));
+        assert!(second.contains("user-2"));
+        assert!(second.contains("false"));
+    }
+
+    #[test]
+    fn cache_key_ignores_untrusted_auth_identity_headers() {
+        let mut trusted_headers = http::HeaderMap::new();
+        trusted_headers.insert(
+            crate::constants::GATEWAY_HEADER,
+            "rust-phase3b".parse().unwrap(),
+        );
+        trusted_headers.insert(
+            crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
+            "user-1".parse().unwrap(),
+        );
+        trusted_headers.insert(
+            crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
+            "key-1".parse().unwrap(),
+        );
+
+        let mut untrusted_headers = http::HeaderMap::new();
+        untrusted_headers.insert(
+            crate::constants::TRUSTED_AUTH_USER_ID_HEADER,
+            "user-1".parse().unwrap(),
+        );
+        untrusted_headers.insert(
+            crate::constants::TRUSTED_AUTH_API_KEY_ID_HEADER,
+            "key-1".parse().unwrap(),
+        );
+
+        let trusted = build_auth_context_cache_key(
+            &trusted_headers,
+            &uri("/v1/chat/completions"),
+            "openai:chat",
+        );
+        let untrusted = build_auth_context_cache_key(
+            &untrusted_headers,
+            &uri("/v1/chat/completions"),
+            "openai:chat",
+        );
+
+        assert!(trusted.is_some());
+        assert_eq!(untrusted, None);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use aether_contracts::{
 use aether_crypto::{
     decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY,
 };
+use aether_data::repository::background_tasks::InMemoryBackgroundTaskRepository;
 use aether_data::repository::management_tokens::{
     InMemoryManagementTokenRepository, ManagementTokenReadRepository,
 };
@@ -15,6 +16,7 @@ use aether_data::repository::oauth_providers::{
 use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::proxy_nodes::InMemoryProxyNodeRepository;
+use aether_data_contracts::repository::background_tasks::BackgroundTaskReadRepository;
 use aether_data_contracts::repository::pool_scores::{
     GetPoolMemberScoresByIdsQuery, PoolMemberHardState, PoolMemberIdentity, PoolScoreReadRepository,
 };
@@ -26,7 +28,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, delete, get, patch, post, put};
 use axum::{extract::Request, Json, Router};
 use http::{HeaderMap, HeaderValue, StatusCode};
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::super::{
     build_router_with_state, build_state_with_execution_runtime_override, hash_management_token,
@@ -36,7 +38,9 @@ use super::super::{
 use crate::admin_api::{
     maybe_build_local_admin_provider_oauth_response, AdminAppState, AdminRequestContext,
 };
-use crate::ai_serving::{provider_key_pool_score_id, provider_key_pool_score_scope};
+use crate::ai_serving::{
+    build_provider_key_pool_score_upsert, provider_key_pool_score_id, provider_key_pool_score_scope,
+};
 use crate::audit::AdminAuditEvent;
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_MANAGEMENT_TOKEN_ID_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER,
@@ -45,16 +49,16 @@ use crate::constants::{
 use crate::control::resolve_public_request_context;
 use crate::data::GatewayDataState;
 
-const MANUAL_KIRO_OAUTH_REFRESH_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+const ADMIN_OAUTH_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-fn run_manual_kiro_oauth_refresh_test<F, Fut>(test_name: &'static str, make_future: F)
+fn run_admin_oauth_test<F, Fut>(test_name: &'static str, make_future: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + 'static,
 {
     let handle = std::thread::Builder::new()
         .name(test_name.to_string())
-        .stack_size(MANUAL_KIRO_OAUTH_REFRESH_TEST_STACK_BYTES)
+        .stack_size(ADMIN_OAUTH_TEST_STACK_BYTES)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -62,7 +66,7 @@ where
                 .expect("test runtime should build");
             runtime.block_on(make_future());
         })
-        .expect("manual kiro oauth refresh test thread should spawn");
+        .expect("admin oauth test thread should spawn");
 
     if let Err(payload) = handle.join() {
         std::panic::resume_unwind(payload);
@@ -148,25 +152,33 @@ fn sample_kiro_device_access_token_without_email() -> String {
 }
 
 fn sample_codex_access_token_with_profile_email(email: &str, account_id: &str) -> String {
+    sample_codex_access_token_with_profile_email_and_expiry(email, account_id, Some(2_000_000_000))
+}
+
+fn sample_codex_access_token_with_profile_email_and_expiry(
+    email: &str,
+    account_id: &str,
+    expires_at: Option<u64>,
+) -> String {
     use base64::Engine as _;
 
     let header =
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"alg":"none","typ":"JWT"}"#);
-    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-        json!({
-            "iss": "https://auth.openai.com",
-            "aud": ["https://api.openai.com/v1"],
-            "exp": 2_000_000_000u64,
-            "https://api.openai.com/profile": {
-                "email": email,
-                "email_verified": true,
-            },
-            "https://api.openai.com/auth": {
-                "chatgpt_account_id": account_id,
-            },
-        })
-        .to_string(),
-    );
+    let mut claims = json!({
+        "iss": "https://auth.openai.com",
+        "aud": ["https://api.openai.com/v1"],
+        "https://api.openai.com/profile": {
+            "email": email,
+            "email_verified": true,
+        },
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+        },
+    });
+    if let Some(expires_at) = expires_at {
+        claims["exp"] = json!(expires_at);
+    }
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
     format!("{header}.{payload}.sig")
 }
 
@@ -263,9 +275,16 @@ fn assert_single_provider_oauth_refresh_token_plan<'a>(
     token_plans[0]
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trusted_admin_principal()
-{
+#[test]
+fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_supported_types_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_oauth_supported_types_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trusted_admin_principal_impl(
+) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -300,19 +319,498 @@ async fn gateway_handles_admin_provider_oauth_supported_types_locally_with_trust
     let items = payload.as_array().expect("items should be array");
     assert_eq!(items.len(), 6);
     assert_eq!(items[0]["provider_type"], "claude_code");
+    assert_eq!(
+        items[0]["authorize_url"],
+        "https://claude.ai/oauth/authorize"
+    );
+    assert_eq!(
+        items[0]["token_url"],
+        "https://platform.claude.com/v1/oauth/token"
+    );
+    assert_eq!(
+        items[0]["redirect_uri"],
+        "https://platform.claude.com/oauth/code/callback"
+    );
+    assert_eq!(items[0]["supports_cookie_authorization"], true);
     assert_eq!(items[1]["provider_type"], "codex");
     assert_eq!(items[2]["provider_type"], "chatgpt_web");
     assert_eq!(items[3]["provider_type"], "gemini_cli");
     assert_eq!(items[4]["provider_type"], "antigravity");
     assert_eq!(items[5]["provider_type"], "windsurf");
+    assert!(items[1..]
+        .iter()
+        .all(|item| item["supports_cookie_authorization"] == false));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_device_authorize_for_windsurf_browser() {
+#[test]
+fn gateway_authorizes_claude_cookie_without_persisting_cookie() {
+    run_admin_oauth_test(
+        "gateway_authorizes_claude_cookie_without_persisting_cookie",
+        gateway_authorizes_claude_cookie_without_persisting_cookie_impl,
+    );
+}
+
+async fn gateway_authorizes_claude_cookie_without_persisting_cookie_impl() {
+    let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
+    let execution_plans_clone = Arc::clone(&execution_plans);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let execution_plans_inner = Arc::clone(&execution_plans_clone);
+            async move {
+                execution_plans_inner
+                    .lock()
+                    .expect("mutex should lock")
+                    .push(plan.clone());
+                let json_body = match plan.request_id.as_str() {
+                    "provider-oauth:claude-cookie-organizations" => json!([
+                        {"uuid": "org-personal", "raven_type": "personal"},
+                        {"uuid": "org-team", "raven_type": "team"}
+                    ]),
+                    "provider-oauth:claude-cookie-authorize" => {
+                        let state = plan
+                            .body
+                            .json_body
+                            .as_ref()
+                            .and_then(|body| body.get("state"))
+                            .and_then(serde_json::Value::as_str)
+                            .expect("authorize plan should contain state");
+                        let mut redirect =
+                            url::Url::parse("https://platform.claude.com/oauth/code/callback")
+                                .expect("redirect URL should parse");
+                        redirect
+                            .query_pairs_mut()
+                            .append_pair("code", "claude-authorization-code")
+                            .append_pair("state", state);
+                        json!({"redirect_uri": redirect.to_string()})
+                    }
+                    "provider-oauth:exchange-code" => json!({
+                        "access_token": "sk-ant-oat01-created",
+                        "refresh_token": "sk-ant-ort01-created",
+                        "expires_in": 3600,
+                        "organization": {"uuid": "org-team"},
+                        "account": {
+                            "uuid": "account-claude-123",
+                            "email_address": "claude@example.com"
+                        }
+                    }),
+                    unexpected => panic!("unexpected execution plan: {unexpected}"),
+                };
+                Json(json!({
+                    "request_id": plan.request_id,
+                    "status_code": 200,
+                    "headers": {"content-type": "application/json"},
+                    "body": {"json_body": json_body}
+                }))
+            }
+        }),
+    );
+
+    let mut provider = sample_provider("provider-claude", "claude", 10);
+    provider.provider_type = "claude_code".to_string();
+    provider.proxy = Some(json!({
+        "mode": "tunnel",
+        "node_id": "proxy-node-claude",
+        "url": "http://proxy.example:8080",
+        "enabled": true
+    }));
+    let endpoint = sample_endpoint(
+        "endpoint-claude-messages",
+        "provider-claude",
+        "claude:messages",
+        "https://api.anthropic.com",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository.clone(),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        )
+        .with_provider_oauth_token_url_for_tests(
+            "claude_code_cookie_base_url",
+            "https://claude.example",
+        )
+        .with_provider_oauth_token_url_for_tests(
+            "claude_code",
+            "https://platform.example/v1/oauth/token",
+        );
+
+    let response = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-claude/cookie-authorize",
+        Some(json!({
+            "cookie": "Cookie: other=value; sessionKey=sk-ant-sid01-secret; theme=dark",
+            "name": "claude-cookie-account"
+        })),
+    )
+    .await;
+    let status = response.status();
+    let payload: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read"),
+    )
+    .expect("response should be JSON");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    assert_eq!(payload["provider_type"], "claude_code");
+    assert_eq!(payload["has_refresh_token"], true);
+    assert_eq!(payload["temporary"], false);
+    assert_eq!(payload["email"], "claude@example.com");
+
+    let keys = provider_catalog_repository
+        .list_keys_by_provider_ids(&["provider-claude".to_string()])
+        .await
+        .expect("keys should load");
+    assert_eq!(keys.len(), 1);
+    let decrypted_api_key = decrypt_python_fernet_ciphertext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        keys[0]
+            .encrypted_api_key
+            .as_deref()
+            .expect("api key should be encrypted"),
+    )
+    .expect("api key should decrypt");
+    assert_eq!(decrypted_api_key, "sk-ant-oat01-created");
+    let decrypted_auth_config = decrypt_python_fernet_ciphertext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        keys[0]
+            .encrypted_auth_config
+            .as_deref()
+            .expect("auth config should be encrypted"),
+    )
+    .expect("auth config should decrypt");
+    let auth_config: serde_json::Value =
+        serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
+    assert_eq!(auth_config["refresh_token"], "sk-ant-ort01-created");
+    assert_eq!(auth_config["org_uuid"], "org-team");
+    assert_eq!(auth_config["account_uuid"], "account-claude-123");
+    assert_eq!(auth_config["email"], "claude@example.com");
+    assert!(!decrypted_auth_config.contains("sk-ant-sid01-secret"));
+    assert!(!decrypted_auth_config.contains("sessionKey"));
+    assert!(auth_config.get("cookie").is_none());
+
+    let plans = execution_plans.lock().expect("mutex should lock");
+    assert_eq!(plans.len(), 3);
+    for plan in &plans[..2] {
+        assert_eq!(
+            plan.headers.get("cookie").map(String::as_str),
+            Some("sessionKey=sk-ant-sid01-secret")
+        );
+        assert_eq!(
+            plan.headers
+                .get(EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER)
+                .map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            plan.proxy.as_ref().and_then(|proxy| proxy.mode.as_deref()),
+            Some("tunnel")
+        );
+        assert!(plan.transport_profile.is_none());
+    }
+    let token_plan = &plans[2];
+    assert_eq!(token_plan.request_id, "provider-oauth:exchange-code");
+    assert!(!token_plan.headers.contains_key("cookie"));
+    assert!(token_plan
+        .body
+        .json_body
+        .as_ref()
+        .is_some_and(|body| body.get("scope").is_none()));
+
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_batch_authorizes_claude_cookies_as_redacted_task() {
+    run_admin_oauth_test(
+        "gateway_batch_authorizes_claude_cookies_as_redacted_task",
+        gateway_batch_authorizes_claude_cookies_as_redacted_task_impl,
+    );
+}
+
+async fn gateway_batch_authorizes_claude_cookies_as_redacted_task_impl() {
+    let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
+    let execution_plans_clone = Arc::clone(&execution_plans);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let execution_plans_inner = Arc::clone(&execution_plans_clone);
+            async move {
+                execution_plans_inner
+                    .lock()
+                    .expect("mutex should lock")
+                    .push(plan.clone());
+                let json_body = match plan.request_id.as_str() {
+                    "provider-oauth:claude-cookie-organizations" => {
+                        json!([{"uuid": "org-team", "raven_type": "team"}])
+                    }
+                    "provider-oauth:claude-cookie-authorize" => {
+                        let cookie = plan
+                            .headers
+                            .get("cookie")
+                            .map(String::as_str)
+                            .expect("authorize plan should contain cookie");
+                        let label = if cookie.contains("batch-sid-one") {
+                            "one"
+                        } else if cookie.contains("batch-sid-two") {
+                            "two"
+                        } else {
+                            panic!("unexpected Cookie authorization input")
+                        };
+                        let state = plan
+                            .body
+                            .json_body
+                            .as_ref()
+                            .and_then(|body| body.get("state"))
+                            .and_then(serde_json::Value::as_str)
+                            .expect("authorize plan should contain state");
+                        let mut redirect =
+                            url::Url::parse("https://platform.claude.com/oauth/code/callback")
+                                .expect("redirect URL should parse");
+                        redirect
+                            .query_pairs_mut()
+                            .append_pair("code", format!("code-{label}").as_str())
+                            .append_pair("state", state);
+                        json!({"redirect_uri": redirect.to_string()})
+                    }
+                    "provider-oauth:exchange-code" => {
+                        let code = plan
+                            .body
+                            .json_body
+                            .as_ref()
+                            .and_then(|body| body.get("code"))
+                            .and_then(serde_json::Value::as_str)
+                            .expect("token plan should contain code");
+                        let label = code.strip_prefix("code-").expect("code should be tagged");
+                        json!({
+                            "access_token": format!("sk-ant-oat01-{label}"),
+                            "refresh_token": format!("sk-ant-ort01-{label}"),
+                            "expires_in": 3600,
+                            "organization": {"uuid": "org-team"},
+                            "account": {
+                                "uuid": format!("account-{label}"),
+                                "email_address": format!("{label}@example.com")
+                            }
+                        })
+                    }
+                    unexpected => panic!("unexpected execution plan: {unexpected}"),
+                };
+                Json(json!({
+                    "request_id": plan.request_id,
+                    "status_code": 200,
+                    "headers": {"content-type": "application/json"},
+                    "body": {"json_body": json_body}
+                }))
+            }
+        }),
+    );
+
+    let mut provider = sample_provider("provider-claude", "claude", 10);
+    provider.provider_type = "claude_code".to_string();
+    provider.proxy = Some(json!({
+        "mode": "tunnel",
+        "node_id": "proxy-node-claude",
+        "url": "http://proxy.example:8080",
+        "enabled": true
+    }));
+    let endpoint = sample_endpoint(
+        "endpoint-claude-messages",
+        "provider-claude",
+        "claude:messages",
+        "https://api.anthropic.com",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+    let background_task_repository = Arc::new(InMemoryBackgroundTaskRepository::default());
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository.clone(),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY)
+            .with_background_task_repository_for_tests(background_task_repository.clone()),
+        )
+        .with_provider_oauth_token_url_for_tests(
+            "claude_code_cookie_base_url",
+            "https://claude.example",
+        )
+        .with_provider_oauth_token_url_for_tests(
+            "claude_code",
+            "https://platform.example/v1/oauth/token",
+        );
+
+    let response = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-claude/cookie-authorize/tasks",
+        Some(json!({
+            "cookies": [
+                "sessionKey=batch-sid-one",
+                "foo=bar",
+                "Cookie: sessionKey=batch-sid-one",
+                "sessionKey=batch-sid-two"
+            ]
+        })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let submitted: serde_json::Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("submitted body should read"),
+    )
+    .expect("submitted body should parse");
+    assert_eq!(submitted["status"], "submitted");
+    assert_eq!(submitted["total"], 4);
+    assert_eq!(submitted["import_kind"], "cookie_authorize");
+    let task_id = submitted["task_id"]
+        .as_str()
+        .expect("task id should exist")
+        .to_string();
+    assert!(task_id.starts_with("claude-cookie-"));
+
+    let mut status_payload = Value::Null;
+    for _ in 0..80 {
+        let response = local_admin_provider_oauth_response(
+            &state,
+            http::Method::GET,
+            format!(
+                "/api/admin/provider-oauth/providers/provider-claude/cookie-authorize/tasks/{task_id}"
+            )
+            .as_str(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        status_payload = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("status body should read"),
+        )
+        .expect("status body should parse");
+        if status_payload["status"] == "completed" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(status_payload["status"], "completed");
+    assert_eq!(status_payload["import_kind"], "cookie_authorize");
+    assert_eq!(status_payload["total"], 4);
+    assert_eq!(status_payload["processed"], 4);
+    assert_eq!(status_payload["success"], 2);
+    assert_eq!(status_payload["failed"], 2);
+    assert_eq!(status_payload["created_count"], 2);
+    assert_eq!(status_payload["replaced_count"], 0);
+    let error_samples = status_payload["error_samples"]
+        .as_array()
+        .expect("error samples should be an array");
+    assert_eq!(error_samples.len(), 2);
+    assert_eq!(error_samples[0]["index"], 1);
+    assert_eq!(error_samples[1]["index"], 2);
+
+    let status_text = status_payload.to_string();
+    for forbidden in ["sessionKey", "batch-sid-one", "batch-sid-two"] {
+        assert!(!status_text.contains(forbidden), "forbidden={forbidden}");
+    }
+    let raw_task_state = state
+        .load_provider_oauth_batch_task_for_tests(
+            format!("provider_oauth_batch_task:{task_id}").as_str(),
+        )
+        .expect("raw task state should exist");
+    for forbidden in ["sessionKey", "batch-sid-one", "batch-sid-two"] {
+        assert!(
+            !raw_task_state.contains(forbidden),
+            "raw task state contains {forbidden}"
+        );
+    }
+    let background_run = background_task_repository
+        .find_run(&task_id)
+        .await
+        .expect("background run should load")
+        .expect("background run should exist");
+    let background_text = serde_json::to_string(&background_run)
+        .expect("background run should serialize for assertion");
+    for forbidden in ["sessionKey", "batch-sid-one", "batch-sid-two"] {
+        assert!(
+            !background_text.contains(forbidden),
+            "forbidden={forbidden}"
+        );
+    }
+
+    let keys = provider_catalog_repository
+        .list_keys_by_provider_ids(&["provider-claude".to_string()])
+        .await
+        .expect("keys should load");
+    assert_eq!(keys.len(), 2);
+    for key in &keys {
+        let auth_config = decrypt_python_fernet_ciphertext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            key.encrypted_auth_config
+                .as_deref()
+                .expect("auth config should be encrypted"),
+        )
+        .expect("auth config should decrypt");
+        assert!(!auth_config.contains("batch-sid"));
+        assert!(!auth_config.contains("sessionKey"));
+    }
+
+    let plans = execution_plans.lock().expect("mutex should lock");
+    assert_eq!(plans.len(), 6);
+    assert_eq!(
+        plans
+            .iter()
+            .filter(|plan| plan.request_id == "provider-oauth:claude-cookie-organizations")
+            .count(),
+        2
+    );
+    assert_eq!(
+        plans
+            .iter()
+            .filter(|plan| plan.request_id == "provider-oauth:claude-cookie-authorize")
+            .count(),
+        2
+    );
+    assert_eq!(
+        plans
+            .iter()
+            .filter(|plan| plan.request_id == "provider-oauth:exchange-code")
+            .count(),
+        2
+    );
+    assert!(plans.iter().all(|plan| {
+        plan.proxy.as_ref().and_then(|proxy| proxy.mode.as_deref()) == Some("tunnel")
+    }));
+
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_handles_admin_provider_oauth_device_authorize_for_windsurf_browser() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_authorize_for_windsurf_browser",
+        gateway_handles_admin_provider_oauth_device_authorize_for_windsurf_browser_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_authorize_for_windsurf_browser_impl() {
     let mut provider = sample_provider("provider-windsurf", "windsurf", 10);
     provider.provider_type = "windsurf".to_string();
     let endpoint = sample_endpoint(
@@ -395,8 +893,15 @@ async fn gateway_handles_admin_provider_oauth_device_authorize_for_windsurf_brow
     assert_eq!(stored["status"], "pending");
 }
 
-#[tokio::test]
-async fn gateway_rejects_generic_oauth_start_for_windsurf_provider() {
+#[test]
+fn gateway_rejects_generic_oauth_start_for_windsurf_provider() {
+    run_admin_oauth_test(
+        "gateway_rejects_generic_oauth_start_for_windsurf_provider",
+        gateway_rejects_generic_oauth_start_for_windsurf_provider_impl,
+    );
+}
+
+async fn gateway_rejects_generic_oauth_start_for_windsurf_provider_impl() {
     let mut provider = sample_provider("provider-windsurf", "windsurf", 10);
     provider.provider_type = "windsurf".to_string();
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -430,8 +935,15 @@ async fn gateway_rejects_generic_oauth_start_for_windsurf_provider() {
     );
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_token() {
+#[test]
+fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_token() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_token",
+        gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_token_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_token_impl() {
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
     let execution_runtime = Router::new().route(
@@ -618,8 +1130,15 @@ async fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_windsurf_callback_state_mismatch_and_missing_token() {
+#[test]
+fn gateway_rejects_windsurf_callback_state_mismatch_and_missing_token() {
+    run_admin_oauth_test(
+        "gateway_rejects_windsurf_callback_state_mismatch_and_missing_token",
+        gateway_rejects_windsurf_callback_state_mismatch_and_missing_token_impl,
+    );
+}
+
+async fn gateway_rejects_windsurf_callback_state_mismatch_and_missing_token_impl() {
     let mut provider = sample_provider("provider-windsurf", "windsurf", 10);
     provider.provider_type = "windsurf".to_string();
     let endpoint = sample_endpoint(
@@ -704,8 +1223,15 @@ async fn gateway_rejects_windsurf_callback_state_mismatch_and_missing_token() {
         .is_some_and(|error| error.contains("token")));
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_device_authorize_locally_with_trusted_admin_principal(
+#[test]
+fn gateway_handles_admin_provider_oauth_device_authorize_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_authorize_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_oauth_device_authorize_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_authorize_locally_with_trusted_admin_principal_impl(
 ) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -837,8 +1363,15 @@ async fn gateway_handles_admin_provider_oauth_device_authorize_locally_with_trus
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_device_authorize_for_kiro_google_social() {
+#[test]
+fn gateway_handles_admin_provider_oauth_device_authorize_for_kiro_google_social() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_authorize_for_kiro_google_social",
+        gateway_handles_admin_provider_oauth_device_authorize_for_kiro_google_social_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_authorize_for_kiro_google_social_impl() {
     let mut provider = sample_provider("provider-kiro", "kiro", 10);
     provider.provider_type = "kiro".to_string();
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -928,8 +1461,16 @@ async fn gateway_handles_admin_provider_oauth_device_authorize_for_kiro_google_s
     assert_eq!(stored["status"], "pending");
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_admin_principal_impl(
+) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -1084,8 +1625,15 @@ async fn gateway_handles_admin_provider_oauth_device_poll_locally_with_trusted_a
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_device_poll_for_kiro_social_callback() {
+#[test]
+fn gateway_handles_admin_provider_oauth_device_poll_for_kiro_social_callback() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_poll_for_kiro_social_callback",
+        gateway_handles_admin_provider_oauth_device_poll_for_kiro_social_callback_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_poll_for_kiro_social_callback_impl() {
     let token_requests = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
     let token_requests_clone = Arc::clone(&token_requests);
     let access_token = sample_kiro_device_access_token("social@example.com");
@@ -1267,8 +1815,16 @@ async fn gateway_handles_admin_provider_oauth_device_poll_for_kiro_social_callba
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_keeps_admin_provider_oauth_device_poll_pending_for_authorization_pending_error() {
+#[test]
+fn gateway_keeps_admin_provider_oauth_device_poll_pending_for_authorization_pending_error() {
+    run_admin_oauth_test(
+        "gateway_keeps_admin_provider_oauth_device_poll_pending_for_authorization_pending_error",
+        gateway_keeps_admin_provider_oauth_device_poll_pending_for_authorization_pending_error_impl,
+    );
+}
+
+async fn gateway_keeps_admin_provider_oauth_device_poll_pending_for_authorization_pending_error_impl(
+) {
     let token_server = Router::new().route(
         "/token",
         post(move |_request: Request| async move {
@@ -1347,8 +1903,15 @@ async fn gateway_keeps_admin_provider_oauth_device_poll_pending_for_authorizatio
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_email() {
+#[test]
+fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_email() {
+    run_admin_oauth_test(
+        "gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_email",
+        gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_email_impl,
+    );
+}
+
+async fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_email_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -1584,8 +2147,16 @@ async fn gateway_revalidates_kiro_device_poll_via_idc_refresh_and_backfills_emai
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn local_admin_provider_oauth_device_poll_attaches_audit_only_when_transition_reaches_terminal_state(
+#[test]
+fn local_admin_provider_oauth_device_poll_attaches_audit_only_when_transition_reaches_terminal_state(
+) {
+    run_admin_oauth_test(
+        "local_admin_provider_oauth_device_poll_attaches_audit_only_when_transition_reaches_terminal_state",
+        local_admin_provider_oauth_device_poll_attaches_audit_only_when_transition_reaches_terminal_state_impl,
+    );
+}
+
+async fn local_admin_provider_oauth_device_poll_attaches_audit_only_when_transition_reaches_terminal_state_impl(
 ) {
     let access_token = sample_kiro_device_access_token("kiro@example.com");
     let token_server = Router::new().route(
@@ -1708,8 +2279,16 @@ async fn local_admin_provider_oauth_device_poll_attaches_audit_only_when_transit
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_device_authorize_via_execution_runtime_proxy_node() {
+#[test]
+fn gateway_handles_admin_provider_oauth_device_authorize_via_execution_runtime_proxy_node() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_authorize_via_execution_runtime_proxy_node",
+        gateway_handles_admin_provider_oauth_device_authorize_via_execution_runtime_proxy_node_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_authorize_via_execution_runtime_proxy_node_impl(
+) {
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
     let execution_runtime = Router::new().route(
@@ -1854,8 +2433,16 @@ async fn gateway_handles_admin_provider_oauth_device_authorize_via_execution_run
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_start_key_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_handles_admin_provider_oauth_start_key_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_start_key_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_oauth_start_key_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_start_key_locally_with_trusted_admin_principal_impl()
+{
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -1879,6 +2466,14 @@ async fn gateway_handles_admin_provider_oauth_start_key_locally_with_trusted_adm
         "oauth-access-token",
     );
     key.auth_type = "oauth".to_string();
+    key.is_active = false;
+    key.error_count = Some(7);
+    key.health_by_format = Some(json!({
+        "openai:chat": {"consecutive_failures": 3}
+    }));
+    key.circuit_breaker_by_format = Some(json!({
+        "openai:chat": {"state": "open"}
+    }));
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
@@ -1924,9 +2519,16 @@ async fn gateway_handles_admin_provider_oauth_start_key_locally_with_trusted_adm
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_start_provider_locally_with_trusted_admin_principal()
-{
+#[test]
+fn gateway_handles_admin_provider_oauth_start_provider_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_start_provider_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_oauth_start_provider_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_start_provider_locally_with_trusted_admin_principal_impl(
+) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -1987,8 +2589,16 @@ async fn gateway_handles_admin_provider_oauth_start_provider_locally_with_truste
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_batch_import_task_status_locally_with_trusted_admin_principal(
+#[test]
+fn gateway_handles_admin_provider_oauth_batch_import_task_status_locally_with_trusted_admin_principal(
+) {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_batch_import_task_status_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_oauth_batch_import_task_status_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_batch_import_task_status_locally_with_trusted_admin_principal_impl(
 ) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -2070,8 +2680,16 @@ async fn gateway_handles_admin_provider_oauth_batch_import_task_status_locally_w
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn local_admin_provider_oauth_batch_task_status_attaches_audit_only_for_terminal_states() {
+#[test]
+fn local_admin_provider_oauth_batch_task_status_attaches_audit_only_for_terminal_states() {
+    run_admin_oauth_test(
+        "local_admin_provider_oauth_batch_task_status_attaches_audit_only_for_terminal_states",
+        local_admin_provider_oauth_batch_task_status_attaches_audit_only_for_terminal_states_impl,
+    );
+}
+
+async fn local_admin_provider_oauth_batch_task_status_attaches_audit_only_for_terminal_states_impl()
+{
     let completed_state = AppState::new()
         .expect("gateway should build")
         .with_provider_oauth_batch_task_entry_for_tests(
@@ -2158,8 +2776,15 @@ async fn local_admin_provider_oauth_batch_task_status_attaches_audit_only_for_te
     );
 }
 
-#[tokio::test]
-async fn gateway_batch_imports_admin_provider_oauth_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_batch_imports_admin_provider_oauth_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_batch_imports_admin_provider_oauth_locally_with_trusted_admin_principal",
+        gateway_batch_imports_admin_provider_oauth_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_batch_imports_admin_provider_oauth_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -2326,8 +2951,15 @@ async fn gateway_batch_imports_admin_provider_oauth_locally_with_trusted_admin_p
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_batch_imports_chatgpt_web_access_tokens_with_pool_hints() {
+#[test]
+fn gateway_batch_imports_chatgpt_web_access_tokens_with_pool_hints() {
+    run_admin_oauth_test(
+        "gateway_batch_imports_chatgpt_web_access_tokens_with_pool_hints",
+        gateway_batch_imports_chatgpt_web_access_tokens_with_pool_hints_impl,
+    );
+}
+
+async fn gateway_batch_imports_chatgpt_web_access_tokens_with_pool_hints_impl() {
     let token_hits = Arc::new(Mutex::new(0usize));
     let token_hits_clone = Arc::clone(&token_hits);
     let token_server = Router::new().route(
@@ -2467,8 +3099,15 @@ async fn gateway_batch_imports_chatgpt_web_access_tokens_with_pool_hints() {
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_starts_admin_provider_oauth_batch_import_task_locally_with_trusted_admin_principal(
+#[test]
+fn gateway_starts_admin_provider_oauth_batch_import_task_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_starts_admin_provider_oauth_batch_import_task_locally_with_trusted_admin_principal",
+        gateway_starts_admin_provider_oauth_batch_import_task_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_starts_admin_provider_oauth_batch_import_task_locally_with_trusted_admin_principal_impl(
 ) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -2607,8 +3246,15 @@ async fn gateway_starts_admin_provider_oauth_batch_import_task_locally_with_trus
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_updates_admin_provider_oauth_batch_import_task_progress() {
+#[test]
+fn gateway_updates_admin_provider_oauth_batch_import_task_progress() {
+    run_admin_oauth_test(
+        "gateway_updates_admin_provider_oauth_batch_import_task_progress",
+        gateway_updates_admin_provider_oauth_batch_import_task_progress_impl,
+    );
+}
+
+async fn gateway_updates_admin_provider_oauth_batch_import_task_progress_impl() {
     let upstream = Router::new().fallback(any(|| async {
         (StatusCode::OK, Body::from("quota refresh body"))
     }));
@@ -2765,8 +3411,15 @@ async fn gateway_updates_admin_provider_oauth_batch_import_task_progress() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_principal",
+        gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_principal_impl() {
     #[derive(Debug, Clone)]
     struct SeenTokenRequest {
         content_type: String,
@@ -2787,11 +3440,16 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
     let token_hits_clone = Arc::clone(&token_hits);
     let seen_token = Arc::new(Mutex::new(None::<SeenTokenRequest>));
     let seen_token_clone = Arc::clone(&seen_token);
+    let namespace_race_repository = Arc::new(Mutex::new(
+        None::<Arc<InMemoryProviderCatalogReadRepository>>,
+    ));
+    let namespace_race_repository_clone = Arc::clone(&namespace_race_repository);
     let token_server = Router::new().route(
         "/oauth/token",
         any(move |request: Request| {
             let token_hits_inner = Arc::clone(&token_hits_clone);
             let seen_token_inner = Arc::clone(&seen_token_clone);
+            let namespace_race_repository_inner = Arc::clone(&namespace_race_repository_clone);
             async move {
                 *token_hits_inner.lock().expect("mutex should lock") += 1;
                 let (parts, body) = request.into_parts();
@@ -2806,6 +3464,23 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
                     body: String::from_utf8(raw_body.to_vec())
                         .expect("token request body should be utf8"),
                 });
+                let repository = namespace_race_repository_inner
+                    .lock()
+                    .expect("mutex should lock")
+                    .clone()
+                    .expect("provider catalog repository should be installed");
+                repository
+                    .upsert_key_upstream_metadata_namespace(
+                        "key-codex-oauth",
+                        "codex",
+                        &json!({
+                            "primary_used_percent": 80.0,
+                            "account_quota_request_id": "concurrent-refresh"
+                        }),
+                        Some(1_800_000_001),
+                    )
+                    .await
+                    .expect("concurrent Codex namespace update should succeed");
                 Json(json!({
                     "access_token": "new-codex-access-token",
                     "refresh_token": "new-codex-refresh-token",
@@ -2821,6 +3496,7 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
 
     let mut provider = sample_provider("provider-codex", "codex", 10);
     provider.provider_type = "codex".to_string();
+    provider.config = Some(json!({"pool_advanced": {}}));
 
     let mut key = sample_key(
         "key-codex-oauth",
@@ -2829,12 +3505,64 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
         "__placeholder__",
     );
     key.auth_type = "oauth".to_string();
+    key.oauth_invalid_at_unix_secs = Some(1_700_000_000);
+    key.oauth_invalid_reason = Some("[ACCOUNT_BLOCK] token invalid".to_string());
+    key.error_count = Some(7);
+    key.health_by_format = Some(json!({
+        "openai:chat": {"consecutive_failures": 3}
+    }));
+    key.circuit_breaker_by_format = Some(json!({
+        "openai:chat": {"state": "open"}
+    }));
+    key.upstream_metadata = Some(json!({
+        "codex": {
+            "primary_used_percent": 100.0,
+            "primary_reset_at": 4_200_000_000u64,
+            "account_quota_reset_fence_unix_ms": 1_800_000_000_000u64,
+            "account_quota_reset_fence_id": "old-account-fence",
+            "account_quota_reset_processed_ids": ["old-account-reset"],
+            "account_quota_reset_pending": true
+        },
+        "unrelated_runtime": {
+            "preserved": true
+        }
+    }));
+    key.status_snapshot = Some(json!({
+        "oauth": {
+            "code": "invalid"
+        },
+        "quota": {
+            "provider_type": "codex",
+            "usage_ratio": 1.0,
+            "windows": [{
+                "kind": "primary",
+                "usage": 100.0,
+                "reset_at": 4_200_000_000u64
+            }]
+        }
+    }));
+
+    let score_identity = PoolMemberIdentity::provider_api_key("provider-codex", "key-codex-oauth");
+    let score_scope = provider_key_pool_score_scope();
+    let invalid_score = build_provider_key_pool_score_upsert(
+        &key,
+        "codex",
+        None,
+        1_700_000_000,
+        aether_pool_core::PoolMemberScoreRules::default(),
+    )
+    .into_stored();
+    assert_eq!(invalid_score.hard_state, PoolMemberHardState::AuthInvalid);
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![],
         vec![key],
     ));
+    *namespace_race_repository.lock().expect("mutex should lock") =
+        Some(Arc::clone(&provider_catalog_repository));
+    let pool_score_repository =
+        Arc::new(InMemoryPoolMemberScoreRepository::seed(vec![invalid_score]));
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (token_url, token_handle) = start_server(token_server).await;
@@ -2845,6 +3573,7 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
                 GatewayDataState::with_provider_catalog_repository_for_tests(
                     provider_catalog_repository.clone(),
                 )
+                .with_pool_score_repository_for_tests(Arc::clone(&pool_score_repository))
                 .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
             )
             .with_provider_oauth_state_entry_for_tests(
@@ -2909,6 +3638,54 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
         .expect("keys should load");
     let persisted = reloaded.first().expect("persisted key should exist");
     assert_eq!(persisted.expires_at_unix_secs, Some(4_102_444_800));
+    assert!(persisted.is_active);
+    assert_eq!(persisted.oauth_invalid_at_unix_secs, None);
+    assert_eq!(persisted.oauth_invalid_reason, None);
+    assert_eq!(persisted.error_count, Some(0));
+    assert_eq!(persisted.health_by_format, Some(json!({})));
+    assert_eq!(persisted.circuit_breaker_by_format, Some(json!({})));
+    assert_eq!(
+        persisted
+            .upstream_metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("codex"))
+            .and_then(Value::as_object)
+            .map(|codex| codex.keys().cloned().collect::<Vec<_>>()),
+        Some(vec!["credential_generation".to_string()]),
+        "explicit Codex reauthorization must not carry quota/reset state across accounts"
+    );
+    assert!(persisted
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/codex/credential_generation"))
+        .and_then(Value::as_str)
+        .is_some_and(|generation| !generation.is_empty()));
+    assert_eq!(
+        persisted
+            .upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("unrelated_runtime")),
+        Some(&json!({"preserved": true}))
+    );
+    assert_eq!(
+        persisted
+            .status_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("quota")),
+        Some(&Value::Null)
+    );
+    let scores = pool_score_repository
+        .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+            ids: vec![provider_key_pool_score_id(&score_identity, &score_scope)],
+        })
+        .await
+        .expect("pool score should load");
+    assert_eq!(scores.len(), 1);
+    assert!(
+        scores[0].hard_state.schedulable(),
+        "OAuth completion should replace AuthInvalid with a schedulable score"
+    );
     let decrypted_api_key = decrypt_python_fernet_ciphertext(
         DEVELOPMENT_ENCRYPTION_KEY,
         persisted
@@ -2940,8 +3717,16 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_completes_admin_provider_oauth_provider_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_completes_admin_provider_oauth_provider_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_completes_admin_provider_oauth_provider_locally_with_trusted_admin_principal",
+        gateway_completes_admin_provider_oauth_provider_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_completes_admin_provider_oauth_provider_locally_with_trusted_admin_principal_impl()
+{
     #[derive(Debug, Clone)]
     struct SeenTokenRequest {
         content_type: String,
@@ -3133,8 +3918,16 @@ async fn gateway_completes_admin_provider_oauth_provider_locally_with_trusted_ad
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_provider_oauth_refresh_token_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_imports_admin_provider_oauth_refresh_token_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_imports_admin_provider_oauth_refresh_token_locally_with_trusted_admin_principal",
+        gateway_imports_admin_provider_oauth_refresh_token_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_imports_admin_provider_oauth_refresh_token_locally_with_trusted_admin_principal_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenTokenRequest {
         content_type: String,
@@ -3309,8 +4102,15 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_locally_with_trusted
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_codex_access_token_without_refresh_token_as_temporary_account() {
+#[test]
+fn gateway_imports_codex_access_token_without_refresh_token_as_temporary_account() {
+    run_admin_oauth_test(
+        "gateway_imports_codex_access_token_without_refresh_token_as_temporary_account",
+        gateway_imports_codex_access_token_without_refresh_token_as_temporary_account_impl,
+    );
+}
+
+async fn gateway_imports_codex_access_token_without_refresh_token_as_temporary_account_impl() {
     let token_hits = Arc::new(Mutex::new(0usize));
     let token_hits_clone = Arc::clone(&token_hits);
     let token_server = Router::new().route(
@@ -3417,8 +4217,16 @@ async fn gateway_imports_codex_access_token_without_refresh_token_as_temporary_a
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_codex_header_authorization_without_overwriting_payload_access_token() {
+#[test]
+fn gateway_imports_codex_header_authorization_without_overwriting_payload_access_token() {
+    run_admin_oauth_test(
+        "gateway_imports_codex_header_authorization_without_overwriting_payload_access_token",
+        gateway_imports_codex_header_authorization_without_overwriting_payload_access_token_impl,
+    );
+}
+
+async fn gateway_imports_codex_header_authorization_without_overwriting_payload_access_token_impl()
+{
     let mut provider = sample_provider("provider-codex", "codex", 10);
     provider.provider_type = "codex".to_string();
     let endpoint = sample_endpoint(
@@ -3506,8 +4314,16 @@ async fn gateway_imports_codex_header_authorization_without_overwriting_payload_
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_chatgpt_web_access_token_without_refresh_token_as_temporary_account() {
+#[test]
+fn gateway_imports_chatgpt_web_access_token_without_refresh_token_as_temporary_account() {
+    run_admin_oauth_test(
+        "gateway_imports_chatgpt_web_access_token_without_refresh_token_as_temporary_account",
+        gateway_imports_chatgpt_web_access_token_without_refresh_token_as_temporary_account_impl,
+    );
+}
+
+async fn gateway_imports_chatgpt_web_access_token_without_refresh_token_as_temporary_account_impl()
+{
     let token_hits = Arc::new(Mutex::new(0usize));
     let token_hits_clone = Arc::clone(&token_hits);
     let token_server = Router::new().route(
@@ -3617,8 +4433,20 @@ async fn gateway_imports_chatgpt_web_access_token_without_refresh_token_as_tempo
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_has_no_exp() {
+#[test]
+fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_has_no_exp() {
+    run_admin_oauth_test(
+        "gateway_imports_codex_access_token_with_payload_expires_at_when_token_has_no_exp",
+        gateway_imports_codex_access_token_with_payload_expires_at_when_token_has_no_exp_impl,
+    );
+}
+
+async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_has_no_exp_impl() {
+    let access_token = sample_codex_access_token_with_profile_email_and_expiry(
+        "opaque@example.com",
+        "acct-opaque-123",
+        None,
+    );
     let mut provider = sample_provider("provider-codex", "codex", 10);
     provider.provider_type = "codex".to_string();
     let endpoint = sample_endpoint(
@@ -3654,7 +4482,7 @@ async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_h
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
-            "access_token": "opaque-codex-access-token",
+            "access_token": access_token,
             "expiresAt": 2_100_000_000u64,
             "name": "temporary-codex-opaque-access-token",
         }))
@@ -3689,8 +4517,15 @@ async fn gateway_imports_codex_access_token_with_payload_expires_at_when_token_h
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_provider_oauth_refresh_token_over_active_expired_duplicate() {
+#[test]
+fn gateway_imports_admin_provider_oauth_refresh_token_over_active_expired_duplicate() {
+    run_admin_oauth_test(
+        "gateway_imports_admin_provider_oauth_refresh_token_over_active_expired_duplicate",
+        gateway_imports_admin_provider_oauth_refresh_token_over_active_expired_duplicate_impl,
+    );
+}
+
+async fn gateway_imports_admin_provider_oauth_refresh_token_over_active_expired_duplicate_impl() {
     #[derive(Debug, Clone)]
     struct SeenTokenRequest {
         content_type: String,
@@ -3874,8 +4709,15 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_over_active_expired_
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_import_invalidate_cached_oauth_entry_before_followup_resolution() {
+#[test]
+fn gateway_import_invalidate_cached_oauth_entry_before_followup_resolution() {
+    run_admin_oauth_test(
+        "gateway_import_invalidate_cached_oauth_entry_before_followup_resolution",
+        gateway_import_invalidate_cached_oauth_entry_before_followup_resolution_impl,
+    );
+}
+
+async fn gateway_import_invalidate_cached_oauth_entry_before_followup_resolution_impl() {
     let token_server = Router::new().route(
         "/oauth/token",
         post(move |body: Bytes| async move {
@@ -3980,19 +4822,16 @@ async fn gateway_import_invalidate_cached_oauth_entry_before_followup_resolution
         cached_entry.auth_header_value,
         "Bearer cached-old-codex-access-token"
     );
-    let mut replaceable_key = provider_catalog_repository
-        .list_keys_by_ids(&["key-codex-import-cache-duplicate".to_string()])
-        .await
-        .expect("keys should load")
-        .into_iter()
-        .next()
-        .expect("key should exist");
-    replaceable_key.oauth_invalid_at_unix_secs = Some(1_700_000_000);
-    replaceable_key.oauth_invalid_reason = Some("[OAUTH_EXPIRED] token invalidated".to_string());
     provider_catalog_repository
-        .update_key(&replaceable_key)
+        .update_key_oauth_runtime_state(
+            "key-codex-import-cache-duplicate",
+            Some(1_700_000_000),
+            Some("[OAUTH_EXPIRED] token invalidated"),
+            None,
+            Some(1_700_000_000),
+        )
         .await
-        .expect("key should update");
+        .expect("oauth invalid marker should be seeded through the runtime mutation");
 
     let gateway = build_router_with_state(app_state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -4046,8 +4885,15 @@ async fn gateway_import_invalidate_cached_oauth_entry_before_followup_resolution
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_kiro_single_refresh_token_import_with_clear_error() {
+#[test]
+fn gateway_rejects_kiro_single_refresh_token_import_with_clear_error() {
+    run_admin_oauth_test(
+        "gateway_rejects_kiro_single_refresh_token_import_with_clear_error",
+        gateway_rejects_kiro_single_refresh_token_import_with_clear_error_impl,
+    );
+}
+
+async fn gateway_rejects_kiro_single_refresh_token_import_with_clear_error_impl() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![{
             let mut provider = sample_provider("provider-kiro", "kiro", 10);
@@ -4091,8 +4937,16 @@ async fn gateway_rejects_kiro_single_refresh_token_import_with_clear_error() {
     );
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_proxy_node() {
+#[test]
+fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_proxy_node() {
+    run_admin_oauth_test(
+        "gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_proxy_node",
+        gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_proxy_node_impl,
+    );
+}
+
+async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_proxy_node_impl()
+{
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
     let execution_runtime = Router::new().route(
@@ -4222,8 +5076,16 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtim
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_provider_proxy_before_system_proxy(
+#[test]
+fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_provider_proxy_before_system_proxy(
+) {
+    run_admin_oauth_test(
+        "gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_provider_proxy_before_system_proxy",
+        gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_provider_proxy_before_system_proxy_impl,
+    );
+}
+
+async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_provider_proxy_before_system_proxy_impl(
 ) {
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
@@ -4343,8 +5205,16 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtim
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_system_proxy() {
+#[test]
+fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_system_proxy() {
+    run_admin_oauth_test(
+        "gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_system_proxy",
+        gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_system_proxy_impl,
+    );
+}
+
+async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtime_system_proxy_impl(
+) {
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
     let execution_runtime = Router::new().route(
@@ -4446,8 +5316,15 @@ async fn gateway_imports_admin_provider_oauth_refresh_token_via_execution_runtim
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_import_refresh_token_surfaces_execution_runtime_error_detail() {
+#[test]
+fn gateway_import_refresh_token_surfaces_execution_runtime_error_detail() {
+    run_admin_oauth_test(
+        "gateway_import_refresh_token_surfaces_execution_runtime_error_detail",
+        gateway_import_refresh_token_surfaces_execution_runtime_error_detail_impl,
+    );
+}
+
+async fn gateway_import_refresh_token_surfaces_execution_runtime_error_detail_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
@@ -4511,8 +5388,16 @@ async fn gateway_import_refresh_token_surfaces_execution_runtime_error_detail() 
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_admin_principal",
+        gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_admin_principal_impl()
+{
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -4653,8 +5538,15 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_locally_with_trusted_ad
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_duplicate() {
+#[test]
+fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_duplicate() {
+    run_admin_oauth_test(
+        "gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_duplicate",
+        gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_duplicate_impl,
+    );
+}
+
+async fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_duplicate_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -4802,8 +5694,15 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_over_active_expired_dup
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_proxy_node() {
+#[test]
+fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_proxy_node() {
+    run_admin_oauth_test(
+        "gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_proxy_node",
+        gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_proxy_node_impl,
+    );
+}
+
+async fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_proxy_node_impl() {
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
     let execution_runtime = Router::new().route(
@@ -4996,8 +5895,16 @@ async fn gateway_batch_imports_admin_provider_oauth_kiro_via_execution_runtime_p
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_starts_admin_provider_oauth_kiro_batch_import_task_locally_with_trusted_admin_principal(
+#[test]
+fn gateway_starts_admin_provider_oauth_kiro_batch_import_task_locally_with_trusted_admin_principal()
+{
+    run_admin_oauth_test(
+        "gateway_starts_admin_provider_oauth_kiro_batch_import_task_locally_with_trusted_admin_principal",
+        gateway_starts_admin_provider_oauth_kiro_batch_import_task_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_starts_admin_provider_oauth_kiro_batch_import_task_locally_with_trusted_admin_principal_impl(
 ) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -5128,8 +6035,15 @@ async fn gateway_starts_admin_provider_oauth_kiro_batch_import_task_locally_with
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_marks_lazy_codex_oauth_refresh_failures_as_invalid() {
+#[test]
+fn gateway_marks_lazy_codex_oauth_refresh_failures_as_invalid() {
+    run_admin_oauth_test(
+        "gateway_marks_lazy_codex_oauth_refresh_failures_as_invalid",
+        gateway_marks_lazy_codex_oauth_refresh_failures_as_invalid_impl,
+    );
+}
+
+async fn gateway_marks_lazy_codex_oauth_refresh_failures_as_invalid_impl() {
     let token_hits = Arc::new(Mutex::new(0usize));
     let token_hits_clone = Arc::clone(&token_hits);
     let token_server = Router::new().route(
@@ -5260,8 +6174,15 @@ async fn gateway_marks_lazy_codex_oauth_refresh_failures_as_invalid() {
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_refreshes_admin_provider_oauth_key_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_refreshes_admin_provider_oauth_key_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_refreshes_admin_provider_oauth_key_locally_with_trusted_admin_principal",
+        gateway_refreshes_admin_provider_oauth_key_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_refreshes_admin_provider_oauth_key_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -5325,6 +6246,7 @@ async fn gateway_refreshes_admin_provider_oauth_key_locally_with_trusted_admin_p
                     candidate_id: None,
                     status_code: 401,
                     headers: std::collections::BTreeMap::new(),
+                    response_observation: None,
                     body: None,
                     telemetry: None,
                     error: None,
@@ -5637,8 +6559,15 @@ async fn gateway_refreshes_admin_provider_oauth_key_locally_with_trusted_admin_p
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint() {
+#[test]
+fn gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint() {
+    run_admin_oauth_test(
+        "gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint",
+        gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint_impl,
+    );
+}
+
+async fn gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint_impl() {
     let token_hits = Arc::new(Mutex::new(0usize));
     let token_hits_clone = Arc::clone(&token_hits);
     let token_server = Router::new().route(
@@ -5677,6 +6606,7 @@ async fn gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint() 
                     candidate_id: None,
                     status_code: 200,
                     headers: std::collections::BTreeMap::new(),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "plan_type": "plus",
@@ -5776,6 +6706,9 @@ async fn gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint() 
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:responses")
         .expect("openai responses endpoint should be reconciled");
+    assert!(endpoints
+        .iter()
+        .any(|endpoint| endpoint.api_format == "openai:search"));
     assert_eq!(
         responses_endpoint.base_url,
         "https://chatgpt.com/backend-api/codex"
@@ -5824,7 +6757,7 @@ async fn gateway_manual_codex_oauth_refresh_reconciles_missing_fixed_endpoint() 
 
 #[test]
 fn gateway_manual_kiro_oauth_refresh_reconciles_missing_fixed_endpoint() {
-    run_manual_kiro_oauth_refresh_test(
+    run_admin_oauth_test(
         "gateway_manual_kiro_oauth_refresh_reconciles_missing_fixed_endpoint",
         gateway_manual_kiro_oauth_refresh_reconciles_missing_fixed_endpoint_impl,
     );
@@ -5836,7 +6769,7 @@ async fn gateway_manual_kiro_oauth_refresh_reconciles_missing_fixed_endpoint_imp
 
 #[test]
 fn gateway_manual_kiro_oauth_refresh_uses_disabled_fixed_endpoint_for_maintenance() {
-    run_manual_kiro_oauth_refresh_test(
+    run_admin_oauth_test(
         "gateway_manual_kiro_oauth_refresh_uses_disabled_fixed_endpoint_for_maintenance",
         gateway_manual_kiro_oauth_refresh_uses_disabled_fixed_endpoint_for_maintenance_impl,
     );
@@ -5908,6 +6841,7 @@ async fn run_gateway_manual_kiro_oauth_refresh_maintenance_endpoint_test(
                     candidate_id: None,
                     status_code: 200,
                     headers: std::collections::BTreeMap::new(),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "subscriptionInfo": {
@@ -6061,8 +6995,15 @@ async fn run_gateway_manual_kiro_oauth_refresh_maintenance_endpoint_test(
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_marks_manual_oauth_refresh_failures_as_invalid_in_pool_payload() {
+#[test]
+fn gateway_marks_manual_oauth_refresh_failures_as_invalid_in_pool_payload() {
+    run_admin_oauth_test(
+        "gateway_marks_manual_oauth_refresh_failures_as_invalid_in_pool_payload",
+        gateway_marks_manual_oauth_refresh_failures_as_invalid_in_pool_payload_impl,
+    );
+}
+
+async fn gateway_marks_manual_oauth_refresh_failures_as_invalid_in_pool_payload_impl() {
     let token_hits = Arc::new(Mutex::new(0usize));
     let token_hits_clone = Arc::clone(&token_hits);
     let token_server = Router::new().route(
@@ -6258,8 +7199,15 @@ async fn gateway_marks_manual_oauth_refresh_failures_as_invalid_in_pool_payload(
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_expiry() {
+#[test]
+fn gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_expiry() {
+    run_admin_oauth_test(
+        "gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_expiry",
+        gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_expiry_impl,
+    );
+}
+
+async fn gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_expiry_impl() {
     let token_hits = Arc::new(Mutex::new(0usize));
     let token_hits_clone = Arc::clone(&token_hits);
     let token_server = Router::new().route(
@@ -6379,8 +7327,16 @@ async fn gateway_auto_removes_manual_oauth_refresh_failure_after_access_token_ex
     token_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_provider_proxy_before_system_proxy(
+#[test]
+fn gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_provider_proxy_before_system_proxy(
+) {
+    run_admin_oauth_test(
+        "gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_provider_proxy_before_system_proxy",
+        gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_provider_proxy_before_system_proxy_impl,
+    );
+}
+
+async fn gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_provider_proxy_before_system_proxy_impl(
 ) {
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
@@ -6540,8 +7496,16 @@ async fn gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtim
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_refreshes_admin_provider_oauth_key_tunnel_proxy_with_direct_refresh_controls() {
+#[test]
+fn gateway_refreshes_admin_provider_oauth_key_tunnel_proxy_with_direct_refresh_controls() {
+    run_admin_oauth_test(
+        "gateway_refreshes_admin_provider_oauth_key_tunnel_proxy_with_direct_refresh_controls",
+        gateway_refreshes_admin_provider_oauth_key_tunnel_proxy_with_direct_refresh_controls_impl,
+    );
+}
+
+async fn gateway_refreshes_admin_provider_oauth_key_tunnel_proxy_with_direct_refresh_controls_impl()
+{
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
     let execution_runtime = Router::new().route(
@@ -6691,8 +7655,15 @@ async fn gateway_refreshes_admin_provider_oauth_key_tunnel_proxy_with_direct_ref
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token() {
+#[test]
+fn gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token() {
+    run_admin_oauth_test(
+        "gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token",
+        gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token_impl,
+    );
+}
+
+async fn gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token_impl() {
     let refresh_request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let refresh_request_bodies_clone = Arc::clone(&refresh_request_bodies);
     let execution_runtime = Router::new().route(
@@ -6889,8 +7860,15 @@ async fn gateway_consecutive_manual_oauth_refresh_uses_rotated_refresh_token() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_after_lock_wait() {
+#[test]
+fn gateway_concurrent_manual_oauth_refresh_reuses_winner_after_lock_wait() {
+    run_admin_oauth_test(
+        "gateway_concurrent_manual_oauth_refresh_reuses_winner_after_lock_wait",
+        gateway_concurrent_manual_oauth_refresh_reuses_winner_after_lock_wait_impl,
+    );
+}
+
+async fn gateway_concurrent_manual_oauth_refresh_reuses_winner_after_lock_wait_impl() {
     let refresh_request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let refresh_request_bodies_clone = Arc::clone(&refresh_request_bodies);
     let execution_runtime = Router::new().route(
@@ -7083,16 +8061,11 @@ async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_afte
         .lock()
         .expect("mutex should lock")
         .clone();
-    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies.len(), 1);
     assert!(
         bodies[0].contains("refresh_token=old-codex-refresh-token"),
         "unexpected first refresh body: {}",
         bodies[0]
-    );
-    assert!(
-        bodies[1].contains("refresh_token=rotated-codex-refresh-token"),
-        "unexpected second refresh body: {}",
-        bodies[1]
     );
 
     let stored_key = provider_catalog_repository
@@ -7112,17 +8085,21 @@ async fn gateway_concurrent_manual_oauth_refresh_uses_rotated_refresh_token_afte
     .expect("auth config should decrypt");
     let auth_config: serde_json::Value =
         serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
-    assert_eq!(
-        auth_config["refresh_token"],
-        "rotated-codex-refresh-token-2"
-    );
+    assert_eq!(auth_config["refresh_token"], "rotated-codex-refresh-token");
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over_stale_runtime_cache(
+#[test]
+fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over_stale_runtime_cache() {
+    run_admin_oauth_test(
+        "gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over_stale_runtime_cache",
+        gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over_stale_runtime_cache_impl,
+    );
+}
+
+async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over_stale_runtime_cache_impl(
 ) {
     let refresh_request_bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let refresh_request_bodies_clone = Arc::clone(&refresh_request_bodies);
@@ -7289,24 +8266,21 @@ async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over
         "Bearer cached-codex-access-token"
     );
 
-    let mut updated_key = provider_catalog_repository
-        .list_keys_by_ids(&["key-codex-oauth-stale-cache".to_string()])
-        .await
-        .expect("keys should list")
-        .into_iter()
-        .next()
-        .expect("key should exist");
-    updated_key.encrypted_auth_config = Some(
-        encrypt_python_fernet_plaintext(
-            DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"codex","refresh_token":"fresh-codex-refresh-token","email":"alice@example.com","account_id":"acct-codex-123","plan_type":"plus","expires_at":1,"updated_at":4102444810}"#,
+    let fresh_auth_config = encrypt_python_fernet_plaintext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        r#"{"provider_type":"codex","refresh_token":"fresh-codex-refresh-token","email":"alice@example.com","account_id":"acct-codex-123","plan_type":"plus","expires_at":1,"updated_at":4102444810}"#,
+    )
+    .expect("updated auth config ciphertext should build");
+    assert!(provider_catalog_repository
+        .update_key_oauth_runtime_state(
+            "key-codex-oauth-stale-cache",
+            None,
+            None,
+            Some(&fresh_auth_config),
+            Some(4_102_444_810),
         )
-        .expect("updated auth config ciphertext should build"),
-    );
-    provider_catalog_repository
-        .update_key(&updated_key)
         .await
-        .expect("key should update");
+        .expect("OAuth runtime state should update"));
 
     let gateway = build_router_with_state(app_state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -7345,8 +8319,16 @@ async fn gateway_manual_oauth_refresh_prefers_fresher_transport_auth_config_over
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_key_proxy_before_system_proxy(
+#[test]
+fn gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_key_proxy_before_system_proxy(
+) {
+    run_admin_oauth_test(
+        "gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_key_proxy_before_system_proxy",
+        gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_key_proxy_before_system_proxy_impl,
+    );
+}
+
+async fn gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtime_key_proxy_before_system_proxy_impl(
 ) {
     let execution_plans = Arc::new(Mutex::new(Vec::<ExecutionPlan>::new()));
     let execution_plans_clone = Arc::clone(&execution_plans);
@@ -7507,8 +8489,15 @@ async fn gateway_refreshes_admin_provider_oauth_key_locally_via_execution_runtim
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_oauth_unavailable_routes_locally_with_trusted_admin_principal(
+#[test]
+fn gateway_handles_admin_provider_oauth_unavailable_routes_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_unavailable_routes_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_oauth_unavailable_routes_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_unavailable_routes_locally_with_trusted_admin_principal_impl(
 ) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
@@ -7527,6 +8516,7 @@ async fn gateway_handles_admin_provider_oauth_unavailable_routes_locally_with_tr
     let client = reqwest::Client::new();
     for path in [
         "/api/admin/provider-oauth/providers/provider-123/import-refresh-token",
+        "/api/admin/provider-oauth/providers/provider-123/cookie-authorize/tasks",
         "/api/admin/provider-oauth/providers/provider-123/batch-import",
         "/api/admin/provider-oauth/providers/provider-123/batch-import/tasks",
         "/api/admin/provider-oauth/providers/provider-123/device-authorize",
@@ -7613,8 +8603,15 @@ async fn gateway_handles_admin_provider_oauth_unavailable_routes_locally_with_tr
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_oauth_supported_types_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_handles_admin_oauth_supported_types_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_oauth_supported_types_locally_with_trusted_admin_principal",
+        gateway_handles_admin_oauth_supported_types_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_oauth_supported_types_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -7656,8 +8653,15 @@ async fn gateway_handles_admin_oauth_supported_types_locally_with_trusted_admin_
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_oauth_provider_list_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_handles_admin_oauth_provider_list_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_oauth_provider_list_locally_with_trusted_admin_principal",
+        gateway_handles_admin_oauth_provider_list_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_oauth_provider_list_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -7706,8 +8710,15 @@ async fn gateway_handles_admin_oauth_provider_list_locally_with_trusted_admin_pr
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_upserts_admin_oauth_provider_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_upserts_admin_oauth_provider_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_upserts_admin_oauth_provider_locally_with_trusted_admin_principal",
+        gateway_upserts_admin_oauth_provider_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_upserts_admin_oauth_provider_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -7774,8 +8785,15 @@ async fn gateway_upserts_admin_oauth_provider_locally_with_trusted_admin_princip
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_custom_oidc_without_allowed_domains() {
+#[test]
+fn gateway_rejects_custom_oidc_without_allowed_domains() {
+    run_admin_oauth_test(
+        "gateway_rejects_custom_oidc_without_allowed_domains",
+        gateway_rejects_custom_oidc_without_allowed_domains_impl,
+    );
+}
+
+async fn gateway_rejects_custom_oidc_without_allowed_domains_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -7837,8 +8855,15 @@ async fn gateway_rejects_custom_oidc_without_allowed_domains() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_upserts_custom_oidc_with_allowed_domains() {
+#[test]
+fn gateway_upserts_custom_oidc_with_allowed_domains() {
+    run_admin_oauth_test(
+        "gateway_upserts_custom_oidc_with_allowed_domains",
+        gateway_upserts_custom_oidc_with_allowed_domains_impl,
+    );
+}
+
+async fn gateway_upserts_custom_oidc_with_allowed_domains_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -7920,8 +8945,15 @@ async fn gateway_upserts_custom_oidc_with_allowed_domains() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_upserts_multiple_custom_oidc_configs() {
+#[test]
+fn gateway_upserts_multiple_custom_oidc_configs() {
+    run_admin_oauth_test(
+        "gateway_upserts_multiple_custom_oidc_configs",
+        gateway_upserts_multiple_custom_oidc_configs_impl,
+    );
+}
+
+async fn gateway_upserts_multiple_custom_oidc_configs_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -7999,8 +9031,15 @@ async fn gateway_upserts_multiple_custom_oidc_configs() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_tests_admin_oauth_linuxdo_endpoints_locally_with_configured_secret() {
+#[test]
+fn gateway_tests_admin_oauth_linuxdo_endpoints_locally_with_configured_secret() {
+    run_admin_oauth_test(
+        "gateway_tests_admin_oauth_linuxdo_endpoints_locally_with_configured_secret",
+        gateway_tests_admin_oauth_linuxdo_endpoints_locally_with_configured_secret_impl,
+    );
+}
+
+async fn gateway_tests_admin_oauth_linuxdo_endpoints_locally_with_configured_secret_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -8090,8 +9129,15 @@ async fn gateway_tests_admin_oauth_linuxdo_endpoints_locally_with_configured_sec
     let _ = upstream_url;
 }
 
-#[tokio::test]
-async fn gateway_tests_admin_oauth_linuxdo_reports_invalid_endpoint_urls() {
+#[test]
+fn gateway_tests_admin_oauth_linuxdo_reports_invalid_endpoint_urls() {
+    run_admin_oauth_test(
+        "gateway_tests_admin_oauth_linuxdo_reports_invalid_endpoint_urls",
+        gateway_tests_admin_oauth_linuxdo_reports_invalid_endpoint_urls_impl,
+    );
+}
+
+async fn gateway_tests_admin_oauth_linuxdo_reports_invalid_endpoint_urls_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -8146,8 +9192,15 @@ async fn gateway_tests_admin_oauth_linuxdo_reports_invalid_endpoint_urls() {
     let _ = upstream_url;
 }
 
-#[tokio::test]
-async fn gateway_deletes_admin_oauth_provider_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_deletes_admin_oauth_provider_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_deletes_admin_oauth_provider_locally_with_trusted_admin_principal",
+        gateway_deletes_admin_oauth_provider_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_deletes_admin_oauth_provider_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -8198,8 +9251,15 @@ async fn gateway_deletes_admin_oauth_provider_locally_with_trusted_admin_princip
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_management_token_detail_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_handles_admin_management_token_detail_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_management_token_detail_locally_with_trusted_admin_principal",
+        gateway_handles_admin_management_token_detail_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_management_token_detail_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -8250,8 +9310,16 @@ async fn gateway_handles_admin_management_token_detail_locally_with_trusted_admi
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_creates_updates_and_regenerates_admin_management_token_locally_with_permissions() {
+#[test]
+fn gateway_creates_updates_and_regenerates_admin_management_token_locally_with_permissions() {
+    run_admin_oauth_test(
+        "gateway_creates_updates_and_regenerates_admin_management_token_locally_with_permissions",
+        gateway_creates_updates_and_regenerates_admin_management_token_locally_with_permissions_impl,
+    );
+}
+
+async fn gateway_creates_updates_and_regenerates_admin_management_token_locally_with_permissions_impl(
+) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -8396,8 +9464,15 @@ async fn gateway_creates_updates_and_regenerates_admin_management_token_locally_
     drop(upstream_url);
 }
 
-#[tokio::test]
-async fn gateway_allows_management_token_with_pool_write_for_provider_oauth_batch_import() {
+#[test]
+fn gateway_allows_management_token_with_pool_write_for_provider_oauth_batch_import() {
+    run_admin_oauth_test(
+        "gateway_allows_management_token_with_pool_write_for_provider_oauth_batch_import",
+        gateway_allows_management_token_with_pool_write_for_provider_oauth_batch_import_impl,
+    );
+}
+
+async fn gateway_allows_management_token_with_pool_write_for_provider_oauth_batch_import_impl() {
     let raw_token = "ae-provider-oauth-batch-pool-write";
     let state = AppState::new().expect("gateway should build");
     let admin_user = state
@@ -8455,8 +9530,147 @@ async fn gateway_allows_management_token_with_pool_write_for_provider_oauth_batc
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_management_token_without_pool_write_for_provider_oauth_batch_import() {
+#[test]
+fn gateway_prevents_pool_write_token_from_importing_agent_identity_via_batch_routes() {
+    run_admin_oauth_test(
+        "gateway_prevents_pool_write_token_from_importing_agent_identity_via_batch_routes",
+        gateway_prevents_pool_write_token_from_importing_agent_identity_via_batch_routes_impl,
+    );
+}
+
+async fn gateway_prevents_pool_write_token_from_importing_agent_identity_via_batch_routes_impl() {
+    let raw_token = "ae-provider-oauth-agent-identity-pool-write";
+    let state = AppState::new().expect("gateway should build");
+    let admin_user = state
+        .create_local_auth_user_with_settings(
+            Some("provider-oauth-agent-identity-pool@example.com".to_string()),
+            true,
+            "admin".to_string(),
+            "hash".to_string(),
+            "admin".to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("admin user should be created")
+        .expect("admin user should exist");
+    let mut management_token = sample_management_token(
+        "token-provider-oauth-agent-identity-pool",
+        &admin_user.id,
+        "provider-oauth-agent-identity-pool",
+        true,
+    );
+    management_token.token.allowed_ips = None;
+    management_token.token.permissions = Some(json!(["admin:pool:read", "admin:pool:write"]));
+    let management_token_repository =
+        Arc::new(InMemoryManagementTokenRepository::seed_with_hashes(
+            vec![management_token],
+            vec![(
+                hash_management_token(raw_token),
+                "token-provider-oauth-agent-identity-pool".to_string(),
+            )],
+        ));
+
+    let mut provider = sample_provider("provider-codex", "codex", 10);
+    provider.provider_type = "codex".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-codex-agent-identity",
+        "provider-codex",
+        "openai:chat",
+        "https://chatgpt.com/backend-api/codex",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+    let data_state =
+        GatewayDataState::with_management_token_repository_for_tests(management_token_repository)
+            .attach_provider_catalog_repository_for_tests(provider_catalog_repository.clone())
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let gateway = build_router_with_state(state.with_data_state_for_tests(data_state));
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let credentials = json!({
+        "auth_mode": "agentIdentity",
+        "agent_runtime_id": "runtime-rbac-guard",
+        "agent_private_key": "MC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "task_id": "task-rbac-guard"
+    })
+    .to_string();
+    let client = reqwest::Client::new();
+    for path in [
+        "/api/admin/provider-oauth/providers/provider-codex/batch-import",
+        "/api/admin/provider-oauth/providers/provider-codex/batch-import/tasks",
+    ] {
+        let response = client
+            .post(format!("{gateway_url}{path}"))
+            .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+            .bearer_auth(raw_token)
+            .json(&json!({ "credentials": credentials }))
+            .send()
+            .await
+            .expect("request should succeed");
+
+        let status = response.status();
+        let payload: serde_json::Value = response.json().await.expect("json body should parse");
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "path={path} payload={payload}"
+        );
+        assert_eq!(
+            payload["detail"],
+            "Agent Identity JSON 必须使用专属导入接口"
+        );
+    }
+
+    let dedicated_response = client
+        .post(format!(
+            "{gateway_url}/api/admin/provider-oauth/providers/provider-codex/agent-identity-import/tasks"
+        ))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .bearer_auth(raw_token)
+        .json(&json!({ "credentials": credentials }))
+        .send()
+        .await
+        .expect("request should succeed");
+    let dedicated_status = dedicated_response.status();
+    let dedicated_payload: serde_json::Value = dedicated_response
+        .json()
+        .await
+        .expect("json body should parse");
+    assert_eq!(
+        dedicated_status,
+        StatusCode::FORBIDDEN,
+        "payload={dedicated_payload}"
+    );
+    assert_eq!(
+        dedicated_payload["required_permission"],
+        "admin:provider_oauth:write"
+    );
+
+    let keys = provider_catalog_repository
+        .list_keys_by_provider_ids(&["provider-codex".to_string()])
+        .await
+        .expect("keys should load");
+    assert!(keys.is_empty());
+
+    gateway_handle.abort();
+}
+
+#[test]
+fn gateway_rejects_management_token_without_pool_write_for_provider_oauth_batch_import() {
+    run_admin_oauth_test(
+        "gateway_rejects_management_token_without_pool_write_for_provider_oauth_batch_import",
+        gateway_rejects_management_token_without_pool_write_for_provider_oauth_batch_import_impl,
+    );
+}
+
+async fn gateway_rejects_management_token_without_pool_write_for_provider_oauth_batch_import_impl()
+{
     let raw_token = "ae-provider-oauth-batch-pool-denied";
     let state = AppState::new().expect("gateway should build");
     let admin_user = state
@@ -8515,8 +9729,15 @@ async fn gateway_rejects_management_token_without_pool_write_for_provider_oauth_
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_deletes_admin_management_token_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_deletes_admin_management_token_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_deletes_admin_management_token_locally_with_trusted_admin_principal",
+        gateway_deletes_admin_management_token_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_deletes_admin_management_token_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -8572,8 +9793,15 @@ async fn gateway_deletes_admin_management_token_locally_with_trusted_admin_princ
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_toggles_admin_management_token_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_toggles_admin_management_token_locally_with_trusted_admin_principal() {
+    run_admin_oauth_test(
+        "gateway_toggles_admin_management_token_locally_with_trusted_admin_principal",
+        gateway_toggles_admin_management_token_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_toggles_admin_management_token_locally_with_trusted_admin_principal_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -8633,8 +9861,15 @@ async fn gateway_toggles_admin_management_token_locally_with_trusted_admin_princ
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_partial_management_token_for_admin_management_token_routes() {
+#[test]
+fn gateway_rejects_partial_management_token_for_admin_management_token_routes() {
+    run_admin_oauth_test(
+        "gateway_rejects_partial_management_token_for_admin_management_token_routes",
+        gateway_rejects_partial_management_token_for_admin_management_token_routes_impl,
+    );
+}
+
+async fn gateway_rejects_partial_management_token_for_admin_management_token_routes_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(

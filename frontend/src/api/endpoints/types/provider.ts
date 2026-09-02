@@ -1,4 +1,4 @@
-import type { ProviderKeyStatusSnapshot } from './statusSnapshot'
+import type { ProviderKeyStatusSnapshot, QuotaResetCreditsSnapshot } from './statusSnapshot'
 
 /**
  * 代理配置类型
@@ -180,8 +180,19 @@ export interface ChatPiiRedactionProviderConfig {
   enabled: boolean
 }
 
+export interface CodexProviderConfig {
+  fingerprint_convergence_enabled?: boolean
+  [key: string]: unknown
+}
+
+export interface ResponsesWebSocketProviderConfig {
+  enabled: boolean
+}
+
 export interface ProviderConfig {
   chat_pii_redaction?: ChatPiiRedactionProviderConfig
+  codex?: CodexProviderConfig
+  responses_websocket?: ResponsesWebSocketProviderConfig
   pool_advanced?: PoolAdvancedConfig
   failover_rules?: FailoverRulesConfig
   claude_code_advanced?: ClaudeCodeAdvancedConfig
@@ -237,6 +248,7 @@ export interface EndpointAPIKey {
   credential_kind?: 'raw_secret' | 'oauth_session' | 'service_account' | string | null
   runtime_auth_kind?: 'api_key' | 'bearer' | 'service_account' | 'mixed' | 'unknown' | string | null
   oauth_managed?: boolean
+  agent_identity?: boolean
   oauth_header_auth?: boolean
   can_refresh_oauth?: boolean
   can_export_oauth?: boolean
@@ -316,6 +328,7 @@ export interface EndpointAPIKey {
 
 // Codex 上游元数据类型
 export interface CodexUpstreamMetadata {
+  credential_generation?: string
   updated_at?: number  // 更新时间（Unix 时间戳）
   plan_type?: string  // 套餐类型
   primary_used_percent?: number  // 周限额窗口使用百分比
@@ -340,12 +353,24 @@ export interface CodexUpstreamMetadata {
   spark_secondary_window_minutes?: number  // Spark 周限额窗口大小（分钟）
   has_credits?: boolean  // 是否有积分
   credits_balance?: number  // 积分余额
+  reset_credits?: QuotaResetCreditsSnapshot | null  // Codex earned rate-limit reset credits
+  account_quota_reset_reservation?: {
+    idempotency_key?: string | null
+    generation?: number | null
+  } | null
 }
 
 export interface AntigravityModelQuota {
-  remaining_fraction: number  // 剩余比例 (0.0-1.0)
-  used_percent: number  // 已用百分比 (0.0-100.0)
-  reset_time?: string  // RFC3339
+  remaining_fraction?: number | string | null  // 剩余比例 (0.0-1.0)
+  used_percent?: number | string | null  // 已用百分比 (0.0-100.0)
+  remaining?: number | string | null
+  total?: number | string | null
+  reset_time?: string | null  // RFC3339
+  reset_at?: number | string | null
+  display_name?: string | null
+  model_id?: string | null
+  token_type?: string | null
+  is_exhausted?: boolean | null
 }
 
 export interface AntigravityUpstreamMetadata {
@@ -563,6 +588,20 @@ export interface EndpointHealthEvent {
   error_message?: string | null
 }
 
+export interface HealthTimelineDetail {
+  segment_index?: number
+  status?: string
+  time_range_start?: string | null
+  time_range_end?: string | null
+  total_attempts?: number | null
+  success_count?: number | null
+  failed_count?: number | null
+  success_rate?: number | null
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
+}
+
 export interface EndpointStatusMonitor {
   api_format: string
   total_attempts: number
@@ -570,11 +609,15 @@ export interface EndpointStatusMonitor {
   failed_count: number
   skipped_count: number
   success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   provider_count: number
   key_count: number
   last_event_at?: string | null
   events: EndpointHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -602,9 +645,13 @@ export interface PublicEndpointStatusMonitor {
   failed_count: number
   skipped_count: number
   success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   last_event_at?: string | null
   events: PublicHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -632,10 +679,12 @@ export interface ModelStatusMonitor {
   success_rate: number
   avg_latency_ms?: number | null
   avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   provider_count?: number
   last_event_at?: string | null
   events: ModelHealthEvent[]
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
 }
@@ -656,9 +705,11 @@ export interface ProviderStatusMonitor {
   success_rate: number
   avg_latency_ms?: number | null
   avg_first_byte_ms?: number | null
+  avg_tps?: number | null
   model_count: number
   last_event_at?: string | null
   timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
   time_range_start?: string | null
   time_range_end?: string | null
   models: ModelStatusMonitor[]
@@ -667,6 +718,36 @@ export interface ProviderStatusMonitor {
 export interface ProviderStatusMonitorResponse {
   generated_at: string
   providers: ProviderStatusMonitor[]
+}
+
+export type HealthMonitorRelatedDimension = 'endpoint' | 'model' | 'provider'
+
+export interface HealthRelatedMonitor {
+  kind: HealthMonitorRelatedDimension
+  key: string
+  display_name: string
+  meta_text?: string | null
+  total_attempts: number
+  success_count: number
+  failed_count: number
+  success_rate: number
+  avg_latency_ms?: number | null
+  avg_first_byte_ms?: number | null
+  avg_tps?: number | null
+  last_event_at?: string | null
+  timeline?: string[]
+  timeline_details?: HealthTimelineDetail[]
+  time_range_start?: string | null
+  time_range_end?: string | null
+}
+
+export interface HealthRelatedMonitorResponse {
+  generated_at: string
+  dimension: HealthMonitorRelatedDimension
+  value: string
+  related_endpoints: HealthRelatedMonitor[]
+  related_models: HealthRelatedMonitor[]
+  related_providers: HealthRelatedMonitor[]
 }
 
 export type ProviderType = 'custom' | 'claude_code' | 'codex' | 'chatgpt_web' | 'gemini_cli' | 'antigravity' | 'kiro' | 'grok' | 'windsurf' | 'vertex_ai'
@@ -752,6 +833,7 @@ export interface PoolAdvancedConfig {
   account_self_check_interval_minutes?: number | null
   account_self_check_concurrency?: number | null
   auto_remove_banned_keys?: boolean
+  auto_remove_quota_exhausted_keys?: boolean
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -780,6 +862,7 @@ export interface FailoverRuleItem {
 
 export interface FailoverRulesConfig {
   max_retries?: number
+  stop_on_transport_errors?: boolean
   stop_status_codes?: number[]
   stop_on_status_codes?: number[]
   early_stop_status_codes?: number[]
@@ -809,6 +892,8 @@ export interface ProviderWithEndpointsSummary {
   quota_expires_at?: string
   // 请求配置（从 Endpoint 迁移）
   max_retries?: number  // 最大重试次数
+  max_transfer_count?: number  // 提供商内最大转移次数，0 表示不限制
+  max_transfer_timeout_seconds?: number  // 提供商内最大转移时长，0 表示不限制
   proxy?: ProxyConfig | null  // 代理配置
   // 超时配置（秒），为空时使用全局配置
   stream_first_byte_timeout?: number  // 流式请求首字节超时
@@ -831,7 +916,9 @@ export interface ProviderWithEndpointsSummary {
   failover_rules?: FailoverRulesConfig | null
   ops_configured: boolean  // 是否配置了扩展操作（余额监控等）
   ops_architecture_id?: string  // 扩展操作使用的架构 ID（如 cubence, anyrouter）
+  codex_fingerprint_convergence_enabled?: boolean
   kiro_simulated_cache_enabled?: boolean
+  responses_websocket_enabled?: boolean
   ops_quota_alert_enabled?: boolean
   created_at: string
   updated_at: string
@@ -875,6 +962,7 @@ export interface ProviderModelMapping {
   priority: number  // 优先级（数字越小优先级越高）
   api_formats?: string[]  // 作用域（适用的 API 格式），为空表示对所有格式生效
   endpoint_ids?: string[]  // 作用域（适用的端点 ID），为空表示对所有端点生效
+  operations?: string[]  // 作用域（适用的请求操作），为空表示对该格式的全部操作生效
 }
 
 // 保留别名以保持向后兼容

@@ -1,6 +1,8 @@
 use http::Uri;
 
 use super::{classify_control_route, headers};
+use crate::control::GatewayPublicRequestContext;
+use crate::handlers::shared::local_proxy_route_requires_buffered_body;
 
 #[test]
 fn classifies_admin_pool_overview_as_admin_proxy_route() {
@@ -81,6 +83,27 @@ fn classifies_admin_pool_provider_key_routes_as_admin_proxy_route() {
         batch_action.route_kind.as_deref(),
         Some("batch_action_keys")
     );
+
+    let batch_update_uri: Uri = "/api/admin/pool/provider-1/keys/batch-update"
+        .parse()
+        .expect("uri should parse");
+    let batch_update = classify_control_route(&http::Method::PATCH, &batch_update_uri, &headers)
+        .expect("route should classify");
+    assert_eq!(batch_update.route_family.as_deref(), Some("pool_manage"));
+    assert_eq!(
+        batch_update.route_kind.as_deref(),
+        Some("batch_update_keys")
+    );
+    let batch_update_context = GatewayPublicRequestContext::from_request_parts(
+        "trace-admin-pool-batch-update",
+        &http::Method::PATCH,
+        &batch_update_uri,
+        &headers,
+        Some(batch_update),
+    );
+    assert!(local_proxy_route_requires_buffered_body(
+        &batch_update_context
+    ));
 
     let resolve_selection_uri: Uri = "/api/admin/pool/provider-1/keys/resolve-selection"
         .parse()

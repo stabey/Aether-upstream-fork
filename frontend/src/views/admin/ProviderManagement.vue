@@ -1,71 +1,14 @@
 <template>
   <div class="space-y-4">
-    <Card
-      v-if="providerDeleteProgress"
-      class="border-primary/30 bg-primary/5"
-    >
-      <div class="px-5 py-4 space-y-4">
-        <div class="flex items-start justify-between gap-4">
-          <div class="min-w-0">
-            <div class="text-sm font-semibold text-foreground">
-              正在删除提供商：{{ providerDeleteProgress.providerName }}
-            </div>
-            <div class="mt-1 text-xs text-muted-foreground">
-              {{ providerDeleteStageLabel }} · {{ providerDeleteProgress.message || '后台处理中' }}
-            </div>
-          </div>
-          <div class="shrink-0 text-right">
-            <div class="text-xs font-medium text-primary">
-              {{ providerDeleteOverallPercent }}%
-            </div>
-            <div class="text-[11px] text-muted-foreground">
-              {{ providerDeleteCompletedUnits }}/{{ providerDeleteTotalUnits }}
-            </div>
-          </div>
-        </div>
-
-        <div class="space-y-2">
-          <div class="flex items-center justify-between text-xs text-muted-foreground">
-            <span>总体进度</span>
-            <span>{{ providerDeleteCompletedUnits }}/{{ providerDeleteTotalUnits }}</span>
-          </div>
-          <div class="h-2 rounded-full bg-primary/10 overflow-hidden">
-            <div
-              class="h-full bg-primary transition-all duration-300"
-              :style="{ width: `${providerDeleteOverallPercent}%` }"
-            />
-          </div>
-        </div>
-
-        <div class="grid gap-3 md:grid-cols-2">
-          <div class="space-y-2">
-            <div class="flex items-center justify-between text-xs text-muted-foreground">
-              <span>账号删除</span>
-              <span>{{ providerDeleteProgress.deletedKeys }}/{{ providerDeleteProgress.totalKeys || '...' }}</span>
-            </div>
-            <div class="h-2 rounded-full bg-primary/10 overflow-hidden">
-              <div
-                class="h-full bg-primary/80 transition-all duration-300"
-                :style="{ width: `${providerDeleteKeysPercent}%` }"
-              />
-            </div>
-          </div>
-
-          <div class="space-y-2">
-            <div class="flex items-center justify-between text-xs text-muted-foreground">
-              <span>端点删除</span>
-              <span>{{ providerDeleteProgress.deletedEndpoints }}/{{ providerDeleteProgress.totalEndpoints || '...' }}</span>
-            </div>
-            <div class="h-2 rounded-full bg-primary/10 overflow-hidden">
-              <div
-                class="h-full bg-primary/60 transition-all duration-300"
-                :style="{ width: `${providerDeleteEndpointsPercent}%` }"
-              />
-            </div>
-          </div>
-        </div>
-      </div>
-    </Card>
+    <ProviderDeleteProgressCard
+      :progress="providerDeleteProgress"
+      :stage-label="providerDeleteStageLabel"
+      :total-units="providerDeleteTotalUnits"
+      :completed-units="providerDeleteCompletedUnits"
+      :overall-percent="providerDeleteOverallPercent"
+      :keys-percent="providerDeleteKeysPercent"
+      :endpoints-percent="providerDeleteEndpointsPercent"
+    />
 
     <!-- 提供商表格 -->
     <Card
@@ -105,24 +48,12 @@
       <!-- 空状态 -->
       <div
         v-else-if="providers.length === 0"
-        class="flex flex-col items-center justify-center py-16 text-center"
+        class="contents"
       >
-        <div class="text-muted-foreground mb-2">
-          <template v-if="hasActiveFilters">
-            未找到匹配当前筛选条件的提供商
-          </template>
-          <template v-else>
-            暂无提供商，点击右上角添加
-          </template>
-        </div>
-        <Button
-          v-if="hasActiveFilters"
-          variant="outline"
-          size="sm"
-          @click="resetFilters"
-        >
-          清除筛选
-        </Button>
+        <ProviderEmptyState
+          :has-active-filters="hasActiveFilters"
+          @reset-filters="resetFilters"
+        />
       </div>
 
       <!-- 桌面端表格 -->
@@ -134,10 +65,10 @@
           <TableHeader>
             <TableRow>
               <TableHead class="w-[18%] min-w-[140px]">
-                提供商信息
+                {{ legacyT('提供商信息') }}
               </TableHead>
               <TableHead class="w-[20%] min-w-[180px]">
-                余额监控
+                {{ legacyT('余额监控') }}
               </TableHead>
               <SortableTableHead
                 class="w-[12%] min-w-[100px] text-center"
@@ -145,10 +76,10 @@
                 :sortable="false"
                 align="center"
                 :filter-active="filterModel !== 'all'"
-                filter-title="筛选模型"
+                :filter-title="legacyT('筛选模型')"
                 filter-content-class="w-64 p-1 rounded-2xl border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
               >
-                资源统计
+                {{ legacyT('资源统计') }}
                 <template #filter="{ close }">
                   <TableFilterMenu
                     v-model="filterModel"
@@ -162,10 +93,10 @@
                 column-key="api_format"
                 :sortable="false"
                 :filter-active="filterApiFormat !== 'all'"
-                filter-title="筛选 API 格式"
+                :filter-title="legacyT('筛选 API 格式')"
                 filter-content-class="w-72 p-1 rounded-2xl border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
               >
-                端点健康
+                {{ legacyT('端点健康') }}
                 <template #filter="{ close }">
                   <TableFilterMenu
                     v-model="filterApiFormat"
@@ -180,10 +111,10 @@
                 :sortable="false"
                 align="center"
                 :filter-active="filterStatus !== 'all'"
-                filter-title="筛选状态"
+                :filter-title="legacyT('筛选状态')"
                 filter-content-class="w-40 p-1 rounded-2xl border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
               >
-                状态
+                {{ legacyT('状态') }}
                 <template #filter="{ close }">
                   <TableFilterMenu
                     v-model="filterStatus"
@@ -193,7 +124,7 @@
                 </template>
               </SortableTableHead>
               <TableHead class="w-[18%] min-w-[160px] text-center">
-                操作
+                {{ legacyT('操作') }}
               </TableHead>
             </TableRow>
           </TableHeader>
@@ -290,6 +221,7 @@
   />
 
   <ProviderDetailDrawer
+    v-if="providerDrawerMounted"
     :open="providerDrawerOpen"
     :provider-id="selectedProviderId"
     :initial-provider="selectedProvider"
@@ -308,8 +240,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import Button from '@/components/ui/button.vue'
+import { ref, computed, watch, onMounted, onUnmounted, defineAsyncComponent } from 'vue'
 import Card from '@/components/ui/card.vue'
 import Table from '@/components/ui/table.vue'
 import TableHeader from '@/components/ui/table-header.vue'
@@ -321,10 +252,11 @@ import TableFilterMenu from '@/components/ui/table-filter-menu.vue'
 import Pagination from '@/components/ui/pagination.vue'
 import { ProviderFormDialog, PriorityManagementDialog, ProviderAuthDialog } from '@/features/providers/components'
 import ProviderBatchActionDialog from '@/features/providers/components/ProviderBatchActionDialog.vue'
-import ProviderDetailDrawer from '@/features/providers/components/ProviderDetailDrawer.vue'
 import ProviderTableHeader from '@/features/providers/components/ProviderTableHeader.vue'
 import ProviderTableRow from '@/features/providers/components/ProviderTableRow.vue'
 import ProviderMobileCard from '@/features/providers/components/ProviderMobileCard.vue'
+import ProviderDeleteProgressCard from '@/features/providers/components/ProviderDeleteProgressCard.vue'
+import ProviderEmptyState from '@/features/providers/components/ProviderEmptyState.vue'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useRowClick } from '@/composables/useRowClick'
@@ -340,7 +272,14 @@ import {
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
 import { adminApi } from '@/api/admin'
+import { listRoutingGroups } from '@/api/routing-profiles'
+import { normalizeRoutingGroupConfig } from '@/features/routing/utils/routingPolicy'
 import { parseApiError } from '@/utils/errorParser'
+import { useI18n } from '@/i18n'
+
+const ProviderDetailDrawer = defineAsyncComponent(
+  () => import('@/features/providers/components/ProviderDetailDrawer.vue'),
+)
 
 interface ProviderDeleteProgressState {
   providerId: string
@@ -357,6 +296,11 @@ interface ProviderDeleteProgressState {
 
 const { error: showError, success: showSuccess, info: showInfo } = useToast()
 const { confirmDanger } = useConfirm()
+const { legacyT } = useI18n()
+
+function showLegacyError(err: unknown, fallback: string, title = '错误') {
+  showError(legacyT(parseApiError(err, fallback)), legacyT(title))
+}
 
 // 状态
 const loading = ref(false)
@@ -368,6 +312,7 @@ const providerToEdit = ref<ProviderWithEndpointsSummary | null>(null)
 const priorityDialogOpen = ref(false)
 const priorityMode = ref<'provider' | 'global_key'>('provider')
 const providerDrawerOpen = ref(false)
+const providerDrawerMounted = ref(false)
 const selectedProviderId = ref<string | null>(null)
 const selectedProvider = computed<ProviderWithEndpointsSummary | null>(() => {
   if (!selectedProviderId.value) return null
@@ -429,23 +374,23 @@ async function pollProviderDeleteTask(providerId: string, taskId: string) {
 const providerDeleteStageLabel = computed(() => {
   switch (providerDeleteProgress.value?.stage) {
     case 'preparing':
-      return '准备删除'
+      return legacyT('准备删除')
     case 'disabling':
-      return '停用提供商'
+      return legacyT('停用提供商')
     case 'cleaning_restrictions':
-      return '清理访问限制'
+      return legacyT('清理访问限制')
     case 'cleaning_provider_refs':
-      return '清理历史引用'
+      return legacyT('清理历史引用')
     case 'deleting_keys':
-      return '删除号池账号'
+      return legacyT('删除号池账号')
     case 'deleting_endpoints':
-      return '删除端点'
+      return legacyT('删除端点')
     case 'completed':
-      return '删除完成'
+      return legacyT('删除完成')
     case 'failed':
-      return '删除失败'
+      return legacyT('删除失败')
     default:
-      return '等待执行'
+      return legacyT('等待执行')
   }
 })
 
@@ -570,14 +515,14 @@ async function saveDescription(_event: Event, provider: ProviderWithEndpointsSum
     }
     cancelEditDescription()
   } catch (err: unknown) {
-    showError(parseApiError(err, '更新备注失败'), '错误')
+    showLegacyError(err, '更新备注失败')
   }
 }
 
 // 优先级模式配置
 const priorityModeConfig = computed(() => {
   return {
-    label: priorityMode.value === 'global_key' ? '全局 Key 优先' : '提供商优先',
+    label: legacyT(priorityMode.value === 'global_key' ? '全局 Key 优先' : '提供商优先'),
   }
 })
 
@@ -590,8 +535,18 @@ const maxProviderPriority = computed(() => {
   return priorities.length > 0 ? Math.max(...priorities) : undefined
 })
 
-// 加载优先级模式
+// 加载优先级模式：优先使用启用中的系统默认调度策略，旧的系统配置键仅作兜底
 async function loadPriorityMode(options: { cacheTtlMs?: number } = {}) {
+  try {
+    const groups = await listRoutingGroups()
+    const systemDefault = groups.items.find(group => group.is_system_default && group.enabled)
+    if (systemDefault) {
+      priorityMode.value = normalizeRoutingGroupConfig(systemDefault.config_json).default_policy.priority_mode
+      return
+    }
+  } catch {
+    // 路由策略不可用时继续尝试旧配置
+  }
   try {
     const response = await adminApi.getSystemConfig('provider_priority_mode', {
       cacheTtlMs: options.cacheTtlMs ?? 0,
@@ -626,13 +581,19 @@ async function loadProviders(options: { cacheTtlMs?: number } = {}) {
       cacheTtlMs: options.cacheTtlMs ?? 0,
     })
     if (requestId !== providersRequestId) return
-    providers.value = response.items
+    const existingProviders = new Map(providers.value.map(provider => [provider.id, provider]))
+    providers.value = response.items.map((item) => {
+      const existing = existingProviders.get(item.id)
+      if (!existing) return item
+      Object.assign(existing, item)
+      return existing
+    })
     total.value = response.total
     // 异步加载配置了 ops 的 provider 的余额数据
     loadBalances(providers.value)
   } catch (err: unknown) {
     if (requestId !== providersRequestId) return
-    showError(parseApiError(err, '加载提供商列表失败'), '错误')
+    showLegacyError(err, '加载提供商列表失败')
   } finally {
     if (requestId === providersRequestId) {
       loading.value = false
@@ -691,14 +652,15 @@ async function handleProviderBatchChanged() {
 // 打开提供商详情抽屉
 function openProviderDrawer(providerId: string) {
   selectedProviderId.value = providerId
+  providerDrawerMounted.value = true
   providerDrawerOpen.value = true
 }
 
 function mergeUpdatedProvider(updated: ProviderWithEndpointsSummary) {
   const index = providers.value.findIndex(p => p.id === updated.id)
   if (index !== -1) {
-    providers.value[index] = updated
-    loadBalances([updated], false)
+    Object.assign(providers.value[index], updated)
+    loadBalances([providers.value[index]], false)
   }
 }
 
@@ -711,7 +673,7 @@ async function refreshProviderSnapshot(
     mergeUpdatedProvider(updated)
     return updated
   } catch (err) {
-    showError(parseApiError(err, fallbackErrorMessage), '错误')
+    showLegacyError(err, fallbackErrorMessage)
     return null
   }
 }
@@ -761,8 +723,8 @@ function handleProviderAdded() {
 // 删除提供商
 async function handleDeleteProvider(provider: ProviderWithEndpointsSummary) {
   const confirmed = await confirmDanger(
-    '删除提供商',
-    `确定要删除提供商 "${provider.name}" 吗？\n\n这将同时删除其所有端点、密钥和配置。此操作不可恢复！`,
+    legacyT('删除提供商'),
+    legacyT(`确定要删除提供商 "${provider.name}" 吗？\n\n这将同时删除其所有端点、密钥和配置。此操作不可恢复！`),
   )
 
   if (!confirmed) return
@@ -781,7 +743,7 @@ async function handleDeleteProvider(provider: ProviderWithEndpointsSummary) {
       deletedEndpoints: 0,
       message: result.message || '删除任务已提交，后台处理中',
     }
-    showInfo(result.message || '删除任务已提交，后台处理中')
+    showInfo(legacyT(result.message || '删除任务已提交，后台处理中'))
 
     const task = await pollProviderDeleteTask(provider.id, result.task_id)
     if (!task) return // aborted
@@ -789,12 +751,12 @@ async function handleDeleteProvider(provider: ProviderWithEndpointsSummary) {
       throw new Error(task.message || 'provider delete task failed')
     }
 
-    showSuccess('提供商已删除')
+    showSuccess(legacyT('提供商已删除'))
     providerDeleteProgress.value = null
     void loadProviders()
   } catch (err: unknown) {
     providerDeleteProgress.value = null
-    showError(parseApiError(err, '删除提供商失败'), '错误')
+    showLegacyError(err, '删除提供商失败')
   }
 }
 
@@ -813,9 +775,9 @@ async function toggleProviderStatus(provider: ProviderWithEndpointsSummary) {
       targetProvider.is_active = newStatus
     }
 
-    showSuccess(newStatus ? '提供商已启用' : '提供商已停用')
+    showSuccess(legacyT(newStatus ? '提供商已启用' : '提供商已停用'))
   } catch (err: unknown) {
-    showError(parseApiError(err, '操作失败'), '错误')
+    showLegacyError(err, '操作失败')
   }
 }
 

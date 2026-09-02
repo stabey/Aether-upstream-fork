@@ -1,11 +1,14 @@
 use super::{
     ApiKeyLastUsedDelta, DataLayerError, GatewayDataState, GeminiFileMappingListQuery,
-    GeminiFileMappingStats, ProviderCatalogKeyListQuery, PublicHealthStatusCount,
-    PublicHealthTimelineBucket, StoredGeminiFileMapping, StoredGeminiFileMappingListPage,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider, StoredRequestCandidate,
-    UpsertGeminiFileMappingRecord, UpsertRequestCandidateRecord,
+    GeminiFileMappingStats, ProviderCatalogKeyAdaptiveStateUpdate,
+    ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyHealthStateUpdate,
+    ProviderCatalogKeyListQuery, ProviderCatalogKeyOAuthCredentialCasDelete,
+    ProviderCatalogKeyOAuthRuntimeStateCasUpdate, ProviderCatalogKeyRuntimeMetadataUpdate,
+    ProviderCatalogKeyStatusSnapshotUpdate, PublicHealthStatusCount, PublicHealthTimelineBucket,
+    StoredGeminiFileMapping, StoredGeminiFileMappingListPage, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    StoredRequestCandidate, UpsertGeminiFileMappingRecord, UpsertRequestCandidateRecord,
 };
 
 impl GatewayDataState {
@@ -107,10 +110,17 @@ impl GatewayDataState {
         &self,
         candidate: UpsertRequestCandidateRecord,
     ) -> Result<Option<StoredRequestCandidate>, DataLayerError> {
-        match &self.request_candidate_writer {
-            Some(repository) => repository.upsert(candidate).await.map(Some),
-            None => Ok(None),
-        }
+        crate::request_diagnostics::observe_db_operation(
+            "request_candidate_upsert",
+            self.database_pool_summary(),
+            async {
+                match &self.request_candidate_writer {
+                    Some(repository) => repository.upsert(candidate).await.map(Some),
+                    None => Ok(None),
+                }
+            },
+        )
+        .await
     }
 
     pub(crate) async fn delete_request_candidates_created_before(
@@ -272,6 +282,16 @@ impl GatewayDataState {
         }
     }
 
+    pub(crate) async fn list_provider_catalog_keys_by_ids_strong(
+        &self,
+        key_ids: &[String],
+    ) -> Result<Vec<StoredProviderCatalogKey>, DataLayerError> {
+        match &self.provider_catalog_reader {
+            Some(repository) => repository.list_keys_by_ids_strong(key_ids).await,
+            None => Ok(Vec::new()),
+        }
+    }
+
     pub(crate) async fn list_provider_catalog_keys_by_provider_ids(
         &self,
         provider_ids: &[String],
@@ -360,6 +380,52 @@ impl GatewayDataState {
         if updated {
             self.clear_provider_catalog_cache();
         }
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_oauth_runtime_state(
+        &self,
+        key_id: &str,
+        oauth_invalid_at_unix_secs: Option<u64>,
+        oauth_invalid_reason: Option<&str>,
+        encrypted_auth_config_update: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .update_key_oauth_runtime_state(
+                        key_id,
+                        oauth_invalid_at_unix_secs,
+                        oauth_invalid_reason,
+                        encrypted_auth_config_update,
+                        updated_at_unix_secs,
+                    )
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_update_provider_catalog_key_oauth_runtime_state(
+        &self,
+        update: &ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .compare_and_update_key_oauth_runtime_state(update)
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        // A false result is a credential CAS conflict. Clear cached snapshots
+        // either way so the next read observes the authoritative row.
+        self.clear_provider_catalog_cache();
         Ok(updated)
     }
 
@@ -505,6 +571,34 @@ impl GatewayDataState {
         Ok(updated)
     }
 
+    pub(crate) async fn compare_and_update_provider_catalog_key_admin_state(
+        &self,
+        update: &ProviderCatalogKeyAdminCasUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository.compare_and_update_key_admin_state(update).await,
+            None => Ok(false),
+        }?;
+        // Clear on both success and conflict so a retry cannot reuse the stale
+        // credential snapshot that lost the CAS.
+        self.clear_provider_catalog_cache();
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_keys(
+        &self,
+        keys: &[StoredProviderCatalogKey],
+    ) -> Result<Option<Vec<StoredProviderCatalogKey>>, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository.update_keys(keys).await.map(Some),
+            None => Ok(None),
+        }?;
+        if updated.as_ref().is_some_and(|keys| !keys.is_empty()) {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
     pub(crate) async fn update_provider_catalog_key_upstream_metadata(
         &self,
         key_id: &str,
@@ -515,6 +609,88 @@ impl GatewayDataState {
             Some(repository) => {
                 repository
                     .update_key_upstream_metadata(key_id, upstream_metadata, updated_at_unix_secs)
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn upsert_provider_catalog_key_upstream_metadata_namespace(
+        &self,
+        key_id: &str,
+        namespace: &str,
+        value: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .upsert_key_upstream_metadata_namespace(
+                        key_id,
+                        namespace,
+                        value,
+                        updated_at_unix_secs,
+                    )
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .update_key_model_fetch_state(
+                        key_id,
+                        allowed_models,
+                        last_models_fetch_at_unix_secs,
+                        last_models_fetch_error,
+                        updated_at_unix_secs,
+                    )
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[aether_data_contracts::repository::provider_catalog::ProviderCatalogUpstreamMetadataNamespaceUpdate],
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .update_key_model_fetch_success(
+                        key_id,
+                        allowed_models,
+                        last_models_fetch_at_unix_secs,
+                        upstream_metadata_updates,
+                        updated_at_unix_secs,
+                    )
                     .await
             }
             None => Ok(false),
@@ -536,6 +712,22 @@ impl GatewayDataState {
         if deleted {
             self.clear_provider_catalog_cache();
         }
+        Ok(deleted)
+    }
+
+    pub(crate) async fn compare_and_delete_provider_catalog_key_oauth_credential(
+        &self,
+        delete: &ProviderCatalogKeyOAuthCredentialCasDelete,
+    ) -> Result<bool, DataLayerError> {
+        let deleted = match &self.provider_catalog_writer {
+            Some(repository) => {
+                repository
+                    .compare_and_delete_key_oauth_credential(delete)
+                    .await
+            }
+            None => Ok(false),
+        }?;
+        self.clear_provider_catalog_cache();
         Ok(deleted)
     }
 
@@ -576,6 +768,78 @@ impl GatewayDataState {
         if updated {
             self.clear_provider_catalog_cache();
         }
+        Ok(updated)
+    }
+
+    pub(crate) async fn reset_provider_catalog_key_error_count(
+        &self,
+        key_id: &str,
+    ) -> Result<bool, DataLayerError> {
+        let updated = match &self.provider_catalog_writer {
+            Some(repository) => repository.reset_key_error_count(key_id).await,
+            None => Ok(false),
+        }?;
+        if updated {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_update_provider_catalog_key_adaptive_state(
+        &self,
+        update: &ProviderCatalogKeyAdaptiveStateUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let Some(repository) = &self.provider_catalog_writer else {
+            return Ok(false);
+        };
+        let updated = repository
+            .compare_and_update_key_adaptive_state(update)
+            .await?;
+        // A false CAS result normally means another instance won the write. Drop the
+        // five-second read cache before the caller reloads and retries.
+        self.clear_provider_catalog_cache();
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_runtime_metadata(
+        &self,
+        update: &ProviderCatalogKeyRuntimeMetadataUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let Some(repository) = &self.provider_catalog_writer else {
+            return Ok(false);
+        };
+        let updated = repository.update_key_runtime_metadata(update).await?;
+        // A false result is a namespace CAS conflict.  Drop the read cache so
+        // the caller's retry observes the writer that won the race.
+        self.clear_provider_catalog_cache();
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_status_snapshot(
+        &self,
+        update: &ProviderCatalogKeyStatusSnapshotUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let Some(repository) = &self.provider_catalog_writer else {
+            return Ok(false);
+        };
+        let updated = repository.update_key_status_snapshot(update).await?;
+        if updated {
+            self.clear_provider_catalog_cache();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_update_provider_catalog_key_health_state(
+        &self,
+        update: &ProviderCatalogKeyHealthStateUpdate,
+    ) -> Result<bool, DataLayerError> {
+        let Some(repository) = &self.provider_catalog_writer else {
+            return Ok(false);
+        };
+        let updated = repository
+            .compare_and_update_key_health_state(update)
+            .await?;
+        self.clear_provider_catalog_cache();
         Ok(updated)
     }
 }

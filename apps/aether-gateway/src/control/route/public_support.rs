@@ -157,6 +157,7 @@ pub(super) fn classify_public_support_route(
                 | "/api/public/global-models"
                 | "/api/public/health/api-formats"
                 | "/api/public/health/models"
+                | "/api/public/health/related"
         )
     {
         let route_kind = match normalized_path {
@@ -168,6 +169,7 @@ pub(super) fn classify_public_support_route(
             "/api/public/global-models" => "global_models",
             "/api/public/health/api-formats" => "health_api_formats",
             "/api/public/health/models" => "health_models",
+            "/api/public/health/related" => "health_related",
             _ => "site_info",
         };
         Some(classified(
@@ -516,6 +518,65 @@ pub(super) fn classify_public_support_route(
             "ccswitch",
             "usage",
             "aether:ccswitch_usage",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(normalized_path, "/api/vscodex/pair" | "/api/vscodex/pair/")
+    {
+        Some(classified(
+            "public_support",
+            "vscodex",
+            "pairing_exchange",
+            "public:vscodex",
+            false,
+        ))
+    } else if method == http::Method::GET
+        && matches!(
+            normalized_path,
+            "/api/users/me/vscodex/devices" | "/api/users/me/vscodex/devices/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "vscodex_devices_list",
+            "user:self",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(
+            normalized_path,
+            "/api/users/me/vscodex/pairings" | "/api/users/me/vscodex/pairings/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "vscodex_pairing_create",
+            "user:self",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && matches!(
+            normalized_path,
+            "/api/users/me/vscodex/ws-tickets" | "/api/users/me/vscodex/ws-tickets/"
+        )
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "vscodex_ws_ticket_create",
+            "user:self",
+            false,
+        ))
+    } else if method == http::Method::DELETE
+        && has_single_segment_after_prefix(normalized_path, "/api/users/me/vscodex/devices/")
+    {
+        Some(classified(
+            "public_support",
+            "users_me",
+            "vscodex_device_delete",
+            "user:self",
             false,
         ))
     } else if method == http::Method::GET

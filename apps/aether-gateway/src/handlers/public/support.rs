@@ -2,9 +2,10 @@ use super::{
     build_api_format_health_monitor_payload, build_model_health_monitor_payload,
     build_public_auth_modules_status_payload, build_public_catalog_models_payload,
     build_public_catalog_search_models_payload, build_public_providers_payload,
-    capability_detail_by_name, ldap_module_config_is_valid, sanitize_public_model_config_for_user,
-    serialize_public_capability, supported_capability_names, ApiFormatHealthMonitorOptions,
-    ModelHealthMonitorOptions, PUBLIC_CAPABILITY_DEFINITIONS,
+    build_related_health_monitor_payload, capability_detail_by_name, ldap_module_config_is_valid,
+    sanitize_public_model_config_for_user, serialize_public_capability, supported_capability_names,
+    ApiFormatHealthMonitorOptions, HealthMonitorRelationDimension, ModelHealthMonitorOptions,
+    PUBLIC_CAPABILITY_DEFINITIONS,
 };
 use crate::control::GatewayPublicRequestContext;
 use crate::handlers::shared::{
@@ -47,10 +48,14 @@ mod support_payment;
 mod support_test_connection;
 #[path = "support/user_me.rs"]
 mod support_user_me;
+#[path = "support/user_me_vscodex.rs"]
+mod support_vscodex;
 #[path = "support/wallet.rs"]
 mod support_wallet;
 
 pub(crate) use self::support_announcements::maybe_build_local_admin_announcements_response;
+#[cfg(test)]
+pub(crate) use self::support_models::filter_eligible_model_rows;
 pub(crate) use self::support_models::matches_model_mapping_for_models;
 
 use self::support_announcements::{
@@ -86,6 +91,8 @@ use self::support_oauth::maybe_build_local_oauth_response;
 use self::support_payment::maybe_build_local_payment_callback_response;
 use self::support_test_connection::maybe_build_local_test_connection_response;
 use self::support_user_me::maybe_build_local_users_me_response;
+pub(crate) use self::support_vscodex::vscodex_ws_proxy;
+use self::support_vscodex::{handle_users_me_vscodex_request, maybe_build_local_vscodex_response};
 use self::support_wallet::{
     build_wallet_balance_payload_for_auth_scope, build_wallet_balance_payload_for_user,
     build_wallet_live_today_usage_payload_for_api_key,
@@ -118,6 +125,7 @@ pub(crate) async fn maybe_build_local_public_support_response(
     request_context: &GatewayPublicRequestContext,
     headers: &http::HeaderMap,
     cf_connecting_ip: Option<&str>,
+    client_ip: std::net::IpAddr,
     request_body: Option<&Bytes>,
 ) -> Option<Response<Body>> {
     let decision = request_context.control_decision.as_ref()?;
@@ -186,6 +194,11 @@ pub(crate) async fn maybe_build_local_public_support_response(
 
     if decision.route_family.as_deref() == Some("users_me") {
         return maybe_build_local_users_me_response(state, request_context, headers, request_body)
+            .await;
+    }
+
+    if decision.route_family.as_deref() == Some("vscodex") {
+        return maybe_build_local_vscodex_response(state, request_context, client_ip, request_body)
             .await;
     }
 
@@ -473,6 +486,77 @@ pub(crate) async fn maybe_build_local_public_support_response(
                 ModelHealthMonitorOptions {
                     include_provider_count: false,
                 },
+            )
+            .await?;
+            return Some(Json(payload).into_response());
+        }
+
+        if decision.route_kind.as_deref() == Some("health_related")
+            && request_context.request_path == "/api/public/health/related"
+        {
+            let Some(dimension) =
+                query_param_value(request_context.request_query_string.as_deref(), "dimension")
+                    .and_then(|value| HealthMonitorRelationDimension::parse(&value))
+            else {
+                return Some(
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        Json(json!({ "detail": "dimension 必须是 endpoint 或 model" })),
+                    )
+                        .into_response(),
+                );
+            };
+            if matches!(dimension, HealthMonitorRelationDimension::Provider) {
+                return Some(
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        Json(json!({ "detail": "公开健康监控不支持 provider 维度" })),
+                    )
+                        .into_response(),
+                );
+            }
+            let Some(value) =
+                query_param_value(request_context.request_query_string.as_deref(), "value")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            else {
+                return Some(
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        Json(json!({ "detail": "value 不能为空" })),
+                    )
+                        .into_response(),
+                );
+            };
+            let lookback_hours = query_param_value(
+                request_context.request_query_string.as_deref(),
+                "lookback_hours",
+            )
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| (1..=168).contains(value))
+            .unwrap_or(6);
+            let related_limit = query_param_value(
+                request_context.request_query_string.as_deref(),
+                "related_limit",
+            )
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (1..=50).contains(value))
+            .unwrap_or(8);
+            let per_item_limit = query_param_value(
+                request_context.request_query_string.as_deref(),
+                "per_item_limit",
+            )
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| (10..=500).contains(value))
+            .unwrap_or(100);
+            let payload = build_related_health_monitor_payload(
+                state,
+                lookback_hours,
+                dimension,
+                &value,
+                related_limit,
+                per_item_limit,
+                false,
             )
             .await?;
             return Some(Json(payload).into_response());

@@ -340,6 +340,8 @@ async fn gateway_handles_admin_provider_summary_locally_with_trusted_admin_princ
     assert_eq!(payload["billing_type"], "monthly_quota");
     assert_eq!(payload["monthly_quota_usd"], 100.0);
     assert_eq!(payload["monthly_used_usd"], 12.5);
+    assert_eq!(payload["max_transfer_count"], 0);
+    assert_eq!(payload["max_transfer_timeout_seconds"], 0);
     assert_eq!(payload["total_endpoints"], 2);
     assert_eq!(payload["active_endpoints"], 2);
     assert_eq!(payload["total_keys"], 2);
@@ -832,7 +834,9 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
             "is_active": false,
             "concurrent_limit": 8,
             "max_retries": 6,
-            "request_timeout": 55.0,
+            "max_transfer_count": 10,
+            "max_transfer_timeout_seconds": 60,
+            "request_timeout": aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS,
             "stream_first_byte_timeout": 11.0,
             "enable_format_conversion": false,
             "config": {
@@ -860,7 +864,12 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     assert_eq!(payload["enable_format_conversion"], false);
     assert_eq!(payload["is_active"], false);
     assert_eq!(payload["max_retries"], 6);
-    assert_eq!(payload["request_timeout"], 55.0);
+    assert_eq!(payload["max_transfer_count"], 10);
+    assert_eq!(payload["max_transfer_timeout_seconds"], 60);
+    assert_eq!(
+        payload["request_timeout"].as_f64(),
+        Some(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS as f64)
+    );
     assert_eq!(payload["stream_first_byte_timeout"], 11.0);
     assert_eq!(payload["proxy"], json!({"url": "https://proxy.example"}));
     assert_eq!(payload["claude_code_advanced"], json!({"pool_size": 2}));
@@ -870,6 +879,44 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
     assert_eq!(payload["ops_configured"], true);
     assert_eq!(payload["ops_architecture_id"], "cubence");
 
+    let invalid_timeout_response = reqwest::Client::new()
+        .patch(format!("{gateway_url}/api/admin/providers/provider-openai"))
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "request_timeout":
+                aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS + 1
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+    assert_eq!(invalid_timeout_response.status(), StatusCode::BAD_REQUEST);
+
+    for (field_name, value) in [
+        ("max_transfer_count", -1),
+        ("max_transfer_timeout_seconds", -1),
+    ] {
+        let invalid_transfer_response = reqwest::Client::new()
+            .patch(format!("{gateway_url}/api/admin/providers/provider-openai"))
+            .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&json!({ (field_name): value }))
+            .send()
+            .await
+            .expect("request should succeed");
+        let status = invalid_transfer_response.status();
+        let payload: serde_json::Value = invalid_transfer_response
+            .json()
+            .await
+            .expect("json body should parse");
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(payload["detail"], format!("{field_name} 必须是非负整数"));
+    }
+
     let disable_response = reqwest::Client::new()
         .patch(format!("{gateway_url}/api/admin/providers/provider-openai"))
         .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
@@ -877,6 +924,7 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
+            "max_transfer_count": null,
             "config": {
                 "chat_pii_redaction": {"enabled": false}
             }
@@ -894,6 +942,8 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         json!({"enabled": false})
     );
     assert_eq!(disable_payload["pool_advanced"], json!({}));
+    assert_eq!(disable_payload["max_transfer_count"], 0);
+    assert_eq!(disable_payload["max_transfer_timeout_seconds"], 60);
     assert_eq!(
         disable_payload["failover_rules"],
         json!({"strategy": "ordered"})
@@ -924,6 +974,26 @@ async fn gateway_updates_admin_provider_locally_with_trusted_admin_principal() {
         .iter()
         .find(|provider| provider.id == "provider-openai")
         .expect("provider should exist");
+    assert_eq!(
+        updated_provider.request_timeout_secs,
+        Some(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS as f64)
+    );
+    assert_eq!(
+        updated_provider
+            .config
+            .as_ref()
+            .and_then(|value| value.get("max_transfer_count"))
+            .and_then(serde_json::Value::as_u64),
+        Some(0)
+    );
+    assert_eq!(
+        updated_provider
+            .config
+            .as_ref()
+            .and_then(|value| value.get("max_transfer_timeout_seconds"))
+            .and_then(serde_json::Value::as_u64),
+        Some(60)
+    );
     assert_eq!(
         updated_provider
             .config
@@ -1000,7 +1070,14 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
             "website": "codex.example",
             "keep_priority_on_conversion": true,
             "max_retries": 7,
-            "config": {"chat_pii_redaction": {"enabled": true}},
+            "max_transfer_count": 12,
+            "max_transfer_timeout_seconds": 90,
+            "request_timeout": aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS,
+            "config": {
+                "chat_pii_redaction": {"enabled": true},
+                "codex": {"pass_through_cyber_flag_interrupt": true}
+            },
+            "codex_fingerprint_convergence_enabled": true,
             "pool_advanced": {},
             "failover_rules": {"strategy": "ordered"},
             "proxy": {"url": "https://proxy.example"}
@@ -1034,6 +1111,26 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
     assert_eq!(created.website.as_deref(), Some("https://codex.example"));
     assert!(created.enable_format_conversion);
     assert_eq!(created.max_retries, Some(7));
+    assert_eq!(
+        created
+            .config
+            .as_ref()
+            .and_then(|value| value.get("max_transfer_count"))
+            .and_then(serde_json::Value::as_u64),
+        Some(12)
+    );
+    assert_eq!(
+        created
+            .config
+            .as_ref()
+            .and_then(|value| value.get("max_transfer_timeout_seconds"))
+            .and_then(serde_json::Value::as_u64),
+        Some(90)
+    );
+    assert_eq!(
+        created.request_timeout_secs,
+        Some(aether_contracts::MAX_EXECUTION_REQUEST_TIMEOUT_SECS as f64)
+    );
     assert_eq!(created.keep_priority_on_conversion, true);
     assert_eq!(
         created
@@ -1059,6 +1156,17 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
             .cloned(),
         Some(json!({"strategy": "ordered"}))
     );
+    assert_eq!(
+        created
+            .config
+            .as_ref()
+            .and_then(|value| value.get("codex"))
+            .cloned(),
+        Some(json!({
+            "fingerprint_convergence_enabled": true,
+            "pass_through_cyber_flag_interrupt": true
+        }))
+    );
 
     let invalid_response = reqwest::Client::new()
         .post(format!("{gateway_url}/api/admin/providers/"))
@@ -1080,7 +1188,7 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
         .list_endpoints_by_provider_ids(std::slice::from_ref(&created.id))
         .await
         .expect("endpoints should list");
-    assert_eq!(endpoints.len(), 3);
+    assert_eq!(endpoints.len(), 5);
     let responses_endpoint = endpoints
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:responses")
@@ -1089,10 +1197,18 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:responses:compact")
         .expect("compact endpoint should exist");
+    let search_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.api_format == "openai:search")
+        .expect("search endpoint should exist");
     let image_endpoint = endpoints
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:image")
         .expect("image endpoint should exist");
+    let live_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.api_format == "codex:live")
+        .expect("Codex Live endpoint should exist");
     assert_eq!(
         responses_endpoint.base_url,
         "https://chatgpt.com/backend-api/codex"
@@ -1102,12 +1218,25 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
         "https://chatgpt.com/backend-api/codex"
     );
     assert_eq!(
+        search_endpoint.base_url,
+        "https://chatgpt.com/backend-api/codex"
+    );
+    assert_eq!(
         image_endpoint.base_url,
         "https://chatgpt.com/backend-api/codex"
     );
     assert_eq!(responses_endpoint.max_retries, Some(7));
     assert_eq!(compact_endpoint.max_retries, Some(7));
+    assert_eq!(search_endpoint.max_retries, Some(7));
     assert_eq!(image_endpoint.max_retries, Some(7));
+    assert_eq!(live_endpoint.api_family.as_deref(), Some("codex"));
+    assert_eq!(live_endpoint.endpoint_kind.as_deref(), Some("live"));
+    assert_eq!(
+        crate::api::ai::public_api_format_local_path(&live_endpoint.api_format),
+        "/v1/live"
+    );
+    assert!(live_endpoint.custom_path.is_none());
+    assert_eq!(live_endpoint.max_retries, Some(7));
     assert_eq!(
         responses_endpoint
             .config
@@ -1117,16 +1246,26 @@ async fn gateway_creates_admin_provider_locally_with_trusted_admin_principal() {
         Some("force_stream")
     );
     assert_eq!(
+        search_endpoint
+            .config
+            .as_ref()
+            .and_then(|value| value.get("upstream_stream_policy"))
+            .and_then(serde_json::Value::as_str),
+        None
+    );
+    assert_eq!(
         image_endpoint
             .config
             .as_ref()
             .and_then(|value| value.get("upstream_stream_policy"))
             .and_then(serde_json::Value::as_str),
-        Some("force_stream")
+        None
     );
     assert!(responses_endpoint.body_rules.is_none());
     assert!(compact_endpoint.body_rules.is_none());
+    assert!(search_endpoint.body_rules.is_none());
     assert!(image_endpoint.body_rules.is_none());
+    assert!(live_endpoint.body_rules.is_none());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();
@@ -1157,7 +1296,9 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
         None,
         None,
         None,
-        None,
+        Some(json!({
+            "codex": {"pass_through_cyber_flag_interrupt": true}
+        })),
     );
     provider.provider_type = "codex".to_string();
     let mut cli_endpoint = sample_endpoint(
@@ -1168,6 +1309,14 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
     );
     cli_endpoint.max_retries = Some(2);
     cli_endpoint.config = Some(json!({"upstream_stream_policy": "force_stream"}));
+    let mut live_endpoint = sample_endpoint(
+        "endpoint-codex-live",
+        "provider-codex",
+        "codex:live",
+        "https://chatgpt.com/backend-api/codex",
+    );
+    live_endpoint.max_retries = Some(2);
+    live_endpoint.custom_path = Some("/custom/live".to_string());
     let mut key = sample_key(
         "key-codex-oauth",
         "provider-codex",
@@ -1179,7 +1328,7 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
-        vec![cli_endpoint],
+        vec![cli_endpoint, live_endpoint],
         vec![key],
     ));
 
@@ -1202,7 +1351,8 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
         .json(&json!({
-            "max_retries": 9
+            "max_retries": 9,
+            "codex_fingerprint_convergence_enabled": true
         }))
         .send()
         .await
@@ -1211,12 +1361,34 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
     let status = response.status();
     let body = response.text().await.expect("body should read");
     assert_eq!(status, StatusCode::OK, "body={body}");
+    let payload: serde_json::Value = serde_json::from_str(&body).expect("json body should parse");
+    assert_eq!(payload["codex_fingerprint_convergence_enabled"], true);
+
+    let providers = provider_catalog_repository
+        .list_providers(false)
+        .await
+        .expect("providers should list");
+    let updated_provider = providers
+        .iter()
+        .find(|provider| provider.id == "provider-codex")
+        .expect("updated provider should exist");
+    assert_eq!(
+        updated_provider
+            .config
+            .as_ref()
+            .and_then(|value| value.get("codex"))
+            .cloned(),
+        Some(json!({
+            "fingerprint_convergence_enabled": true,
+            "pass_through_cyber_flag_interrupt": true
+        }))
+    );
 
     let endpoints = provider_catalog_repository
         .list_endpoints_by_provider_ids(&["provider-codex".to_string()])
         .await
         .expect("endpoints should list");
-    assert_eq!(endpoints.len(), 3);
+    assert_eq!(endpoints.len(), 5);
     let responses_endpoint = endpoints
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:responses")
@@ -1225,14 +1397,31 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:responses:compact")
         .expect("compact endpoint should exist");
+    let search_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.api_format == "openai:search")
+        .expect("search endpoint should exist");
     let image_endpoint = endpoints
         .iter()
         .find(|endpoint| endpoint.api_format == "openai:image")
         .expect("image endpoint should exist");
+    let live_endpoint = endpoints
+        .iter()
+        .find(|endpoint| endpoint.api_format == "codex:live")
+        .expect("Codex Live endpoint should exist");
 
     assert_eq!(responses_endpoint.max_retries, Some(9));
     assert_eq!(compact_endpoint.max_retries, Some(9));
+    assert_eq!(search_endpoint.max_retries, Some(9));
     assert_eq!(image_endpoint.max_retries, Some(9));
+    assert_eq!(live_endpoint.api_family.as_deref(), Some("codex"));
+    assert_eq!(live_endpoint.endpoint_kind.as_deref(), Some("live"));
+    assert_eq!(
+        crate::api::ai::public_api_format_local_path(&live_endpoint.api_format),
+        "/v1/live"
+    );
+    assert_eq!(live_endpoint.custom_path.as_deref(), Some("/custom/live"));
+    assert_eq!(live_endpoint.max_retries, Some(9));
     assert_eq!(
         responses_endpoint
             .config
@@ -1243,19 +1432,36 @@ async fn gateway_updates_fixed_provider_and_reconciles_template_managed_endpoint
         Some(true)
     );
     assert_eq!(
+        search_endpoint
+            .config
+            .as_ref()
+            .and_then(|value| value.get("_aether_fixed_provider_template"))
+            .and_then(|value| value.get("managed"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        search_endpoint
+            .config
+            .as_ref()
+            .and_then(|value| value.get("upstream_stream_policy"))
+            .and_then(serde_json::Value::as_str),
+        None
+    );
+    assert_eq!(
         image_endpoint
             .config
             .as_ref()
             .and_then(|value| value.get("upstream_stream_policy"))
             .and_then(serde_json::Value::as_str),
-        Some("force_stream")
+        None
     );
     let keys = provider_catalog_repository
         .list_keys_by_provider_ids(&["provider-codex".to_string()])
         .await
         .expect("keys should list");
     assert_eq!(keys.len(), 1);
-    assert!(keys[0].api_formats.is_none());
+    assert_eq!(keys[0].api_formats, Some(json!(["openai:responses"])));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

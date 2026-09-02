@@ -50,21 +50,29 @@ pub(crate) use aether_ai_formats::api::{
     resolve_claude_stream_spec, resolve_claude_sync_spec, resolve_gemini_stream_spec,
     resolve_gemini_sync_spec, resolve_local_image_stream_spec, resolve_local_image_sync_spec,
     resolve_local_same_format_stream_spec, resolve_local_same_format_sync_spec,
-    resolve_openai_embedding_sync_spec, sanitize_request_path_and_query, AiControlPlanRequest,
-    CanonicalContentPart, CanonicalStreamEvent, CanonicalStreamFrame, ClaudeClientEmitter,
-    ExecutionRuntimeAuthContext, LocalCoreSyncErrorKind, LocalOpenAiImageSpec,
-    LocalSameFormatProviderFamily, LocalSameFormatProviderSpec, LocalStandardSourceFamily,
-    LocalStandardSourceMode, LocalStandardSpec, OpenAIChatClientEmitter,
-    OpenAIResponsesClientEmitter, StreamingStandardTerminalObserver,
+    resolve_openai_embedding_sync_spec, sanitize_request_path_and_query,
+    sanitize_request_query_string, AiControlPlanRequest, CanonicalContentPart,
+    CanonicalStreamEvent, CanonicalStreamFrame, ClaudeClientEmitter, ExecutionRuntimeAuthContext,
+    LocalCoreSyncErrorKind, LocalOpenAiImageSpec, LocalSameFormatProviderFamily,
+    LocalSameFormatProviderSpec, LocalStandardSourceFamily, LocalStandardSourceMode,
+    LocalStandardSpec, OpenAIChatClientEmitter, OpenAIResponsesClientEmitter,
+    StreamingStandardTerminalObserver, CLAUDE_CHAT_STREAM_PLAN_KIND, CLAUDE_CLI_STREAM_PLAN_KIND,
     EXECUTION_RUNTIME_STREAM_DECISION_ACTION, EXECUTION_RUNTIME_SYNC_DECISION_ACTION,
-    GEMINI_EMBEDDING_SYNC_PLAN_KIND, GEMINI_FILES_DOWNLOAD_PLAN_KIND,
-    GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_EMBEDDING_SYNC_PLAN_KIND,
-    OPENAI_IMAGE_STREAM_PLAN_KIND, OPENAI_IMAGE_SYNC_FINALIZE_REPORT_KIND,
-    OPENAI_IMAGE_SYNC_PLAN_KIND, OPENAI_RERANK_SYNC_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
+    GEMINI_CHAT_STREAM_PLAN_KIND, GEMINI_CLI_STREAM_PLAN_KIND, GEMINI_EMBEDDING_SYNC_PLAN_KIND,
+    GEMINI_FILES_DOWNLOAD_PLAN_KIND, GEMINI_INTERACTIONS_STREAM_PLAN_KIND,
+    GEMINI_VIDEO_CANCEL_SYNC_PLAN_KIND, OPENAI_CHAT_STREAM_PLAN_KIND,
+    OPENAI_EMBEDDING_SYNC_PLAN_KIND, OPENAI_IMAGE_STREAM_PLAN_KIND,
+    OPENAI_IMAGE_SYNC_FINALIZE_REPORT_KIND, OPENAI_IMAGE_SYNC_PLAN_KIND,
+    OPENAI_RERANK_SYNC_PLAN_KIND, OPENAI_RESPONSES_COMPACT_STREAM_PLAN_KIND,
+    OPENAI_RESPONSES_STREAM_PLAN_KIND, OPENAI_VIDEO_CANCEL_SYNC_PLAN_KIND,
     OPENAI_VIDEO_CONTENT_PLAN_KIND, OPENAI_VIDEO_DELETE_SYNC_PLAN_KIND,
     OPENAI_VIDEO_REMIX_SYNC_PLAN_KIND,
 };
 pub(crate) use aether_ai_formats::protocol::stream::CanonicalUsage as StreamingCanonicalUsage;
+/// Codex client identity headers re-exported for out-of-crate probe binaries,
+/// which must reach `aether_ai_formats` through this seam.
+pub use aether_ai_formats::{CODEX_CLIENT_ORIGINATOR, CODEX_CLIENT_USER_AGENT};
+pub(crate) use aether_ai_formats::{CODEX_RESPONSES_LITE_HEADER, UPSTREAM_IS_STREAM_KEY};
 
 pub(crate) fn parse_direct_request_body(
     parts: &http::request::Parts,
@@ -83,28 +91,36 @@ pub(crate) fn resolve_execution_runtime_stream_plan_kind(
     parts: &http::request::Parts,
     decision: &GatewayControlDecision,
 ) -> Option<&'static str> {
-    aether_ai_formats::api::resolve_execution_runtime_stream_plan_kind(
-        decision.route_class.as_deref(),
-        decision.route_family.as_deref(),
-        decision.route_kind.as_deref(),
-        decision.request_auth_channel.as_deref(),
-        &parts.method,
-        parts.uri.path(),
-    )
+    let plan_kind =
+        aether_ai_formats::api::resolve_execution_runtime_stream_plan_kind_with_client_surface(
+            decision.route_class.as_deref(),
+            decision.route_family.as_deref(),
+            decision.route_kind.as_deref(),
+            decision.client_surface,
+            decision.request_auth_channel.as_deref(),
+            &parts.method,
+            parts.uri.path(),
+        )?;
+    crate::ai_serving::plan_kind_matches_api_operation(plan_kind, true, decision.api_operation)
+        .then_some(plan_kind)
 }
 
 pub(crate) fn resolve_execution_runtime_sync_plan_kind(
     parts: &http::request::Parts,
     decision: &GatewayControlDecision,
 ) -> Option<&'static str> {
-    aether_ai_formats::api::resolve_execution_runtime_sync_plan_kind(
-        decision.route_class.as_deref(),
-        decision.route_family.as_deref(),
-        decision.route_kind.as_deref(),
-        decision.request_auth_channel.as_deref(),
-        &parts.method,
-        parts.uri.path(),
-    )
+    let plan_kind =
+        aether_ai_formats::api::resolve_execution_runtime_sync_plan_kind_with_client_surface(
+            decision.route_class.as_deref(),
+            decision.route_family.as_deref(),
+            decision.route_kind.as_deref(),
+            decision.client_surface,
+            decision.request_auth_channel.as_deref(),
+            &parts.method,
+            parts.uri.path(),
+        )?;
+    crate::ai_serving::plan_kind_matches_api_operation(plan_kind, false, decision.api_operation)
+        .then_some(plan_kind)
 }
 
 pub(crate) fn is_matching_stream_request(

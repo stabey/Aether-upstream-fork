@@ -10,10 +10,11 @@ pub(crate) use self::catalog_helpers::{
     admin_requested_force_stream, api_format_display_name, build_api_format_health_monitor_payload,
     build_model_health_monitor_payload, build_provider_health_monitor_payload,
     build_public_catalog_models_payload, build_public_catalog_search_models_payload,
-    build_public_health_timeline, build_public_providers_payload, normalize_admin_base_url,
+    build_public_health_timeline, build_public_health_timeline_details,
+    build_public_providers_payload, build_related_health_monitor_payload, normalize_admin_base_url,
     provider_key_api_formats, request_candidate_event_unix_ms, request_candidate_status_label,
     sanitize_public_model_config_for_user, ApiFormatHealthMonitorOptions,
-    ModelHealthMonitorOptions,
+    HealthMonitorRelationDimension, ModelHealthMonitorOptions,
 };
 pub(crate) use self::system_modules_helpers::{
     build_admin_keys_grouped_by_format_payload, build_public_auth_modules_status_payload,
@@ -21,9 +22,11 @@ pub(crate) use self::system_modules_helpers::{
     serialize_public_capability, supported_capability_names, PUBLIC_CAPABILITY_DEFINITIONS,
 };
 
+#[cfg(test)]
+pub(crate) use self::support::filter_eligible_model_rows;
 pub(crate) use self::support::{
     build_api_key_install_session_response, build_proxy_node_install_session_response,
     build_unhandled_public_support_response, matches_model_mapping_for_models,
     maybe_build_local_admin_announcements_response, maybe_build_local_public_support_response,
-    CreateApiKeyInstallSessionRequest,
+    vscodex_ws_proxy, CreateApiKeyInstallSessionRequest,
 };

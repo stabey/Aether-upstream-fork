@@ -2,7 +2,6 @@ use super::{
     any, build_router_with_state, build_state_with_execution_runtime_override, json, start_server,
     to_bytes, Arc, Body, Json, Mutex, Request, Router, StatusCode, TRACE_ID_HEADER,
 };
-use crate::ai_serving::CODEX_OPENAI_IMAGE_INTERNAL_MODEL;
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::auth::{
     InMemoryAuthApiKeySnapshotRepository, StoredAuthApiKeySnapshot,
@@ -43,8 +42,15 @@ where
     }
 }
 
-#[tokio::test]
-async fn gateway_converts_openai_image_sync_to_gemini_image_provider() {
+#[test]
+fn gateway_converts_openai_image_sync_to_gemini_image_provider() {
+    run_image_sync_test(
+        "gateway_converts_openai_image_sync_to_gemini_image_provider",
+        gateway_converts_openai_image_sync_to_gemini_image_provider_impl,
+    );
+}
+
+async fn gateway_converts_openai_image_sync_to_gemini_image_provider_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -123,6 +129,7 @@ async fn gateway_converts_openai_image_sync_to_gemini_image_provider() {
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -404,10 +411,11 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
         url: String,
         authorization: String,
         model: String,
-        action: String,
         prompt: String,
-        image_url: String,
+        images: serde_json::Value,
+        has_legacy_image_field: bool,
         request_stream: bool,
+        body_stream: Option<bool>,
     }
 
     fn hash_api_key(value: &str) -> String {
@@ -475,6 +483,7 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
                 priority: 1,
                 api_formats: Some(vec!["openai:image".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -567,12 +576,6 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
                     .and_then(|value| value.get("json_body"))
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                let content = body_json
-                    .get("input")
-                    .and_then(|value| value.get(0))
-                    .and_then(|value| value.get("content"))
-                    .cloned()
-                    .unwrap_or_else(|| json!([]));
                 *seen_execution_runtime_inner
                     .lock()
                     .expect("mutex should lock") = Some(SeenExecutionRuntimeSyncRequest {
@@ -598,39 +601,18 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    action: body_json
-                        .get("tools")
-                        .and_then(|value| value.get(0))
-                        .and_then(|value| value.get("action"))
+                    prompt: body_json
+                        .get("prompt")
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    prompt: content
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .find(|item| {
-                            item.get("type").and_then(|value| value.as_str()) == Some("input_text")
-                        })
-                        .and_then(|item| item.get("text"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    image_url: content
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .find(|item| {
-                            item.get("type").and_then(|value| value.as_str()) == Some("input_image")
-                        })
-                        .and_then(|item| item.get("image_url"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    request_stream: body_json
+                    images: body_json.get("images").cloned().unwrap_or_default(),
+                    has_legacy_image_field: body_json.get("image").is_some(),
+                    request_stream: payload
                         .get("stream")
                         .and_then(|value| value.as_bool())
                         .unwrap_or(true),
+                    body_stream: body_json.get("stream").and_then(serde_json::Value::as_bool),
                 });
                 Json(json!({
                     "request_id": "trace-gemini-image-to-openai-123",
@@ -640,21 +622,16 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
                     },
                     "body": {
                         "json_body": {
-                            "id": "resp_img_bridge_123",
-                            "object": "response",
+                            "created": 1776839946,
                             "model": "gpt-image-2-upstream",
-                            "status": "completed",
                             "usage": {
                                 "input_tokens": 3,
                                 "output_tokens": 4,
                                 "total_tokens": 7
                             },
-                            "output": [{
-                                "type": "image_generation_call",
-                                "status": "completed",
-                                "output_format": "png",
+                            "data": [{
                                 "revised_prompt": "converted gemini prompt",
-                                "result": "aGVsbG8="
+                                "b64_json": "aGVsbG8="
                             }]
                         }
                     },
@@ -743,46 +720,45 @@ async fn gateway_converts_gemini_image_sync_to_openai_image_provider_impl() {
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://api.openai.com/v1/images/generations"
+        "https://api.openai.com/v1/images/edits"
     );
     assert_eq!(
         seen_execution_runtime_request.authorization,
         "Bearer sk-upstream-openai-image"
     );
     assert_eq!(seen_execution_runtime_request.model, "gpt-image-2-upstream");
-    assert_eq!(seen_execution_runtime_request.action, "edit");
     assert_eq!(
         seen_execution_runtime_request.prompt,
         "Change the background"
     );
     assert_eq!(
-        seen_execution_runtime_request.image_url,
-        "data:image/png;base64,aGVsbG8="
+        seen_execution_runtime_request.images,
+        json!([{"image_url": "data:image/png;base64,aGVsbG8="}])
     );
+    assert!(!seen_execution_runtime_request.has_legacy_image_field);
     assert!(!seen_execution_runtime_request.request_stream);
+    assert_eq!(seen_execution_runtime_request.body_stream, None);
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh() {
+#[test]
+fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh() {
+    run_image_sync_test(
+        "gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh",
+        gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh_impl,
+    );
+}
+
+async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_refresh_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
         url: String,
-        model: String,
         authorization: String,
-        x_client_request_id: String,
-        prompt: String,
-        content_is_string: bool,
-        tool_type: String,
-        tool_size: String,
-        tool_quality: String,
-        tool_background: String,
-        tool_choice_type: String,
-        tool_has_n: bool,
-        request_stream: bool,
+        headers: serde_json::Value,
+        body: serde_json::Value,
         plan_stream: bool,
     }
 
@@ -857,6 +833,7 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
                 priority: 1,
                 api_formats: Some(vec!["openai:image".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -997,98 +974,18 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    model: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("model"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
                     authorization: payload
                         .get("headers")
                         .and_then(|value| value.get("authorization"))
                         .and_then(|value| value.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    x_client_request_id: payload
-                        .get("headers")
-                        .and_then(|value| value.get("x-client-request-id"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    prompt: payload
+                    headers: payload.get("headers").cloned().unwrap_or_default(),
+                    body: payload
                         .get("body")
                         .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("input"))
-                        .and_then(|value| value.get(0))
-                        .and_then(|value| value.get("content"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    content_is_string: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("input"))
-                        .and_then(|value| value.get(0))
-                        .and_then(|value| value.get("content"))
-                        .is_some_and(|value| value.is_string()),
-                    tool_type: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("tools"))
-                        .and_then(|value| value.get(0))
-                        .and_then(|value| value.get("type"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    tool_size: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("tools"))
-                        .and_then(|value| value.get(0))
-                        .and_then(|value| value.get("size"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    tool_quality: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("tools"))
-                        .and_then(|value| value.get(0))
-                        .and_then(|value| value.get("quality"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    tool_background: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("tools"))
-                        .and_then(|value| value.get(0))
-                        .and_then(|value| value.get("background"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    tool_choice_type: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("tool_choice"))
-                        .and_then(|value| value.get("type"))
-                        .and_then(|value| value.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    tool_has_n: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("tools"))
-                        .and_then(|value| value.get(0))
-                        .and_then(|value| value.as_object())
-                        .is_some_and(|object| object.contains_key("n")),
-                    request_stream: payload
-                        .get("body")
-                        .and_then(|value| value.get("json_body"))
-                        .and_then(|value| value.get("stream"))
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false),
+                        .cloned()
+                        .unwrap_or_default(),
                     plan_stream: payload
                         .get("stream")
                         .and_then(|value| value.as_bool())
@@ -1098,20 +995,11 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
                     "request_id": "trace-codex-image-local-123",
                     "status_code": 200,
                     "headers": {
-                        "content-type": "text/event-stream"
+                        "content-type": "application/json"
                     },
                     "body": {
                         "body_bytes_b64": base64::engine::general_purpose::STANDARD.encode(
-                            concat!(
-                                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_img_123\",\"created_at\":1776839946}}\n\n",
-                                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ig_123\",\"type\":\"image_generation_call\",\"status\":\"generating\",\"output_format\":\"png\",\"quality\":\"medium\",\"size\":\"1024x1024\",\"revised_prompt\":\"中国历史视觉海报\",\"result\":\"aGVsbG8=\"}}\n\n",
-                                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_img_123\",\"object\":\"response\",\"model\":\"__CODEX_IMAGE_MODEL__\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2440,\"output_tokens\":184,\"total_tokens\":2624},\"tool_usage\":{\"image_gen\":{\"input_tokens\":171,\"input_tokens_details\":{\"image_tokens\":0,\"text_tokens\":171},\"output_tokens\":1372,\"output_tokens_details\":{\"image_tokens\":1372,\"text_tokens\":0},\"total_tokens\":1543}}}}\n\n",
-                                "data: [DONE]\n\n"
-                            )
-                            .replace(
-                                "__CODEX_IMAGE_MODEL__",
-                                CODEX_OPENAI_IMAGE_INTERNAL_MODEL,
-                            )
+                            r#"{"created":1776839946,"data":[{"b64_json":"aGVsbG8=","revised_prompt":"水墨视觉海报"}],"usage":{"input_tokens":171,"output_tokens":1372,"total_tokens":1543}}"#
                         )
                     },
                     "telemetry": {
@@ -1168,7 +1056,7 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
             format!("Bearer {client_api_key}"),
         )
         .header(TRACE_ID_HEADER, "trace-codex-image-local-123")
-        .body("{\"model\":\"gpt-image-2\",\"prompt\":\"生成一张中国历史视觉海报\",\"size\":\"1024x1024\",\"n\":1,\"response_format\":\"b64_json\"}")
+        .body("{\"model\":\"gpt-image-2\",\"prompt\":\"生成一张水墨视觉海报\",\"background\":\"auto\",\"quality\":\"auto\",\"size\":\"auto\",\"n\":1,\"response_format\":\"b64_json\"}")
         .send()
         .await
         .expect("request should succeed");
@@ -1177,10 +1065,7 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
     let response_json: serde_json::Value = response.json().await.expect("body should parse");
     assert_eq!(response_json["created"], 1776839946);
     assert_eq!(response_json["data"][0]["b64_json"], "aGVsbG8=");
-    assert_eq!(
-        response_json["data"][0]["revised_prompt"],
-        "中国历史视觉海报"
-    );
+    assert_eq!(response_json["data"][0]["revised_prompt"], "水墨视觉海报");
     assert_eq!(response_json["usage"]["input_tokens"], 171);
     assert_eq!(response_json["usage"]["output_tokens"], 1372);
 
@@ -1215,35 +1100,34 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
     );
     assert_eq!(
         seen_execution_runtime_request.url,
-        "https://chatgpt.com/backend-api/codex/responses"
-    );
-    assert_eq!(
-        seen_execution_runtime_request.model,
-        CODEX_OPENAI_IMAGE_INTERNAL_MODEL
+        "https://chatgpt.com/backend-api/codex/images/generations"
     );
     assert_eq!(
         seen_execution_runtime_request.authorization,
         "Bearer refreshed-codex-image-access-token"
     );
     assert_eq!(
-        seen_execution_runtime_request.x_client_request_id,
-        "trace-codex-image-local-123"
+        seen_execution_runtime_request.body,
+        json!({
+            "prompt": "生成一张水墨视觉海报",
+            "background": "auto",
+            "model": "gpt-image-2",
+            "n": 1,
+            "quality": "auto",
+            "size": "auto"
+        })
     );
     assert_eq!(
-        seen_execution_runtime_request.prompt,
-        "生成一张中国历史视觉海报"
+        seen_execution_runtime_request.headers["user-agent"],
+        "codex_cli_rs/0.144.1"
     );
-    assert!(seen_execution_runtime_request.content_is_string);
-    assert_eq!(seen_execution_runtime_request.tool_type, "image_generation");
-    assert_eq!(seen_execution_runtime_request.tool_size, "1024x1024");
-    assert_eq!(seen_execution_runtime_request.tool_quality, "high");
-    assert_eq!(seen_execution_runtime_request.tool_background, "auto");
     assert_eq!(
-        seen_execution_runtime_request.tool_choice_type,
-        "image_generation"
+        seen_execution_runtime_request.headers["originator"],
+        "codex_cli_rs"
     );
-    assert!(!seen_execution_runtime_request.tool_has_n);
-    assert!(seen_execution_runtime_request.request_stream);
+    for header in ["x-client-request-id", "session-id", "thread-id"] {
+        assert!(seen_execution_runtime_request.headers.get(header).is_none());
+    }
     assert!(!seen_execution_runtime_request.plan_stream);
 
     let persisted_transport_state =
@@ -1271,8 +1155,15 @@ async fn gateway_executes_codex_image_sync_via_local_decision_gate_after_oauth_r
     refresh_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url() {
+#[test]
+fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url() {
+    run_image_sync_test(
+        "gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url",
+        gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url_impl,
+    );
+}
+
+async fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeSyncRequest {
         trace_id: String,
@@ -1352,6 +1243,7 @@ async fn gateway_plans_chatgpt_web_image_sync_with_internal_web_executor_url() {
                 priority: 1,
                 api_formats: Some(vec!["openai:image".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,

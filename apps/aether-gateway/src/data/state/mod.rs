@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::RwLock;
 
 use super::auth::GatewayAuthApiKeySnapshot;
@@ -11,6 +13,7 @@ use crate::provider_transport::{
     read_provider_transport_snapshot, GatewayProviderTransportSnapshot,
 };
 use crate::video_tasks::LocalVideoTaskReadResponse;
+use aether_cache::ExpiringMap;
 use aether_data::repository::announcements::{
     AnnouncementListQuery, AnnouncementReadRepository, AnnouncementWriteRepository,
     CreateAnnouncementRecord, StoredAnnouncement, StoredAnnouncementPage, UpdateAnnouncementRecord,
@@ -94,9 +97,9 @@ use aether_data_contracts::repository::billing::{
     UserPlanEntitlementRecord,
 };
 use aether_data_contracts::repository::candidate_selection::{
-    MinimalCandidateSelectionReadRepository, StoredMinimalCandidateSelectionRow,
-    StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
-    StoredRequestedModelCandidateRowsQuery,
+    MinimalCandidateSelectionReadRepository, StoredApiFormatCandidateRowsQuery,
+    StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateRowsByKeyIdsQuery,
+    StoredPoolKeyCandidateRowsQuery, StoredRequestedModelCandidateRowsQuery,
 };
 use aether_data_contracts::repository::candidates::{
     PublicHealthStatusCount, PublicHealthTimelineBucket, RequestCandidateReadRepository,
@@ -118,10 +121,13 @@ use aether_data_contracts::repository::pool_scores::{
     UpsertPoolMemberScore,
 };
 use aether_data_contracts::repository::provider_catalog::{
-    ProviderCatalogKeyListQuery, ProviderCatalogReadRepository, ProviderCatalogWriteRepository,
-    StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogKeyMaintenanceSummary, StoredProviderCatalogKeyPage,
-    StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
+    ProviderCatalogKeyAdaptiveStateUpdate, ProviderCatalogKeyAdminCasUpdate,
+    ProviderCatalogKeyHealthStateUpdate, ProviderCatalogKeyListQuery,
+    ProviderCatalogKeyOAuthCredentialCasDelete, ProviderCatalogKeyOAuthRuntimeStateCasUpdate,
+    ProviderCatalogKeyRuntimeMetadataUpdate, ProviderCatalogKeyStatusSnapshotUpdate,
+    ProviderCatalogReadRepository, ProviderCatalogWriteRepository, StoredProviderCatalogEndpoint,
+    StoredProviderCatalogKey, StoredProviderCatalogKeyMaintenanceSummary,
+    StoredProviderCatalogKeyPage, StoredProviderCatalogKeyStats, StoredProviderCatalogProvider,
 };
 use aether_data_contracts::repository::quota::{
     ProviderQuotaReadRepository, ProviderQuotaWriteRepository, StoredProviderQuotaSnapshot,
@@ -194,6 +200,58 @@ pub(crate) struct GatewayDataState {
     wallet_writer: Option<Arc<dyn WalletWriteRepository>>,
     settlement_writer: Option<Arc<dyn SettlementWriteRepository>>,
     system_config_values: Option<Arc<RwLock<BTreeMap<String, StoredSystemConfigEntry>>>>,
+    system_config_value_cache: Arc<SystemConfigValueCacheState>,
+    billing_model_context_cache: Arc<BillingModelContextCacheState>,
+}
+
+pub(super) struct SystemConfigValueCacheState {
+    pub(super) entries: ExpiringMap<String, Option<serde_json::Value>>,
+    pub(super) inflight: std::sync::Mutex<HashMap<String, Arc<SystemConfigValueInflightState>>>,
+    pub(super) mutation: std::sync::Mutex<()>,
+    pub(super) admission: Arc<tokio::sync::Semaphore>,
+}
+
+pub(super) struct SystemConfigValueInflightState {
+    pub(super) notify: Arc<tokio::sync::Notify>,
+    pub(super) completion: OnceLock<SystemConfigValueInflightCompletion>,
+}
+
+#[derive(Clone)]
+pub(super) enum SystemConfigValueInflightCompletion {
+    Loaded,
+    Failed(DataLayerError),
+    Cancelled,
+    Invalidated,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) enum BillingModelContextCacheKey {
+    ByModelId {
+        provider_id: String,
+        provider_api_key_id: Option<String>,
+        model_id: String,
+    },
+    ByGlobalModelName {
+        provider_id: String,
+        provider_api_key_id: Option<String>,
+        global_model_name: String,
+    },
+}
+
+pub(super) struct BillingModelContextCacheState {
+    pub(super) entries: ExpiringMap<BillingModelContextCacheKey, Option<StoredBillingModelContext>>,
+    pub(super) inflight: std::sync::Mutex<
+        HashMap<BillingModelContextCacheKey, Arc<BillingModelContextInflightState>>,
+    >,
+    pub(super) epoch: std::sync::atomic::AtomicU64,
+    pub(super) mutation: std::sync::Mutex<()>,
+    pub(super) admission: Arc<tokio::sync::Semaphore>,
+}
+
+pub(super) struct BillingModelContextInflightState {
+    pub(super) epoch: u64,
+    pub(super) completion: std::sync::OnceLock<Result<(), DataLayerError>>,
+    pub(super) notify: tokio::sync::Notify,
 }
 
 impl fmt::Debug for GatewayDataState {
@@ -318,6 +376,7 @@ impl fmt::Debug for GatewayDataState {
 }
 
 mod auth;
+mod auth_api_key_cache;
 mod candidate_cache;
 mod catalog;
 mod core;
@@ -326,7 +385,11 @@ mod models;
 mod pool_scores;
 mod provider_catalog_cache;
 mod referrals;
+mod request_candidate_cache;
+mod routing_group_cache;
 mod routing_profiles;
 mod runtime;
 #[cfg(test)]
 mod testing;
+#[cfg(feature = "testkit")]
+pub(crate) mod testkit;

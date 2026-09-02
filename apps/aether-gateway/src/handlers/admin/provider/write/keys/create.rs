@@ -1,8 +1,9 @@
+use crate::handlers::admin::provider::oauth::provisioning::rotate_codex_credential_generation;
 use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyCreateRequest;
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-    normalize_max_probe_interval_minutes, validate_vertex_api_formats,
+    normalize_max_probe_interval_minutes, normalize_rate_multipliers, validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -51,6 +52,16 @@ pub(crate) async fn build_admin_create_provider_key_record(
         .as_ref()
         .and_then(serde_json::Value::as_object)
         .cloned();
+
+    if auth_config
+        .as_ref()
+        .is_some_and(aether_provider_transport::is_codex_agent_identity_auth_config_value)
+    {
+        return Err(
+            "Agent Identity 凭据必须通过专属创建或导入接口管理，不能通过通用 Key 接口写入"
+                .to_string(),
+        );
+    }
 
     match auth_type.as_str() {
         "service_account" if auth_config_object.is_none() => {
@@ -165,7 +176,7 @@ pub(crate) async fn build_admin_create_provider_key_record(
         },
         encrypted_api_key,
         encrypted_auth_config,
-        normalize_api_format_json_object_keys(payload.rate_multipliers, "rate_multipliers")?,
+        normalize_rate_multipliers(payload.rate_multipliers)?,
         None,
         normalize_string_list(payload.allowed_models).map(|value| json!(value)),
         None,
@@ -206,6 +217,7 @@ pub(crate) async fn build_admin_create_provider_key_record(
     )?;
     key.created_at_unix_ms = Some(now_unix_secs);
     key.updated_at_unix_secs = Some(now_unix_secs);
+    rotate_codex_credential_generation(&mut key, &provider.provider_type);
     Ok(key)
 }
 
