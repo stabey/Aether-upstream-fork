@@ -480,6 +480,16 @@ impl AppState {
             .map_err(|err| GatewayError::Internal(err.to_string()))
     }
 
+    pub(crate) async fn list_provider_catalog_keys_by_ids_strong(
+        &self,
+        key_ids: &[String],
+    ) -> Result<Vec<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
+        self.data
+            .list_provider_catalog_keys_by_ids_strong(key_ids)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))
+    }
+
     pub(crate) async fn list_provider_catalog_key_page(
         &self,
         query: &provider_catalog::ProviderCatalogKeyListQuery,
@@ -662,16 +672,107 @@ impl AppState {
         Ok(updated)
     }
 
-    pub(crate) async fn update_provider_catalog_key_runtime_state(
+    pub(crate) async fn compare_and_update_provider_catalog_key_admin_state(
         &self,
-        key: &provider_catalog::StoredProviderCatalogKey,
-    ) -> Result<Option<provider_catalog::StoredProviderCatalogKey>, GatewayError> {
+        update: &provider_catalog::ProviderCatalogKeyAdminCasUpdate,
+    ) -> Result<bool, GatewayError> {
         let updated = self
             .data
-            .update_provider_catalog_key(key)
+            .compare_and_update_provider_catalog_key_admin_state(update)
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
-        if updated.is_some() {
+        // A conflict means another instance changed credentials. Invalidate on
+        // both outcomes before the caller reloads or reports the conflict.
+        self.invalidate_provider_routing_caches();
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_keys(
+        &self,
+        keys: &[provider_catalog::StoredProviderCatalogKey],
+    ) -> Result<Option<Vec<provider_catalog::StoredProviderCatalogKey>>, GatewayError> {
+        let updated = self
+            .data
+            .update_provider_catalog_keys(keys)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated.as_ref().is_some_and(|keys| !keys.is_empty()) {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_update_provider_catalog_key_adaptive_state(
+        &self,
+        update: &provider_catalog::ProviderCatalogKeyAdaptiveStateUpdate,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .compare_and_update_provider_catalog_key_adaptive_state(update)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        // A CAS conflict means a remote writer changed state, so local runtime reads
+        // must be refreshed even though this instance did not update the row.
+        self.invalidate_provider_runtime_state_caches();
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_runtime_metadata(
+        &self,
+        update: &provider_catalog::ProviderCatalogKeyRuntimeMetadataUpdate,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .update_provider_catalog_key_runtime_metadata(update)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        // A false result is a namespace CAS conflict.  Invalidate the runtime
+        // snapshots before the caller reloads and retries. Upstream metadata is
+        // part of the transport snapshot, unlike health/adaptive state.
+        self.invalidate_provider_transport_runtime_state_caches();
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_status_snapshot(
+        &self,
+        update: &provider_catalog::ProviderCatalogKeyStatusSnapshotUpdate,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .update_provider_catalog_key_status_snapshot(update)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated {
+            self.invalidate_provider_runtime_state_caches();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn compare_and_update_provider_catalog_key_health_state(
+        &self,
+        update: &provider_catalog::ProviderCatalogKeyHealthStateUpdate,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .compare_and_update_provider_catalog_key_health_state(update)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        // On conflict another Gateway changed the health snapshot; invalidate all
+        // health-sensitive caches before the retry reads it back.
+        self.invalidate_provider_health_routing_caches();
+        Ok(updated)
+    }
+
+    pub(crate) async fn reset_provider_catalog_key_error_count(
+        &self,
+        key_id: &str,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .reset_provider_catalog_key_error_count(key_id)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated {
             self.invalidate_provider_health_routing_caches();
         }
         Ok(updated)
@@ -688,6 +789,79 @@ impl AppState {
             .update_provider_catalog_key_upstream_metadata(
                 key_id,
                 upstream_metadata,
+                updated_at_unix_secs,
+            )
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn upsert_provider_catalog_key_upstream_metadata_namespace(
+        &self,
+        key_id: &str,
+        namespace: &str,
+        value: &serde_json::Value,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .upsert_provider_catalog_key_upstream_metadata_namespace(
+                key_id,
+                namespace,
+                value,
+                updated_at_unix_secs,
+            )
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_model_fetch_state(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: Option<u64>,
+        last_models_fetch_error: Option<&str>,
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .update_provider_catalog_key_model_fetch_state(
+                key_id,
+                allowed_models,
+                last_models_fetch_at_unix_secs,
+                last_models_fetch_error,
+                updated_at_unix_secs,
+            )
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if updated {
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(updated)
+    }
+
+    pub(crate) async fn update_provider_catalog_key_model_fetch_success(
+        &self,
+        key_id: &str,
+        allowed_models: Option<&serde_json::Value>,
+        last_models_fetch_at_unix_secs: u64,
+        upstream_metadata_updates: &[provider_catalog::ProviderCatalogUpstreamMetadataNamespaceUpdate],
+        updated_at_unix_secs: Option<u64>,
+    ) -> Result<bool, GatewayError> {
+        let updated = self
+            .data
+            .update_provider_catalog_key_model_fetch_success(
+                key_id,
+                allowed_models,
+                last_models_fetch_at_unix_secs,
+                upstream_metadata_updates,
                 updated_at_unix_secs,
             )
             .await
@@ -739,6 +913,38 @@ impl AppState {
         Ok(deleted)
     }
 
+    pub(crate) async fn compare_and_delete_provider_catalog_key_oauth_credential(
+        &self,
+        delete: &provider_catalog::ProviderCatalogKeyOAuthCredentialCasDelete,
+    ) -> Result<bool, GatewayError> {
+        let deleted = self
+            .data
+            .compare_and_delete_provider_catalog_key_oauth_credential(delete)
+            .await
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if deleted {
+            if let Err(err) = self
+                .data
+                .delete_pool_member_scores_for_member(
+                    &pool_scores::PoolMemberIdentity::provider_api_key(
+                        delete.expected_credential.provider_id.clone(),
+                        delete.key_id.clone(),
+                    ),
+                )
+                .await
+            {
+                warn!(
+                    provider_id = %delete.expected_credential.provider_id,
+                    key_id = %delete.key_id,
+                    error = ?err,
+                    "gateway provider catalog OAuth credential CAS delete: failed to delete pool member scores"
+                );
+            }
+            self.invalidate_provider_routing_caches();
+        }
+        Ok(deleted)
+    }
+
     pub(crate) async fn clear_provider_catalog_key_oauth_invalid_marker(
         &self,
         key_id: &str,
@@ -763,9 +969,34 @@ impl AppState {
             .ok()
             .map(|duration| duration.as_secs());
 
-        self.update_provider_catalog_key(&key)
+        let cleared = self
+            .data
+            .clear_provider_catalog_key_oauth_invalid_marker(key_id)
             .await
-            .map(|updated| updated.is_some())
+            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+        if !cleared {
+            return Ok(false);
+        }
+        // The marker write already committed. Invalidate before any follow-up
+        // status patch so error/false paths cannot retain an invalid transport.
+        self.invalidate_provider_transport_runtime_state_caches();
+        let oauth = key
+            .status_snapshot
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .and_then(|snapshot| snapshot.get("oauth"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let updated = self
+            .update_provider_catalog_key_status_snapshot(
+                &provider_catalog::ProviderCatalogKeyStatusSnapshotUpdate {
+                    key_id: key_id.to_string(),
+                    status_snapshot_patch: serde_json::json!({"oauth":oauth}),
+                    updated_at_unix_secs: key.updated_at_unix_secs,
+                },
+            )
+            .await?;
+        Ok(updated)
     }
 
     pub(crate) fn put_provider_delete_task(&self, task: LocalProviderDeleteTaskState) {
@@ -887,7 +1118,10 @@ impl AppState {
             .await
             .map_err(|err| GatewayError::Internal(err.to_string()))?;
         if updated {
-            self.invalidate_provider_health_routing_caches();
+            // This administrator-facing API also writes `is_active`, which is
+            // part of the transport snapshot. Runtime health CAS updates use the
+            // separate compare-and-update API above and keep transport cached.
+            self.invalidate_provider_routing_caches();
         }
         Ok(updated)
     }
@@ -920,7 +1154,8 @@ mod tests {
     };
     use async_trait::async_trait;
 
-    use crate::cache::SchedulerAffinityTarget;
+    use crate::cache::{CandidatePageCacheKey, SchedulerAffinityTarget};
+    use crate::data::auth::GatewayAuthApiKeySnapshot;
     use crate::data::GatewayDataState;
     use crate::AppState;
 
@@ -967,6 +1202,35 @@ mod tests {
             true,
         )
         .expect("key should build")
+    }
+
+    fn sample_auth_snapshot() -> GatewayAuthApiKeySnapshot {
+        GatewayAuthApiKeySnapshot {
+            user_id: "user-1".to_string(),
+            username: "alice".to_string(),
+            email: None,
+            user_role: "user".to_string(),
+            user_auth_source: "local".to_string(),
+            user_is_active: true,
+            user_is_deleted: false,
+            user_rate_limit: None,
+            user_allowed_providers: None,
+            user_allowed_api_formats: None,
+            user_allowed_models: None,
+            api_key_id: "api-key-1".to_string(),
+            api_key_name: Some("default".to_string()),
+            api_key_is_active: true,
+            api_key_is_locked: false,
+            api_key_is_standalone: false,
+            api_key_rate_limit: None,
+            api_key_concurrent_limit: None,
+            api_key_expires_at_unix_secs: None,
+            api_key_allowed_providers: None,
+            api_key_allowed_api_formats: None,
+            api_key_allowed_models: None,
+            api_key_ip_rules: None,
+            currently_usable: true,
+        }
     }
 
     fn sample_admin_global_model() -> StoredAdminGlobalModel {
@@ -1219,7 +1483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_catalog_health_update_keeps_scheduler_affinity_cache() {
+    async fn provider_catalog_runtime_health_update_keeps_scheduler_affinity_and_transport_cache() {
         let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
             vec![sample_provider()],
             vec![sample_endpoint()],
@@ -1231,6 +1495,12 @@ mod tests {
                 GatewayDataState::with_provider_catalog_repository_for_tests(repository)
                     .with_encryption_key_for_tests("test-encryption-key"),
             );
+
+        let transport_before = state
+            .read_provider_transport_snapshot_arc("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("provider transport should read")
+            .expect("provider transport should exist");
 
         let cache_key = "scheduler_affinity:api-key-1:openai:chat:gpt-5";
         let ttl = Duration::from_secs(300);
@@ -1249,7 +1519,16 @@ mod tests {
             }
         });
         let updated = state
-            .update_provider_catalog_key_health_state("key-1", true, Some(&health_by_format), None)
+            .compare_and_update_provider_catalog_key_health_state(
+                &aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyHealthStateUpdate {
+                    key_id: "key-1".to_string(),
+                    expected_encrypted_auth_config: None,
+                    expected_health_by_format: None,
+                    expected_circuit_breaker_by_format: None,
+                    health_by_format: Some(health_by_format),
+                    circuit_breaker_by_format: None,
+                },
+            )
             .await
             .expect("key health update should succeed");
 
@@ -1259,5 +1538,150 @@ mod tests {
             state.read_scheduler_affinity_target(cache_key, ttl),
             Some(target)
         );
+        let transport_after = state
+            .read_provider_transport_snapshot_arc("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("provider transport should read after health update")
+            .expect("provider transport should still exist");
+        assert!(
+            Arc::ptr_eq(&transport_before, &transport_after),
+            "health-only writes must not invalidate transport configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_admin_health_update_invalidates_transport_when_active_changes() {
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            vec![sample_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+
+        let transport_before = state
+            .read_provider_transport_snapshot_arc("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("provider transport should read")
+            .expect("provider transport should exist");
+        assert!(transport_before.key.is_active);
+
+        assert!(state
+            .update_provider_catalog_key_health_state("key-1", false, None, None)
+            .await
+            .expect("administrator health update should succeed"));
+
+        let transport_after = state
+            .read_provider_transport_snapshot_arc("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("provider transport should read after active update")
+            .expect("provider transport should still exist");
+        assert!(!transport_after.key.is_active);
+        assert!(!Arc::ptr_eq(&transport_before, &transport_after));
+    }
+
+    #[tokio::test]
+    async fn clearing_oauth_invalid_marker_invalidates_transport_snapshot() {
+        let mut key = sample_key();
+        key.auth_type = "oauth".to_string();
+        key.oauth_invalid_at_unix_secs = Some(1_700_000_000);
+        key.oauth_invalid_reason = Some("[REFRESH_FAILED] stale token".to_string());
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            vec![key],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+
+        let transport_before = state
+            .read_provider_transport_snapshot_arc("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("provider transport should read")
+            .expect("provider transport should exist");
+
+        assert!(state
+            .clear_provider_catalog_key_oauth_invalid_marker("key-1")
+            .await
+            .expect("OAuth invalid marker should clear"));
+
+        let transport_after = state
+            .read_provider_transport_snapshot_arc("provider-1", "endpoint-1", "key-1")
+            .await
+            .expect("provider transport should reload")
+            .expect("provider transport should exist");
+        let persisted = state
+            .read_provider_catalog_keys_by_ids(&["key-1".to_string()])
+            .await
+            .expect("provider key should reload")
+            .into_iter()
+            .next()
+            .expect("provider key should exist");
+        assert!(persisted.oauth_invalid_at_unix_secs.is_none());
+        assert!(persisted.oauth_invalid_reason.is_none());
+        assert!(!Arc::ptr_eq(&transport_before, &transport_after));
+    }
+
+    #[tokio::test]
+    async fn provider_catalog_runtime_state_update_keeps_candidate_page_cache() {
+        let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            vec![sample_provider()],
+            vec![sample_endpoint()],
+            vec![sample_key()],
+        ));
+        let state = AppState::new()
+            .expect("app state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                    .with_encryption_key_for_tests("test-encryption-key"),
+            );
+
+        let ttl = Duration::from_secs(300);
+        let cache_key = CandidatePageCacheKey::new(
+            "gpt-5",
+            None,
+            "openai:chat",
+            true,
+            &sample_auth_snapshot(),
+            None,
+            None,
+            None,
+            state.scheduler_affinity_epoch(),
+            "fixed_order",
+            true,
+            None,
+            "",
+        );
+        state.candidate_page_cache.insert(
+            cache_key.clone(),
+            Some(Arc::new(crate::cache::CandidatePageSnapshot {
+                candidates: Vec::new(),
+                skipped_candidates: Vec::new(),
+            })),
+            ttl,
+        );
+        assert!(state.candidate_page_cache.get(&cache_key, ttl).is_some());
+
+        let updated = state
+            .update_provider_catalog_key_status_snapshot(
+                &aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyStatusSnapshotUpdate {
+                    key_id: "key-1".to_string(),
+                    status_snapshot_patch: serde_json::json!({"source": "runtime"}),
+                    updated_at_unix_secs: None,
+                },
+            )
+            .await
+            .expect("runtime state update should succeed");
+
+        assert!(updated);
+        assert!(state.candidate_page_cache.get(&cache_key, ttl).is_some());
     }
 }

@@ -58,7 +58,9 @@ pub(super) async fn resolve_local_openai_image_decision_input(
         state,
         auth_context,
         Some(requested_model.as_str()),
+        decision.auth_endpoint_signature.as_deref(),
         None,
+        &decision.model_directive_policy,
     )
     .await
     {
@@ -124,6 +126,10 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
                 matches_client_format.then_some(&input.auth_snapshot),
                 input.client_session_affinity.as_ref(),
                 current_unix_secs(),
+                false,
+                crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                    input.routing_policy.as_ref(),
+                ),
             )
             .await
         {
@@ -144,8 +150,8 @@ pub(super) async fn list_local_openai_image_candidate_attempts(
                 auth_snapshot_allows_cross_format_candidate(
                     &input.auth_snapshot,
                     &input.requested_model,
+                    None,
                     candidate,
-                    false,
                 )
             });
         }
@@ -197,6 +203,10 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
                 matches_client_format.then_some(&input.auth_snapshot),
                 input.client_session_affinity.as_ref(),
                 current_unix_secs(),
+                false,
+                crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                    input.routing_policy.as_ref(),
+                ),
             )
             .await
         {
@@ -206,16 +216,16 @@ pub(super) async fn build_local_openai_image_candidate_attempt_source<'a>(
                         auth_snapshot_allows_cross_format_candidate(
                             &input.auth_snapshot,
                             &input.requested_model,
+                            None,
                             candidate,
-                            false,
                         )
                     });
                     format_skipped.retain(|candidate| {
                         auth_snapshot_allows_cross_format_candidate(
                             &input.auth_snapshot,
                             &input.requested_model,
+                            None,
                             &candidate.candidate,
-                            false,
                         )
                     });
                 }

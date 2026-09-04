@@ -29,6 +29,30 @@ use crate::constants::{
 };
 use crate::data::GatewayDataState;
 
+const PROVIDER_QUERY_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_provider_query_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(PROVIDER_QUERY_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("provider query test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xffff_ffffu32;
     for &byte in data {
@@ -122,8 +146,15 @@ async fn assert_admin_provider_query_route(
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key() {
+#[test]
+fn gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key",
+        gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key_impl() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -244,8 +275,15 @@ async fn gateway_handles_admin_provider_query_models_fetches_upstream_for_select
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_models_fetches_windsurf_model_configs() {
+#[test]
+fn gateway_handles_admin_provider_query_models_fetches_windsurf_model_configs() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_models_fetches_windsurf_model_configs",
+        gateway_handles_admin_provider_query_models_fetches_windsurf_model_configs_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_fetches_windsurf_model_configs_impl() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -382,8 +420,15 @@ async fn gateway_handles_admin_provider_query_models_fetches_windsurf_model_conf
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_models_with_openai_responses_endpoint() {
+#[test]
+fn gateway_handles_admin_provider_query_models_with_openai_responses_endpoint() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_models_with_openai_responses_endpoint",
+        gateway_handles_admin_provider_query_models_with_openai_responses_endpoint_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_with_openai_responses_endpoint_impl() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -492,8 +537,168 @@ async fn gateway_handles_admin_provider_query_models_with_openai_responses_endpo
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_when_token_invalidated(
+#[test]
+fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache() {
+    run_provider_query_test(
+        "gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache",
+        gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl,
+    );
+}
+
+async fn gateway_recovers_codex_slug_only_models_from_an_empty_legacy_cache_impl() {
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                *execution_runtime_hits_inner
+                    .lock()
+                    .expect("mutex should lock") += 1;
+                assert_eq!(
+                    plan.url,
+                    "https://chatgpt.com/backend-api/codex/models?client_version=0.144.1"
+                );
+                assert_eq!(plan.provider_api_format, "openai:responses");
+                Json(json!({
+                    "request_id": "req-provider-query-codex-slug-only",
+                    "status_code": 200,
+                    "headers": {
+                        "content-type": "application/json"
+                    },
+                    "body": {
+                        "json_body": {
+                            "models": [{
+                                "slug": "gpt-future-dynamic",
+                                "display_name": "Future Dynamic",
+                                "description": "A model unknown to this Aether build",
+                                "model_messages": {
+                                    "instructions_template": "Follow the dynamic instructions."
+                                },
+                                "api_format": "opaque-upstream-protocol",
+                                "future_capability": {
+                                    "opaque": true,
+                                    "schema_version": 7
+                                }
+                            }]
+                        }
+                    }
+                }))
+            }
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-codex-dynamic", "Codex Dynamic", 10);
+    provider.provider_type = "codex".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-codex-dynamic",
+            "provider-codex-dynamic",
+            "openai:responses",
+            "https://chatgpt.com/backend-api/codex",
+        )],
+        vec![sample_key(
+            "key-codex-dynamic",
+            "provider-codex-dynamic",
+            "openai:responses",
+            "codex-dynamic-token",
+        )],
+    ));
+
+    let state = build_state_with_execution_runtime_override(execution_runtime_url)
+        .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
+            provider_catalog_repository,
+            DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+        ));
+    state
+        .runtime_state()
+        .kv_set(
+            "upstream_models:provider-codex-dynamic:key-codex-dynamic",
+            "[]".to_string(),
+            None,
+        )
+        .await
+        .expect("empty legacy cache should seed");
+    let cache_state = state.clone();
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    for (request_index, expected_from_cache) in [(0usize, false), (1usize, true)] {
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_url}/api/admin/provider-query/models"))
+            .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&json!({
+                "provider_id": "provider-codex-dynamic",
+                "api_key_id": "key-codex-dynamic"
+            }))
+            .send()
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload: serde_json::Value = response.json().await.expect("json body should parse");
+        assert_eq!(payload["success"], json!(true));
+        assert_eq!(payload["data"]["error"], serde_json::Value::Null);
+        assert_eq!(
+            payload["data"]["from_cache"],
+            json!(expected_from_cache),
+            "request {request_index} cache status"
+        );
+        assert_eq!(
+            payload["data"]["models"][0]["id"],
+            json!("gpt-future-dynamic")
+        );
+        assert_eq!(
+            payload["data"]["models"][0]["api_formats"],
+            json!(["openai:responses"])
+        );
+        assert_eq!(
+            payload["data"]["models"][0]["api_format"],
+            json!("opaque-upstream-protocol")
+        );
+        assert_eq!(
+            payload["data"]["models"][0]["model_messages"]["instructions_template"],
+            json!("Follow the dynamic instructions.")
+        );
+        assert_eq!(
+            payload["data"]["models"][0]["future_capability"],
+            json!({"opaque": true, "schema_version": 7})
+        );
+        assert_eq!(
+            *execution_runtime_hits.lock().expect("mutex should lock"),
+            1,
+            "request {request_index} must not cause another upstream fetch"
+        );
+        if request_index == 0 {
+            <AppState as crate::model_fetch::ModelFetchRuntimeState>::write_upstream_models_cache(
+                &cache_state,
+                "provider-codex-dynamic",
+                "key-codex-dynamic",
+                &[],
+            )
+            .await;
+        }
+    }
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_when_token_invalidated() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_when_token_invalidated",
+        gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_when_token_invalidated_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_when_token_invalidated_impl(
 ) {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
@@ -507,7 +712,7 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
                     .expect("mutex should lock") += 1;
                 assert_eq!(
                     plan.url,
-                    "https://chatgpt.com/backend-api/codex/models?client_version=0.128.0-alpha.1"
+                    "https://chatgpt.com/backend-api/codex/models?client_version=0.144.1"
                 );
                 Json(json!({
                     "request_id": "req-provider-query-codex-invalidated",
@@ -573,6 +778,11 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["success"], json!(true));
     assert_eq!(payload["data"]["error"], serde_json::Value::Null);
+    let warning = payload["data"]["warning"]
+        .as_str()
+        .expect("Codex fallback warning should be present");
+    assert!(warning.contains("Codex 动态模型目录不可用"));
+    assert!(warning.contains("invalidated"));
     let model_ids = payload["data"]["models"]
         .as_array()
         .expect("models should be an array")
@@ -582,11 +792,14 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
     assert_eq!(
         model_ids,
         vec![
-            "gpt-5.3-codex",
-            "gpt-5.3-codex-spark",
+            "codex-auto-review",
+            "gpt-5.2",
             "gpt-5.4",
             "gpt-5.4-mini",
             "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
         ]
     );
     assert_eq!(
@@ -598,8 +811,15 @@ async fn gateway_handles_admin_provider_query_models_falls_back_to_codex_preset_
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_models_respecting_key_api_formats() {
+#[test]
+fn gateway_handles_admin_provider_query_models_respecting_key_api_formats() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_models_respecting_key_api_formats",
+        gateway_handles_admin_provider_query_models_respecting_key_api_formats_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_respecting_key_api_formats_impl() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -729,8 +949,15 @@ async fn gateway_handles_admin_provider_query_models_respecting_key_api_formats(
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_models_aggregating_active_keys() {
+#[test]
+fn gateway_handles_admin_provider_query_models_aggregating_active_keys() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_models_aggregating_active_keys",
+        gateway_handles_admin_provider_query_models_aggregating_active_keys_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_aggregating_active_keys_impl() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -871,8 +1098,15 @@ async fn gateway_handles_admin_provider_query_models_aggregating_active_keys() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_models_for_fixed_provider_without_endpoint() {
+#[test]
+fn gateway_handles_admin_provider_query_models_for_fixed_provider_without_endpoint() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_models_for_fixed_provider_without_endpoint",
+        gateway_handles_admin_provider_query_models_for_fixed_provider_without_endpoint_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_for_fixed_provider_without_endpoint_impl() {
     let execution_runtime_hits = Arc::new(Mutex::new(0usize));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -946,8 +1180,16 @@ async fn gateway_handles_admin_provider_query_models_for_fixed_provider_without_
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_test_model_locally_with_trusted_admin_principal() {
+#[test]
+fn gateway_handles_admin_provider_query_test_model_locally_with_trusted_admin_principal() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_test_model_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_query_test_model_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_test_model_locally_with_trusted_admin_principal_impl()
+{
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -1056,8 +1298,15 @@ async fn gateway_handles_admin_provider_query_test_model_locally_with_trusted_ad
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_embedding_model_test() {
+#[test]
+fn gateway_handles_admin_provider_query_embedding_model_test() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_embedding_model_test",
+        gateway_handles_admin_provider_query_embedding_model_test_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_embedding_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -1167,8 +1416,15 @@ async fn gateway_handles_admin_provider_query_embedding_model_test() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_doubao_text_embedding_model_test() {
+#[test]
+fn gateway_handles_admin_provider_query_doubao_text_embedding_model_test() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_doubao_text_embedding_model_test",
+        gateway_handles_admin_provider_query_doubao_text_embedding_model_test_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_doubao_text_embedding_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -1281,8 +1537,15 @@ async fn gateway_handles_admin_provider_query_doubao_text_embedding_model_test()
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_gemini_embedding_model_test() {
+#[test]
+fn gateway_handles_admin_provider_query_gemini_embedding_model_test() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_gemini_embedding_model_test",
+        gateway_handles_admin_provider_query_gemini_embedding_model_test_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_gemini_embedding_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -1396,8 +1659,15 @@ async fn gateway_handles_admin_provider_query_gemini_embedding_model_test() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_vertex_gemini_embedding_model_test() {
+#[test]
+fn gateway_handles_admin_provider_query_vertex_gemini_embedding_model_test() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_vertex_gemini_embedding_model_test",
+        gateway_handles_admin_provider_query_vertex_gemini_embedding_model_test_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_vertex_gemini_embedding_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -1536,8 +1806,15 @@ async fn gateway_handles_admin_provider_query_vertex_gemini_embedding_model_test
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_jina_embedding_model_test() {
+#[test]
+fn gateway_handles_admin_provider_query_jina_embedding_model_test() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_jina_embedding_model_test",
+        gateway_handles_admin_provider_query_jina_embedding_model_test_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_jina_embedding_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -1647,8 +1924,15 @@ async fn gateway_handles_admin_provider_query_jina_embedding_model_test() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_openai_rerank_model_test() {
+#[test]
+fn gateway_handles_admin_provider_query_openai_rerank_model_test() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_openai_rerank_model_test",
+        gateway_handles_admin_provider_query_openai_rerank_model_test_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_openai_rerank_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -1765,8 +2049,15 @@ async fn gateway_handles_admin_provider_query_openai_rerank_model_test() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_rerank_model_test() {
+#[test]
+fn gateway_handles_admin_provider_query_rerank_model_test() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_rerank_model_test",
+        gateway_handles_admin_provider_query_rerank_model_test_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_rerank_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -1886,8 +2177,15 @@ async fn gateway_handles_admin_provider_query_rerank_model_test() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_maps_admin_provider_model_before_model_list_test_request() {
+#[test]
+fn gateway_maps_admin_provider_model_before_model_list_test_request() {
+    run_provider_query_test(
+        "gateway_maps_admin_provider_model_before_model_list_test_request",
+        gateway_maps_admin_provider_model_before_model_list_test_request_impl,
+    );
+}
+
+async fn gateway_maps_admin_provider_model_before_model_list_test_request_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -2141,8 +2439,15 @@ async fn gateway_maps_admin_provider_model_before_model_list_test_request() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_test() {
+#[test]
+fn gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_test() {
+    run_provider_query_test(
+        "gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_test",
+        gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_test_impl,
+    );
+}
+
+async fn gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -2247,8 +2552,197 @@ async fn gateway_streams_codex_openai_responses_upstream_for_admin_pool_model_te
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtime() {
+#[test]
+fn gateway_executes_codex_search_admin_pool_model_test_with_search_contract() {
+    run_provider_query_test(
+        "gateway_executes_codex_search_admin_pool_model_test_with_search_contract",
+        gateway_executes_codex_search_admin_pool_model_test_with_search_contract_impl,
+    );
+}
+
+async fn gateway_executes_codex_search_admin_pool_model_test_with_search_contract_impl() {
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| async move {
+            assert_eq!(plan.provider_id, "provider-codex-search");
+            assert_eq!(plan.endpoint_id, "endpoint-codex-search");
+            assert_eq!(plan.key_id, "key-codex-search");
+            assert_eq!(plan.client_api_format, "openai:search");
+            assert_eq!(plan.provider_api_format, "openai:search");
+            assert_eq!(
+                plan.url,
+                "https://chatgpt.com/backend-api/codex/alpha/search"
+            );
+            assert_eq!(plan.model_name.as_deref(), Some("gpt-5.6-sol"));
+            assert!(!plan.stream, "Codex Search is a synchronous JSON protocol");
+            assert_eq!(
+                plan.timeouts
+                    .as_ref()
+                    .and_then(|timeouts| timeouts.total_ms),
+                Some(900_000)
+            );
+            assert_eq!(
+                plan.headers.get("authorization").map(String::as_str),
+                Some("Bearer codex-search-access-token")
+            );
+            assert_eq!(
+                plan.headers.get("chatgpt-account-id").map(String::as_str),
+                Some("account-search-admin")
+            );
+            assert_eq!(
+                plan.headers.get("x-openai-fedramp").map(String::as_str),
+                Some("true")
+            );
+            assert_eq!(
+                plan.headers.get("originator").map(String::as_str),
+                Some("codex_cli_rs")
+            );
+            assert!(plan
+                .headers
+                .get("user-agent")
+                .is_some_and(|value| value.starts_with("codex_cli_rs/")));
+            assert!(!plan.headers.contains_key("openai-beta"));
+            assert!(!plan
+                .headers
+                .contains_key("x-openai-internal-codex-responses-lite"));
+            assert_ne!(
+                plan.headers.get("accept").map(String::as_str),
+                Some("text/event-stream")
+            );
+
+            let body = plan.body.json_body.as_ref().expect("search json body");
+            assert_eq!(
+                body["id"],
+                json!("aether-model-test-provider-query-search-trace")
+            );
+            assert_eq!(body["model"], json!("gpt-5.6-sol"));
+            assert_eq!(body["input"], json!("find current OpenAI documentation"));
+            assert_eq!(
+                body["commands"]["search_query"][0]["q"],
+                json!("OpenAI Codex Search")
+            );
+            assert!(body.get("stream").is_none());
+            assert!(body.get("store").is_none());
+            assert!(body.get("service_tier").is_none());
+            assert!(body.get("unknown_field").is_none());
+
+            Json(json!({
+                "request_id": plan.request_id,
+                "candidate_id": plan.candidate_id,
+                "status_code": 200,
+                "headers": {
+                    "content-type": "application/json"
+                },
+                "body": {
+                    "json_body": {
+                        "output": "search result"
+                    }
+                },
+                "telemetry": {
+                    "elapsed_ms": 21
+                }
+            }))
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-codex-search", "Codex Search", 10);
+    provider.provider_type = "codex".to_string();
+    provider.request_timeout_secs = Some(900.0);
+    let mut endpoint = sample_endpoint(
+        "endpoint-codex-search",
+        "provider-codex-search",
+        "openai:search",
+        "https://chatgpt.com/backend-api/codex",
+    );
+    endpoint.config = Some(json!({"upstream_stream_policy": "force_stream"}));
+    let mut key = sample_key(
+        "key-codex-search",
+        "provider-codex-search",
+        "openai:search",
+        "codex-search-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.encrypted_auth_config = Some(
+        aether_crypto::encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"codex","account_id":"account-search-admin","is_fedramp":true}"#,
+        )
+        .expect("auth config should encrypt"),
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ));
+
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(GatewayDataState::with_provider_transport_reader_for_tests(
+                provider_catalog_repository,
+                DEVELOPMENT_ENCRYPTION_KEY.to_string(),
+            )),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/provider-query/test-model-failover"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-codex-search",
+            "mode": "pool",
+            "model": "gpt-5.6-sol",
+            "failover_models": ["gpt-5.6-sol"],
+            "api_format": "openai:search",
+            "endpoint_id": "endpoint-codex-search",
+            "request_id": "provider-query-search-trace",
+            "request_body": {
+                "model": "gpt-5.6-sol",
+                "input": "find current OpenAI documentation",
+                "commands": {
+                    "search_query": [{"q": "OpenAI Codex Search"}]
+                },
+                "max_output_tokens": 256,
+                "stream": true,
+                "store": false,
+                "service_tier": "priority",
+                "unknown_field": true
+            }
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], json!(true), "payload={payload}");
+    assert_eq!(
+        payload["attempts"][0]["request_body"]["id"],
+        json!("aether-model-test-provider-query-search-trace")
+    );
+    assert_eq!(
+        payload["attempts"][0]["response_body"]["output"],
+        json!("search result")
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtime() {
+    run_provider_query_test(
+        "gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtime",
+        gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtime_impl,
+    );
+}
+
+async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtime_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -2385,8 +2879,15 @@ async fn gateway_routes_grok_responses_admin_pool_model_test_through_grok_runtim
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_streams_windsurf_connect_upstream_for_admin_model_test() {
+#[test]
+fn gateway_streams_windsurf_connect_upstream_for_admin_model_test() {
+    run_provider_query_test(
+        "gateway_streams_windsurf_connect_upstream_for_admin_model_test",
+        gateway_streams_windsurf_connect_upstream_for_admin_model_test_impl,
+    );
+}
+
+async fn gateway_streams_windsurf_connect_upstream_for_admin_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -2477,7 +2978,6 @@ async fn gateway_streams_windsurf_connect_upstream_for_admin_model_test() {
                     "content": "Hello! This is a test message."
                 }],
                 "max_tokens": 30,
-                "temperature": 0.7,
                 "stream": true
             }
         }))
@@ -2501,8 +3001,15 @@ async fn gateway_streams_windsurf_connect_upstream_for_admin_model_test() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_uses_pool_scheduler_order_for_admin_pool_model_test() {
+#[test]
+fn gateway_uses_pool_scheduler_order_for_admin_pool_model_test() {
+    run_provider_query_test(
+        "gateway_uses_pool_scheduler_order_for_admin_pool_model_test",
+        gateway_uses_pool_scheduler_order_for_admin_pool_model_test_impl,
+    );
+}
+
+async fn gateway_uses_pool_scheduler_order_for_admin_pool_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -2649,8 +3156,15 @@ async fn gateway_uses_pool_scheduler_order_for_admin_pool_model_test() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_test_model_failover_locally_with_trusted_admin_principal(
+#[test]
+fn gateway_handles_admin_provider_query_test_model_failover_locally_with_trusted_admin_principal() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_test_model_failover_locally_with_trusted_admin_principal",
+        gateway_handles_admin_provider_query_test_model_failover_locally_with_trusted_admin_principal_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_test_model_failover_locally_with_trusted_admin_principal_impl(
 ) {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
@@ -2825,8 +3339,15 @@ async fn gateway_handles_admin_provider_query_test_model_failover_locally_with_t
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_test_model_for_kiro_locally() {
+#[test]
+fn gateway_handles_admin_provider_query_test_model_for_kiro_locally() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_test_model_for_kiro_locally",
+        gateway_handles_admin_provider_query_test_model_for_kiro_locally_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_test_model_for_kiro_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -2949,8 +3470,15 @@ async fn gateway_handles_admin_provider_query_test_model_for_kiro_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_uses_kiro_mapped_model_name_for_explicit_model_mapping_test() {
+#[test]
+fn gateway_uses_kiro_mapped_model_name_for_explicit_model_mapping_test() {
+    run_provider_query_test(
+        "gateway_uses_kiro_mapped_model_name_for_explicit_model_mapping_test",
+        gateway_uses_kiro_mapped_model_name_for_explicit_model_mapping_test_impl,
+    );
+}
+
+async fn gateway_uses_kiro_mapped_model_name_for_explicit_model_mapping_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -3141,8 +3669,15 @@ async fn gateway_uses_kiro_mapped_model_name_for_explicit_model_mapping_test() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_test_model_failover_for_kiro_locally() {
+#[test]
+fn gateway_handles_admin_provider_query_test_model_failover_for_kiro_locally() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_test_model_failover_for_kiro_locally",
+        gateway_handles_admin_provider_query_test_model_failover_for_kiro_locally_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_test_model_failover_for_kiro_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -3298,8 +3833,15 @@ async fn gateway_handles_admin_provider_query_test_model_failover_for_kiro_local
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_retries_kiro_failover_after_http_error_without_message() {
+#[test]
+fn gateway_retries_kiro_failover_after_http_error_without_message() {
+    run_provider_query_test(
+        "gateway_retries_kiro_failover_after_http_error_without_message",
+        gateway_retries_kiro_failover_after_http_error_without_message_impl,
+    );
+}
+
+async fn gateway_retries_kiro_failover_after_http_error_without_message_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -3443,8 +3985,15 @@ async fn gateway_retries_kiro_failover_after_http_error_without_message() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_non_kiro_multi_model_failover_locally() {
+#[test]
+fn gateway_handles_non_kiro_multi_model_failover_locally() {
+    run_provider_query_test(
+        "gateway_handles_non_kiro_multi_model_failover_locally",
+        gateway_handles_non_kiro_multi_model_failover_locally_impl,
+    );
+}
+
+async fn gateway_handles_non_kiro_multi_model_failover_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -3558,8 +4107,15 @@ async fn gateway_handles_non_kiro_multi_model_failover_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_openai_responses_test_model_locally() {
+#[test]
+fn gateway_handles_openai_responses_test_model_locally() {
+    run_provider_query_test(
+        "gateway_handles_openai_responses_test_model_locally",
+        gateway_handles_openai_responses_test_model_locally_impl,
+    );
+}
+
+async fn gateway_handles_openai_responses_test_model_locally_impl() {
     let prompt = "Tell me whether the CLI request preserved this prompt.";
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
@@ -3623,13 +4179,12 @@ async fn gateway_handles_openai_responses_test_model_locally() {
                     .and_then(|value| value.as_str()),
                 Some(prompt)
             );
-            assert_eq!(
-                plan.body
-                    .json_body
-                    .as_ref()
-                    .and_then(|body| body.get("instructions")),
-                Some(&json!(""))
-            );
+            assert!(plan
+                .body
+                .json_body
+                .as_ref()
+                .and_then(|body| body.get("instructions"))
+                .is_none());
             assert_eq!(
                 plan.body
                     .json_body
@@ -3642,7 +4197,7 @@ async fn gateway_handles_openai_responses_test_model_locally() {
                 .json_body
                 .as_ref()
                 .and_then(|body| body.get("prompt_cache_key"))
-                .is_some());
+                .is_none());
             Json(json!({
                 "request_id": plan.request_id,
                 "candidate_id": plan.candidate_id,
@@ -3728,8 +4283,15 @@ async fn gateway_handles_openai_responses_test_model_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_openai_image_test_model_locally() {
+#[test]
+fn gateway_handles_openai_image_test_model_locally() {
+    run_provider_query_test(
+        "gateway_handles_openai_image_test_model_locally",
+        gateway_handles_openai_image_test_model_locally_impl,
+    );
+}
+
+async fn gateway_handles_openai_image_test_model_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -3739,8 +4301,8 @@ async fn gateway_handles_openai_image_test_model_locally() {
             assert_eq!(plan.client_api_format, "openai:image");
             assert_eq!(plan.provider_api_format, "openai:image");
             assert_eq!(plan.model_name.as_deref(), Some("gpt-image-1"));
-            assert_eq!(plan.url, "https://api.openai.example/v1/responses");
-            assert!(plan.stream);
+            assert_eq!(plan.url, "https://api.openai.example/v1/images/generations");
+            assert!(!plan.stream);
             assert_eq!(
                 plan.headers.get("authorization").map(String::as_str),
                 Some("Bearer sk-test-image")
@@ -3750,38 +4312,42 @@ async fn gateway_handles_openai_image_test_model_locally() {
                     .json_body
                     .as_ref()
                     .and_then(|body| body.get("model")),
-                Some(&json!(crate::ai_serving::CODEX_OPENAI_IMAGE_INTERNAL_MODEL))
+                Some(&json!("gpt-image-1"))
             );
             assert_eq!(
                 plan.body
                     .json_body
                     .as_ref()
-                    .and_then(|body| body.get("input"))
-                    .and_then(|input| input.as_array())
-                    .and_then(|items| items.first())
-                    .and_then(|item| item.get("content"))
+                    .and_then(|body| body.get("prompt"))
                     .and_then(|value| value.as_str()),
                 Some("Draw a small blue square")
             );
+            assert!(plan
+                .body
+                .json_body
+                .as_ref()
+                .is_some_and(|body| body.get("stream").is_none()));
             Json(json!({
                 "request_id": plan.request_id,
                 "candidate_id": plan.candidate_id,
                 "status_code": 200,
                 "headers": {
-                    "content-type": "text/event-stream"
+                    "content-type": "application/json"
                 },
                 "body": {
-                    "body_bytes_b64": base64::engine::general_purpose::STANDARD.encode(
-                        concat!(
-                            "event: response.created\n",
-                            "data: {\"type\":\"response.created\",\"response\":{\"created_at\":1776839946}}\n\n",
-                            "event: response.output_item.done\n",
-                            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"image_generation_call\",\"output_format\":\"png\",\"revised_prompt\":\"revised prompt\",\"result\":\"aGVsbG8=\"}}\n\n",
-                            "event: response.completed\n",
-                            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_img_123\",\"model\":\"gpt-image-1\",\"status\":\"completed\",\"tool_usage\":{\"image_gen\":{\"input_tokens\":171,\"output_tokens\":1372,\"total_tokens\":1543}}}}\n\n"
-                        )
-                        .as_bytes()
-                    )
+                    "json_body": {
+                        "created": 1776839946,
+                        "model": "gpt-image-1",
+                        "data": [{
+                            "b64_json": "aGVsbG8=",
+                            "revised_prompt": "revised prompt"
+                        }],
+                        "usage": {
+                            "input_tokens": 171,
+                            "output_tokens": 1372,
+                            "total_tokens": 1543
+                        }
+                    }
                 },
                 "telemetry": {
                     "elapsed_ms": 19
@@ -3846,8 +4412,15 @@ async fn gateway_handles_openai_image_test_model_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_reports_transport_unsupported_reason_for_non_kiro_provider() {
+#[test]
+fn gateway_reports_transport_unsupported_reason_for_non_kiro_provider() {
+    run_provider_query_test(
+        "gateway_reports_transport_unsupported_reason_for_non_kiro_provider",
+        gateway_reports_transport_unsupported_reason_for_non_kiro_provider_impl,
+    );
+}
+
+async fn gateway_reports_transport_unsupported_reason_for_non_kiro_provider_impl() {
     let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
     provider.provider_type = "antigravity".to_string();
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -3897,15 +4470,22 @@ async fn gateway_reports_transport_unsupported_reason_for_non_kiro_provider() {
     assert_eq!(
         payload["error"],
         json!(
-            "Rust local provider-query model test cannot execute endpoint format gemini:generate_content (transport_antigravity_auth_unsupported)"
+            "Rust local provider-query model test cannot execute endpoint format gemini:generate_content (transport_antigravity_auth_config_missing)"
         )
     );
 
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_antigravity_endpoint_test_model_locally() {
+#[test]
+fn gateway_handles_antigravity_endpoint_test_model_locally() {
+    run_provider_query_test(
+        "gateway_handles_antigravity_endpoint_test_model_locally",
+        gateway_handles_antigravity_endpoint_test_model_locally_impl,
+    );
+}
+
+async fn gateway_handles_antigravity_endpoint_test_model_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4070,8 +4650,212 @@ async fn gateway_handles_antigravity_endpoint_test_model_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_prefers_supported_non_kiro_endpoint_when_api_format_is_omitted() {
+#[test]
+fn gateway_hydrates_antigravity_project_id_from_load_code_assist_for_test_model() {
+    run_provider_query_test(
+        "gateway_hydrates_antigravity_project_id_from_load_code_assist_for_test_model",
+        gateway_hydrates_antigravity_project_id_from_load_code_assist_for_test_model_impl,
+    );
+}
+
+async fn gateway_hydrates_antigravity_project_id_from_load_code_assist_for_test_model_impl() {
+    let seen_urls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let seen_urls_clone = Arc::clone(&seen_urls);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let seen_urls_inner = Arc::clone(&seen_urls_clone);
+            async move {
+                seen_urls_inner
+                    .lock()
+                    .expect("mutex should lock")
+                    .push(plan.url.clone());
+                if plan.url == "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" {
+                    assert_eq!(plan.model_name.as_deref(), Some("loadCodeAssist"));
+                    assert_eq!(
+                        plan.headers.get("authorization").map(String::as_str),
+                        Some("Bearer cached-antigravity-token")
+                    );
+                    assert_eq!(
+                        plan.body.json_body.as_ref().and_then(|body| body
+                            .get("metadata")
+                            .and_then(|metadata| metadata.get("pluginType"))),
+                        Some(&json!("GEMINI"))
+                    );
+                    return Json(json!({
+                        "request_id": plan.request_id,
+                        "candidate_id": plan.candidate_id,
+                        "status_code": 200,
+                        "headers": {
+                            "content-type": "application/json"
+                        },
+                        "body": {
+                            "json_body": {
+                                "cloudaicompanionProject": {
+                                    "id": "project-from-antigravity-load-code-assist"
+                                },
+                                "currentTier": {
+                                    "id": "free"
+                                }
+                            }
+                        }
+                    }));
+                }
+
+                assert_eq!(
+                    plan.url,
+                    "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent"
+                );
+                assert_eq!(plan.provider_id, "provider-antigravity");
+                assert_eq!(plan.endpoint_id, "endpoint-antigravity-gemini");
+                assert_eq!(plan.key_id, "key-antigravity-gemini");
+                assert_eq!(plan.provider_api_format, "gemini:generate_content");
+                assert!(!plan.stream);
+                assert_eq!(
+                    plan.body.json_body.as_ref().unwrap()["project"],
+                    json!("project-from-antigravity-load-code-assist")
+                );
+                assert_eq!(
+                    plan.body.json_body.as_ref().unwrap()["requestType"],
+                    json!("endpoint_test")
+                );
+                assert_eq!(
+                    plan.body.json_body.as_ref().unwrap()["model"],
+                    json!("gemini-3.1-flash-lite")
+                );
+                Json(json!({
+                    "request_id": plan.request_id,
+                    "candidate_id": plan.candidate_id,
+                    "status_code": 200,
+                    "headers": {
+                        "content-type": "application/json"
+                    },
+                    "body": {
+                        "json_body": {
+                            "response": {
+                                "candidates": [{
+                                    "content": {
+                                        "parts": [
+                                            {"text": "Hello from hydrated Antigravity"}
+                                        ],
+                                        "role": "model"
+                                    },
+                                    "finishReason": "STOP",
+                                    "index": 0
+                                }],
+                                "modelVersion": "gemini-3.1-flash-lite",
+                                "usageMetadata": {
+                                    "promptTokenCount": 2,
+                                    "candidatesTokenCount": 4,
+                                    "totalTokenCount": 6
+                                }
+                            },
+                            "responseId": "resp-antigravity-hydrated-test-123"
+                        }
+                    },
+                    "telemetry": {
+                        "elapsed_ms": 23
+                    }
+                }))
+            }
+        }),
+    );
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("provider-antigravity", "Antigravity", 10);
+    provider.provider_type = "antigravity".to_string();
+    let mut key = sample_key(
+        "key-antigravity-gemini",
+        "provider-antigravity",
+        "gemini:generate_content",
+        "cached-antigravity-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.encrypted_auth_config = Some(
+        aether_crypto::encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"antigravity","refresh_token":"rt-antigravity-123"}"#,
+        )
+        .expect("auth config should encrypt"),
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![sample_endpoint(
+            "endpoint-antigravity-gemini",
+            "provider-antigravity",
+            "gemini:generate_content",
+            "https://daily-cloudcode-pa.googleapis.com",
+        )],
+        vec![key],
+    ));
+
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(Arc::clone(
+                    &provider_catalog_repository,
+                ))
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/test-model"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-antigravity",
+            "model": "gemini-3.1-flash-lite",
+            "api_format": "gemini:generate_content",
+            "message": "Say hello"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], json!(true));
+    assert_eq!(
+        payload["data"]["response"]["choices"][0]["message"]["content"],
+        json!("Hello from hydrated Antigravity")
+    );
+    assert_eq!(
+        *seen_urls.lock().expect("mutex should lock"),
+        vec![
+            "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist".to_string(),
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent".to_string(),
+        ]
+    );
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-antigravity-gemini".to_string()])
+        .await
+        .expect("key should reload");
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("antigravity"))
+            .and_then(|metadata| metadata.get("project_id")),
+        Some(&json!("project-from-antigravity-load-code-assist"))
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
+#[test]
+fn gateway_prefers_supported_non_kiro_endpoint_when_api_format_is_omitted() {
+    run_provider_query_test(
+        "gateway_prefers_supported_non_kiro_endpoint_when_api_format_is_omitted",
+        gateway_prefers_supported_non_kiro_endpoint_when_api_format_is_omitted_impl,
+    );
+}
+
+async fn gateway_prefers_supported_non_kiro_endpoint_when_api_format_is_omitted_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4172,8 +4956,15 @@ async fn gateway_prefers_supported_non_kiro_endpoint_when_api_format_is_omitted(
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_prefers_transport_supported_non_kiro_endpoint_when_api_format_is_omitted() {
+#[test]
+fn gateway_prefers_transport_supported_non_kiro_endpoint_when_api_format_is_omitted() {
+    run_provider_query_test(
+        "gateway_prefers_transport_supported_non_kiro_endpoint_when_api_format_is_omitted",
+        gateway_prefers_transport_supported_non_kiro_endpoint_when_api_format_is_omitted_impl,
+    );
+}
+
+async fn gateway_prefers_transport_supported_non_kiro_endpoint_when_api_format_is_omitted_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4272,8 +5063,15 @@ async fn gateway_prefers_transport_supported_non_kiro_endpoint_when_api_format_i
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_prefers_supported_non_kiro_endpoint_with_compatible_key_when_api_format_is_omitted(
+#[test]
+fn gateway_prefers_supported_non_kiro_endpoint_with_compatible_key_when_api_format_is_omitted() {
+    run_provider_query_test(
+        "gateway_prefers_supported_non_kiro_endpoint_with_compatible_key_when_api_format_is_omitted",
+        gateway_prefers_supported_non_kiro_endpoint_with_compatible_key_when_api_format_is_omitted_impl,
+    );
+}
+
+async fn gateway_prefers_supported_non_kiro_endpoint_with_compatible_key_when_api_format_is_omitted_impl(
 ) {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
@@ -4368,8 +5166,15 @@ async fn gateway_prefers_supported_non_kiro_endpoint_with_compatible_key_when_ap
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted() {
+#[test]
+fn gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted() {
+    run_provider_query_test(
+        "gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted",
+        gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted_impl,
+    );
+}
+
+async fn gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4463,8 +5268,16 @@ async fn gateway_uses_compatible_cli_endpoint_when_api_format_is_omitted() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_format_is_omitted() {
+#[test]
+fn gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_format_is_omitted() {
+    run_provider_query_test(
+        "gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_format_is_omitted",
+        gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_format_is_omitted_impl,
+    );
+}
+
+async fn gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_format_is_omitted_impl()
+{
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4560,8 +5373,15 @@ async fn gateway_uses_runnable_cli_endpoint_after_chat_preference_when_api_forma
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_openai_responses_test_model_failover_locally() {
+#[test]
+fn gateway_handles_openai_responses_test_model_failover_locally() {
+    run_provider_query_test(
+        "gateway_handles_openai_responses_test_model_failover_locally",
+        gateway_handles_openai_responses_test_model_failover_locally_impl,
+    );
+}
+
+async fn gateway_handles_openai_responses_test_model_failover_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4653,8 +5473,15 @@ async fn gateway_handles_openai_responses_test_model_failover_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_claude_cli_test_model_locally() {
+#[test]
+fn gateway_handles_claude_cli_test_model_locally() {
+    run_provider_query_test(
+        "gateway_handles_claude_cli_test_model_locally",
+        gateway_handles_claude_cli_test_model_locally_impl,
+    );
+}
+
+async fn gateway_handles_claude_cli_test_model_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4744,8 +5571,15 @@ async fn gateway_handles_claude_cli_test_model_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted() {
+#[test]
+fn gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted() {
+    run_provider_query_test(
+        "gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted",
+        gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted_impl,
+    );
+}
+
+async fn gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4831,8 +5665,15 @@ async fn gateway_uses_compatible_claude_cli_endpoint_when_api_format_is_omitted(
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_claude_cli_test_model_failover_locally() {
+#[test]
+fn gateway_handles_claude_cli_test_model_failover_locally() {
+    run_provider_query_test(
+        "gateway_handles_claude_cli_test_model_failover_locally",
+        gateway_handles_claude_cli_test_model_failover_locally_impl,
+    );
+}
+
+async fn gateway_handles_claude_cli_test_model_failover_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -4924,8 +5765,15 @@ async fn gateway_handles_claude_cli_test_model_failover_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_gemini_cli_test_model_locally() {
+#[test]
+fn gateway_handles_gemini_cli_test_model_locally() {
+    run_provider_query_test(
+        "gateway_handles_gemini_cli_test_model_locally",
+        gateway_handles_gemini_cli_test_model_locally_impl,
+    );
+}
+
+async fn gateway_handles_gemini_cli_test_model_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -5018,8 +5866,15 @@ async fn gateway_handles_gemini_cli_test_model_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_gemini_cli_test_model_with_oauth_header_fallback() {
+#[test]
+fn gateway_handles_gemini_cli_test_model_with_oauth_header_fallback() {
+    run_provider_query_test(
+        "gateway_handles_gemini_cli_test_model_with_oauth_header_fallback",
+        gateway_handles_gemini_cli_test_model_with_oauth_header_fallback_impl,
+    );
+}
+
+async fn gateway_handles_gemini_cli_test_model_with_oauth_header_fallback_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -5137,8 +5992,15 @@ async fn gateway_handles_gemini_cli_test_model_with_oauth_header_fallback() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_hydrates_gemini_cli_project_id_from_load_code_assist_for_test_model() {
+#[test]
+fn gateway_hydrates_gemini_cli_project_id_from_load_code_assist_for_test_model() {
+    run_provider_query_test(
+        "gateway_hydrates_gemini_cli_project_id_from_load_code_assist_for_test_model",
+        gateway_hydrates_gemini_cli_project_id_from_load_code_assist_for_test_model_impl,
+    );
+}
+
+async fn gateway_hydrates_gemini_cli_project_id_from_load_code_assist_for_test_model_impl() {
     let seen_urls = Arc::new(Mutex::new(Vec::<String>::new()));
     let seen_urls_clone = Arc::clone(&seen_urls);
     let execution_runtime = Router::new().route(
@@ -5306,8 +6168,15 @@ async fn gateway_hydrates_gemini_cli_project_id_from_load_code_assist_for_test_m
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_uses_compatible_gemini_cli_endpoint_when_api_format_is_omitted() {
+#[test]
+fn gateway_uses_compatible_gemini_cli_endpoint_when_api_format_is_omitted() {
+    run_provider_query_test(
+        "gateway_uses_compatible_gemini_cli_endpoint_when_api_format_is_omitted",
+        gateway_uses_compatible_gemini_cli_endpoint_when_api_format_is_omitted_impl,
+    );
+}
+
+async fn gateway_uses_compatible_gemini_cli_endpoint_when_api_format_is_omitted_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -5393,8 +6262,15 @@ async fn gateway_uses_compatible_gemini_cli_endpoint_when_api_format_is_omitted(
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_gemini_cli_test_model_failover_locally() {
+#[test]
+fn gateway_handles_gemini_cli_test_model_failover_locally() {
+    run_provider_query_test(
+        "gateway_handles_gemini_cli_test_model_failover_locally",
+        gateway_handles_gemini_cli_test_model_failover_locally_impl,
+    );
+}
+
+async fn gateway_handles_gemini_cli_test_model_failover_locally_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -5486,8 +6362,15 @@ async fn gateway_handles_gemini_cli_test_model_failover_locally() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_unwraps_gemini_cli_v1internal_response_for_failover_model_test() {
+#[test]
+fn gateway_unwraps_gemini_cli_v1internal_response_for_failover_model_test() {
+    run_provider_query_test(
+        "gateway_unwraps_gemini_cli_v1internal_response_for_failover_model_test",
+        gateway_unwraps_gemini_cli_v1internal_response_for_failover_model_test_impl,
+    );
+}
+
+async fn gateway_unwraps_gemini_cli_v1internal_response_for_failover_model_test_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -5613,8 +6496,16 @@ async fn gateway_unwraps_gemini_cli_v1internal_response_for_failover_model_test(
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_handles_admin_provider_query_test_model_failover_with_single_model_name_alias() {
+#[test]
+fn gateway_handles_admin_provider_query_test_model_failover_with_single_model_name_alias() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_test_model_failover_with_single_model_name_alias",
+        gateway_handles_admin_provider_query_test_model_failover_with_single_model_name_alias_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_test_model_failover_with_single_model_name_alias_impl(
+) {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -5703,8 +6594,15 @@ async fn gateway_handles_admin_provider_query_test_model_failover_with_single_mo
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_retries_non_kiro_failover_after_http_error_without_message() {
+#[test]
+fn gateway_retries_non_kiro_failover_after_http_error_without_message() {
+    run_provider_query_test(
+        "gateway_retries_non_kiro_failover_after_http_error_without_message",
+        gateway_retries_non_kiro_failover_after_http_error_without_message_impl,
+    );
+}
+
+async fn gateway_retries_non_kiro_failover_after_http_error_without_message_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -5825,8 +6723,15 @@ async fn gateway_retries_non_kiro_failover_after_http_error_without_message() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_retries_non_kiro_failover_after_success_status_without_body() {
+#[test]
+fn gateway_retries_non_kiro_failover_after_success_status_without_body() {
+    run_provider_query_test(
+        "gateway_retries_non_kiro_failover_after_success_status_without_body",
+        gateway_retries_non_kiro_failover_after_success_status_without_body_impl,
+    );
+}
+
+async fn gateway_retries_non_kiro_failover_after_success_status_without_body_impl() {
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |Json(plan): Json<ExecutionPlan>| async move {
@@ -5953,8 +6858,15 @@ async fn gateway_retries_non_kiro_failover_after_success_status_without_body() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_preserves_non_success_status_for_test_model_local_wrapper() {
+#[test]
+fn gateway_preserves_non_success_status_for_test_model_local_wrapper() {
+    run_provider_query_test(
+        "gateway_preserves_non_success_status_for_test_model_local_wrapper",
+        gateway_preserves_non_success_status_for_test_model_local_wrapper_impl,
+    );
+}
+
+async fn gateway_preserves_non_success_status_for_test_model_local_wrapper_impl() {
     let gateway = build_router_with_state(AppState::new().expect("gateway should build"));
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -5979,8 +6891,15 @@ async fn gateway_preserves_non_success_status_for_test_model_local_wrapper() {
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_admin_provider_query_invalid_json_body() {
+#[test]
+fn gateway_rejects_admin_provider_query_invalid_json_body() {
+    run_provider_query_test(
+        "gateway_rejects_admin_provider_query_invalid_json_body",
+        gateway_rejects_admin_provider_query_invalid_json_body_impl,
+    );
+}
+
+async fn gateway_rejects_admin_provider_query_invalid_json_body_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -6019,8 +6938,15 @@ async fn gateway_rejects_admin_provider_query_invalid_json_body() {
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_admin_provider_query_test_model_without_provider_id() {
+#[test]
+fn gateway_rejects_admin_provider_query_test_model_without_provider_id() {
+    run_provider_query_test(
+        "gateway_rejects_admin_provider_query_test_model_without_provider_id",
+        gateway_rejects_admin_provider_query_test_model_without_provider_id_impl,
+    );
+}
+
+async fn gateway_rejects_admin_provider_query_test_model_without_provider_id_impl() {
     assert_admin_provider_query_route(
         "/api/admin/provider-query/test-model",
         json!({ "model": "gpt-4.1" }),
@@ -6032,8 +6958,15 @@ async fn gateway_rejects_admin_provider_query_test_model_without_provider_id() {
     .await;
 }
 
-#[tokio::test]
-async fn gateway_rejects_admin_provider_query_test_model_without_model() {
+#[test]
+fn gateway_rejects_admin_provider_query_test_model_without_model() {
+    run_provider_query_test(
+        "gateway_rejects_admin_provider_query_test_model_without_model",
+        gateway_rejects_admin_provider_query_test_model_without_model_impl,
+    );
+}
+
+async fn gateway_rejects_admin_provider_query_test_model_without_model_impl() {
     assert_admin_provider_query_route(
         "/api/admin/provider-query/test-model",
         json!({ "provider_id": "provider-openai" }),
@@ -6045,8 +6978,15 @@ async fn gateway_rejects_admin_provider_query_test_model_without_model() {
     .await;
 }
 
-#[tokio::test]
-async fn gateway_rejects_admin_provider_query_test_model_failover_without_provider_id() {
+#[test]
+fn gateway_rejects_admin_provider_query_test_model_failover_without_provider_id() {
+    run_provider_query_test(
+        "gateway_rejects_admin_provider_query_test_model_failover_without_provider_id",
+        gateway_rejects_admin_provider_query_test_model_failover_without_provider_id_impl,
+    );
+}
+
+async fn gateway_rejects_admin_provider_query_test_model_failover_without_provider_id_impl() {
     assert_admin_provider_query_route(
         "/api/admin/provider-query/test-model-failover",
         json!({ "failover_models": ["gpt-4.1"] }),
@@ -6058,8 +6998,15 @@ async fn gateway_rejects_admin_provider_query_test_model_failover_without_provid
     .await;
 }
 
-#[tokio::test]
-async fn gateway_rejects_admin_provider_query_test_model_failover_without_models() {
+#[test]
+fn gateway_rejects_admin_provider_query_test_model_failover_without_models() {
+    run_provider_query_test(
+        "gateway_rejects_admin_provider_query_test_model_failover_without_models",
+        gateway_rejects_admin_provider_query_test_model_failover_without_models_impl,
+    );
+}
+
+async fn gateway_rejects_admin_provider_query_test_model_failover_without_models_impl() {
     assert_admin_provider_query_route(
         "/api/admin/provider-query/test-model-failover",
         json!({ "provider_id": "provider-openai", "failover_models": [] }),

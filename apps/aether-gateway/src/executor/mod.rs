@@ -11,13 +11,16 @@ pub(crate) use crate::request_candidate_runtime::{
     persist_available_local_candidate, persist_skipped_local_candidate,
 };
 pub(crate) use candidate_loop::{
-    execute_stream_plan_and_reports, execute_sync_plan_and_reports,
-    mark_unused_local_candidate_items,
+    execute_stream_plan_and_reports, execute_stream_plan_and_reports_with_transfer_tracker,
+    execute_sync_plan_and_reports, execute_sync_plan_and_reports_with_transfer_tracker,
+    mark_unused_local_candidate_items, ProviderTransferTracker,
 };
 pub(crate) use orchestration::*;
 pub(crate) use outcome::{
-    beautify_local_execution_client_error_message, build_local_execution_exhaustion,
-    build_local_execution_runtime_miss_context, record_failed_usage_for_exhausted_request,
+    beautify_local_execution_client_error_message, build_fast_local_execution_exhaustion,
+    build_fast_local_execution_runtime_miss_context, build_local_execution_exhaustion,
+    build_local_execution_runtime_miss_context, is_deferred_upstream_response,
+    mark_deferred_upstream_response, record_failed_usage_for_exhausted_request,
     record_failed_usage_for_runtime_miss_request, LocalExecutionExhaustion,
     LocalExecutionRequestOutcome, LocalExecutionRuntimeMissContext,
 };

@@ -1,17 +1,25 @@
 use super::{
     any, build_router_with_state, build_state_with_execution_runtime_override,
-    encrypt_python_fernet_plaintext, json, start_server, strip_sse_keepalive_comments, to_bytes,
-    Arc, Body, Bytes, Digest, HeaderName, HeaderValue, InMemoryAuthApiKeySnapshotRepository,
-    InMemoryMinimalCandidateSelectionReadRepository, InMemoryProviderCatalogReadRepository,
-    InMemoryRequestCandidateRepository, Json, Mutex, Request, RequestCandidateReadRepository,
-    RequestCandidateStatus, Response, Router, Sha256, StatusCode, StoredAuthApiKeySnapshot,
-    StoredMinimalCandidateSelectionRow, StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
-    StoredProviderCatalogProvider, StoredProviderModelMapping, DEVELOPMENT_ENCRYPTION_KEY,
-    TRACE_ID_HEADER,
+    encrypt_python_fernet_plaintext, json, run_stream_provider_gemini_test, start_server,
+    strip_sse_keepalive_comments, to_bytes, Arc, Body, Bytes, Digest, HeaderName, HeaderValue,
+    InMemoryAuthApiKeySnapshotRepository, InMemoryMinimalCandidateSelectionReadRepository,
+    InMemoryProviderCatalogReadRepository, InMemoryRequestCandidateRepository, Json, Mutex,
+    Request, RequestCandidateReadRepository, RequestCandidateStatus, Response, Router, Sha256,
+    StatusCode, StoredAuthApiKeySnapshot, StoredMinimalCandidateSelectionRow,
+    StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    StoredProviderModelMapping, DEVELOPMENT_ENCRYPTION_KEY, TRACE_ID_HEADER,
 };
 
-#[tokio::test]
-async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision() {
+#[test]
+fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision() {
+    run_stream_provider_gemini_test(
+        "gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision",
+        gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision_impl,
+    );
+}
+
+async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision_impl(
+) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
         trace_id: String,
@@ -93,6 +101,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_s
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -446,8 +455,15 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_with_local_s
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh() {
+#[test]
+fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh() {
+    run_stream_provider_gemini_test(
+        "gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh",
+        gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh_impl,
+    );
+}
+
+async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
         trace_id: String,
@@ -538,6 +554,7 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1001,8 +1018,16 @@ async fn gateway_executes_gemini_cli_stream_via_local_decision_gate_after_oauth_
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision(
+#[test]
+fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision()
+{
+    run_stream_provider_gemini_test(
+        "gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision",
+        gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision_impl,
+    );
+}
+
+async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_with_local_stream_decision_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
@@ -1085,6 +1110,7 @@ async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_wi
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1436,8 +1462,15 @@ async fn gateway_executes_vertex_ai_gemini_cli_stream_via_local_decision_gate_wi
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh(
+#[test]
+fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh() {
+    run_stream_provider_gemini_test(
+        "gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh",
+        gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh_impl,
+    );
+}
+
+async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_after_oauth_refresh_impl(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
@@ -1543,6 +1576,7 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
                 priority: 1,
                 api_formats: Some(vec!["gemini:generate_content".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1881,6 +1915,7 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
             Arc::clone(&request_candidate_repository),
             DEVELOPMENT_ENCRYPTION_KEY,
         )
+        .with_system_default_routing_group_for_tests()
         .with_system_config_values_for_tests([(
             crate::constants::ANTIGRAVITY_BEARER_BRIDGE_CONFIG_KEY.to_string(),
             json!({
@@ -1983,7 +2018,7 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
         "Bearer refreshed-antigravity-cli-stream-access-token"
     );
     assert_eq!(seen_execution_runtime_request.x_client_name, "antigravity");
-    assert_eq!(seen_execution_runtime_request.x_client_version, "1.2.3");
+    assert_eq!(seen_execution_runtime_request.x_client_version, "4.3.0");
     assert_eq!(
         seen_execution_runtime_request.x_vscode_sessionid,
         "sess-antigravity-stream-local-123"
@@ -2001,7 +2036,10 @@ async fn gateway_executes_antigravity_gemini_cli_stream_via_local_decision_gate_
         "trace-antigravity-cli-oauth-local-stream-123"
     );
     assert_eq!(seen_execution_runtime_request.model, "claude-sonnet-4-5");
-    assert_eq!(seen_execution_runtime_request.user_agent, "antigravity");
+    assert_eq!(
+        seen_execution_runtime_request.user_agent,
+        aether_provider_transport::antigravity::ANTIGRAVITY_REQUEST_USER_AGENT
+    );
     assert_eq!(seen_execution_runtime_request.request_type, "agent");
     assert_eq!(seen_execution_runtime_request.contents_len, 0);
     assert!((seen_execution_runtime_request.exact_temperature - 0.2).abs() < f64::EPSILON);

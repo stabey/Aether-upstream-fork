@@ -54,7 +54,7 @@ fn disabled_gateway_data_state_has_no_backends() {
 
 #[test]
 fn maintenance_pool_pressure_keeps_idle_reserve_for_foreground_work() {
-    let pressured = aether_data::DatabasePoolSummary {
+    let pool_can_still_grow = aether_data::DatabasePoolSummary {
         driver: DatabaseDriver::Postgres,
         checked_out: 6,
         pool_size: 6,
@@ -62,17 +62,31 @@ fn maintenance_pool_pressure_keeps_idle_reserve_for_foreground_work() {
         max_connections: 20,
         usage_rate: 30.0,
     };
-    assert!(GatewayDataState::database_pool_summary_under_maintenance_pressure(&pressured));
+    assert!(
+        !GatewayDataState::database_pool_summary_under_maintenance_pressure(&pool_can_still_grow)
+    );
 
-    let one_idle_left = aether_data::DatabasePoolSummary {
+    let reserve_idle_left = aether_data::DatabasePoolSummary {
         driver: DatabaseDriver::Postgres,
-        checked_out: 5,
-        pool_size: 6,
-        idle: 1,
+        checked_out: 18,
+        pool_size: 20,
+        idle: 2,
         max_connections: 20,
-        usage_rate: 25.0,
+        usage_rate: 90.0,
     };
-    assert!(GatewayDataState::database_pool_summary_under_maintenance_pressure(&one_idle_left));
+    assert!(GatewayDataState::database_pool_summary_under_maintenance_pressure(&reserve_idle_left));
+
+    let above_idle_reserve = aether_data::DatabasePoolSummary {
+        driver: DatabaseDriver::Postgres,
+        checked_out: 17,
+        pool_size: 20,
+        idle: 3,
+        max_connections: 20,
+        usage_rate: 85.0,
+    };
+    assert!(
+        !GatewayDataState::database_pool_summary_under_maintenance_pressure(&above_idle_reserve)
+    );
 
     let idle = aether_data::DatabasePoolSummary {
         driver: DatabaseDriver::Postgres,
@@ -83,6 +97,39 @@ fn maintenance_pool_pressure_keeps_idle_reserve_for_foreground_work() {
         usage_rate: 0.0,
     };
     assert!(!GatewayDataState::database_pool_summary_under_maintenance_pressure(&idle));
+}
+
+#[test]
+fn usage_worker_pool_pressure_only_defers_near_pool_exhaustion() {
+    let comfortable = aether_data::DatabasePoolSummary {
+        driver: DatabaseDriver::Postgres,
+        checked_out: 56,
+        pool_size: 64,
+        idle: 8,
+        max_connections: 64,
+        usage_rate: 87.5,
+    };
+    assert!(!GatewayDataState::database_pool_summary_under_usage_worker_pressure(&comfortable));
+
+    let last_idle_left = aether_data::DatabasePoolSummary {
+        driver: DatabaseDriver::Postgres,
+        checked_out: 63,
+        pool_size: 64,
+        idle: 1,
+        max_connections: 64,
+        usage_rate: 98.4375,
+    };
+    assert!(GatewayDataState::database_pool_summary_under_usage_worker_pressure(&last_idle_left));
+
+    let exhausted = aether_data::DatabasePoolSummary {
+        driver: DatabaseDriver::Postgres,
+        checked_out: 64,
+        pool_size: 64,
+        idle: 0,
+        max_connections: 64,
+        usage_rate: 100.0,
+    };
+    assert!(GatewayDataState::database_pool_summary_under_usage_worker_pressure(&exhausted));
 }
 
 #[test]
@@ -543,6 +590,7 @@ fn sample_minimal_candidate_selection_row(
             priority: 1,
             api_formats: Some(vec!["openai:chat".to_string()]),
             endpoint_ids: None,
+            operations: None,
         }]),
         model_supports_streaming: None,
         model_is_active: true,
@@ -860,6 +908,7 @@ async fn data_state_reads_minimal_candidate_selection_with_auth_filters() {
         enumerate_minimal_candidate_selection(EnumerateMinimalCandidateSelectionInput {
             rows,
             normalized_api_format: "openai:chat",
+            request_operation: None,
             requested_model_name: "gpt-4.1",
             resolved_global_model_name: "gpt-4.1",
             require_streaming: false,

@@ -1,7 +1,8 @@
 use super::super::helpers::admin_provider_oauth_key_name_from_auth_config;
 use super::super::token_import::{
     build_provider_access_token_import_auth_config, decode_access_token_expires_at,
-    provider_oauth_import_authorization_bearer_token, provider_type_supports_access_token_import,
+    is_claude_session_key, provider_oauth_import_authorization_bearer_token,
+    provider_type_supports_access_token_import, validate_claude_access_token_import,
 };
 use super::kiro_import::execute_admin_provider_oauth_kiro_batch_import;
 use super::parse::{
@@ -13,7 +14,10 @@ use super::progress::{
     maybe_report_admin_provider_oauth_batch_import_progress,
     AdminProviderOAuthBatchProgressReporter,
 };
-use crate::handlers::admin::provider::oauth::duplicates::find_duplicate_provider_oauth_key;
+use crate::handlers::admin::provider::oauth::duplicates::{
+    acquire_codex_oauth_account_locks, find_duplicate_provider_oauth_key,
+    release_codex_oauth_account_locks,
+};
 use crate::handlers::admin::provider::oauth::provisioning::build_provider_oauth_auth_config_from_token_payload;
 use crate::handlers::admin::provider::oauth::provisioning::{
     create_provider_oauth_catalog_key, provider_oauth_active_api_formats,
@@ -51,6 +55,154 @@ fn sanitize_windsurf_batch_import_error(error: &OAuthError) -> String {
         }
         _ => "Windsurf 凭据验证失败".to_string(),
     }
+}
+
+fn can_fallback_batch_refresh_to_access_token(
+    provider_type: &str,
+    access_token: Option<&str>,
+) -> bool {
+    !provider_type.eq_ignore_ascii_case("claude_code")
+        && access_token.is_some()
+        && provider_type_supports_access_token_import(provider_type)
+}
+
+fn validate_batch_access_token_import(
+    provider_type: &str,
+    access_token: &str,
+    imported_expires_at: Option<u64>,
+    now_unix_secs: u64,
+) -> Result<(), String> {
+    if !provider_type_supports_access_token_import(provider_type) {
+        return Err(
+            "Access Token 导入仅支持 Claude Code / Codex / ChatGPT Web / Grok Provider".to_string(),
+        );
+    }
+    if provider_type.eq_ignore_ascii_case("claude_code") {
+        validate_claude_access_token_import(access_token, imported_expires_at, now_unix_secs)
+            .map_err(str::to_string)?;
+    }
+    Ok(())
+}
+
+const CODEX_AGENT_IDENTITY_SAFE_FIELDS: &[(&str, &[&str])] = &[
+    ("agent_runtime_id", &["agent_runtime_id", "agentRuntimeId"]),
+    (
+        "agent_private_key",
+        &["agent_private_key", "agentPrivateKey"],
+    ),
+    ("task_id", &["task_id", "taskId"]),
+    (
+        "account_id",
+        &[
+            "account_id",
+            "accountId",
+            "chatgpt_account_id",
+            "chatgptAccountId",
+        ],
+    ),
+    (
+        "account_user_id",
+        &[
+            "account_user_id",
+            "accountUserId",
+            "chatgpt_account_user_id",
+            "chatgptAccountUserId",
+        ],
+    ),
+    (
+        "user_id",
+        &["user_id", "userId", "chatgpt_user_id", "chatgptUserId"],
+    ),
+    ("email", &["email"]),
+    (
+        "plan_type",
+        &[
+            "plan_type",
+            "planType",
+            "chatgpt_plan_type",
+            "chatgptPlanType",
+        ],
+    ),
+    ("account_name", &["account_name", "accountName"]),
+    (
+        "is_fedramp",
+        &[
+            "is_fedramp",
+            "chatgpt_account_is_fedramp",
+            "chatgptAccountIsFedramp",
+        ],
+    ),
+    ("workspace_id", &["workspace_id", "workspaceId"]),
+];
+
+fn copy_codex_agent_identity_safe_fields(
+    auth_config: &mut Map<String, Value>,
+    preferred: Option<&Map<String, Value>>,
+    fallback: &Map<String, Value>,
+) {
+    for (canonical_key, aliases) in CODEX_AGENT_IDENTITY_SAFE_FIELDS {
+        if auth_config.contains_key(*canonical_key) {
+            continue;
+        }
+        let value = preferred
+            .and_then(|map| aliases.iter().find_map(|key| map.get(*key)))
+            .or_else(|| aliases.iter().find_map(|key| fallback.get(*key)))
+            .cloned();
+        let Some(value) = value else {
+            continue;
+        };
+        let type_is_allowed = if *canonical_key == "is_fedramp" {
+            value.is_boolean()
+        } else {
+            value.as_str().is_some_and(|text| !text.trim().is_empty())
+        };
+        if !type_is_allowed {
+            continue;
+        }
+        auth_config.insert((*canonical_key).to_string(), value);
+    }
+}
+
+fn sanitize_codex_agent_identity_nested_fields(nested: &Map<String, Value>) -> Map<String, Value> {
+    let mut sanitized = Map::new();
+    copy_codex_agent_identity_safe_fields(&mut sanitized, None, nested);
+    sanitized
+}
+
+pub(super) fn codex_agent_identity_auth_config_from_import(
+    entry: &AdminProviderOAuthBatchImportEntry,
+) -> Result<Option<Map<String, Value>>, String> {
+    let Some(raw_credentials) = entry.raw_credentials.as_ref() else {
+        return Ok(None);
+    };
+    if !aether_provider_transport::is_codex_agent_identity_auth_config_value(raw_credentials) {
+        return Ok(None);
+    }
+    let root = raw_credentials
+        .as_object()
+        .ok_or_else(|| "Agent Identity 凭据必须是 JSON 对象".to_string())?;
+    let nested = root
+        .get("agent_identity")
+        .or_else(|| root.get("agentIdentity"))
+        .and_then(Value::as_object)
+        .cloned();
+    let mut auth_config = Map::new();
+    copy_codex_agent_identity_safe_fields(&mut auth_config, nested.as_ref(), root);
+    if let Some(nested) = nested.as_ref() {
+        let sanitized_nested = sanitize_codex_agent_identity_nested_fields(nested);
+        if !sanitized_nested.is_empty() {
+            auth_config.insert(
+                "agent_identity".to_string(),
+                Value::Object(sanitized_nested),
+            );
+        }
+    }
+    auth_config.insert("provider_type".to_string(), json!("codex"));
+    auth_config.insert("auth_mode".to_string(), json!("agentIdentity"));
+    aether_provider_transport::validate_codex_agent_identity_auth_config(&Value::Object(
+        auth_config.clone(),
+    ))?;
+    Ok(Some(auth_config))
 }
 
 pub(super) fn estimate_admin_provider_oauth_batch_import_total(
@@ -103,6 +255,18 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
     entry: &AdminProviderOAuthBatchImportEntry,
     request_proxy: Option<ProxySnapshot>,
 ) -> Result<AdminProviderOAuthResolvedBatchImport, String> {
+    if provider_type.eq_ignore_ascii_case("codex") {
+        if let Some(auth_config) = codex_agent_identity_auth_config_from_import(entry)? {
+            return Ok(AdminProviderOAuthResolvedBatchImport {
+                // Agent Identity signs an assertion for every request. The existing OAuth
+                // record keeps a placeholder in its encrypted token column only.
+                access_token: "__placeholder__".to_string(),
+                auth_config,
+                expires_at: None,
+            });
+        }
+    }
+
     let refresh_token = entry
         .refresh_token
         .as_deref()
@@ -113,6 +277,15 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
+    let is_claude = provider_type.eq_ignore_ascii_case("claude_code");
+    if is_claude
+        && refresh_token
+            .into_iter()
+            .chain(access_token)
+            .any(is_claude_session_key)
+    {
+        return Err("Claude sessionKey 请使用 Cookie 授权，不能作为导入凭据".to_string());
+    }
 
     if provider_type.eq_ignore_ascii_case("windsurf") {
         let token_for_import = refresh_token.or(access_token);
@@ -171,7 +344,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
 
     if let Some(refresh_token) = refresh_token {
         let Some(template) = template else {
-            if provider_type_supports_access_token_import(provider_type) {
+            if can_fallback_batch_refresh_to_access_token(provider_type, access_token) {
                 if let Some(access_token) = access_token {
                     let (auth_config, expires_at) = build_provider_access_token_import_auth_config(
                         provider_type,
@@ -204,7 +377,7 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
             Ok(payload) => payload,
             Err(response) => {
                 let detail = extract_admin_provider_oauth_batch_error_detail(response).await;
-                if provider_type_supports_access_token_import(provider_type) {
+                if can_fallback_batch_refresh_to_access_token(provider_type, access_token) {
                     if let Some(access_token) = access_token {
                         let (auth_config, expires_at) =
                             build_provider_access_token_import_auth_config(
@@ -245,9 +418,17 @@ async fn resolve_admin_provider_oauth_batch_import_tokens(
     }
 
     if let Some(access_token) = access_token {
-        if !provider_type_supports_access_token_import(provider_type) {
-            return Err("Access Token 导入仅支持 Codex / ChatGPT Web / Grok Provider".to_string());
-        }
+        let now_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        validate_batch_access_token_import(
+            provider_type,
+            access_token,
+            entry.expires_at,
+            now_unix_secs,
+        )?;
         let (auth_config, expires_at) = build_provider_access_token_import_auth_config(
             provider_type,
             access_token,
@@ -412,10 +593,49 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
             }
         }
 
+        let is_agent_identity = provider_type.eq_ignore_ascii_case("codex")
+            && aether_provider_transport::is_codex_agent_identity_auth_config_value(
+                &Value::Object(auth_config.clone()),
+            );
+        let codex_oauth_account_leases =
+            if provider_type.eq_ignore_ascii_case("codex") && !is_agent_identity {
+                match acquire_codex_oauth_account_locks(
+                    state,
+                    provider_id,
+                    &auth_config,
+                    "batch-import",
+                )
+                .await
+                {
+                    Ok(leases) => leases,
+                    Err(error) => {
+                        failed += 1;
+                        results.push(json!({
+                            "index": index,
+                            "status": "error",
+                            "error": error.detail(),
+                            "replaced": false,
+                        }));
+                        maybe_report_admin_provider_oauth_batch_import_progress(
+                            &mut progress,
+                            entries.len(),
+                            success,
+                            failed,
+                            &results,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
         let duplicate =
             match find_duplicate_provider_oauth_key(state, provider_id, &auth_config, None).await {
                 Ok(value) => value,
                 Err(detail) => {
+                    release_codex_oauth_account_locks(state, codex_oauth_account_leases).await;
                     failed += 1;
                     results.push(json!({
                         "index": index,
@@ -437,7 +657,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
 
         let replaced = duplicate.is_some();
         let (persisted_key, key_name) = if let Some(existing_key) = duplicate {
-            match update_existing_provider_oauth_catalog_key(
+            let update_result = update_existing_provider_oauth_catalog_key(
                 state,
                 &existing_key,
                 provider_type,
@@ -447,10 +667,15 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 key_proxy.clone(),
                 expires_at,
             )
-            .await?
-            {
-                Some(key) => (key, existing_key.name.clone()),
-                None => {
+            .await;
+            match update_result {
+                Err(error) => {
+                    release_codex_oauth_account_locks(state, codex_oauth_account_leases).await;
+                    return Err(error);
+                }
+                Ok(Some(key)) => (key, existing_key.name.clone()),
+                Ok(None) => {
+                    release_codex_oauth_account_locks(state, codex_oauth_account_leases).await;
                     failed += 1;
                     results.push(json!({
                         "index": index,
@@ -475,7 +700,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 &auth_config,
                 Some(index),
             );
-            match create_provider_oauth_catalog_key(
+            let create_result = create_provider_oauth_catalog_key(
                 state,
                 provider_id,
                 provider_type,
@@ -486,10 +711,15 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 key_proxy.clone(),
                 expires_at,
             )
-            .await?
-            {
-                Some(key) => (key, key_name),
-                None => {
+            .await;
+            match create_result {
+                Err(error) => {
+                    release_codex_oauth_account_locks(state, codex_oauth_account_leases).await;
+                    return Err(error);
+                }
+                Ok(Some(key)) => (key, key_name),
+                Ok(None) => {
+                    release_codex_oauth_account_locks(state, codex_oauth_account_leases).await;
                     failed += 1;
                     results.push(json!({
                         "index": index,
@@ -509,6 +739,7 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
                 }
             }
         };
+        release_codex_oauth_account_locks(state, codex_oauth_account_leases).await;
 
         spawn_provider_oauth_account_state_refresh_after_update(
             state.cloned_app(),
@@ -546,8 +777,13 @@ pub(super) async fn execute_admin_provider_oauth_batch_import(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_windsurf_batch_import_error;
+    use super::super::parse::parse_admin_provider_oauth_batch_import_entries;
+    use super::{
+        can_fallback_batch_refresh_to_access_token, codex_agent_identity_auth_config_from_import,
+        sanitize_windsurf_batch_import_error, validate_batch_access_token_import,
+    };
     use aether_oauth::core::OAuthError;
+    use serde_json::json;
 
     #[test]
     fn windsurf_batch_import_error_redacts_http_body() {
@@ -571,5 +807,141 @@ mod tests {
         assert_eq!(detail, "Windsurf 凭据验证失败");
         assert!(!detail.contains("sk-secret"));
         assert!(!detail.contains("secret-token"));
+    }
+
+    #[test]
+    fn claude_batch_refresh_failure_never_falls_back_to_imported_access_token() {
+        assert!(!can_fallback_batch_refresh_to_access_token(
+            "claude_code",
+            Some("sk-ant-oat01-stale")
+        ));
+        assert!(can_fallback_batch_refresh_to_access_token(
+            "codex",
+            Some("fallback-access-token")
+        ));
+    }
+
+    #[test]
+    fn claude_batch_access_only_requires_oat_prefix_and_future_expiry() {
+        let now = 2_000_000_000;
+        assert!(validate_batch_access_token_import(
+            "claude_code",
+            "sk-ant-oat01-valid",
+            Some(now + 3600),
+            now,
+        )
+        .is_ok());
+        assert!(validate_batch_access_token_import(
+            "claude_code",
+            "not-an-oat",
+            Some(now + 3600),
+            now,
+        )
+        .is_err());
+        assert!(validate_batch_access_token_import(
+            "claude_code",
+            "sk-ant-oat01-missing-expiry",
+            None,
+            now,
+        )
+        .is_err());
+        assert!(validate_batch_access_token_import(
+            "claude_code",
+            "sk-ant-oat01-expired",
+            Some(now),
+            now,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn normalizes_codex_agent_identity_import_without_access_token() {
+        let entries = parse_admin_provider_oauth_batch_import_entries(
+            "codex",
+            r#"{
+                "type":"sub2api-data",
+                "version":1,
+                "accounts":[{
+                    "name":"agent@example.com",
+                    "platform":"openai",
+                    "credentials":{
+                        "auth_mode":"agentIdentity",
+                        "id_token":"stale-id-token",
+                        "sessionToken":"stale-session-token",
+                        "apiKey":"stale-api-key",
+                        "cookie":"stale-cookie",
+                        "headers":{
+                            "authorization":"Bearer stale-bearer-token",
+                            "cookie":"stale-header-cookie",
+                            "x-api-key":"stale-header-api-key"
+                        },
+                        "profile":{"token":"stale-deep-token"},
+                        "agent_identity":{
+                            "agent_runtime_id":"runtime-1",
+                            "agent_private_key":"MC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                            "accountId":"account-1",
+                            "chatgptUserId":"user-1",
+                            "chatgptAccountIsFedramp":true,
+                            "access_token":"stale-access-token",
+                            "refreshToken":"stale-refresh-token",
+                            "headers":{"authorization":"Bearer stale-nested-bearer"}
+                        }
+                    }
+                }]
+            }"#,
+        );
+
+        let auth_config = codex_agent_identity_auth_config_from_import(&entries[0])
+            .expect("Agent Identity import should validate")
+            .expect("Agent Identity config should be recognized");
+
+        assert_eq!(auth_config.get("provider_type"), Some(&json!("codex")));
+        assert_eq!(auth_config.get("auth_mode"), Some(&json!("agentIdentity")));
+        assert_eq!(
+            auth_config.get("agent_runtime_id"),
+            Some(&json!("runtime-1"))
+        );
+        assert_eq!(auth_config.get("account_id"), Some(&json!("account-1")));
+        assert_eq!(auth_config.get("user_id"), Some(&json!("user-1")));
+        assert_eq!(auth_config.get("is_fedramp"), Some(&json!(true)));
+        assert_eq!(
+            auth_config.get("account_name"),
+            Some(&json!("agent@example.com"))
+        );
+        assert!(!auth_config.contains_key("id_token"));
+        assert!(auth_config
+            .get("agent_identity")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|nested| !nested.contains_key("access_token")));
+        let serialized = serde_json::to_string(&auth_config).expect("auth config should serialize");
+        for secret in [
+            "stale-id-token",
+            "stale-session-token",
+            "stale-api-key",
+            "stale-cookie",
+            "stale-bearer-token",
+            "stale-header-cookie",
+            "stale-header-api-key",
+            "stale-deep-token",
+            "stale-access-token",
+            "stale-refresh-token",
+            "stale-nested-bearer",
+        ] {
+            assert!(!serialized.contains(secret), "secret leaked: {secret}");
+        }
+        for forbidden_key in [
+            "access_token",
+            "refreshToken",
+            "sessionToken",
+            "apiKey",
+            "cookie",
+            "headers",
+            "profile",
+        ] {
+            assert!(
+                !serialized.contains(forbidden_key),
+                "forbidden key persisted: {forbidden_key}"
+            );
+        }
     }
 }

@@ -1,5 +1,7 @@
 import client from '../client'
 
+const CLAUDE_COOKIE_AUTHORIZE_TIMEOUT_MS = 4 * 60 * 1000
+
 export interface ProviderOAuthStartResponse {
   authorization_url: string
   redirect_uri: string
@@ -31,6 +33,20 @@ export interface ProviderOAuthCompleteResponseWithKey {
   temporary?: boolean
   email?: string | null
   replaced?: boolean
+  task_ready?: boolean
+  recoverable?: boolean
+  detail?: string
+}
+
+export interface ProviderCookieAuthorizeRequest {
+  cookie: string
+  name?: string
+  proxy_node_id?: string
+}
+
+export interface ProviderCookieAuthorizeBatchTaskRequest {
+  cookies: string[]
+  proxy_node_id?: string
 }
 
 export interface OAuthBatchImportResultItem {
@@ -44,9 +60,11 @@ export interface OAuthBatchImportResultItem {
 }
 
 export type OAuthBatchImportTaskStatus = 'submitted' | 'processing' | 'completed' | 'failed'
+export type OAuthBatchImportKind = 'oauth_batch' | 'agent_identity' | 'cookie_authorize'
 
 export interface OAuthBatchImportTaskStartResponse {
   task_id: string
+  import_kind?: OAuthBatchImportKind
   status: OAuthBatchImportTaskStatus
   total: number
   processed: number
@@ -60,6 +78,7 @@ export interface OAuthBatchImportTaskStartResponse {
 
 export interface OAuthBatchImportTaskStatusResponse {
   task_id: string
+  import_kind?: OAuthBatchImportKind
   provider_id: string
   provider_type: string
   status: OAuthBatchImportTaskStatus
@@ -230,6 +249,39 @@ export async function completeProviderLevelOAuth(
   return resp.data
 }
 
+export async function authorizeProviderWithCookie(
+  providerId: string,
+  data: ProviderCookieAuthorizeRequest
+): Promise<ProviderOAuthCompleteResponseWithKey> {
+  const resp = await client.post(
+    `/api/admin/provider-oauth/providers/${providerId}/cookie-authorize`,
+    data,
+    { timeout: CLAUDE_COOKIE_AUTHORIZE_TIMEOUT_MS },
+  )
+  return resp.data
+}
+
+export async function startProviderCookieAuthorizeTask(
+  providerId: string,
+  data: ProviderCookieAuthorizeBatchTaskRequest,
+): Promise<OAuthBatchImportTaskStartResponse> {
+  const resp = await client.post(
+    `/api/admin/provider-oauth/providers/${providerId}/cookie-authorize/tasks`,
+    data,
+  )
+  return resp.data
+}
+
+export async function getProviderCookieAuthorizeTaskStatus(
+  providerId: string,
+  taskId: string,
+): Promise<OAuthBatchImportTaskStatusResponse> {
+  const resp = await client.get(
+    `/api/admin/provider-oauth/providers/${providerId}/cookie-authorize/tasks/${taskId}`,
+  )
+  return resp.data
+}
+
 export async function importProviderRefreshToken(
   providerId: string,
   data: {
@@ -240,6 +292,8 @@ export async function importProviderRefreshToken(
     authToken?: string
     refresh_token?: string
     access_token?: string
+    session_token?: string
+    create_agent_identity?: boolean
     password?: string
     expires_at?: number
     name?: string
@@ -268,7 +322,10 @@ export async function startBatchImportOAuthTask(
   credentials: string,
   proxyNodeId?: string
 ): Promise<OAuthBatchImportTaskStartResponse> {
-  const resp = await client.post(`/api/admin/provider-oauth/providers/${providerId}/batch-import/tasks`, {
+  const route = containsAgentIdentityImport(credentials)
+    ? 'agent-identity-import/tasks'
+    : 'batch-import/tasks'
+  const resp = await client.post(`/api/admin/provider-oauth/providers/${providerId}/${route}`, {
     credentials,
     proxy_node_id: proxyNodeId || undefined,
   })
@@ -279,8 +336,39 @@ export async function getBatchImportOAuthTaskStatus(
   providerId: string,
   taskId: string
 ): Promise<OAuthBatchImportTaskStatusResponse> {
-  const resp = await client.get(`/api/admin/provider-oauth/providers/${providerId}/batch-import/tasks/${taskId}`)
+  const route = taskId.startsWith('agent-identity-')
+    ? 'agent-identity-import/tasks'
+    : 'batch-import/tasks'
+  const resp = await client.get(`/api/admin/provider-oauth/providers/${providerId}/${route}/${taskId}`)
   return resp.data
+}
+
+function containsAgentIdentityImport(credentials: string): boolean {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(credentials)
+  } catch {
+    return false
+  }
+  return jsonValueContainsAgentIdentity(parsed)
+}
+
+function jsonValueContainsAgentIdentity(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(jsonValueContainsAgentIdentity)
+  if (typeof value !== 'object' || value === null) return false
+  const root = value as Record<string, unknown>
+  const nestedValue = root.agent_identity ?? root.agentIdentity
+  const nested = typeof nestedValue === 'object' && nestedValue !== null && !Array.isArray(nestedValue)
+    ? nestedValue as Record<string, unknown>
+    : undefined
+  const authMode = root.auth_mode ?? root.authMode ?? nested?.auth_mode ?? nested?.authMode
+  if (typeof authMode === 'string' && authMode.trim().toLowerCase() === 'agentidentity') return true
+  const runtimeId = nested?.agent_runtime_id ?? nested?.agentRuntimeId ?? root.agent_runtime_id ?? root.agentRuntimeId
+  const privateKey = nested?.agent_private_key ?? nested?.agentPrivateKey ?? root.agent_private_key ?? root.agentPrivateKey
+  if (typeof runtimeId === 'string' && runtimeId.trim().length > 0
+    && typeof privateKey === 'string' && privateKey.trim().length > 0
+  ) return true
+  return Object.values(root).some(jsonValueContainsAgentIdentity)
 }
 
 // Device Authorization (AWS SSO OIDC)

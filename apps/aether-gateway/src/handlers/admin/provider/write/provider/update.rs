@@ -1,10 +1,14 @@
 use crate::handlers::admin::provider::shared::payloads::AdminProviderUpdatePatch;
 use crate::handlers::admin::provider::shared::support::{
-    normalize_provider_billing_type, parse_optional_rfc3339_unix_secs,
+    normalize_provider_billing_type, normalize_provider_transfer_limit,
+    normalize_provider_transfer_limit_json, parse_optional_rfc3339_unix_secs,
+    PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY, PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
 };
 use crate::handlers::admin::provider::write::normalize::normalize_chat_pii_redaction_config;
 use crate::handlers::admin::provider::write::normalize::normalize_pool_advanced_config;
 use crate::handlers::admin::provider::write::normalize::normalize_provider_type_input;
+use crate::handlers::admin::provider::write::normalize::set_responses_websocket_enabled;
+use crate::handlers::admin::provider::write::normalize::validate_responses_websocket_config;
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::normalize_json_object;
 use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogProvider;
@@ -202,21 +206,13 @@ pub(crate) async fn build_admin_update_provider_record(
     }
 
     if fields.contains("stream_first_byte_timeout") {
-        updated.stream_first_byte_timeout_secs = match payload.stream_first_byte_timeout {
-            Some(value) if (1.0..=300.0).contains(&value) => Some(value),
-            Some(_) => {
-                return Err("stream_first_byte_timeout 必须是 1 到 300 之间的数字".to_string());
-            }
-            None => None,
-        };
+        updated.stream_first_byte_timeout_secs =
+            super::normalize_provider_stream_first_byte_timeout(payload.stream_first_byte_timeout)?;
     }
 
     if fields.contains("request_timeout") {
-        updated.request_timeout_secs = match payload.request_timeout {
-            Some(value) if (1.0..=600.0).contains(&value) => Some(value),
-            Some(_) => return Err("request_timeout 必须是 1 到 600 之间的数字".to_string()),
-            None => None,
-        };
+        updated.request_timeout_secs =
+            super::normalize_provider_request_timeout(payload.request_timeout)?;
     }
 
     if fields.contains("enable_format_conversion") {
@@ -246,6 +242,56 @@ pub(crate) async fn build_admin_update_provider_record(
                 } else {
                     config_map.insert(key, value);
                 }
+            }
+        }
+    }
+
+    if fields.contains("codex_fingerprint_convergence_enabled") {
+        let Some(enabled) = payload.codex_fingerprint_convergence_enabled else {
+            return Err("codex_fingerprint_convergence_enabled 必须是布尔值".to_string());
+        };
+        if target_provider_type != "codex" && enabled {
+            return Err(
+                "codex_fingerprint_convergence_enabled 仅适用于 provider_type=codex".to_string(),
+            );
+        }
+        if target_provider_type == "codex" {
+            let codex_config = config_map
+                .entry(crate::provider_transport::CODEX_FINGERPRINT_CONFIG_NAMESPACE.to_string())
+                .or_insert_with(|| json!({}));
+            let Some(codex_config) = codex_config.as_object_mut() else {
+                return Err("config.codex 必须是 JSON 对象".to_string());
+            };
+            codex_config.insert(
+                crate::provider_transport::CODEX_FINGERPRINT_ENABLED_CONFIG_KEY.to_string(),
+                json!(enabled),
+            );
+        }
+    }
+    if target_provider_type != "codex" {
+        remove_codex_fingerprint_config(&mut config_map);
+    }
+
+    for (field_name, payload_value) in [
+        (
+            PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY,
+            payload.max_transfer_count,
+        ),
+        (
+            PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
+            payload.max_transfer_timeout_seconds,
+        ),
+    ] {
+        if fields.contains(field_name) {
+            let value = payload_value
+                .map(|value| normalize_provider_transfer_limit(value, field_name))
+                .transpose()?
+                .unwrap_or(0);
+            config_map.insert(field_name.to_string(), json!(value));
+        } else if fields.contains("config") {
+            if let Some(value) = config_map.get(field_name) {
+                let value = normalize_provider_transfer_limit_json(value, field_name)?;
+                config_map.insert(field_name.to_string(), json!(value));
             }
         }
     }
@@ -293,10 +339,65 @@ pub(crate) async fn build_admin_update_provider_record(
         }
     }
 
+    if fields.contains("responses_websocket_enabled") {
+        let enabled = payload
+            .responses_websocket_enabled
+            .ok_or_else(|| "responses_websocket_enabled 必须是布尔值".to_string())?;
+        set_responses_websocket_enabled(&mut config_map, enabled)?;
+    }
+    validate_responses_websocket_config(&config_map)?;
+
     updated.config = (!config_map.is_empty()).then_some(serde_json::Value::Object(config_map));
+    crate::provider_transport::validate_anthropic_compatibility_profile_config(
+        updated.config.as_ref(),
+    )
+    .map_err(|_| "无效的 Anthropic compatibility profile".to_string())?;
     updated.updated_at_unix_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs());
     Ok(updated)
+}
+
+fn remove_codex_fingerprint_config(config_map: &mut serde_json::Map<String, serde_json::Value>) {
+    let namespace = crate::provider_transport::CODEX_FINGERPRINT_CONFIG_NAMESPACE;
+    let key = crate::provider_transport::CODEX_FINGERPRINT_ENABLED_CONFIG_KEY;
+    let mut remove_namespace = false;
+    if let Some(codex_config) = config_map
+        .get_mut(namespace)
+        .and_then(|value| value.as_object_mut())
+    {
+        codex_config.remove(key);
+        remove_namespace = codex_config.is_empty();
+    }
+    if remove_namespace {
+        config_map.remove(namespace);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn removing_fingerprint_setting_preserves_other_codex_config() {
+        let mut config = json!({
+            "codex": {
+                "fingerprint_convergence_enabled": true,
+                "pass_through_cyber_flag_interrupt": true
+            },
+            "other": {"kept": true}
+        })
+        .as_object()
+        .expect("config object")
+        .clone();
+
+        super::remove_codex_fingerprint_config(&mut config);
+
+        assert_eq!(
+            config["codex"],
+            json!({"pass_through_cyber_flag_interrupt": true})
+        );
+        assert_eq!(config["other"], json!({"kept": true}));
+    }
 }

@@ -18,6 +18,7 @@ use crate::ai_serving::planner::spec_metadata::{
 };
 use crate::ai_serving::GatewayControlDecision;
 use crate::{AiExecutionDecision, AppState, GatewayError};
+use aether_routing_core::RoutingExecutionPolicy;
 
 use super::candidates::{
     build_local_standard_candidate_attempt_source, resolve_local_standard_decision_input,
@@ -177,8 +178,15 @@ pub(crate) async fn build_local_stream_attempt_source<'a>(
 
 #[async_trait]
 impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalStandardSyncAttemptSource<'_> {
+    fn routing_execution_policy(&self) -> Option<RoutingExecutionPolicy> {
+        self.input
+            .routing_policy
+            .as_ref()
+            .map(|policy| policy.execution_policy)
+    }
+
     async fn next_execution_attempt(&mut self) -> Result<Option<AiSyncAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             match self.build_sync_attempt(attempt).await? {
                 Some(attempt) => return Ok(Some(attempt)),
                 None => continue,
@@ -201,12 +209,34 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalStandardSyncAttemptSour
         }
         Ok(drained)
     }
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_credential(key_id);
+        Ok(())
+    }
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_endpoint(endpoint_id);
+        Ok(())
+    }
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_provider(provider_id);
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalStandardStreamAttemptSource<'_> {
+    fn routing_execution_policy(&self) -> Option<RoutingExecutionPolicy> {
+        self.input
+            .routing_policy
+            .as_ref()
+            .map(|policy| policy.execution_policy)
+    }
+
     async fn next_execution_attempt(&mut self) -> Result<Option<AiStreamAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             match self.build_stream_attempt(attempt).await? {
                 Some(attempt) => return Ok(Some(attempt)),
                 None => continue,
@@ -228,6 +258,21 @@ impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalStandardStreamAttempt
             }
         }
         Ok(drained)
+    }
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_credential(key_id);
+        Ok(())
+    }
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_endpoint(endpoint_id);
+        Ok(())
+    }
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_provider(provider_id);
+        Ok(())
     }
 }
 
@@ -340,7 +385,7 @@ pub(crate) async fn maybe_build_sync_via_standard_family_payload(
             .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         if let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
@@ -390,7 +435,7 @@ pub(crate) async fn maybe_build_stream_via_standard_family_payload(
             .await?;
     apply_local_runtime_candidate_evaluation_progress(state, trace_id, candidate_count);
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         if let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
@@ -449,7 +494,7 @@ pub(crate) async fn build_local_sync_plan_and_reports(
         return Ok(Vec::new());
     }
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )
@@ -524,7 +569,7 @@ pub(crate) async fn build_local_stream_plan_and_reports(
         return Ok(Vec::new());
     }
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let Some(payload) = maybe_build_local_standard_decision_payload_for_candidate(
             state, parts, trace_id, body_json, &input, attempt, spec,
         )

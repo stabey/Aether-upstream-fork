@@ -14,8 +14,11 @@ export interface UsageRecord {
   provider_id?: string // UUID
   provider_name?: string
   model: string
+  request_type?: string | null
+  requested_reasoning_effort?: string | null
   reasoning_effort?: string | null
   service_tier?: string | null
+  actual_service_tier?: string | null
   input_tokens: number
   effective_input_tokens?: number
   output_tokens: number
@@ -26,6 +29,16 @@ export interface UsageRecord {
   total_tokens: number
   cost?: number
   response_time?: number
+  response_time_ms?: number | null
+  first_byte_time_ms?: number | null
+  end_to_end_time_ms?: number | null
+  end_to_end_first_byte_time_ms?: number | null
+  is_websocket?: boolean
+  websocket_transport?: string | null
+  usage_available?: boolean
+  usage_pricing_available?: boolean
+  input_audio_tokens?: number | null
+  output_audio_tokens?: number | null
   created_at: string
   updated_at?: string | null
   response_time_updated_at?: string | null
@@ -43,6 +56,8 @@ export interface UsageStats {
   total_cost: number
   total_actual_cost?: number
   avg_response_time: number
+  error_count?: number
+  error_rate?: number
   today?: {
     requests: number
     tokens: number
@@ -128,6 +143,21 @@ export interface UsageFilters {
 export interface UsageRequestOptions {
   skipCache?: boolean
 }
+
+export type UsageRecordStatusFilter =
+  | 'stream'
+  | 'standard'
+  | 'websocket'
+  | 'ws'
+  | 'active'
+  | 'pending'
+  | 'streaming'
+  | 'completed'
+  | 'failed'
+  | 'error'
+  | 'cancelled'
+  | 'has_fallback'
+  | 'has_retry'
 
 type UsageListResponse = {
   records?: unknown
@@ -473,7 +503,7 @@ export const usageApi = {
     model?: string
     provider?: string
     api_format?: string  // API 格式筛选（如 openai:chat, claude:messages）
-    status?: string // 'stream' | 'standard' | 'error'
+    status?: UsageRecordStatusFilter
     client_family?: string
     hide_unknown?: boolean
     include_total?: boolean
@@ -506,7 +536,7 @@ export const usageApi = {
     model?: string
     provider?: string
     api_format?: string
-    status?: string
+    status?: UsageRecordStatusFilter
     client_family?: string
     hide_unknown?: boolean
   }): Promise<number> {
@@ -549,6 +579,8 @@ export const usageApi = {
       rate_multiplier?: number | null
       response_time_ms: number | null
       first_byte_time_ms: number | null
+      end_to_end_time_ms?: number | null
+      end_to_end_first_byte_time_ms?: number | null
       updated_at?: string | null
       response_time_updated_at?: string | null
       status_code?: number | null
@@ -559,14 +591,23 @@ export const usageApi = {
       api_format?: string | null
       endpoint_api_format?: string | null
       is_stream?: boolean | null
+      is_websocket?: boolean | null
+      websocket_transport?: string | null
+      usage_available?: boolean | null
+      usage_pricing_available?: boolean | null
+      input_audio_tokens?: number | null
+      output_audio_tokens?: number | null
       upstream_is_stream?: boolean | null
       client_requested_stream?: boolean | null
       client_is_stream?: boolean | null
       has_format_conversion?: boolean | null
       has_fallback?: boolean | null
       target_model?: string | null
+      request_type?: string | null
+      requested_reasoning_effort?: string | null
       reasoning_effort?: string | null
       service_tier?: string | null
+      actual_service_tier?: string | null
       image_progress?: ImageProgress | null
     }>
   }> {

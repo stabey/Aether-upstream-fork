@@ -8,12 +8,16 @@ pub(crate) const ROUTING_GROUP_HEADER: &str = "x-aether-scheduler-group";
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum GatewayRoutingSelectionError {
+    #[error("no enabled routing strategy is configured for this request")]
+    NoDefault,
     #[error("routing group was explicitly requested but was not found: {0}")]
     NotFound(String),
     #[error("routing group was explicitly requested but is not enabled: {0}")]
     Disabled(String),
     #[error("routing group was explicitly requested but is not allowed for this principal: {0}")]
     Forbidden(String),
+    #[error("routing group repository lookup failed: {0}")]
+    Repository(String),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -24,7 +28,7 @@ pub(crate) struct GatewayRoutingSelectionInput<'a> {
     pub user_group_ids: &'a [String],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GatewayRoutingGroupSelection {
     pub group: Option<StoredRoutingGroup>,
     pub source: String,
@@ -42,27 +46,46 @@ pub(crate) async fn select_gateway_routing_group(
         let group = repository
             .find_routing_group(RoutingGroupLookupKey::Id(explicit))
             .await
-            .ok()
-            .flatten()
-            .or({
-                let group: Option<StoredRoutingGroup> = repository
-                    .find_routing_group(RoutingGroupLookupKey::Name(explicit))
-                    .await
-                    .unwrap_or_default();
-                group
-            });
+            .map_err(repository_selection_error)?;
+        let group = match group {
+            Some(group) => Some(group),
+            None => repository
+                .find_routing_group(RoutingGroupLookupKey::Name(explicit))
+                .await
+                .map_err(repository_selection_error)?,
+        };
         let Some(group) = group else {
             return Err(GatewayRoutingSelectionError::NotFound(explicit.to_string()));
         };
         if !group.enabled {
             return Err(GatewayRoutingSelectionError::Disabled(group.id));
         }
-        if !explicit_group_allowed(repository, &group.id, &input).await {
+        if !explicit_group_allowed(repository, &group, &input).await? {
             return Err(GatewayRoutingSelectionError::Forbidden(group.id));
         }
         return Ok(GatewayRoutingGroupSelection {
             group: Some(group),
             source: "explicit_header".to_string(),
+        });
+    }
+
+    // When there are no bindings at all, no principal-specific lookup can
+    // produce a group. The data-state repository answers this with a cached
+    // existence query, so the common "routing configured but unused" case
+    // does not materialize the binding table per API key/user.
+    let has_bindings = repository
+        .has_any_routing_group_binding()
+        .await
+        .map_err(repository_selection_error)?;
+    if !has_bindings {
+        let system_default = repository
+            .find_routing_group(RoutingGroupLookupKey::SystemDefault)
+            .await
+            .map_err(repository_selection_error)?
+            .filter(|group| group.enabled);
+        return Ok(GatewayRoutingGroupSelection {
+            group: system_default,
+            source: "system_default".to_string(),
         });
     }
 
@@ -74,13 +97,12 @@ pub(crate) async fn select_gateway_routing_group(
                 subject_id: Some(subject_id.to_string()),
             })
             .await
-            .unwrap_or_default();
+            .map_err(repository_selection_error)?;
         for binding in bindings.into_iter().filter(|binding| binding.is_default) {
             let group = repository
                 .find_routing_group(RoutingGroupLookupKey::Id(&binding.group_id))
                 .await
-                .ok()
-                .flatten();
+                .map_err(repository_selection_error)?;
             if let Some(group) = group.filter(|group| group.enabled) {
                 return Ok(GatewayRoutingGroupSelection {
                     group: Some(group),
@@ -93,8 +115,7 @@ pub(crate) async fn select_gateway_routing_group(
     let system_default = repository
         .find_routing_group(RoutingGroupLookupKey::SystemDefault)
         .await
-        .ok()
-        .flatten()
+        .map_err(repository_selection_error)?
         .filter(|group| group.enabled);
     Ok(GatewayRoutingGroupSelection {
         group: system_default,
@@ -104,31 +125,30 @@ pub(crate) async fn select_gateway_routing_group(
 
 async fn explicit_group_allowed(
     repository: &(impl RoutingGroupReadRepository + ?Sized),
-    group_id: &str,
+    group: &StoredRoutingGroup,
     input: &GatewayRoutingSelectionInput<'_>,
-) -> bool {
-    if let Ok(Some(group)) = repository
-        .find_routing_group(RoutingGroupLookupKey::Id(group_id))
-        .await
-    {
-        if group.is_system_default {
-            return true;
-        }
+) -> Result<bool, GatewayRoutingSelectionError> {
+    if group.is_system_default {
+        return Ok(true);
     }
     for (subject_type, subject_id, _) in default_binding_candidates(input) {
         let bindings = repository
             .list_routing_group_bindings(&RoutingGroupBindingQuery {
-                group_id: Some(group_id.to_string()),
+                group_id: Some(group.id.clone()),
                 subject_type: Some(subject_type),
                 subject_id: Some(subject_id.to_string()),
             })
             .await
-            .unwrap_or_default();
+            .map_err(repository_selection_error)?;
         if bindings.iter().any(|binding| binding.allow_explicit_select) {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
+}
+
+fn repository_selection_error(error: impl std::fmt::Display) -> GatewayRoutingSelectionError {
+    GatewayRoutingSelectionError::Repository(error.to_string())
 }
 
 fn default_binding_candidates<'a>(
@@ -160,10 +180,56 @@ mod tests {
     use aether_data::repository::routing_profiles::InMemoryRoutingGroupRepository;
     use aether_data_contracts::repository::routing_profiles::{
         CreateRoutingGroupBindingRecord, CreateRoutingGroupRecord, RoutingGroupWriteRepository,
+        StoredRoutingGroupBinding, StoredRoutingGroupVersion,
     };
+    use aether_data_contracts::DataLayerError;
+    use async_trait::async_trait;
     use serde_json::json;
 
     use super::*;
+
+    struct FailingRoutingGroupRepository {
+        id_lookup_is_missing: bool,
+    }
+
+    impl FailingRoutingGroupRepository {
+        fn failure<T>() -> Result<T, DataLayerError> {
+            Err(DataLayerError::Sql(
+                "routing repository unavailable".to_string(),
+            ))
+        }
+    }
+
+    #[async_trait]
+    impl RoutingGroupReadRepository for FailingRoutingGroupRepository {
+        async fn list_routing_groups(&self) -> Result<Vec<StoredRoutingGroup>, DataLayerError> {
+            Self::failure()
+        }
+
+        async fn find_routing_group(
+            &self,
+            lookup: RoutingGroupLookupKey<'_>,
+        ) -> Result<Option<StoredRoutingGroup>, DataLayerError> {
+            if self.id_lookup_is_missing && matches!(lookup, RoutingGroupLookupKey::Id(_)) {
+                return Ok(None);
+            }
+            Self::failure()
+        }
+
+        async fn list_routing_group_bindings(
+            &self,
+            _query: &RoutingGroupBindingQuery,
+        ) -> Result<Vec<StoredRoutingGroupBinding>, DataLayerError> {
+            Self::failure()
+        }
+
+        async fn list_routing_group_versions(
+            &self,
+            _group_id: &str,
+        ) -> Result<Vec<StoredRoutingGroupVersion>, DataLayerError> {
+            Self::failure()
+        }
+    }
 
     #[tokio::test]
     async fn selects_api_key_default_binding() {
@@ -175,6 +241,7 @@ mod tests {
                 description: None,
                 enabled: true,
                 is_system_default: false,
+                sort_order: 0,
                 config_json: json!({}),
                 version: 1,
                 created_at: 1,
@@ -214,6 +281,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selects_system_default_when_no_bindings_exist() {
+        let repository = InMemoryRoutingGroupRepository::default();
+        repository
+            .create_routing_group(CreateRoutingGroupRecord {
+                id: "system-default".to_string(),
+                name: "system-default".to_string(),
+                description: None,
+                enabled: true,
+                is_system_default: true,
+                sort_order: 0,
+                config_json: json!({}),
+                version: 1,
+                created_at: 1,
+                updated_at: 1,
+                published_at: None,
+            })
+            .await
+            .unwrap();
+
+        let selection = select_gateway_routing_group(
+            &repository,
+            GatewayRoutingSelectionInput {
+                explicit_group: None,
+                user_id: Some("user-1"),
+                api_key_id: Some("api-key-1"),
+                user_group_ids: &["user-group-1".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selection.source, "system_default");
+        assert_eq!(selection.group.unwrap().id, "system-default");
+    }
+
+    #[tokio::test]
+    async fn selects_explicit_group_allowed_by_user_group_binding() {
+        let repository = InMemoryRoutingGroupRepository::default();
+        repository
+            .create_routing_group(CreateRoutingGroupRecord {
+                id: "private-group".to_string(),
+                name: "private".to_string(),
+                description: None,
+                enabled: true,
+                is_system_default: false,
+                sort_order: 0,
+                config_json: json!({}),
+                version: 1,
+                created_at: 1,
+                updated_at: 1,
+                published_at: None,
+            })
+            .await
+            .unwrap();
+        repository
+            .create_routing_group_binding(CreateRoutingGroupBindingRecord {
+                id: "binding-explicit".to_string(),
+                group_id: "private-group".to_string(),
+                subject_type: RoutingGroupBindingSubject::UserGroup,
+                subject_id: "team-1".to_string(),
+                is_default: false,
+                allow_explicit_select: true,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .await
+            .unwrap();
+
+        let selection = select_gateway_routing_group(
+            &repository,
+            GatewayRoutingSelectionInput {
+                explicit_group: Some("private-group"),
+                user_id: Some("user-1"),
+                api_key_id: Some("api-key-1"),
+                user_group_ids: &["team-1".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selection.source, "explicit_header");
+        assert_eq!(selection.group.unwrap().id, "private-group");
+    }
+
+    #[tokio::test]
     async fn rejects_explicit_group_that_does_not_exist() {
         let repository = InMemoryRoutingGroupRepository::default();
 
@@ -236,6 +388,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn propagates_explicit_name_lookup_failure_after_missing_id() {
+        let repository = FailingRoutingGroupRepository {
+            id_lookup_is_missing: true,
+        };
+
+        let error = select_gateway_routing_group(
+            &repository,
+            GatewayRoutingSelectionInput {
+                explicit_group: Some("group-name"),
+                user_id: Some("user-1"),
+                api_key_id: Some("api-key-1"),
+                user_group_ids: &[],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            GatewayRoutingSelectionError::Repository(
+                "sql error: routing repository unavailable".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn propagates_implicit_binding_lookup_failure() {
+        let repository = FailingRoutingGroupRepository {
+            id_lookup_is_missing: false,
+        };
+
+        let error = select_gateway_routing_group(
+            &repository,
+            GatewayRoutingSelectionInput {
+                explicit_group: None,
+                user_id: Some("user-1"),
+                api_key_id: Some("api-key-1"),
+                user_group_ids: &[],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            GatewayRoutingSelectionError::Repository(
+                "sql error: routing repository unavailable".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
     async fn rejects_explicit_disabled_group() {
         let repository = InMemoryRoutingGroupRepository::default();
         repository
@@ -245,6 +449,7 @@ mod tests {
                 description: None,
                 enabled: false,
                 is_system_default: false,
+                sort_order: 0,
                 config_json: json!({}),
                 version: 1,
                 created_at: 1,
@@ -282,6 +487,7 @@ mod tests {
                 description: None,
                 enabled: true,
                 is_system_default: false,
+                sort_order: 0,
                 config_json: json!({}),
                 version: 1,
                 created_at: 1,

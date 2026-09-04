@@ -81,8 +81,6 @@
             :registration-privacy-policy-version="systemConfig.registration_privacy_policy_version"
             :auto-delete-expired-keys="systemConfig.auto_delete_expired_keys"
             :enable-format-conversion="systemConfig.enable_format_conversion"
-            :enable-openai-image-sync-heartbeat="systemConfig.enable_openai_image_sync_heartbeat"
-            :enable-standard-text-sync-heartbeat="systemConfig.enable_standard_text_sync_heartbeat"
             :loading="systemConfigLoading || basicConfigLoading"
             :has-changes="hasBasicConfigChanges"
             @save="saveBasicConfig"
@@ -106,23 +104,17 @@
             @update:registration-privacy-policy-version="systemConfig.registration_privacy_policy_version = $event"
             @update:auto-delete-expired-keys="systemConfig.auto_delete_expired_keys = $event"
             @update:enable-format-conversion="systemConfig.enable_format_conversion = $event"
-            @update:enable-openai-image-sync-heartbeat="systemConfig.enable_openai_image_sync_heartbeat = $event"
-            @update:enable-standard-text-sync-heartbeat="systemConfig.enable_standard_text_sync_heartbeat = $event"
           />
 
           <!-- 请求记录配置 -->
           <RequestLogSection
             id="section-request-log"
             :request-record-level="systemConfig.request_record_level"
-            :max-request-body-size-k-b="maxRequestBodySizeKB"
-            :max-response-body-size-k-b="maxResponseBodySizeKB"
             :sensitive-headers-str="sensitiveHeadersStr"
             :loading="systemConfigLoading || logConfigLoading"
             :has-changes="hasLogConfigChanges"
             @save="saveLogConfig"
             @update:request-record-level="systemConfig.request_record_level = $event"
-            @update:max-request-body-size-k-b="maxRequestBodySizeKB = $event"
-            @update:max-response-body-size-k-b="maxResponseBodySizeKB = $event"
             @update:sensitive-headers-str="sensitiveHeadersStr = $event"
           />
 
@@ -357,8 +349,6 @@ const {
   hasBasicConfigChanges,
   hasLogConfigChanges,
   hasCleanupConfigChanges,
-  maxRequestBodySizeKB,
-  maxResponseBodySizeKB,
   sensitiveHeadersStr,
   turnstileAllowedHostnamesStr,
   loadSystemConfig,

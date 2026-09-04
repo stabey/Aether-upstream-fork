@@ -770,6 +770,18 @@ const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
         aliases: &["responses_compact"],
     },
     AdminApiFormatDefinition {
+        value: "openai:realtime",
+        label: "OpenAI Realtime",
+        default_path: "/v1/realtime",
+        aliases: &["openai_realtime", "realtime"],
+    },
+    AdminApiFormatDefinition {
+        value: "openai:search",
+        label: "OpenAI Search",
+        default_path: "/v1/alpha/search",
+        aliases: &["openai_search", "search"],
+    },
+    AdminApiFormatDefinition {
         value: "openai:embedding",
         label: "OpenAI Embedding",
         default_path: "/v1/embeddings",
@@ -794,6 +806,12 @@ const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
         aliases: &["openai_video", "sora"],
     },
     AdminApiFormatDefinition {
+        value: "codex:live",
+        label: "OpenAI Live",
+        default_path: "/v1/live",
+        aliases: &["codex_live", "live"],
+    },
+    AdminApiFormatDefinition {
         value: "claude:messages",
         label: "Claude Messages",
         default_path: "/v1/messages",
@@ -804,6 +822,12 @@ const ADMIN_API_FORMAT_DEFINITIONS: &[AdminApiFormatDefinition] = &[
         label: "Gemini Generate Content",
         default_path: "/v1beta/models/{model}:{action}",
         aliases: &["gemini", "google", "vertex"],
+    },
+    AdminApiFormatDefinition {
+        value: "gemini:interactions",
+        label: "Gemini Interactions",
+        default_path: "/v1/interactions",
+        aliases: &["gemini_interactions", "interactions"],
     },
     AdminApiFormatDefinition {
         value: "gemini:embedding",
@@ -1679,8 +1703,8 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "default_user_initial_gift_usd" => Some(json!(10.0)),
         "password_policy_level" => Some(json!("weak")),
         REQUEST_RECORD_LEVEL_KEY => Some(json!("full")),
-        "max_request_body_size" => Some(json!(5_242_880)),
-        "max_response_body_size" => Some(json!(5_242_880)),
+        "max_request_body_size" => Some(json!(0)),
+        "max_response_body_size" => Some(json!(0)),
         "sensitive_headers" => Some(json!([
             "authorization",
             "x-api-key",
@@ -1701,8 +1725,6 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "proxy_node_metrics_cleanup_batch_size" => Some(json!(5000)),
         "enable_provider_checkin" => Some(json!(true)),
         "provider_checkin_time" => Some(json!("01:05")),
-        "provider_priority_mode" => Some(json!("provider")),
-        "scheduling_mode" => Some(json!("cache_affinity")),
         "auto_delete_expired_keys" => Some(json!(false)),
         "turnstile_enabled" => Some(json!(false)),
         "turnstile_site_key" => Some(serde_json::Value::Null),
@@ -1712,6 +1734,7 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "backup_s3_scope" => Some(json!("data")),
         "backup_s3_endpoint" => Some(serde_json::Value::Null),
         "backup_s3_region" => Some(json!("auto")),
+        "backup_s3_user_agent" => Some(json!("rclone/v1.68.0")),
         "backup_s3_bucket" => Some(serde_json::Value::Null),
         "backup_s3_prefix" => Some(json!("aether/backups/")),
         "backup_s3_access_key_id" => Some(serde_json::Value::Null),
@@ -1730,70 +1753,11 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
         "email_suffix_list" => Some(json!([])),
         "enable_format_conversion" => Some(json!(false)),
         "enable_model_directives" => Some(json!(false)),
-        "model_directives" => Some(json!({
-            "reasoning_effort": {
-                "enabled": true,
-                "api_formats": {
-                    "openai:chat": {
-                        "enabled": true,
-                        "mappings": {
-                            "low": { "reasoning_effort": "low" },
-                            "medium": { "reasoning_effort": "medium" },
-                            "high": { "reasoning_effort": "high" },
-                            "xhigh": { "reasoning_effort": "xhigh" },
-                            "max": { "reasoning_effort": "xhigh" },
-                            "fast": { "service_tier": "priority" }
-                        }
-                    },
-                    "openai:responses": {
-                        "enabled": true,
-                        "mappings": {
-                            "low": { "reasoning": { "effort": "low" } },
-                            "medium": { "reasoning": { "effort": "medium" } },
-                            "high": { "reasoning": { "effort": "high" } },
-                            "xhigh": { "reasoning": { "effort": "xhigh" } },
-                            "max": { "reasoning": { "effort": "xhigh" } },
-                            "fast": { "service_tier": "priority" }
-                        }
-                    },
-                    "openai:responses:compact": {
-                        "enabled": true,
-                        "mappings": {
-                            "low": { "reasoning": { "effort": "low" } },
-                            "medium": { "reasoning": { "effort": "medium" } },
-                            "high": { "reasoning": { "effort": "high" } },
-                            "xhigh": { "reasoning": { "effort": "xhigh" } },
-                            "max": { "reasoning": { "effort": "xhigh" } },
-                            "fast": { "service_tier": "priority" }
-                        }
-                    },
-                    "claude:messages": {
-                        "enabled": true,
-                        "mappings": {
-                            "low": { "thinking": { "type": "enabled", "budget_tokens": 1024 } },
-                            "medium": { "thinking": { "type": "enabled", "budget_tokens": 4096 } },
-                            "high": { "thinking": { "type": "enabled", "budget_tokens": 8192 } },
-                            "xhigh": { "thinking": { "type": "enabled", "budget_tokens": 16384 } },
-                            "max": { "thinking": { "type": "enabled", "budget_tokens": 32768 } }
-                        }
-                    },
-                    "gemini:generate_content": {
-                        "enabled": true,
-                        "mappings": {
-                            "low": { "generationConfig": { "thinkingConfig": { "thinkingBudget": 1024 } } },
-                            "medium": { "generationConfig": { "thinkingConfig": { "thinkingBudget": 4096 } } },
-                            "high": { "generationConfig": { "thinkingConfig": { "thinkingBudget": 8192 } } },
-                            "xhigh": { "generationConfig": { "thinkingConfig": { "thinkingBudget": 16384 } } },
-                            "max": { "generationConfig": { "thinkingConfig": { "thinkingBudget": -1 } } }
-                        }
-                    }
-                }
-            }
-        })),
-        "keep_priority_on_conversion" => Some(json!(false)),
+        "model_directives" => Some(aether_ai_formats::default_model_directives_config()),
         "audit_log_retention_days" => Some(json!(30)),
         "enable_db_maintenance" => Some(json!(true)),
         "system_proxy_node_id" => Some(serde_json::Value::Null),
+        "external_models_proxy_node_id" => Some(serde_json::Value::Null),
         "smtp_host" => Some(serde_json::Value::Null),
         "smtp_port" => Some(json!(587)),
         "smtp_user" => Some(serde_json::Value::Null),
@@ -1826,22 +1790,26 @@ pub fn admin_system_config_default_value(key: &str) -> Option<serde_json::Value>
 pub fn build_admin_system_configs_payload(
     entries: &[StoredSystemConfigEntry],
 ) -> serde_json::Value {
-    let has_request_record_level = entries
+    let canonical_keys = entries
         .iter()
-        .any(|entry| entry.key == REQUEST_RECORD_LEVEL_KEY);
+        .filter_map(|entry| {
+            let normalized = normalize_admin_system_config_key(&entry.key);
+            entry
+                .key
+                .eq_ignore_ascii_case(&normalized)
+                .then(|| normalized.to_ascii_lowercase())
+        })
+        .collect::<BTreeSet<_>>();
     json!(entries
         .iter()
         .filter_map(|entry| {
-            if entry.key == LEGACY_REQUEST_LOG_LEVEL_KEY && has_request_record_level {
+            let normalized_key = normalize_admin_system_config_key(&entry.key);
+            let is_legacy = !entry.key.eq_ignore_ascii_case(&normalized_key);
+            if is_legacy && canonical_keys.contains(&normalized_key.to_ascii_lowercase()) {
                 return None;
             }
-            let key = if entry.key == LEGACY_REQUEST_LOG_LEVEL_KEY {
-                REQUEST_RECORD_LEVEL_KEY
-            } else {
-                entry.key.as_str()
-            };
             Some(build_admin_system_config_list_item(
-                key,
+                &normalized_key,
                 &entry.value,
                 entry.description.as_deref(),
                 entry.updated_at_unix_secs,
@@ -2142,6 +2110,75 @@ fn normalize_optional_bounded_string(
     }
 }
 
+fn validate_model_directives_config_value(value: &Value) -> Result<(), ()> {
+    let root = value.as_object().ok_or(())?;
+    let reasoning = root
+        .get("reasoning_effort")
+        .and_then(Value::as_object)
+        .ok_or(())?;
+    if reasoning
+        .get("enabled")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(());
+    }
+
+    let Some(api_formats) = reasoning.get("api_formats") else {
+        return Ok(());
+    };
+    let api_formats = api_formats.as_object().ok_or(())?;
+    let mut canonical_api_formats = BTreeSet::new();
+    for (api_format, raw_config) in api_formats {
+        if api_format.trim().is_empty() {
+            return Err(());
+        }
+        let canonical_api_format = aether_ai_formats::normalize_api_format_alias(api_format);
+        if !canonical_api_formats.insert(canonical_api_format) {
+            return Err(());
+        }
+        if raw_config.is_boolean() {
+            continue;
+        }
+        let config = raw_config.as_object().ok_or(())?;
+        if config
+            .get("enabled")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(());
+        }
+        if let Some(suffixes) = config.get("suffixes") {
+            let suffixes = suffixes.as_array().ok_or(())?;
+            let mut canonical_suffixes = BTreeSet::new();
+            for suffix in suffixes {
+                let suffix = suffix.as_str().map(str::trim).ok_or(())?;
+                if suffix.is_empty()
+                    || suffix.starts_with('-')
+                    || suffix.ends_with('-')
+                    || !canonical_suffixes.insert(suffix.to_ascii_lowercase())
+                {
+                    return Err(());
+                }
+            }
+        }
+        if let Some(mappings) = config.get("mappings") {
+            let mappings = mappings.as_object().ok_or(())?;
+            let mut canonical_suffixes = BTreeSet::new();
+            for (suffix, mapping) in mappings {
+                let suffix = suffix.trim();
+                if suffix.is_empty()
+                    || suffix.starts_with('-')
+                    || suffix.ends_with('-')
+                    || !canonical_suffixes.insert(suffix.to_ascii_lowercase())
+                    || !mapping.is_object()
+                {
+                    return Err(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_admin_system_config_update(
     requested_key: &str,
     request_body: &[u8],
@@ -2195,7 +2232,8 @@ pub fn parse_admin_system_config_update(
     }
 
     match normalized_key.as_str() {
-        "module.important_notification.enabled"
+        "enable_model_directives"
+        | "module.important_notification.enabled"
         | "module.important_notification.email_enabled"
         | "module.server_chan_push.enabled"
         | "module.bark_push.enabled" => match value.as_bool() {
@@ -2285,6 +2323,18 @@ pub fn parse_admin_system_config_update(
                     ));
                 }
             };
+        }
+        "model_directives" => {
+            if value.is_null() {
+                value = aether_ai_formats::default_model_directives_config();
+            } else {
+                validate_model_directives_config_value(&value).map_err(|_| {
+                    (
+                        http::StatusCode::BAD_REQUEST,
+                        json!({ "detail": "模型后缀参数配置格式无效" }),
+                    )
+                })?;
+            }
         }
         "module.chat_pii_redaction.enabled" => match value.as_bool() {
             Some(enabled) => value = json!(enabled),
@@ -3079,6 +3129,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn api_formats_payload_exposes_realtime_and_codex_live_separately() {
+        let payload = build_admin_api_formats_payload();
+        let formats = payload["formats"]
+            .as_array()
+            .expect("formats payload should be an array");
+        let realtime = formats
+            .iter()
+            .find(|format| format["value"] == "openai:realtime")
+            .expect("OpenAI Realtime format should be registered");
+        let live = formats
+            .iter()
+            .find(|format| format["value"] == "codex:live")
+            .expect("OpenAI Live format should be registered");
+
+        assert_eq!(realtime["label"], "OpenAI Realtime");
+        assert_eq!(realtime["default_path"], "/v1/realtime");
+        assert_eq!(
+            realtime["aliases"],
+            serde_json::json!(["openai_realtime", "realtime"])
+        );
+        assert_eq!(live["label"], "OpenAI Live");
+        assert_eq!(live["default_path"], "/v1/live");
+        assert_eq!(live["aliases"], serde_json::json!(["codex_live", "live"]));
+    }
+
+    #[test]
     fn build_admin_system_check_update_payload_reports_available_release() {
         let payload = build_admin_system_check_update_payload_with_release(
             "0.7.0-rc27".to_string(),
@@ -3421,6 +3497,112 @@ mod tests {
             admin_system_config_default_value("backup_s3_path_style"),
             Some(json!(true))
         );
+        assert_eq!(
+            admin_system_config_default_value("backup_s3_user_agent"),
+            Some(json!("rclone/v1.68.0"))
+        );
+    }
+
+    #[test]
+    fn model_directives_update_accepts_legacy_and_current_config_shapes() {
+        for body in [
+            r#"{
+                "value": {
+                    "reasoning_effort": {
+                        "enabled": true,
+                        "api_formats": {
+                            "openai:responses": {
+                                "enabled": true,
+                                "mappings": {
+                                    "low": { "reasoning": { "effort": "low" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+            r#"{
+                "value": {
+                    "reasoning_effort": {
+                        "api_formats": {
+                            "openai:responses": {
+                                "suffixes": ["low", "VendorFuture"],
+                                "mappings": {
+                                    "VendorFuture": { "reasoning": { "context": "all_turns" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }"#,
+            r#"{
+                "value": {
+                    "reasoning_effort": {
+                        "api_formats": {
+                            "/v1/responses": {
+                                "suffixes": ["low"],
+                                "mappings": {}
+                            }
+                        }
+                    }
+                }
+            }"#,
+        ] {
+            let update = parse_admin_system_config_update("model_directives", body.as_bytes())
+                .expect("valid model directive config should parse");
+            assert!(update.value["reasoning_effort"].is_object());
+        }
+
+        let reset = parse_admin_system_config_update("model_directives", br#"{"value":null}"#)
+            .expect("null should reset model directives to defaults");
+        assert_eq!(
+            reset.value,
+            aether_ai_formats::default_model_directives_config()
+        );
+    }
+
+    #[test]
+    fn model_directives_update_rejects_unsafe_mapping_shapes() {
+        for body in [
+            r#"{"value":[]}"#,
+            r#"{"value":{"reasoning_effort":true}}"#,
+            r#"{"value":{"reasoning_effort":{"enabled":"true"}}}"#,
+            r#"{"value":{"reasoning_effort":{"api_formats":[]}}}"#,
+            r#"{"value":{"reasoning_effort":{"api_formats":{"openai:responses":{"suffixes":["low",42]}}}}}"#,
+            r#"{"value":{"reasoning_effort":{"api_formats":{"openai:responses":{"mappings":{"low":"replace-body"}}}}}}"#,
+        ] {
+            let error = parse_admin_system_config_update("model_directives", body.as_bytes())
+                .expect_err("invalid model directive config should fail");
+            assert_eq!(error.0, http::StatusCode::BAD_REQUEST);
+            assert_eq!(error.1["detail"], "模型后缀参数配置格式无效");
+        }
+    }
+
+    #[test]
+    fn model_directives_update_rejects_ambiguous_aliases_and_suffixes() {
+        for body in [
+            r#"{"value":{"reasoning_effort":{"api_formats":{"openai:responses":true,"/v1/responses":false}}}}"#,
+            r#"{"value":{"reasoning_effort":{"api_formats":{"openai:responses":{"suffixes":["low","LOW"]}}}}}"#,
+            r#"{"value":{"reasoning_effort":{"api_formats":{"openai:responses":{"mappings":{"VendorFuture":{},"vendorfuture":{}}}}}}}"#,
+        ] {
+            let error = parse_admin_system_config_update("model_directives", body.as_bytes())
+                .expect_err("ambiguous model directive config should fail");
+            assert_eq!(error.0, http::StatusCode::BAD_REQUEST);
+            assert_eq!(error.1["detail"], "模型后缀参数配置格式无效");
+        }
+    }
+
+    #[test]
+    fn enable_model_directives_update_requires_a_boolean() {
+        let update =
+            parse_admin_system_config_update("enable_model_directives", br#"{"value":true}"#)
+                .expect("boolean model directives flag should parse");
+        assert_eq!(update.value, json!(true));
+        assert!(parse_admin_system_config_update(
+            "enable_model_directives",
+            br#"{"value":"true"}"#,
+        )
+        .is_err());
     }
 
     #[test]
@@ -3464,6 +3646,41 @@ mod tests {
                 "module.important_notification.server_chan_send_key".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn system_config_list_normalizes_legacy_keys_and_prefers_canonical_rows() {
+        let entries = vec![
+            StoredSystemConfigEntry {
+                key: "module.important_notification.server_chan_send_key".to_string(),
+                value: json!("legacy-secret"),
+                description: None,
+                updated_at_unix_secs: None,
+            },
+            StoredSystemConfigEntry {
+                key: "module.server_chan_push.send_key".to_string(),
+                value: json!("canonical-secret"),
+                description: None,
+                updated_at_unix_secs: None,
+            },
+            StoredSystemConfigEntry {
+                key: "module.notification_email.enabled".to_string(),
+                value: json!(true),
+                description: None,
+                updated_at_unix_secs: None,
+            },
+        ];
+
+        let payload = build_admin_system_configs_payload(&entries);
+        let rows = payload.as_array().expect("config list should be an array");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row["key"] == json!("module.server_chan_push.send_key") && row["is_set"] == json!(true)
+        }));
+        assert!(rows.iter().any(|row| {
+            row["key"] == json!("module.important_notification.enabled")
+                && row["value"] == json!(true)
+        }));
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::data::candidate_selection::{
     read_requested_model_rows, MinimalCandidateSelectionRowSource,
 };
 use crate::data::GatewayDataState;
+use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::{AppState, GatewayError};
 
 use super::super::affinity::build_scheduler_affinity_cache_key;
@@ -36,6 +37,7 @@ async fn select_candidate(
     global_model_name: &str,
     require_streaming: bool,
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    client_session_affinity: Option<&ClientSessionAffinity>,
     now_unix_secs: u64,
 ) -> Result<Option<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
     select_candidate_impl(
@@ -46,9 +48,10 @@ async fn select_candidate(
         require_streaming,
         None,
         auth_snapshot,
-        None,
+        client_session_affinity,
         now_unix_secs,
         false,
+        SchedulerOrderingConfig::default(),
     )
     .await
 }
@@ -106,6 +109,7 @@ async fn same_priority_candidates_are_distributed_by_affinity_key() {
         priority: 1,
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
+        operations: None,
     }]);
 
     let mut second = sample_row();
@@ -123,6 +127,7 @@ async fn same_priority_candidates_are_distributed_by_affinity_key() {
         priority: 1,
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
+        operations: None,
     }]);
 
     let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
@@ -141,6 +146,7 @@ async fn same_priority_candidates_are_distributed_by_affinity_key() {
         enumerate_minimal_candidate_selection(EnumerateMinimalCandidateSelectionInput {
             rows,
             normalized_api_format: "openai:chat",
+            request_operation: None,
             requested_model_name: "gpt-4.1",
             resolved_global_model_name: "gpt-4.1",
             require_streaming: false,
@@ -207,9 +213,14 @@ async fn reuses_cached_scheduler_affinity_candidate_before_sorted_fallback() {
         );
 
     let auth_snapshot = sample_auth_snapshot("affinity-key-1");
-    let cache_key =
-        build_scheduler_affinity_cache_key(Some(&auth_snapshot), "openai:chat", "gpt-4.1", None)
-            .expect("cache key should build");
+    let client_session_affinity = ClientSessionAffinity::from_session_key("session-1");
+    let cache_key = build_scheduler_affinity_cache_key(
+        Some(&auth_snapshot),
+        "openai:chat",
+        "gpt-4.1",
+        Some(&client_session_affinity),
+    )
+    .expect("cache key should build");
     state.remember_scheduler_affinity_target(
         &cache_key,
         SchedulerAffinityTarget {
@@ -228,6 +239,7 @@ async fn reuses_cached_scheduler_affinity_candidate_before_sorted_fallback() {
         "gpt-4.1",
         false,
         Some(&auth_snapshot),
+        Some(&client_session_affinity),
         100,
     )
     .await
@@ -312,9 +324,14 @@ async fn cached_affinity_candidate_cannot_use_reserved_provider_key_rpm_capacity
         );
 
     let auth_snapshot = sample_auth_snapshot("api-key-cached-user");
-    let cache_key =
-        build_scheduler_affinity_cache_key(Some(&auth_snapshot), "openai:chat", "gpt-4.1", None)
-            .expect("cache key should build");
+    let client_session_affinity = ClientSessionAffinity::from_session_key("session-1");
+    let cache_key = build_scheduler_affinity_cache_key(
+        Some(&auth_snapshot),
+        "openai:chat",
+        "gpt-4.1",
+        Some(&client_session_affinity),
+    )
+    .expect("cache key should build");
     state.remember_scheduler_affinity_target(
         &cache_key,
         SchedulerAffinityTarget {
@@ -333,6 +350,7 @@ async fn cached_affinity_candidate_cannot_use_reserved_provider_key_rpm_capacity
         "gpt-4.1",
         false,
         Some(&auth_snapshot),
+        Some(&client_session_affinity),
         100,
     )
     .await

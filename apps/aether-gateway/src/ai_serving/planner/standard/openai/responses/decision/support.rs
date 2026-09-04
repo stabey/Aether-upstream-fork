@@ -22,6 +22,7 @@ use crate::ai_serving::planner::common::extract_standard_requested_model;
 use crate::ai_serving::planner::decision_input::{
     attach_routing_policy_to_local_requested_model_input,
     build_local_requested_model_decision_input, resolve_local_authenticated_decision_input,
+    resolve_local_authenticated_decision_input_with_snapshot,
 };
 use crate::ai_serving::planner::materialization_policy::{
     build_local_candidate_persistence_policy, LocalCandidatePersistencePolicyKind,
@@ -31,8 +32,9 @@ use crate::ai_serving::planner::spec_metadata::local_openai_responses_spec_metad
 use crate::ai_serving::planner::CandidateFailureDiagnostic;
 use crate::ai_serving::{
     ai_local_execution_contract_for_formats, extract_pool_sticky_session_token,
-    resolve_local_decision_execution_runtime_auth_context, ExecutionRuntimeAuthContext,
-    GatewayControlDecision, PlannerAppState,
+    openai_responses_request_operation, resolve_local_decision_execution_runtime_auth_context,
+    ExecutionRuntimeAuthContext, GatewayAuthApiKeySnapshot, GatewayControlDecision,
+    PlannerAppState,
 };
 use crate::client_session_affinity::client_session_affinity_from_parts;
 use crate::{AppState, GatewayError};
@@ -51,6 +53,21 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
     decision: &GatewayControlDecision,
     body_json: &serde_json::Value,
     plan_kind: &str,
+) -> Result<Option<LocalOpenAiResponsesDecisionInput>, GatewayError> {
+    resolve_local_openai_responses_decision_input_with_snapshot(
+        state, parts, trace_id, decision, body_json, plan_kind, None,
+    )
+    .await
+}
+
+pub(crate) async fn resolve_local_openai_responses_decision_input_with_snapshot(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    body_json: &serde_json::Value,
+    plan_kind: &str,
+    auth_snapshot_override: Option<&GatewayAuthApiKeySnapshot>,
 ) -> Result<Option<LocalOpenAiResponsesDecisionInput>, GatewayError> {
     let Some(auth_context) = resolve_local_decision_execution_runtime_auth_context(decision) else {
         warn!(
@@ -87,14 +104,28 @@ pub(crate) async fn resolve_local_openai_responses_decision_input(
         return Ok(None);
     };
 
-    let resolved_input = match resolve_local_authenticated_decision_input(
-        state,
-        auth_context.clone(),
-        Some(requested_model.as_str()),
-        None,
-    )
-    .await
-    {
+    let resolved_input = match if let Some(auth_snapshot) = auth_snapshot_override {
+        resolve_local_authenticated_decision_input_with_snapshot(
+            state,
+            auth_context.clone(),
+            Some(auth_snapshot.clone()),
+            Some(requested_model.as_str()),
+            decision.auth_endpoint_signature.as_deref(),
+            None,
+            &decision.model_directive_policy,
+        )
+        .await
+    } else {
+        resolve_local_authenticated_decision_input(
+            state,
+            auth_context.clone(),
+            Some(requested_model.as_str()),
+            decision.auth_endpoint_signature.as_deref(),
+            None,
+            &decision.model_directive_policy,
+        )
+        .await
+    } {
         Ok(Some(resolved_input)) => resolved_input,
         Ok(None) => {
             warn!(
@@ -161,6 +192,7 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
     spec: LocalOpenAiResponsesSpec,
 ) -> Result<(Vec<LocalOpenAiResponsesCandidateAttempt>, usize), GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
+    let request_operation = openai_responses_request_operation(spec_metadata.api_format, body_json);
     let planner_state = PlannerAppState::new(state);
     let sticky_session_token = extract_pool_sticky_session_token(body_json);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
@@ -171,8 +203,10 @@ pub(crate) async fn materialize_local_openai_responses_candidate_attempts(
     );
     let preselection = preselect_local_execution_candidates_with_serving(
         planner_state,
+        &input.model_directive_policy,
         spec_metadata.api_format,
         &input.requested_model,
+        request_operation,
         spec_metadata.require_streaming,
         input.required_capabilities.as_ref(),
         &input.auth_snapshot,
@@ -259,6 +293,7 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
     spec: LocalOpenAiResponsesSpec,
 ) -> Result<(LocalOpenAiResponsesCandidateAttemptSource<'a>, usize), GatewayError> {
     let spec_metadata = local_openai_responses_spec_metadata(spec);
+    let request_operation = openai_responses_request_operation(spec_metadata.api_format, body_json);
     let planner_state = PlannerAppState::new(state);
     let sticky_session_token = extract_pool_sticky_session_token(body_json);
     let auth_context: &ExecutionRuntimeAuthContext = &input.auth_context;
@@ -280,9 +315,11 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
     Ok(
         build_lazy_requested_model_execution_candidate_attempt_source_with_serving(
             planner_state,
+            &input.model_directive_policy,
             trace_id,
             spec_metadata.api_format,
             &input.requested_model,
+            request_operation,
             spec_metadata.require_streaming,
             &input.auth_snapshot,
             input.client_session_affinity.as_ref(),
@@ -365,8 +402,10 @@ pub(crate) async fn build_local_openai_responses_image_candidate_attempt_source<
     );
     let preselection = preselect_local_execution_candidates_for_api_formats_with_serving(
         planner_state,
+        &input.model_directive_policy,
         spec_metadata.api_format,
         &input.requested_model,
+        None,
         false,
         input.required_capabilities.as_ref(),
         &input.auth_snapshot,

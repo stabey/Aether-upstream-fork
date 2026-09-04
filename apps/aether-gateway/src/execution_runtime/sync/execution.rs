@@ -3,10 +3,10 @@ use std::io::Error as IoError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aether_ai_serving::UPSTREAM_IS_STREAM_KEY;
+use aether_ai_serving::{AiAttemptExecutionOutcome, AiAttemptRetryScope, UPSTREAM_IS_STREAM_KEY};
 use aether_contracts::{
-    ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionPlan, ExecutionResult,
-    ExecutionTelemetry,
+    ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionPlan,
+    ExecutionResponseObservation, ExecutionResult, ExecutionTelemetry,
 };
 use aether_data_contracts::repository::candidates::RequestCandidateStatus;
 use aether_scheduler_core::{
@@ -22,6 +22,7 @@ use axum::body::{to_bytes, Body, Bytes};
 use axum::http::header::{CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::http::{HeaderName, HeaderValue, Response, StatusCode};
 use futures_util::StreamExt;
+use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
@@ -33,6 +34,7 @@ use crate::ai_serving::api::{
     implicit_sync_finalize_report_kind, maybe_build_sync_finalize_outcome, LocalCoreSyncErrorKind,
     LocalCoreSyncFinalizeOutcome,
 };
+use crate::ai_serving::record_local_runtime_candidate_skip_reason;
 use crate::api::response::{
     attach_control_metadata_headers, build_client_response, build_client_response_from_parts,
     build_client_response_from_parts_with_mutator,
@@ -54,30 +56,41 @@ use crate::execution_runtime::submission::{
     resolve_local_sync_error_status_code, submit_local_core_error_or_sync_finalize,
 };
 use crate::execution_runtime::transport::{
-    build_execution_response_body, build_request_body, collect_response_headers,
-    decode_response_body_bytes, format_upstream_request_error, format_wreq_upstream_request_error,
+    append_upstream_response_body_chunk_with_limit, build_execution_response_body,
+    build_request_body, collect_response_headers, decode_response_body_bytes_with_limit,
+    execution_plan_response_body_limit_bytes, execution_response_body_mode,
+    format_hyper_error_chain, format_upstream_request_error, format_wreq_upstream_request_error,
     response_body_is_json, send_request, DirectHttpResponse, DirectSyncExecutionRuntime,
     ExecutionRuntimeTransportError,
 };
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::execution_runtime::{
-    analyze_local_candidate_failover_sync, apply_endpoint_response_header_rules,
-    attach_provider_response_headers_to_report_context, local_failover_response_text,
-    resolve_core_sync_error_finalize_report_kind, should_fallback_to_control_sync,
-    should_finalize_sync_response, LocalFailoverDecision,
+    ai_attempt_retry_scope_from_failure_disposition, analyze_local_candidate_failover_sync,
+    apply_endpoint_response_header_rules, attach_provider_response_headers_to_report_context,
+    local_failover_response_text, resolve_core_sync_error_finalize_report_kind,
+    should_fallback_to_control_sync, should_finalize_sync_response, LocalFailoverDecision,
 };
 use crate::log_ids::short_request_id;
 use crate::orchestration::{
-    apply_local_execution_effect, build_local_error_flow_metadata, trace_upstream_response_body,
-    with_error_flow_report_context, with_upstream_response_report_context,
-    LocalAdaptiveRateLimitEffect, LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect,
-    LocalExecutionEffect, LocalExecutionEffectContext, LocalHealthFailureEffect,
-    LocalHealthSuccessEffect, LocalOAuthInvalidationEffect, LocalPoolErrorEffect,
+    apply_local_execution_effect, build_local_error_flow_metadata,
+    spawn_local_oauth_success_effect, trace_upstream_response_body, with_error_flow_report_context,
+    with_upstream_response_report_context, LocalAdaptiveRateLimitEffect,
+    LocalAdaptiveSuccessEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
+    LocalExecutionEffectContext, LocalHealthFailureEffect, LocalHealthSuccessEffect,
+    LocalOAuthInvalidationEffect, LocalOAuthSuccessEffect, LocalPoolErrorEffect,
 };
-use crate::provider_pool_demand::acquire_provider_pool_in_flight_guard;
+use crate::provider_pool_demand::{
+    acquire_provider_pool_execution_guard, ProviderPoolInFlightAdmission,
+};
 use crate::request_candidate_runtime::{
     ensure_execution_request_candidate_slot, record_local_request_candidate_extra_data,
-    record_local_request_candidate_status,
+    record_local_request_candidate_status, record_local_request_candidate_status_snapshot,
+    snapshot_local_request_candidate_status,
+};
+use crate::request_diagnostics::{
+    attach_current_request_diagnostics_and_candidate_start_timing_to_report_context,
+    attach_request_diagnostics_to_report_context, calibrate_candidate_first_byte_elapsed_ms,
+    current_request_diagnostics, RequestDiagnostics,
 };
 use crate::usage::{spawn_sync_report, submit_sync_report};
 use crate::video_tasks::VideoTaskSyncReportMode;
@@ -102,6 +115,23 @@ const SYNC_EXECUTION_IDLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const OPENAI_IMAGE_SYNC_JSON_HEARTBEAT_BYTES: &[u8] = b"\n";
 const OPENAI_IMAGE_SYNC_PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(5);
+const INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE: &str = "Provider returned HTTP 200 but the Gemini response did not contain visible model output; refusing to finalize it as a successful response.";
+
+fn elapsed_ms_since(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn calibrated_sync_candidate_first_byte_elapsed_ms(
+    candidate_started_at: Instant,
+    result: &ExecutionResult,
+) -> Option<u64> {
+    let telemetry = result.telemetry.as_ref()?;
+    calibrate_candidate_first_byte_elapsed_ms(
+        elapsed_ms_since(candidate_started_at),
+        telemetry.elapsed_ms,
+        telemetry.ttfb_ms,
+    )
+}
 
 #[derive(Debug)]
 struct SyncExecutionFailure {
@@ -109,13 +139,38 @@ struct SyncExecutionFailure {
     message: String,
     status_code: Option<u16>,
     latency_ms: Option<u64>,
+    fallback_kind: Option<SyncExecutionFailureFallbackKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncExecutionFailureFallbackKind {
+    UpstreamResponseTooLarge,
+    UpstreamResponseDecode,
+}
+
+impl SyncExecutionFailureFallbackKind {
+    fn error_type(self) -> &'static str {
+        match self {
+            Self::UpstreamResponseTooLarge => "upstream_response_too_large",
+            Self::UpstreamResponseDecode => "upstream_response_decode_failed",
+        }
+    }
+
+    fn client_message(self) -> &'static str {
+        match self {
+            Self::UpstreamResponseTooLarge => "Upstream response too large",
+            Self::UpstreamResponseDecode => "Failed to decode upstream response",
+        }
+    }
 }
 
 struct SyncAttemptTerminalGuard {
     state: AppState,
     plan: ExecutionPlan,
     report_context: Option<Value>,
+    request_diagnostics: Option<Arc<RequestDiagnostics>>,
     candidate_started_unix_ms: u64,
+    candidate_started_at: Instant,
     armed: bool,
 }
 
@@ -125,12 +180,15 @@ impl SyncAttemptTerminalGuard {
         plan: &ExecutionPlan,
         report_context: Option<Value>,
         candidate_started_unix_ms: u64,
+        candidate_started_at: Instant,
     ) -> Self {
         Self {
             state: state.clone(),
             plan: plan.clone(),
             report_context,
+            request_diagnostics: current_request_diagnostics(),
             candidate_started_unix_ms,
+            candidate_started_at,
             armed: true,
         }
     }
@@ -148,7 +206,9 @@ impl SyncAttemptTerminalGuard {
             self.state.clone(),
             self.plan.clone(),
             self.report_context.clone(),
+            self.request_diagnostics.clone(),
             self.candidate_started_unix_ms,
+            self.candidate_started_at,
             UsageEventType::Failed,
             RequestCandidateStatus::Failed,
             StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
@@ -168,14 +228,18 @@ impl Drop for SyncAttemptTerminalGuard {
         let state = self.state.clone();
         let plan = self.plan.clone();
         let report_context = self.report_context.clone();
+        let request_diagnostics = self.request_diagnostics.clone();
         let candidate_started_unix_ms = self.candidate_started_unix_ms;
+        let candidate_started_at = self.candidate_started_at;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 record_sync_attempt_forced_terminal_state(
                     state,
                     plan,
                     report_context,
+                    request_diagnostics,
                     candidate_started_unix_ms,
+                    candidate_started_at,
                     UsageEventType::Cancelled,
                     RequestCandidateStatus::Cancelled,
                     499,
@@ -201,7 +265,9 @@ async fn record_sync_attempt_forced_terminal_state(
     state: AppState,
     plan: ExecutionPlan,
     report_context: Option<Value>,
+    request_diagnostics: Option<Arc<RequestDiagnostics>>,
     candidate_started_unix_ms: u64,
+    candidate_started_at: Instant,
     usage_event_type: UsageEventType,
     candidate_status: RequestCandidateStatus,
     status_code: u16,
@@ -209,8 +275,10 @@ async fn record_sync_attempt_forced_terminal_state(
     error_message: impl Into<String>,
 ) {
     let error_message = error_message.into();
+    let report_context =
+        attach_request_diagnostics_to_report_context(report_context, request_diagnostics.as_ref());
     let terminal_unix_ms = current_request_candidate_unix_ms();
-    let latency_ms = terminal_unix_ms.saturating_sub(candidate_started_unix_ms);
+    let latency_ms = elapsed_ms_since(candidate_started_at);
     record_local_request_candidate_status(
         &state,
         &plan,
@@ -257,7 +325,7 @@ async fn record_sync_attempt_forced_terminal_state(
     state
         .usage_runtime
         .record_terminal_event_direct(
-            state.data.as_ref(),
+            state.usage_lifecycle_data_state().as_ref(),
             UsageEvent::new(usage_event_type, plan.request_id.clone(), usage_data),
         )
         .await;
@@ -265,11 +333,23 @@ async fn record_sync_attempt_forced_terminal_state(
 
 impl SyncExecutionFailure {
     fn from_transport(err: ExecutionRuntimeTransportError) -> Self {
+        let fallback_kind = match &err {
+            ExecutionRuntimeTransportError::UpstreamResponseTooLarge { .. } => {
+                Some(SyncExecutionFailureFallbackKind::UpstreamResponseTooLarge)
+            }
+            ExecutionRuntimeTransportError::UpstreamResponseDecode { .. } => {
+                Some(SyncExecutionFailureFallbackKind::UpstreamResponseDecode)
+            }
+            _ => None,
+        };
         Self {
-            error_type: "execution_runtime_unavailable",
+            error_type: fallback_kind
+                .map(SyncExecutionFailureFallbackKind::error_type)
+                .unwrap_or("execution_runtime_unavailable"),
             message: err.to_string(),
-            status_code: None,
+            status_code: fallback_kind.map(|_| StatusCode::BAD_GATEWAY.as_u16()),
             latency_ms: None,
+            fallback_kind,
         }
     }
 
@@ -281,8 +361,127 @@ impl SyncExecutionFailure {
             ),
             status_code: Some(StatusCode::GATEWAY_TIMEOUT.as_u16()),
             latency_ms: Some(elapsed_ms),
+            fallback_kind: None,
         }
     }
+}
+
+fn build_sync_execution_failure_fallback_body(
+    client_api_format: &str,
+    kind: SyncExecutionFailureFallbackKind,
+) -> Value {
+    let message = kind.client_message();
+    let error_type = kind.error_type();
+    match crate::ai_serving::normalize_api_format_alias(client_api_format).as_str() {
+        "claude:messages" => json!({
+            "type": "error",
+            "error": {
+                "type": "upstream_error",
+                "message": message,
+            }
+        }),
+        "gemini:generate_content" => json!({
+            "error": {
+                "code": StatusCode::BAD_GATEWAY.as_u16(),
+                "message": message,
+                "status": "BAD_GATEWAY",
+            }
+        }),
+        _ => json!({
+            "error": {
+                "type": "upstream_error",
+                "message": message,
+                "code": error_type,
+            }
+        }),
+    }
+}
+
+fn build_sync_execution_failure_fallback_response(
+    failure: &SyncExecutionFailure,
+    plan: &ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+) -> Result<Option<Response<Body>>, GatewayError> {
+    let Some(kind) = failure.fallback_kind else {
+        return Ok(None);
+    };
+    let body_json = build_sync_execution_failure_fallback_body(&plan.client_api_format, kind);
+    let body_bytes = serde_json::to_vec(&body_json)
+        .map_err(|error| GatewayError::Internal(error.to_string()))?;
+    let headers = BTreeMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), body_bytes.len().to_string()),
+    ]);
+    let response = build_client_response_from_parts(
+        StatusCode::BAD_GATEWAY.as_u16(),
+        &headers,
+        Body::from(body_bytes),
+        trace_id,
+        Some(decision),
+    )?;
+    attach_control_metadata_headers(
+        response,
+        Some(plan.request_id.as_str()),
+        plan.candidate_id.as_deref(),
+    )
+    .map(Some)
+}
+
+fn maybe_store_sync_execution_failure_fallback(
+    failure: &SyncExecutionFailure,
+    plan: &ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    retry_scope_out: &mut Option<&mut AiAttemptRetryScope>,
+    retry_fallback_out: &mut Option<&mut Option<Response<Body>>>,
+) -> Result<(), GatewayError> {
+    if failure.fallback_kind.is_none() {
+        return Ok(());
+    }
+    if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+        *retry_scope = AiAttemptRetryScope::Candidate;
+    }
+    if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
+        *retry_fallback =
+            build_sync_execution_failure_fallback_response(failure, plan, trace_id, decision)?;
+    }
+    Ok(())
+}
+
+async fn maybe_build_sync_transport_error_stop_response(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    error_type: &str,
+    error_message: &str,
+    elapsed_ms: u64,
+) -> Result<Option<Response<Body>>, GatewayError> {
+    let analysis = crate::orchestration::resolve_local_transport_failover_analysis_for_attempt(
+        state,
+        plan,
+        report_context,
+    )
+    .await;
+    if !matches!(analysis.decision, LocalFailoverDecision::StopLocalFailover) {
+        return Ok(None);
+    }
+
+    crate::execution_runtime::build_transport_error_stop_response(
+        state,
+        plan,
+        report_context,
+        trace_id,
+        decision,
+        StatusCode::BAD_GATEWAY.as_u16(),
+        error_type,
+        error_message,
+        elapsed_ms,
+    )
+    .await
+    .map(Some)
 }
 
 struct ImplicitSyncFinalizeOutcome {
@@ -290,27 +489,130 @@ struct ImplicitSyncFinalizeOutcome {
     outcome: LocalCoreSyncFinalizeOutcome,
 }
 
-fn record_sync_terminal_usage(
+fn spawn_sync_candidate_status_update(
+    state: AppState,
+    snapshot: crate::request_candidate_runtime::LocalRequestCandidateStatusSnapshot,
+    status_update: SchedulerRequestCandidateStatusUpdate,
+) {
+    tokio::spawn(async move {
+        record_local_request_candidate_status_snapshot(&state, &snapshot, status_update).await;
+    });
+}
+
+fn record_sync_response_started(
+    state: &AppState,
+    lifecycle_seed: aether_usage_runtime::LifecycleUsageSeed,
+    request_candidate_status_snapshot: Option<
+        crate::request_candidate_runtime::LocalRequestCandidateStatusSnapshot,
+    >,
+    candidate_started_unix_ms: u64,
+    status_code: u16,
+    ttfb_ms: u64,
+) {
+    state.usage_runtime.record_stream_started_immediate_async(
+        state.usage_lifecycle_data_state().as_ref(),
+        lifecycle_seed,
+        status_code,
+        Some(ExecutionTelemetry {
+            ttfb_ms: Some(ttfb_ms),
+            elapsed_ms: Some(ttfb_ms),
+            upstream_bytes: None,
+        }),
+    );
+
+    if let Some(snapshot) = request_candidate_status_snapshot {
+        spawn_sync_candidate_status_update(
+            state.clone(),
+            snapshot,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Streaming,
+                status_code: Some(status_code),
+                error_type: None,
+                error_message: None,
+                latency_ms: Some(ttfb_ms),
+                started_at_unix_ms: Some(candidate_started_unix_ms),
+                finished_at_unix_ms: None,
+            },
+        );
+    }
+}
+
+fn record_sync_execution_active(
+    state: &AppState,
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    candidate_started_unix_ms: u64,
+) {
+    let lifecycle_seed = build_lifecycle_usage_seed(plan, report_context);
+    state.usage_runtime.record_sync_active_immediate_async(
+        state.usage_lifecycle_data_state().as_ref(),
+        lifecycle_seed,
+    );
+
+    if let Some(snapshot) = snapshot_local_request_candidate_status(plan, report_context) {
+        spawn_sync_candidate_status_update(
+            state.clone(),
+            snapshot,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Streaming,
+                status_code: None,
+                error_type: None,
+                error_message: None,
+                latency_ms: None,
+                started_at_unix_ms: Some(candidate_started_unix_ms),
+                finished_at_unix_ms: None,
+            },
+        );
+    }
+}
+
+async fn record_sync_terminal_usage(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
+    candidate_started_at: Instant,
+    candidate_first_byte_elapsed_ms: Option<u64>,
 ) {
-    let context_seed = build_terminal_usage_context_seed(plan, report_context);
+    let report_context_with_diagnostics =
+        attach_current_request_diagnostics_and_candidate_start_timing_to_report_context(
+            report_context,
+            candidate_started_at,
+            candidate_first_byte_elapsed_ms,
+        );
+    let context_seed = build_terminal_usage_context_seed(
+        plan,
+        report_context_with_diagnostics.as_ref().or(report_context),
+    );
     let payload_seed = build_sync_terminal_usage_payload_seed(payload);
     state
         .usage_runtime
-        .record_sync_terminal(state.data.as_ref(), context_seed, payload_seed);
+        .record_sync_terminal(
+            state.usage_lifecycle_data_state().as_ref(),
+            context_seed,
+            payload_seed,
+        )
+        .await;
 }
 
-fn record_sync_terminal_usage_and_disarm_guard(
+async fn record_sync_terminal_usage_and_disarm_guard(
     state: &AppState,
     plan: &ExecutionPlan,
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
+    candidate_started_at: Instant,
+    candidate_first_byte_elapsed_ms: Option<u64>,
     terminal_guard: &mut SyncAttemptTerminalGuard,
 ) {
-    record_sync_terminal_usage(state, plan, report_context, payload);
+    record_sync_terminal_usage(
+        state,
+        plan,
+        report_context,
+        payload,
+        candidate_started_at,
+        candidate_first_byte_elapsed_ms,
+    )
+    .await;
     terminal_guard.disarm();
 }
 
@@ -544,13 +846,7 @@ fn invalid_gemini_provider_success_message(
     if status_code >= 400 {
         return None;
     }
-    let provider_api_format = report_context
-        .and_then(|value| value.get("provider_api_format"))
-        .and_then(Value::as_str)
-        .unwrap_or(plan.provider_api_format.as_str());
-    if crate::ai_serving::normalize_api_format_alias(provider_api_format)
-        != "gemini:generate_content"
-    {
+    if !provider_api_format_is_gemini_generate_content(plan, report_context) {
         return None;
     }
     let body_json = body_json?;
@@ -574,7 +870,53 @@ fn invalid_gemini_provider_success_message(
     if crate::ai_serving::gemini_generate_content_response_has_visible_output(body_json) {
         return None;
     }
-    Some("Provider returned HTTP 200 but the Gemini response did not contain visible model output; refusing to finalize it as a successful response.")
+    Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE)
+}
+
+fn invalid_gemini_provider_stream_success_message(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+    status_code: u16,
+    body_json: Option<&Value>,
+    body_bytes: &[u8],
+    has_body_bytes: bool,
+) -> Option<&'static str> {
+    if status_code >= 400 || body_json.is_some() || !has_body_bytes {
+        return None;
+    }
+    if !provider_api_format_is_gemini_generate_content(plan, report_context) {
+        return None;
+    }
+    let Some(body_json) = crate::ai_serving::aggregate_gemini_stream_sync_response(body_bytes)
+    else {
+        return Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE);
+    };
+    if crate::ai_serving::gemini_generate_content_response_has_visible_output(&body_json) {
+        return None;
+    }
+    Some(INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE)
+}
+
+fn provider_api_format_is_gemini_generate_content(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> bool {
+    let provider_api_format = report_context
+        .and_then(|value| value.get("provider_api_format"))
+        .and_then(Value::as_str)
+        .unwrap_or(plan.provider_api_format.as_str());
+    crate::ai_serving::normalize_api_format_alias(provider_api_format) == "gemini:generate_content"
+}
+
+fn invalid_gemini_provider_success_execution_error(message: &str) -> ExecutionError {
+    ExecutionError {
+        kind: ExecutionErrorKind::Upstream5xx,
+        phase: ExecutionPhase::Finalize,
+        message: message.to_string(),
+        upstream_status: Some(StatusCode::OK.as_u16()),
+        retryable: true,
+        failover_recommended: true,
+    }
 }
 
 fn build_invalid_provider_success_body(
@@ -1012,6 +1354,7 @@ async fn execute_direct_sync_runtime_candidate(
     report_context: Option<&Value>,
     trace_id: &str,
     plan_kind: &str,
+    candidate_started_unix_ms: u64,
     request_id_for_log: &str,
     candidate_id: Option<&str>,
     provider_name: &str,
@@ -1028,8 +1371,33 @@ async fn execute_direct_sync_runtime_candidate(
         return Ok(result);
     }
     if !should_track_openai_image_sync_upstream_sse(plan_kind, plan, report_context) {
+        let state_for_response_started = state.clone();
+        let response_started_lifecycle_seed = build_lifecycle_usage_seed(plan, report_context);
+        let response_started_candidate_snapshot =
+            snapshot_local_request_candidate_status(plan, report_context);
         return DirectSyncExecutionRuntime::new()
-            .execute_sync(plan)
+            .execute_sync_with_response_started(plan, move |event| {
+                record_sync_response_started(
+                    &state_for_response_started,
+                    response_started_lifecycle_seed,
+                    response_started_candidate_snapshot,
+                    candidate_started_unix_ms,
+                    event.status_code,
+                    event.ttfb_ms,
+                );
+                spawn_local_oauth_success_effect(
+                    state_for_response_started.clone(),
+                    plan,
+                    report_context,
+                    LocalOAuthSuccessEffect {
+                        status_code: event.status_code,
+                        request_started_at_unix_ms: Some(
+                            event.response_observation.request_started_at_unix_ms,
+                        ),
+                        request_order_id: Some(&event.response_observation.request_order_id),
+                    },
+                );
+            })
             .await
             .map_err(SyncExecutionFailure::from_transport);
     }
@@ -1127,17 +1495,31 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
     progress_snapshot: Option<Arc<Mutex<OpenAiImageSyncProgressSnapshot>>>,
 ) -> Result<ExecutionResult, SyncExecutionFailure> {
     let request_body = build_request_body(plan).map_err(SyncExecutionFailure::from_transport)?;
+    let response_body_limit_bytes = execution_plan_response_body_limit_bytes(plan);
     let started_at = Instant::now();
     let mut progress =
         OpenAiImageSyncProgressRecorder::new(state, plan, report_context, progress_snapshot);
     progress.record_connecting().await;
 
+    let request_started_at_unix_ms = current_request_candidate_unix_ms();
+    let request_order_id = uuid::Uuid::now_v7().to_string();
     let response = send_request(plan, request_body)
         .await
         .map_err(SyncExecutionFailure::from_transport)?;
     let ttfb_ms = started_at.elapsed().as_millis() as u64;
+    let response_headers_observed_at_unix_ms = current_request_candidate_unix_ms();
     let status_code = response.status_code();
     let headers = response.headers();
+    spawn_local_oauth_success_effect(
+        state.clone(),
+        plan,
+        report_context,
+        LocalOAuthSuccessEffect {
+            status_code,
+            request_started_at_unix_ms: Some(request_started_at_unix_ms),
+            request_order_id: Some(&request_order_id),
+        },
+    );
     progress.record_response_started(status_code, ttfb_ms).await;
 
     let mut body_bytes = Vec::new();
@@ -1152,11 +1534,38 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
                         ),
                     )
                 })?;
+                append_upstream_response_body_chunk_with_limit(
+                    &mut body_bytes,
+                    &chunk,
+                    response_body_limit_bytes,
+                )
+                .map_err(SyncExecutionFailure::from_transport)?;
                 let elapsed_ms = started_at.elapsed().as_millis() as u64;
                 progress
                     .observe_chunk(&chunk, status_code, elapsed_ms)
                     .await;
-                body_bytes.extend_from_slice(&chunk);
+            }
+        }
+        DirectHttpResponse::HyperH2c(response) => {
+            let mut upstream_stream = response.into_body().into_data_stream();
+            while let Some(chunk) = upstream_stream.next().await {
+                let chunk = chunk.map_err(|err| {
+                    SyncExecutionFailure::from_transport(
+                        ExecutionRuntimeTransportError::UpstreamRequest(format_hyper_error_chain(
+                            &err,
+                        )),
+                    )
+                })?;
+                append_upstream_response_body_chunk_with_limit(
+                    &mut body_bytes,
+                    &chunk,
+                    response_body_limit_bytes,
+                )
+                .map_err(SyncExecutionFailure::from_transport)?;
+                let elapsed_ms = started_at.elapsed().as_millis() as u64;
+                progress
+                    .observe_chunk(&chunk, status_code, elapsed_ms)
+                    .await;
             }
         }
         DirectHttpResponse::BrowserWreq(response) => {
@@ -1169,30 +1578,46 @@ async fn execute_openai_image_sync_upstream_sse_candidate(
                         ),
                     )
                 })?;
+                append_upstream_response_body_chunk_with_limit(
+                    &mut body_bytes,
+                    &chunk,
+                    response_body_limit_bytes,
+                )
+                .map_err(SyncExecutionFailure::from_transport)?;
                 let elapsed_ms = started_at.elapsed().as_millis() as u64;
                 progress
                     .observe_chunk(&chunk, status_code, elapsed_ms)
                     .await;
-                body_bytes.extend_from_slice(&chunk);
             }
         }
     }
 
     let decoded_body_bytes =
-        decode_response_body_bytes(&headers, &body_bytes).unwrap_or_else(|| body_bytes.clone());
+        decode_response_body_bytes_with_limit(&headers, &body_bytes, response_body_limit_bytes)
+            .map_err(SyncExecutionFailure::from_transport)?;
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
     let upstream_bytes = body_bytes.len() as u64;
     progress.finish(status_code, elapsed_ms).await;
 
-    let body =
-        build_execution_response_body(&headers, &body_bytes, &decoded_body_bytes, plan.stream)
-            .map_err(SyncExecutionFailure::from_transport)?;
+    let body = build_execution_response_body(
+        &headers,
+        &body_bytes,
+        decoded_body_bytes.as_ref(),
+        plan.stream,
+        execution_response_body_mode(plan),
+    )
+    .map_err(SyncExecutionFailure::from_transport)?;
 
     Ok(ExecutionResult {
         request_id: plan.request_id.clone(),
         candidate_id: plan.candidate_id.clone(),
         status_code,
         headers,
+        response_observation: Some(ExecutionResponseObservation {
+            request_started_at_unix_ms,
+            response_headers_observed_at_unix_ms,
+            request_order_id,
+        }),
         body,
         telemetry: Some(ExecutionTelemetry {
             ttfb_ms: Some(ttfb_ms),
@@ -1289,6 +1714,8 @@ fn build_openai_image_sync_json_heartbeat_response(
                 report_context,
                 false,
                 Some(progress_snapshot),
+                None,
+                None,
             )
             .await,
         )
@@ -1378,7 +1805,12 @@ async fn openai_image_sync_json_heartbeat_final_bytes(
     result: Result<Option<Response<Body>>, GatewayError>,
 ) -> Vec<u8> {
     match result {
-        Ok(Some(response)) => match to_bytes(response.into_body(), usize::MAX).await {
+        Ok(Some(response)) => match to_bytes(
+            response.into_body(),
+            crate::headers::max_internal_buffered_body_bytes(),
+        )
+        .await
+        {
             Ok(bytes) if !bytes.is_empty() => bytes.to_vec(),
             Ok(_) => openai_image_sync_json_heartbeat_error_body("empty sync image response"),
             Err(err) => openai_image_sync_json_heartbeat_error_body(&err.to_string()),
@@ -1406,6 +1838,17 @@ async fn apply_sync_success_effects(
     report_context: Option<&serde_json::Value>,
     payload: &GatewaySyncReportRequest,
 ) {
+    if let Some(report_context) = report_context {
+        crate::ai_serving::persist_converted_response_history(
+            state.runtime_state(),
+            report_context,
+            payload
+                .client_body_json
+                .as_ref()
+                .or(payload.body_json.as_ref()),
+        )
+        .await;
+    }
     apply_local_execution_effect(
         state,
         LocalExecutionEffectContext {
@@ -1464,8 +1907,47 @@ pub(crate) async fn execute_execution_runtime_sync(
         report_context,
         true,
         None,
+        None,
+        None,
     )
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_execution_runtime_sync_with_retry_scope(
+    state: &AppState,
+    request_path: &str,
+    plan: ExecutionPlan,
+    trace_id: &str,
+    decision: &GatewayControlDecision,
+    plan_kind: &str,
+    report_kind: Option<String>,
+    report_context: Option<serde_json::Value>,
+) -> Result<AiAttemptExecutionOutcome<Response<Body>>, GatewayError> {
+    let mut retry_scope = AiAttemptRetryScope::Candidate;
+    let mut fallback_response = None;
+    let response = execute_execution_runtime_sync_impl(
+        state,
+        request_path,
+        plan,
+        trace_id,
+        decision,
+        plan_kind,
+        report_kind,
+        report_context,
+        true,
+        None,
+        Some(&mut retry_scope),
+        Some(&mut fallback_response),
+    )
+    .await?;
+    Ok(match response {
+        Some(response) => AiAttemptExecutionOutcome::Responded(response),
+        None => AiAttemptExecutionOutcome::Retry {
+            scope: retry_scope,
+            fallback_response,
+        },
+    })
 }
 
 #[allow(clippy::too_many_arguments)] // internal function, grouping would add unnecessary indirection
@@ -1480,6 +1962,8 @@ async fn execute_execution_runtime_sync_impl(
     mut report_context: Option<serde_json::Value>,
     allow_json_heartbeat: bool,
     progress_snapshot: Option<Arc<Mutex<OpenAiImageSyncProgressSnapshot>>>,
+    mut retry_scope_out: Option<&mut AiAttemptRetryScope>,
+    mut retry_fallback_out: Option<&mut Option<Response<Body>>>,
 ) -> Result<Option<Response<Body>>, GatewayError> {
     if allow_json_heartbeat
         && should_enable_openai_image_sync_json_heartbeat(plan_kind, &plan, report_context.as_ref())
@@ -1512,11 +1996,45 @@ async fn execute_execution_runtime_sync_impl(
         .and_then(|context| context.candidate_index)
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_string());
+    let candidate_started_at = Instant::now();
     let candidate_started_unix_secs = current_request_candidate_unix_ms();
+    let _provider_pool_in_flight_guard = match acquire_provider_pool_execution_guard(state, &plan)
+        .await?
+    {
+        ProviderPoolInFlightAdmission::Acquired(guard) => guard,
+        ProviderPoolInFlightAdmission::Saturated { limit } => {
+            record_local_runtime_candidate_skip_reason(
+                state,
+                trace_id,
+                "provider_key_concurrency_limit_reached",
+            );
+            if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+                *retry_scope = AiAttemptRetryScope::Candidate;
+            }
+            record_local_request_candidate_status(
+                state,
+                &plan,
+                report_context.as_ref(),
+                SchedulerRequestCandidateStatusUpdate {
+                    status: RequestCandidateStatus::Skipped,
+                    status_code: Some(StatusCode::TOO_MANY_REQUESTS.as_u16()),
+                    error_type: Some("provider_key_concurrency_limit_reached".to_string()),
+                    error_message: Some(format!("provider key concurrency limit reached: {limit}")),
+                    latency_ms: Some(0),
+                    started_at_unix_ms: Some(candidate_started_unix_secs),
+                    finished_at_unix_ms: Some(candidate_started_unix_secs),
+                },
+            )
+            .await;
+            return Ok(None);
+        }
+    };
     let lifecycle_seed = build_lifecycle_usage_seed(&plan, report_context.as_ref());
+    let usage_data = state.usage_lifecycle_data_state().as_ref().clone();
     state
         .usage_runtime
-        .record_pending(state.data.as_ref(), lifecycle_seed);
+        .record_pending_direct(&usage_data, lifecycle_seed)
+        .await;
     record_local_request_candidate_status(
         state,
         &plan,
@@ -1537,16 +2055,15 @@ async fn execute_execution_runtime_sync_impl(
         &plan,
         report_context.clone(),
         candidate_started_unix_secs,
+        candidate_started_at,
     );
     let result = (async {
-    let _provider_pool_in_flight_guard = acquire_provider_pool_in_flight_guard(
-        state.runtime_state.clone(),
-        &plan.provider_id,
-        plan_request_id.as_str(),
-        plan_candidate_id.as_deref(),
-        key_id.as_str(),
-    )
-    .await;
+    record_sync_execution_active(
+        state,
+        &plan,
+        report_context.as_ref(),
+        candidate_started_unix_secs,
+    );
     #[cfg(not(test))]
     let mut result = {
         match maybe_execute_grok_sync(&plan, report_context.as_ref()).await {
@@ -1562,6 +2079,7 @@ async fn execute_execution_runtime_sync_impl(
                         report_context.as_ref(),
                         trace_id,
                         plan_kind,
+                        candidate_started_unix_secs,
                         plan_request_id_for_log.as_str(),
                         plan_candidate_id.as_deref(),
                         provider_name.as_str(),
@@ -1575,6 +2093,19 @@ async fn execute_execution_runtime_sync_impl(
                     {
                         Ok(result) => result,
                         Err(err) => {
+                            let failure_error_type = err.error_type;
+                            let failure_message = err.message.clone();
+                            let failure_latency_ms = err
+                                .latency_ms
+                                .unwrap_or_else(|| elapsed_ms_since(candidate_started_at));
+                            maybe_store_sync_execution_failure_fallback(
+                                &err,
+                                &plan,
+                                trace_id,
+                                decision,
+                                &mut retry_scope_out,
+                                &mut retry_fallback_out,
+                            )?;
                             warn!(
                                 event_name = "sync_execution_runtime_unavailable",
                                 log_type = "ops",
@@ -1597,19 +2128,34 @@ async fn execute_execution_runtime_sync_impl(
                                 report_context.as_ref(),
                                 SchedulerRequestCandidateStatusUpdate {
                                     status: RequestCandidateStatus::Failed,
-                                    status_code: err.status_code,
-                                    error_type: Some(err.error_type.to_string()),
+                                    status_code: None,
+                                    error_type: Some(failure_error_type.to_string()),
                                     error_message: Some(err.message),
-                                    latency_ms: err.latency_ms,
+                                    latency_ms: Some(failure_latency_ms),
                                     started_at_unix_ms: Some(candidate_started_unix_secs),
                                     finished_at_unix_ms: Some(terminal_unix_secs),
                                 },
                             )
                             .await;
+                            if let Some(response) = maybe_build_sync_transport_error_stop_response(
+                                state,
+                                &plan,
+                                report_context.as_ref(),
+                                trace_id,
+                                decision,
+                                failure_error_type,
+                                failure_message.as_str(),
+                                failure_latency_ms,
+                            )
+                            .await?
+                            {
+                                return Ok(Some(response));
+                            }
                             return Ok(None);
                         }
                     },
                     Err(err) => {
+                        let transport_error_message = err.to_string();
                         warn!(
                             event_name = "chatgpt_web_image_execution_unavailable",
                             log_type = "ops",
@@ -1635,18 +2181,33 @@ async fn execute_execution_runtime_sync_impl(
                                 error_type: Some(
                                     "chatgpt_web_image_execution_unavailable".to_string(),
                                 ),
-                                error_message: Some(err.to_string()),
-                                latency_ms: None,
+                                error_message: Some(transport_error_message.clone()),
+                                latency_ms: Some(elapsed_ms_since(candidate_started_at)),
                                 started_at_unix_ms: Some(candidate_started_unix_secs),
                                 finished_at_unix_ms: Some(terminal_unix_secs),
                             },
                         )
                         .await;
+                        if let Some(response) = maybe_build_sync_transport_error_stop_response(
+                            state,
+                            &plan,
+                            report_context.as_ref(),
+                            trace_id,
+                            decision,
+                            "chatgpt_web_image_execution_unavailable",
+                            transport_error_message.as_str(),
+                            elapsed_ms_since(candidate_started_at),
+                        )
+                        .await?
+                        {
+                            return Ok(Some(response));
+                        }
                         return Ok(None);
                     }
                 }
             }
             Err(err) => {
+                let transport_error_message = err.to_string();
                 warn!(
                     event_name = "grok_execution_unavailable",
                     log_type = "ops",
@@ -1670,13 +2231,27 @@ async fn execute_execution_runtime_sync_impl(
                         status: RequestCandidateStatus::Failed,
                         status_code: None,
                         error_type: Some("grok_execution_unavailable".to_string()),
-                        error_message: Some(err.to_string()),
-                        latency_ms: None,
+                        error_message: Some(transport_error_message.clone()),
+                        latency_ms: Some(elapsed_ms_since(candidate_started_at)),
                         started_at_unix_ms: Some(candidate_started_unix_secs),
                         finished_at_unix_ms: Some(terminal_unix_secs),
                     },
                 )
                 .await;
+                if let Some(response) = maybe_build_sync_transport_error_stop_response(
+                    state,
+                    &plan,
+                    report_context.as_ref(),
+                    trace_id,
+                    decision,
+                    "grok_execution_unavailable",
+                    transport_error_message.as_str(),
+                    elapsed_ms_since(candidate_started_at),
+                )
+                .await?
+                {
+                    return Ok(Some(response));
+                }
                 return Ok(None);
             }
         }
@@ -1687,6 +2262,7 @@ async fn execute_execution_runtime_sync_impl(
             match (override_fn.0)(&plan) {
                 Ok(result) => result,
                 Err(err) => {
+                    let transport_error_message = format!("{err:?}");
                     warn!(
                         event_name = "sync_execution_runtime_test_override_failed",
                         log_type = "ops",
@@ -1710,13 +2286,27 @@ async fn execute_execution_runtime_sync_impl(
                             status: RequestCandidateStatus::Failed,
                             status_code: None,
                             error_type: Some("execution_runtime_unavailable".to_string()),
-                            error_message: Some(format!("{err:?}")),
-                            latency_ms: None,
+                            error_message: Some(transport_error_message.clone()),
+                            latency_ms: Some(elapsed_ms_since(candidate_started_at)),
                             started_at_unix_ms: Some(candidate_started_unix_secs),
                             finished_at_unix_ms: Some(terminal_unix_secs),
                         },
                     )
                     .await;
+                    if let Some(response) = maybe_build_sync_transport_error_stop_response(
+                        state,
+                        &plan,
+                        report_context.as_ref(),
+                        trace_id,
+                        decision,
+                        "execution_runtime_unavailable",
+                        transport_error_message.as_str(),
+                        elapsed_ms_since(candidate_started_at),
+                    )
+                    .await?
+                    {
+                        return Ok(Some(response));
+                    }
                     return Ok(None);
                 }
             }
@@ -1742,6 +2332,7 @@ async fn execute_execution_runtime_sync_impl(
                         report_context.as_ref(),
                         trace_id,
                         plan_kind,
+                        candidate_started_unix_secs,
                         plan_request_id_for_log.as_str(),
                         plan_candidate_id.as_deref(),
                         provider_name.as_str(),
@@ -1755,6 +2346,19 @@ async fn execute_execution_runtime_sync_impl(
                     {
                         Ok(result) => result,
                         Err(err) => {
+                            let failure_error_type = err.error_type;
+                            let failure_message = err.message.clone();
+                            let failure_latency_ms = err
+                                .latency_ms
+                                .unwrap_or_else(|| elapsed_ms_since(candidate_started_at));
+                            maybe_store_sync_execution_failure_fallback(
+                                &err,
+                                &plan,
+                                trace_id,
+                                decision,
+                                &mut retry_scope_out,
+                                &mut retry_fallback_out,
+                            )?;
                             warn!(
                                 event_name = "sync_execution_runtime_unavailable",
                                 log_type = "ops",
@@ -1777,19 +2381,34 @@ async fn execute_execution_runtime_sync_impl(
                                 report_context.as_ref(),
                                 SchedulerRequestCandidateStatusUpdate {
                                     status: RequestCandidateStatus::Failed,
-                                    status_code: err.status_code,
-                                    error_type: Some(err.error_type.to_string()),
+                                    status_code: None,
+                                    error_type: Some(failure_error_type.to_string()),
                                     error_message: Some(err.message),
-                                    latency_ms: err.latency_ms,
+                                    latency_ms: Some(failure_latency_ms),
                                     started_at_unix_ms: Some(candidate_started_unix_secs),
                                     finished_at_unix_ms: Some(terminal_unix_secs),
                                 },
                             )
                             .await;
+                            if let Some(response) = maybe_build_sync_transport_error_stop_response(
+                                state,
+                                &plan,
+                                report_context.as_ref(),
+                                trace_id,
+                                decision,
+                                failure_error_type,
+                                failure_message.as_str(),
+                                failure_latency_ms,
+                            )
+                            .await?
+                            {
+                                return Ok(Some(response));
+                            }
                             return Ok(None);
                         }
                     },
                     Err(err) => {
+                        let transport_error_message = err.to_string();
                         warn!(
                             event_name = "chatgpt_web_image_execution_unavailable",
                             log_type = "ops",
@@ -1815,17 +2434,32 @@ async fn execute_execution_runtime_sync_impl(
                                 error_type: Some(
                                     "chatgpt_web_image_execution_unavailable".to_string(),
                                 ),
-                                error_message: Some(err.to_string()),
-                                latency_ms: None,
+                                error_message: Some(transport_error_message.clone()),
+                                latency_ms: Some(elapsed_ms_since(candidate_started_at)),
                                 started_at_unix_ms: Some(candidate_started_unix_secs),
                                 finished_at_unix_ms: Some(terminal_unix_secs),
                             },
                         )
                         .await;
+                        if let Some(response) = maybe_build_sync_transport_error_stop_response(
+                            state,
+                            &plan,
+                            report_context.as_ref(),
+                            trace_id,
+                            decision,
+                            "chatgpt_web_image_execution_unavailable",
+                            transport_error_message.as_str(),
+                            elapsed_ms_since(candidate_started_at),
+                        )
+                        .await?
+                        {
+                            return Ok(Some(response));
+                        }
                         return Ok(None);
                     }
                 },
                 Err(err) => {
+                    let transport_error_message = err.to_string();
                     warn!(
                         event_name = "grok_execution_unavailable",
                         log_type = "ops",
@@ -1849,13 +2483,27 @@ async fn execute_execution_runtime_sync_impl(
                             status: RequestCandidateStatus::Failed,
                             status_code: None,
                             error_type: Some("grok_execution_unavailable".to_string()),
-                            error_message: Some(err.to_string()),
-                            latency_ms: None,
+                            error_message: Some(transport_error_message.clone()),
+                            latency_ms: Some(elapsed_ms_since(candidate_started_at)),
                             started_at_unix_ms: Some(candidate_started_unix_secs),
                             finished_at_unix_ms: Some(terminal_unix_secs),
                         },
                     )
                     .await;
+                    if let Some(response) = maybe_build_sync_transport_error_stop_response(
+                        state,
+                        &plan,
+                        report_context.as_ref(),
+                        trace_id,
+                        decision,
+                        "grok_execution_unavailable",
+                        transport_error_message.as_str(),
+                        elapsed_ms_since(candidate_started_at),
+                    )
+                    .await?
+                    {
+                        return Ok(Some(response));
+                    }
                     return Ok(None);
                 }
             }
@@ -1873,6 +2521,7 @@ async fn execute_execution_runtime_sync_impl(
                 plan_candidate_id.as_deref(),
                 report_context.as_ref(),
                 candidate_started_unix_secs,
+                candidate_started_at,
             )
             .await?;
             match remote_outcome {
@@ -1882,6 +2531,18 @@ async fn execute_execution_runtime_sync_impl(
             }
         }
     };
+    let mut candidate_first_byte_elapsed_ms =
+        calibrated_sync_candidate_first_byte_elapsed_ms(candidate_started_at, &result);
+    let initial_response_observed_at_unix_ms = current_request_candidate_unix_ms();
+    let mut provider_response_observation =
+        result
+            .response_observation
+            .clone()
+            .unwrap_or(ExecutionResponseObservation {
+                request_started_at_unix_ms: candidate_started_unix_secs,
+                response_headers_observed_at_unix_ms: initial_response_observed_at_unix_ms,
+                request_order_id: uuid::Uuid::now_v7().to_string(),
+            });
     let mut oauth_retry_attempted = false;
     let (
         result_error_type,
@@ -1894,6 +2555,18 @@ async fn execute_execution_runtime_sync_impl(
         local_failover_response_text,
         local_failover_analysis,
     ) = loop {
+        spawn_local_oauth_success_effect(
+            state.clone(),
+            &plan,
+            report_context.as_ref(),
+            LocalOAuthSuccessEffect {
+                status_code: result.status_code,
+                request_started_at_unix_ms: Some(
+                    provider_response_observation.request_started_at_unix_ms,
+                ),
+                request_order_id: Some(&provider_response_observation.request_order_id),
+            },
+        );
         let result_latency_ms = result
             .telemetry
             .as_ref()
@@ -1906,16 +2579,19 @@ async fn execute_execution_runtime_sync_impl(
             report_context.as_ref(),
             result.status_code,
             body_json.as_ref(),
-        ) {
+        )
+        .or_else(|| {
+            invalid_gemini_provider_stream_success_message(
+                &plan,
+                report_context.as_ref(),
+                result.status_code,
+                body_json.as_ref(),
+                &body_bytes,
+                body_base64.is_some(),
+            )
+        }) {
             result.status_code = StatusCode::BAD_GATEWAY.as_u16();
-            result.error = Some(ExecutionError {
-                kind: ExecutionErrorKind::Upstream5xx,
-                phase: ExecutionPhase::Finalize,
-                message: message.to_string(),
-                upstream_status: Some(StatusCode::OK.as_u16()),
-                retryable: false,
-                failover_recommended: false,
-            });
+            result.error = Some(invalid_gemini_provider_success_execution_error(message));
             if let Some(error_body) =
                 build_invalid_provider_success_body(&plan, report_context.as_ref(), message)
             {
@@ -1952,10 +2628,15 @@ async fn execute_execution_runtime_sync_impl(
                 result.status_code,
                 local_failover_response_text.as_deref(),
                 trace_id,
+                report_context.as_ref(),
+                Some(provider_response_observation.request_started_at_unix_ms),
+                Some(&provider_response_observation.request_order_id),
             )
             .await
         {
             oauth_retry_attempted = true;
+            let retry_started_at_unix_ms = current_request_candidate_unix_ms();
+            let retry_request_order_id = uuid::Uuid::now_v7().to_string();
             match crate::execution_runtime::execute_execution_runtime_sync_plan(
                 state,
                 Some(trace_id),
@@ -1964,6 +2645,21 @@ async fn execute_execution_runtime_sync_impl(
             .await
             {
                 Ok(retry_result) => {
+                    let retry_response_observed_at_unix_ms = current_request_candidate_unix_ms();
+                    provider_response_observation = retry_result
+                        .response_observation
+                        .clone()
+                        .unwrap_or(ExecutionResponseObservation {
+                            request_started_at_unix_ms: retry_started_at_unix_ms,
+                            response_headers_observed_at_unix_ms:
+                                retry_response_observed_at_unix_ms,
+                            request_order_id: retry_request_order_id,
+                        });
+                    candidate_first_byte_elapsed_ms =
+                        calibrated_sync_candidate_first_byte_elapsed_ms(
+                            candidate_started_at,
+                            &retry_result,
+                        );
                     result = retry_result;
                     continue;
                 }
@@ -2007,6 +2703,13 @@ async fn execute_execution_runtime_sync_impl(
             local_failover_analysis,
         );
     };
+    let mut report_context = attach_provider_response_headers_to_report_context(
+        report_context,
+        &headers,
+        provider_response_observation.request_started_at_unix_ms,
+        provider_response_observation.response_headers_observed_at_unix_ms,
+        &provider_response_observation.request_order_id,
+    );
     if result.status_code >= 400 {
         apply_local_execution_effect(
             state,
@@ -2076,6 +2779,38 @@ async fn execute_execution_runtime_sync_impl(
         local_failover_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate
     ) {
+        let failure_disposition = crate::orchestration::classify_failure_disposition(
+            &plan.provider_api_format,
+            local_failover_analysis.classification,
+            result.status_code,
+        );
+        if let Some(retry_scope) = retry_scope_out.as_deref_mut() {
+            *retry_scope =
+                ai_attempt_retry_scope_from_failure_disposition(failure_disposition);
+        }
+        if failure_disposition.preserve_upstream_error {
+            if let Some(retry_fallback) = retry_fallback_out.as_deref_mut() {
+                let mut fallback_headers = headers.clone();
+                apply_endpoint_response_header_rules(
+                    state,
+                    &plan,
+                    &mut fallback_headers,
+                    body_json.as_ref(),
+                )
+                .await?;
+                *retry_fallback = Some(attach_control_metadata_headers(
+                    build_client_response_from_parts(
+                        result.status_code,
+                        &fallback_headers,
+                        Body::from(body_bytes.clone()),
+                        trace_id,
+                        Some(decision),
+                    )?,
+                    Some(plan.request_id.as_str()),
+                    plan.candidate_id.as_deref(),
+                )?);
+            }
+        }
         let terminal_unix_secs = current_request_candidate_unix_ms();
         let error_trace_report_context = with_sync_error_trace_context(
             report_context.as_ref(),
@@ -2120,8 +2855,6 @@ async fn execute_execution_runtime_sync_impl(
     }
     let status_code = result.status_code;
     let has_body_bytes = body_base64.is_some();
-    let mut report_context =
-        attach_provider_response_headers_to_report_context(report_context, &headers);
     if (200..300).contains(&status_code) {
         seed_kiro_sync_simulated_cache_enabled(state, &plan, &mut report_context).await;
         if kiro_simulated_cache_enabled_from_report_context(report_context.as_ref()) {
@@ -2258,8 +2991,11 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             implicit_finalize.payload.report_context.as_ref(),
             usage_payload,
+            candidate_started_at,
+            candidate_first_byte_elapsed_ms,
             &mut terminal_guard,
-        );
+        )
+        .await;
         if let Some(report_payload) = implicit_finalize.outcome.background_report {
             spawn_sync_report(state.clone(), report_payload);
         } else {
@@ -2311,8 +3047,11 @@ async fn execute_execution_runtime_sync_impl(
                 &plan,
                 payload.report_context.as_ref(),
                 usage_payload,
+                candidate_started_at,
+                candidate_first_byte_elapsed_ms,
                 &mut terminal_guard,
-            );
+            )
+            .await;
             if let Some(report_payload) = outcome.background_report {
                 spawn_sync_report(state.clone(), report_payload);
             } else {
@@ -2357,8 +3096,11 @@ async fn execute_execution_runtime_sync_impl(
                     &plan,
                     original_report_context.as_ref(),
                     &report_payload,
+                    candidate_started_at,
+                    candidate_first_byte_elapsed_ms,
                     &mut terminal_guard,
-                );
+                )
+                .await;
                 if let Some(snapshot) = local_task_snapshot {
                     let _ = state.upsert_video_task_snapshot(&snapshot).await?;
                     state.video_tasks.record_snapshot(snapshot);
@@ -2391,8 +3133,11 @@ async fn execute_execution_runtime_sync_impl(
                 &plan,
                 payload.report_context.as_ref(),
                 &payload,
+                candidate_started_at,
+                candidate_first_byte_elapsed_ms,
                 &mut terminal_guard,
-            );
+            )
+            .await;
             state
                 .video_tasks
                 .apply_finalize_mutation(request_path, payload.report_kind.as_str());
@@ -2437,8 +3182,11 @@ async fn execute_execution_runtime_sync_impl(
                 &plan,
                 payload.report_context.as_ref(),
                 &payload,
+                candidate_started_at,
+                candidate_first_byte_elapsed_ms,
                 &mut terminal_guard,
-            );
+            )
+            .await;
             if background_error_report_kind.is_some() {
                 spawn_sync_report(state.clone(), payload);
             } else {
@@ -2463,8 +3211,11 @@ async fn execute_execution_runtime_sync_impl(
             &plan,
             payload.report_context.as_ref(),
             &payload,
+            candidate_started_at,
+            candidate_first_byte_elapsed_ms,
             &mut terminal_guard,
-        );
+        )
+        .await;
         let response =
             submit_local_core_error_or_sync_finalize(state, trace_id, decision, payload).await?;
         return Ok(Some(attach_control_metadata_headers(
@@ -2498,8 +3249,11 @@ async fn execute_execution_runtime_sync_impl(
         &plan,
         usage_payload.report_context.as_ref(),
         &usage_payload,
+        candidate_started_at,
+        candidate_first_byte_elapsed_ms,
         &mut terminal_guard,
-    );
+    )
+    .await;
     let response = attach_control_metadata_headers(
         build_client_response_from_parts(
             status_code,
@@ -2512,7 +3266,20 @@ async fn execute_execution_runtime_sync_impl(
         candidate_id,
     )?;
     if !usage_payload.report_kind.trim().is_empty() {
-        spawn_sync_report(state.clone(), usage_payload);
+        if status_code >= 400 {
+            let report_kind = usage_payload.report_kind.clone();
+            if let Err(err) = submit_sync_report(state, usage_payload).await {
+                warn!(
+                    event_name = "local_sync_error_report_submit_failed",
+                    log_type = "ops",
+                    trace_id = %trace_id,
+                    report_kind = %report_kind,
+                    "gateway failed to submit local sync error report before returning response: {err:?}"
+                );
+            }
+        } else {
+            spawn_sync_report(state.clone(), usage_payload);
+        }
     }
 
     Ok(Some(response))
@@ -2538,7 +3305,14 @@ fn maybe_build_implicit_sync_finalize_outcome(
     body_base64: &Option<String>,
     telemetry: &Option<ExecutionTelemetry>,
 ) -> Result<Option<ImplicitSyncFinalizeOutcome>, GatewayError> {
-    if status_code >= 400 || body_json.is_some() || body_base64.is_none() {
+    let needs_conversion = report_context
+        .as_ref()
+        .and_then(|value| value.get("needs_conversion"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let has_captured_stream_body = body_json.is_none() && body_base64.is_some();
+    let has_cross_format_sync_body = needs_conversion && body_json.is_some();
+    if status_code >= 400 || (!has_captured_stream_body && !has_cross_format_sync_body) {
         return Ok(None);
     }
 
@@ -2576,7 +3350,10 @@ async fn execute_sync_via_remote_execution_runtime(
     plan_candidate_id: Option<&str>,
     report_context: Option<&serde_json::Value>,
     candidate_started_unix_secs: u64,
+    candidate_started_at: Instant,
 ) -> Result<RemoteSyncFallbackOutcome, GatewayError> {
+    let remote_request_started_at_unix_ms = current_request_candidate_unix_ms();
+    let remote_request_order_id = uuid::Uuid::now_v7().to_string();
     let response = match post_sync_plan_to_remote_execution_runtime(
         state,
         remote_execution_runtime_base_url,
@@ -2606,7 +3383,7 @@ async fn execute_sync_via_remote_execution_runtime(
                     status_code: None,
                     error_type: Some("execution_runtime_unavailable".to_string()),
                     error_message: Some(format!("{err:?}")),
-                    latency_ms: None,
+                    latency_ms: Some(elapsed_ms_since(candidate_started_at)),
                     started_at_unix_ms: Some(candidate_started_unix_secs),
                     finished_at_unix_ms: Some(terminal_unix_secs),
                 },
@@ -2630,7 +3407,7 @@ async fn execute_sync_via_remote_execution_runtime(
                     "execution runtime returned HTTP {}",
                     response.status()
                 )),
-                latency_ms: None,
+                latency_ms: Some(elapsed_ms_since(candidate_started_at)),
                 started_at_unix_ms: Some(candidate_started_unix_secs),
                 finished_at_unix_ms: Some(terminal_unix_secs),
             },
@@ -2645,11 +3422,19 @@ async fn execute_sync_via_remote_execution_runtime(
         ));
     }
 
-    response
-        .json()
+    let remote_response_observed_at_unix_ms = current_request_candidate_unix_ms();
+    let mut result = response
+        .json::<ExecutionResult>()
         .await
-        .map(RemoteSyncFallbackOutcome::Executed)
-        .map_err(|err| GatewayError::Internal(err.to_string()))
+        .map_err(|err| GatewayError::Internal(err.to_string()))?;
+    result
+        .response_observation
+        .get_or_insert(ExecutionResponseObservation {
+            request_started_at_unix_ms: remote_request_started_at_unix_ms,
+            response_headers_observed_at_unix_ms: remote_response_observed_at_unix_ms,
+            request_order_id: remote_request_order_id,
+        });
+    Ok(RemoteSyncFallbackOutcome::Executed(result))
 }
 
 #[cfg(test)]
@@ -2664,6 +3449,7 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn test_openai_image_plan(stream: bool) -> ExecutionPlan {
         ExecutionPlan {
@@ -2695,6 +3481,202 @@ mod tests {
         plan.provider_api_format = "gemini:generate_content".to_string();
         plan.model_name = Some("gemini-3-flash-preview".to_string());
         plan
+    }
+
+    fn test_decision() -> GatewayControlDecision {
+        GatewayControlDecision::synthetic(
+            "/v1/chat/completions",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("chat".to_string()),
+            Some("openai:chat".to_string()),
+        )
+        .with_execution_runtime_candidate(true)
+    }
+
+    #[tokio::test]
+    async fn implicit_sync_finalize_converts_chat_json_to_namespaced_responses() {
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/responses",
+            Some("ai_public".to_string()),
+            Some("openai".to_string()),
+            Some("responses".to_string()),
+            Some("openai:responses".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let report_context = Some(json!({
+            "provider_api_format": "openai:chat",
+            "client_api_format": "openai:responses",
+            "needs_conversion": true,
+            "mapped_model": "qwen-upstream",
+            "original_request_body": {
+                "model": "qwen",
+                "tools": [{
+                    "type": "namespace",
+                    "name": "mcp__vulnerability_report",
+                    "description": "reporting tools",
+                    "tools": [{
+                        "type": "function",
+                        "name": "vulnerability_report",
+                        "description": "write the confirmed report",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "report_path": {"type": "string"}
+                            },
+                            "required": ["report_path"]
+                        },
+                        "strict": true
+                    }]
+                }]
+            }
+        }));
+        let provider_body = Some(json!({
+            "id": "chatcmpl_namespace_sync",
+            "object": "chat.completion",
+            "created": 1_777_777_777,
+            "model": "qwen-upstream",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_report_1",
+                        "type": "function",
+                        "function": {
+                            "name": "vulnerability_report",
+                            "arguments": "{\"report_path\":\"reports/sql-001-c1.md\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "total_tokens": 14
+            }
+        }));
+
+        let implicit = maybe_build_implicit_sync_finalize_outcome(
+            "trace-namespace-sync",
+            &decision,
+            "openai_responses_sync",
+            &report_context,
+            StatusCode::OK.as_u16(),
+            &BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            &provider_body,
+            &None,
+            &None,
+        )
+        .expect("cross-format sync JSON finalize should not error")
+        .expect("cross-format sync JSON should be finalized");
+        let response_body = axum::body::to_bytes(implicit.outcome.response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        let response_json: Value =
+            serde_json::from_slice(&response_body).expect("response body should be JSON");
+
+        assert_eq!(response_json["object"], "response");
+        assert!(response_json.get("choices").is_none());
+        assert_eq!(response_json["output"][0]["type"], "function_call");
+        assert_eq!(response_json["output"][0]["name"], "vulnerability_report");
+        assert_eq!(
+            response_json["output"][0]["namespace"],
+            "mcp__vulnerability_report"
+        );
+        assert_eq!(response_json["output"][0]["call_id"], "call_report_1");
+    }
+
+    #[test]
+    fn implicit_sync_finalize_leaves_same_format_json_on_passthrough_path() {
+        let report_context = Some(json!({
+            "provider_api_format": "openai:responses",
+            "client_api_format": "openai:responses",
+            "needs_conversion": false
+        }));
+        let body_json = Some(json!({
+            "id": "resp_same_format",
+            "object": "response",
+            "status": "completed",
+            "output": []
+        }));
+
+        let outcome = maybe_build_implicit_sync_finalize_outcome(
+            "trace-same-format-sync",
+            &GatewayControlDecision::synthetic(
+                "/v1/responses",
+                Some("ai_public".to_string()),
+                Some("openai".to_string()),
+                Some("responses".to_string()),
+                Some("openai:responses".to_string()),
+            ),
+            "openai_responses_sync",
+            &report_context,
+            StatusCode::OK.as_u16(),
+            &BTreeMap::new(),
+            &body_json,
+            &None,
+            &None,
+        )
+        .expect("same-format sync JSON guard should not error");
+
+        assert!(outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_upstream_response_builds_claude_502_retry_fallback() {
+        let mut plan = test_openai_image_plan(false);
+        plan.client_api_format = "claude:messages".to_string();
+        plan.provider_api_format = "claude:messages".to_string();
+        let decision = GatewayControlDecision::synthetic(
+            "/v1/messages",
+            Some("ai_public".to_string()),
+            Some("claude".to_string()),
+            Some("messages".to_string()),
+            Some("claude:messages".to_string()),
+        )
+        .with_execution_runtime_candidate(true);
+        let failure = SyncExecutionFailure::from_transport(
+            ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
+                phase: crate::execution_runtime::transport::UpstreamResponseBodyPhase::Wire,
+                limit_bytes: 8,
+            },
+        );
+
+        assert_eq!(failure.status_code, Some(StatusCode::BAD_GATEWAY.as_u16()));
+        assert_eq!(
+            failure.fallback_kind,
+            Some(SyncExecutionFailureFallbackKind::UpstreamResponseTooLarge)
+        );
+        let mut retry_scope = AiAttemptRetryScope::Provider;
+        let mut retry_fallback = None;
+        {
+            let mut retry_scope_out = Some(&mut retry_scope);
+            let mut retry_fallback_out = Some(&mut retry_fallback);
+            maybe_store_sync_execution_failure_fallback(
+                &failure,
+                &plan,
+                "trace-too-large",
+                &decision,
+                &mut retry_scope_out,
+                &mut retry_fallback_out,
+            )
+            .expect("fallback response should build");
+        }
+
+        assert_eq!(retry_scope, AiAttemptRetryScope::Candidate);
+        let response = retry_fallback.expect("oversized response should provide a fallback");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("fallback body should read");
+        let body: Value = serde_json::from_slice(&body).expect("fallback body should be json");
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "upstream_error");
+        assert_eq!(body["error"]["message"], "Upstream response too large");
     }
 
     fn test_kiro_sync_plan() -> ExecutionPlan {
@@ -2764,6 +3746,121 @@ mod tests {
     }
 
     #[test]
+    fn invalid_gemini_provider_success_accepts_thought_only_max_tokens() {
+        let plan = test_gemini_chat_plan();
+        let body = json!({
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [{"text": "hidden plan", "thought": true}]
+                },
+                "finishReason": "MAX_TOKENS"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "candidatesTokenCount": 0,
+                "thoughtsTokenCount": 24,
+                "totalTokenCount": 32
+            }
+        });
+
+        let message = invalid_gemini_provider_success_message(
+            &plan,
+            None,
+            StatusCode::OK.as_u16(),
+            Some(&body),
+        );
+
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn invalid_gemini_provider_stream_success_accepts_signature_only_reasoning_exhaustion() {
+        let plan = test_gemini_chat_plan();
+        let report_context = json!({
+            "has_envelope": true,
+            "envelope_name": "antigravity:v1internal",
+            "provider_api_format": "gemini:generate_content",
+        });
+        let body = concat!(
+            "data: {\"response\":{\"responseId\":\"resp_signature_only_123\",\"modelVersion\":\"gemini-3.7-flash-tiered\",",
+            "\"candidates\":[{\"index\":0,\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"\",\"thoughtSignature\":\"opaque-thought-signature\"}]},\"finishReason\":\"MAX_TOKENS\"}],",
+            "\"usageMetadata\":{\"promptTokenCount\":22,\"thoughtsTokenCount\":29,\"totalTokenCount\":51}},",
+            "\"traceId\":\"trace-signature-only\"}\n\n",
+        );
+
+        let message = invalid_gemini_provider_stream_success_message(
+            &plan,
+            Some(&report_context),
+            StatusCode::OK.as_u16(),
+            None,
+            body.as_bytes(),
+            true,
+        );
+
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn invalid_gemini_provider_success_error_is_retryable_candidate_failure() {
+        let error = invalid_gemini_provider_success_execution_error(
+            INVALID_GEMINI_PROVIDER_SUCCESS_MESSAGE,
+        );
+
+        assert_eq!(error.kind, ExecutionErrorKind::Upstream5xx);
+        assert_eq!(error.phase, ExecutionPhase::Finalize);
+        assert_eq!(error.upstream_status, Some(StatusCode::OK.as_u16()));
+        assert!(error.retryable);
+        assert!(error.failover_recommended);
+    }
+
+    #[test]
+    fn invalid_gemini_provider_success_accepts_antigravity_chunks_with_visible_output() {
+        let plan = test_gemini_chat_plan();
+        let report_context = json!({
+            "has_envelope": true,
+            "envelope_name": "antigravity:v1internal",
+            "provider_api_format": "gemini:generate_content",
+        });
+        let body = json!({
+            "chunks": [{
+                "response": {
+                    "responseId": "resp_antigravity_chunks_123",
+                    "candidates": [{
+                        "content": {
+                            "parts": [{"text": "Hello Gemini"}],
+                            "role": "model"
+                        },
+                        "finishReason": "STOP",
+                        "index": 0
+                    }],
+                    "modelVersion": "gemini-3-flash-agent",
+                    "usageMetadata": {
+                        "promptTokenCount": 2,
+                        "candidatesTokenCount": 2,
+                        "totalTokenCount": 4
+                    }
+                },
+                "traceId": "trace-antigravity-chunks"
+            }],
+            "metadata": {
+                "stream": true,
+                "stored_chunks": 1,
+                "total_chunks": 1
+            }
+        });
+
+        let message = invalid_gemini_provider_success_message(
+            &plan,
+            Some(&report_context),
+            StatusCode::OK.as_u16(),
+            Some(&body),
+        );
+
+        assert!(message.is_none());
+    }
+
+    #[test]
     fn invalid_gemini_provider_success_unwraps_gemini_cli_v1internal_envelope() {
         let plan = test_gemini_chat_plan();
         let report_context = json!({
@@ -2829,9 +3926,10 @@ mod tests {
         }));
 
         ensure_execution_request_candidate_slot(&state, &mut plan, &mut report_context).await;
+        let candidate_started_at = Instant::now();
         let started_at = current_request_candidate_unix_ms();
         state.usage_runtime.record_pending(
-            state.data.as_ref(),
+            state.usage_lifecycle_data_state().as_ref(),
             build_lifecycle_usage_seed(&plan, report_context.as_ref()),
         );
         record_local_request_candidate_status(
@@ -2850,10 +3948,19 @@ mod tests {
         )
         .await;
 
-        {
-            let _guard =
-                SyncAttemptTerminalGuard::new(&state, &plan, report_context.clone(), started_at);
-        }
+        crate::request_diagnostics::scope_request_diagnostics(async {
+            crate::request_diagnostics::record_request_accepted_at(
+                Instant::now() - Duration::from_millis(25),
+            );
+            let _guard = SyncAttemptTerminalGuard::new(
+                &state,
+                &plan,
+                report_context.clone(),
+                started_at,
+                candidate_started_at,
+            );
+        })
+        .await;
 
         let mut stored_usage = None;
         for _ in 0..50 {
@@ -2871,9 +3978,20 @@ mod tests {
         }
         let stored_usage = stored_usage.expect("cancelled usage should be recorded");
         assert_eq!(stored_usage.status, "cancelled");
-        assert_eq!(stored_usage.billing_status, "pending");
+        assert_eq!(stored_usage.billing_status, "void");
         assert_eq!(stored_usage.status_code, Some(499));
         assert_eq!(stored_usage.error_category.as_deref(), Some("cancelled"));
+        let request_metadata = stored_usage
+            .request_metadata
+            .as_ref()
+            .expect("cancelled usage should retain request diagnostics");
+        assert!(request_metadata
+            .get("end_to_end_time_ms")
+            .and_then(Value::as_u64)
+            .is_some());
+        assert!(request_metadata
+            .get("end_to_end_first_byte_time_ms")
+            .is_none());
 
         let stored_candidates = request_candidate_repository
             .list_by_request_id("sync-cancel-guard-request")
@@ -2889,6 +4007,293 @@ mod tests {
             stored_candidates[0].error_type.as_deref(),
             Some("local_sync_attempt_cancelled")
         );
+    }
+
+    #[tokio::test]
+    async fn sync_direct_response_start_marks_usage_and_candidate_active_before_body_finishes() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        let (body_tx, body_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 4096];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("request should read");
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n",
+                )
+                .await
+                .expect("headers should write");
+            socket.flush().await.expect("headers should flush");
+            let _ = headers_tx.send(());
+            let _ = body_rx.await;
+            socket
+                .write_all(br#"{"ok":true}"#)
+                .await
+                .expect("body should write");
+        });
+
+        let mut plan = test_gemini_chat_plan();
+        plan.request_id = "sync-response-start-active-request".to_string();
+        plan.candidate_id = Some("sync-response-start-active-candidate".to_string());
+        plan.url = format!("http://{addr}/chat");
+        plan.provider_api_format = "openai:chat".to_string();
+        plan.model_name = Some("gpt-5".to_string());
+        plan.body = aether_contracts::RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "slow body"}],
+        }));
+        let report_context = Some(json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+            "user_id": "user-active",
+            "api_key_id": "api-key-active",
+            "client_api_format": "openai:chat",
+            "provider_api_format": "openai:chat",
+            "request_path": "/v1/chat/completions",
+            "request_path_and_query": "/v1/chat/completions",
+            "upstream_url": plan.url.clone(),
+            "mapped_model": "gpt-5",
+        }));
+        let started_at = current_request_candidate_unix_ms();
+        state
+            .usage_runtime
+            .record_pending_direct(
+                state.usage_lifecycle_data_state().as_ref(),
+                build_lifecycle_usage_seed(&plan, report_context.as_ref()),
+            )
+            .await;
+        record_local_request_candidate_status(
+            &state,
+            &plan,
+            report_context.as_ref(),
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Pending,
+                status_code: None,
+                error_type: None,
+                error_message: None,
+                latency_ms: None,
+                started_at_unix_ms: Some(started_at),
+                finished_at_unix_ms: None,
+            },
+        )
+        .await;
+
+        let state_for_exec = state.clone();
+        let plan_for_exec = plan.clone();
+        let report_context_for_exec = report_context.clone();
+        let exec = tokio::spawn(async move {
+            execute_direct_sync_runtime_candidate(
+                &state_for_exec,
+                &plan_for_exec,
+                report_context_for_exec.as_ref(),
+                "trace-response-start-active",
+                "openai_chat_sync",
+                started_at,
+                "sync-response-start-active-request",
+                plan_for_exec.candidate_id.as_deref(),
+                "openai",
+                "endpoint-1",
+                "key-1",
+                "gpt-5",
+                "0",
+                None,
+            )
+            .await
+        });
+
+        headers_rx.await.expect("headers should be written");
+        let mut active_usage = None;
+        for _ in 0..50 {
+            if let Some(usage) = usage_repository
+                .find_by_request_id("sync-response-start-active-request")
+                .await
+                .expect("usage should read")
+            {
+                if usage.status == "streaming" {
+                    active_usage = Some(usage);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let active_usage = active_usage.expect("usage should become active before body finishes");
+        assert_eq!(active_usage.status_code, Some(200));
+        assert!(active_usage.first_byte_time_ms.is_some());
+        assert!(active_usage.response_time_ms.is_some());
+
+        let stored_candidates = request_candidate_repository
+            .list_by_request_id("sync-response-start-active-request")
+            .await
+            .expect("candidate should read");
+        let active_candidate = stored_candidates
+            .iter()
+            .find(|candidate| candidate.id == "sync-response-start-active-candidate")
+            .expect("candidate should exist");
+        assert_eq!(active_candidate.status, RequestCandidateStatus::Streaming);
+        assert_eq!(active_candidate.status_code, Some(200));
+
+        let _ = body_tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(2), exec)
+            .await
+            .expect("sync execution should finish")
+            .expect("sync execution task should not panic")
+            .expect("sync execution should succeed");
+        assert_eq!(result.status_code, 200);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_execution_active_marks_usage_before_response_headers() {
+        let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
+        let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+        let state = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    Arc::clone(&request_candidate_repository),
+                    Arc::clone(&usage_repository),
+                ),
+            )
+            .with_usage_runtime_for_tests(UsageRuntimeConfig {
+                enabled: true,
+                ..UsageRuntimeConfig::default()
+            });
+
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("local addr should resolve");
+        let (request_seen_tx, request_seen_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 4096];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("request should read");
+            let _ = request_seen_tx.send(());
+            let _ = finish_rx.await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+                )
+                .await
+                .expect("response should write");
+        });
+
+        let mut plan = test_gemini_chat_plan();
+        plan.request_id = "sync-active-before-headers-request".to_string();
+        plan.candidate_id = Some("sync-active-before-headers-candidate".to_string());
+        plan.url = format!("http://{addr}/chat");
+        plan.provider_name = Some("OpenAI".to_string());
+        plan.provider_api_format = "openai:chat".to_string();
+        plan.model_name = Some("gpt-5".to_string());
+        plan.body = aether_contracts::RequestBody::from_json(json!({
+            "model": "gpt-5",
+            "messages": [{"role": "user", "content": "slow headers"}],
+        }));
+        let report_context = Some(json!({
+            "candidate_index": 0,
+            "retry_index": 0,
+            "user_id": "user-active-before-headers",
+            "api_key_id": "api-key-active-before-headers",
+            "candidate_id": "sync-active-before-headers-candidate",
+            "provider_id": "provider-1",
+            "endpoint_id": "endpoint-1",
+            "key_id": "key-1",
+            "provider_name": "OpenAI",
+            "client_api_format": "openai:chat",
+            "provider_api_format": "openai:chat",
+            "request_path": "/v1/chat/completions",
+            "request_path_and_query": "/v1/chat/completions",
+            "upstream_url": plan.url.clone(),
+            "mapped_model": "gpt-5",
+        }));
+        let state_for_exec = state.clone();
+        let plan_for_exec = plan.clone();
+        let report_context_for_exec = report_context.clone();
+        let exec = tokio::spawn(async move {
+            execute_execution_runtime_sync(
+                &state_for_exec,
+                "/v1/chat/completions",
+                plan_for_exec,
+                "trace-active-before-headers",
+                &test_decision(),
+                "openai_chat_sync",
+                Some("openai_chat_sync".to_string()),
+                report_context_for_exec,
+            )
+            .await
+        });
+
+        request_seen_rx
+            .await
+            .expect("upstream request should be observed");
+        let mut active_usage = None;
+        for _ in 0..50 {
+            if let Some(usage) = usage_repository
+                .find_by_request_id("sync-active-before-headers-request")
+                .await
+                .expect("usage should read")
+            {
+                if usage.status == "streaming" {
+                    active_usage = Some(usage);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let active_usage =
+            active_usage.expect("usage should become active before upstream headers");
+        assert_eq!(active_usage.status_code, None);
+        assert_eq!(active_usage.first_byte_time_ms, None);
+        assert_eq!(active_usage.response_time_ms, None);
+
+        let stored_candidates = request_candidate_repository
+            .list_by_request_id("sync-active-before-headers-request")
+            .await
+            .expect("candidate should read");
+        let active_candidate = stored_candidates
+            .iter()
+            .find(|candidate| candidate.id == "sync-active-before-headers-candidate")
+            .expect("candidate should exist");
+        assert_eq!(active_candidate.status, RequestCandidateStatus::Streaming);
+        assert_eq!(active_candidate.status_code, None);
+        assert!(active_candidate.started_at_unix_ms.is_some());
+        assert!(active_candidate.finished_at_unix_ms.is_none());
+
+        let _ = finish_tx.send(());
+        let response = tokio::time::timeout(Duration::from_secs(2), exec)
+            .await
+            .expect("sync execution should finish")
+            .expect("sync execution task should not panic")
+            .expect("sync execution should succeed")
+            .expect("sync execution should produce a response");
+        assert_eq!(response.status(), StatusCode::OK);
+        server.abort();
     }
 
     #[test]

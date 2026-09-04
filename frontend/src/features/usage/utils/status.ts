@@ -49,6 +49,12 @@ export function hasUsageRetry(
   return record.has_retry === true
 }
 
+export function isUsageWebSocket(
+  record: Pick<UsageRecord, 'is_websocket'>
+): boolean {
+  return record.is_websocket === true
+}
+
 export function resolveUsageStreamModes(
   record: Pick<
     UsageRecord,
@@ -160,6 +166,7 @@ function usageApiFormatDefaultsToNonStream(apiFormat: string): boolean {
     case 'openai:chat':
     case 'openai:responses':
     case 'openai:responses:compact':
+    case 'openai:search':
     case 'openai:image':
     case 'claude:messages':
       return true

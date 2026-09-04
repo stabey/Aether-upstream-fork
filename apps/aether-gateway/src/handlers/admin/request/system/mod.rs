@@ -9,7 +9,6 @@ mod proxy_nodes;
 mod templates;
 
 const ADMIN_SYSTEM_DATA_EXPORT_VERSION: &str = "1.0";
-const ADMIN_SYSTEM_DATA_IMPORT_MAX_SIZE_BYTES: usize = 500 * 1024 * 1024;
 
 impl<'a> AdminAppState<'a> {
     pub(crate) async fn upsert_system_config_json_value(
@@ -28,6 +27,13 @@ impl<'a> AdminAppState<'a> {
         key: &str,
     ) -> Result<Option<serde_json::Value>, GatewayError> {
         self.app.read_system_config_json_value(key).await
+    }
+
+    pub(crate) async fn read_system_config_json_value_strong(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, GatewayError> {
+        self.app.read_system_config_json_value_strong(key).await
     }
 
     pub(crate) async fn list_system_config_entries(

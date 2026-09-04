@@ -1,20 +1,16 @@
-use std::collections::BTreeMap;
-
 use aether_ai_serving::{
     ai_ranking_context, build_ai_rankable_candidate, run_ai_candidate_ranking,
     AiCandidateRankingPort, AiRankableCandidateParts, AiRankingContextConfig,
     AiRankingSchedulingMode,
 };
-use aether_routing_core::{ResolvedRoutingPolicy, RoutingSchedulingMode, RoutingSetPriorityMode};
+use aether_routing_core::ResolvedRoutingPolicy;
 use async_trait::async_trait;
-use tracing::warn;
+use tokio::sync::Mutex;
 
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
 use crate::clock::current_unix_ms;
 use crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value;
-use crate::scheduler::config::{
-    read_scheduler_ordering_config, SchedulerOrderingConfig, SchedulerSchedulingMode,
-};
+use crate::scheduler::config::{SchedulerOrderingConfig, SchedulerSchedulingMode};
 use aether_scheduler_core::{
     matches_affinity_target, ClientSessionAffinity, SchedulerAffinityTarget,
     SchedulerMinimalCandidateSelectionCandidate, SchedulerPriorityMode, SchedulerRankableCandidate,
@@ -24,7 +20,7 @@ use aether_scheduler_core::{
 use super::candidate_affinity_cache::read_cached_scheduler_affinity_target;
 use super::candidate_resolution::{EligibleLocalExecutionCandidate, LocalExecutionCandidateKind};
 use super::candidate_transport_ranking_facts::{
-    resolve_cached_transport_ranking_facts, CandidateTransportRankingFacts,
+    resolve_cached_transport_ranking_facts, CandidateTransportRankingFactsCache,
 };
 
 struct GatewayLocalCandidateRankingPort<'a> {
@@ -35,6 +31,7 @@ struct GatewayLocalCandidateRankingPort<'a> {
     required_capabilities: Option<&'a serde_json::Value>,
     ordering_config: SchedulerOrderingConfig,
     routing_policy: Option<&'a ResolvedRoutingPolicy>,
+    transport_ranking_facts_cache: Mutex<CandidateTransportRankingFactsCache>,
 }
 
 #[async_trait]
@@ -66,6 +63,7 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
             self.client_session_affinity,
             normalized_client_api_format,
             affinity_requested_model,
+            self.routing_policy,
         ))
     }
 
@@ -84,13 +82,17 @@ impl AiCandidateRankingPort for GatewayLocalCandidateRankingPort<'_> {
         normalized_client_api_format: &str,
         cached_affinity_match: bool,
     ) -> Result<SchedulerRankableCandidate, Self::Error> {
-        let ranking_facts = resolve_transport_ranking_facts_for_candidate(
-            self.state,
-            &candidate.candidate,
-            candidate.transport.as_ref(),
-            self.ordering_config,
-        )
-        .await;
+        let ranking_facts = {
+            let mut cache = self.transport_ranking_facts_cache.lock().await;
+            resolve_cached_transport_ranking_facts(
+                self.state,
+                &mut cache,
+                &candidate.candidate,
+                candidate.transport.as_ref(),
+                self.ordering_config,
+            )
+            .await
+        };
         let routing_overlaid_candidate =
             routing_overlaid_candidate(self.routing_policy, candidate.kind, &candidate.candidate);
         Ok(build_ai_rankable_candidate(AiRankableCandidateParts {
@@ -128,7 +130,7 @@ pub(crate) async fn rank_eligible_local_execution_candidates(
     required_capabilities: Option<&serde_json::Value>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> Vec<EligibleLocalExecutionCandidate> {
-    let ordering_config = scheduler_ordering_config_for_routing_policy(state, routing_policy).await;
+    let ordering_config = scheduler_ordering_config_for_routing_policy(routing_policy);
     let port = GatewayLocalCandidateRankingPort {
         state,
         requested_model,
@@ -137,29 +139,13 @@ pub(crate) async fn rank_eligible_local_execution_candidates(
         required_capabilities,
         ordering_config,
         routing_policy,
+        transport_ranking_facts_cache: Mutex::new(CandidateTransportRankingFactsCache::default()),
     };
 
     match run_ai_candidate_ranking(&port, candidates, normalized_client_api_format).await {
         Ok(candidates) => candidates,
         Err(error) => match error {},
     }
-}
-
-async fn resolve_transport_ranking_facts_for_candidate(
-    state: PlannerAppState<'_>,
-    candidate: &SchedulerMinimalCandidateSelectionCandidate,
-    transport: &crate::ai_serving::GatewayProviderTransportSnapshot,
-    ordering_config: SchedulerOrderingConfig,
-) -> CandidateTransportRankingFacts {
-    let mut ordering_cache = BTreeMap::new();
-    resolve_cached_transport_ranking_facts(
-        state,
-        &mut ordering_cache,
-        candidate,
-        transport,
-        ordering_config,
-    )
-    .await
 }
 
 fn cached_affinity_matches_local_execution_scope(
@@ -195,30 +181,24 @@ fn ai_ranking_scheduling_mode(mode: SchedulerSchedulingMode) -> AiRankingSchedul
     }
 }
 
-pub(crate) async fn scheduler_ordering_config_for_routing_policy(
-    state: PlannerAppState<'_>,
+/// Return the immutable scheduler snapshot carried by a resolved routing
+/// policy. A missing policy is a programming error in production request
+/// paths; unit tests may use the scheduler default for isolated ranking tests.
+pub(crate) fn scheduler_ordering_config_for_routing_policy(
     routing_policy: Option<&ResolvedRoutingPolicy>,
 ) -> SchedulerOrderingConfig {
     match routing_policy {
-        Some(policy) => scheduler_ordering_config_from_routing_policy(policy),
-        None => read_scheduler_ordering_config_or_default(state).await,
-    }
-}
-
-fn scheduler_ordering_config_from_routing_policy(
-    policy: &ResolvedRoutingPolicy,
-) -> SchedulerOrderingConfig {
-    SchedulerOrderingConfig {
-        priority_mode: match policy.priority_mode {
-            RoutingSetPriorityMode::Provider => SchedulerPriorityMode::Provider,
-            RoutingSetPriorityMode::GlobalKey => SchedulerPriorityMode::GlobalKey,
-        },
-        scheduling_mode: match policy.scheduling_mode {
-            RoutingSchedulingMode::FixedOrder => SchedulerSchedulingMode::FixedOrder,
-            RoutingSchedulingMode::CacheAffinity => SchedulerSchedulingMode::CacheAffinity,
-            RoutingSchedulingMode::LoadBalance => SchedulerSchedulingMode::LoadBalance,
-        },
-        keep_priority_on_conversion: policy.keep_priority_on_conversion,
+        Some(policy) => SchedulerOrderingConfig::from_routing_policy(policy),
+        None => {
+            #[cfg(test)]
+            {
+                SchedulerOrderingConfig::default()
+            }
+            #[cfg(not(test))]
+            {
+                panic!("resolved routing policy is required before candidate scheduling")
+            }
+        }
     }
 }
 
@@ -233,35 +213,34 @@ fn routing_overlaid_candidate(
     let mut overlaid = candidate.clone();
     overlaid.provider_priority = policy
         .ranking_overlay
-        .provider_priority_or_unspecified(candidate.provider_id.as_str());
+        .provider_priority(candidate.provider_id.as_str(), candidate.provider_priority);
     let overlaid_key_priority = match kind {
         LocalExecutionCandidateKind::SingleKey => policy
             .ranking_overlay
-            .key_priority_or_unspecified(candidate.key_id.as_str()),
+            .key_priority_override_matching_format(candidate.key_id.as_str(), |format| {
+                crate::ai_serving::api_format_alias_matches(
+                    format,
+                    candidate.endpoint_api_format.as_str(),
+                )
+            })
+            .or_else(|| {
+                policy
+                    .ranking_overlay
+                    .key_priority_overrides
+                    .get(candidate.key_id.as_str())
+                    .copied()
+            }),
         LocalExecutionCandidateKind::PoolGroup => policy
             .ranking_overlay
-            .pool_priority_or_unspecified(candidate.provider_id.as_str()),
+            .pool_priority_overrides
+            .get(candidate.provider_id.as_str())
+            .copied(),
     };
-    overlaid.key_internal_priority = overlaid_key_priority;
-    overlaid.key_global_priority_for_format = Some(overlaid_key_priority);
-    overlaid
-}
-
-async fn read_scheduler_ordering_config_or_default(
-    state: PlannerAppState<'_>,
-) -> SchedulerOrderingConfig {
-    match read_scheduler_ordering_config(state.app()).await {
-        Ok(config) => config,
-        Err(error) => {
-            warn!(
-                event_name = "planner_scheduler_ordering_config_load_failed",
-                log_type = "event",
-                error = ?error,
-                "failed to load scheduler ordering config while ranking local execution candidates"
-            );
-            SchedulerOrderingConfig::default()
-        }
+    if let Some(overlaid_key_priority) = overlaid_key_priority {
+        overlaid.key_internal_priority = overlaid_key_priority;
+        overlaid.key_global_priority_for_format = Some(overlaid_key_priority);
     }
+    overlaid
 }
 
 #[cfg(test)]
@@ -272,9 +251,15 @@ mod tests {
     use aether_ai_serving::{
         ai_ranking_context, build_ai_rankable_candidate, AiRankableCandidateParts,
     };
-    use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data::repository::{
+        provider_catalog::InMemoryProviderCatalogReadRepository,
+        routing_profiles::InMemoryRoutingGroupRepository,
+    };
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
+    };
+    use aether_data_contracts::repository::routing_profiles::{
+        CreateRoutingGroupRecord, RoutingGroupWriteRepository,
     };
     use aether_scheduler_core::{
         apply_scheduler_candidate_ranking,
@@ -284,7 +269,9 @@ mod tests {
     use serde_json::json;
 
     use super::super::candidate_affinity_cache::remember_scheduler_affinity_for_candidate;
-    use super::super::candidate_transport_ranking_facts::resolve_cached_candidate_transport_ranking_facts;
+    use super::super::candidate_transport_ranking_facts::{
+        resolve_cached_candidate_transport_ranking_facts, CandidateTransportRankingFactsCache,
+    };
     use super::{PlannerAppState, SchedulerMinimalCandidateSelectionCandidate};
     use crate::ai_serving::planner::candidate_resolution::{
         resolve_and_rank_local_execution_candidates,
@@ -303,10 +290,14 @@ mod tests {
         required_capabilities: Option<&serde_json::Value>,
     ) -> Vec<SchedulerMinimalCandidateSelectionCandidate> {
         let normalized_client_api_format = client_api_format.trim().to_ascii_lowercase();
-        let ordering_config = super::read_scheduler_ordering_config_or_default(state).await;
+        let ordering_config =
+            crate::scheduler::config::read_system_default_routing_ordering_config(state.app())
+                .await
+                .expect("routing strategy should load")
+                .unwrap_or_default();
         let mut candidates = candidates;
         let mut rankables = Vec::with_capacity(candidates.len());
-        let mut ordering_cache = BTreeMap::new();
+        let mut ordering_cache = CandidateTransportRankingFactsCache::default();
 
         for (original_index, candidate) in candidates.iter().enumerate() {
             let ranking_facts = resolve_cached_candidate_transport_ranking_facts(
@@ -358,12 +349,13 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-4.1".to_string(),
             selected_provider_model_name: "gpt-4.1".to_string(),
+            supports_streaming: true,
             mapping_matched_model: None,
         }
     }
 
     #[test]
-    fn routing_policy_priorities_do_not_fall_back_to_candidate_priorities() {
+    fn routing_policy_priorities_fall_back_to_candidate_priorities() {
         let mut candidate = sample_candidate("endpoint-1", "key-1");
         candidate.provider_priority = 7;
         candidate.key_internal_priority = 3;
@@ -377,6 +369,8 @@ mod tests {
             priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::CacheAffinity,
             keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
             ranking_overlay: aether_routing_core::RankingOverlay::default(),
             mutation_plan: Default::default(),
             pool_policy_overrides: BTreeMap::new(),
@@ -389,17 +383,46 @@ mod tests {
             &candidate,
         );
 
+        assert_eq!(overlaid.provider_priority, 7);
+        assert_eq!(overlaid.key_internal_priority, 3);
+        assert_eq!(overlaid.key_global_priority_for_format, Some(2));
+    }
+
+    #[tokio::test]
+    async fn routing_policy_ignores_legacy_global_conversion_priority_override() {
+        let data_state = GatewayDataState::default().with_system_config_values_for_tests([(
+            "keep_priority_on_conversion".to_string(),
+            json!(true),
+        )]);
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let policy = aether_routing_core::ResolvedRoutingPolicy {
+            group_id: Some("group-1".to_string()),
+            group_version: Some(1),
+            selection_source: "system_default".to_string(),
+            requested_model: "gpt-5.4-mini".to_string(),
+            resolved_model: "gpt-5.4-mini".to_string(),
+            priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
+            scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
+            keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
+            ranking_overlay: Default::default(),
+            mutation_plan: Default::default(),
+            pool_policy_overrides: Default::default(),
+            matched_rules: Vec::new(),
+        };
+
+        let ordering = super::scheduler_ordering_config_for_routing_policy(Some(&policy));
+
         assert_eq!(
-            overlaid.provider_priority,
-            aether_routing_core::ROUTING_PRIORITY_UNSPECIFIED
+            ordering.scheduling_mode,
+            crate::scheduler::config::SchedulerSchedulingMode::FixedOrder
         );
-        assert_eq!(
-            overlaid.key_internal_priority,
-            aether_routing_core::ROUTING_PRIORITY_UNSPECIFIED
-        );
-        assert_eq!(
-            overlaid.key_global_priority_for_format,
-            Some(aether_routing_core::ROUTING_PRIORITY_UNSPECIFIED)
+        assert!(
+            !ordering.keep_priority_on_conversion,
+            "a resolved routing policy must not inherit the legacy system-config flag"
         );
     }
 
@@ -418,6 +441,8 @@ mod tests {
             priority_mode: aether_routing_core::RoutingSetPriorityMode::GlobalKey,
             scheduling_mode: aether_routing_core::RoutingSchedulingMode::CacheAffinity,
             keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
             ranking_overlay: aether_routing_core::RankingOverlay {
                 pool_priority_overrides: BTreeMap::from([("provider-1".to_string(), 4)]),
                 key_priority_overrides: BTreeMap::from([("representative-key".to_string(), 1)]),
@@ -634,6 +659,7 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-4.1".to_string(),
             selected_provider_model_name: "gpt-4.1".to_string(),
+            supports_streaming: true,
             mapping_matched_model: None,
         }
     }
@@ -888,7 +914,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_execution_ranking_keeps_cross_format_priority_when_global_override_is_enabled() {
+    async fn local_execution_ranking_keeps_cross_format_priority_when_strategy_override_is_enabled()
+    {
         let provider_catalog = InMemoryProviderCatalogReadRepository::seed(
             vec![
                 sample_provider_with_options("provider-same", false, 10),
@@ -903,14 +930,32 @@ mod tests {
                 sample_key_for_provider("provider-cross", "key-cross", ""),
             ],
         );
+        let routing_repository = std::sync::Arc::new(InMemoryRoutingGroupRepository::default());
+        routing_repository
+            .create_routing_group(CreateRoutingGroupRecord {
+                id: "strategy-default".to_string(),
+                name: "strategy-default".to_string(),
+                description: None,
+                enabled: true,
+                is_system_default: true,
+                sort_order: 0,
+                config_json: json!({
+                    "default_policy": {
+                        "keep_priority_on_conversion": true
+                    }
+                }),
+                version: 1,
+                created_at: 1,
+                updated_at: 1,
+                published_at: None,
+            })
+            .await
+            .expect("routing strategy should be created");
         let data_state = GatewayDataState::with_provider_transport_reader_for_tests(
             std::sync::Arc::new(provider_catalog),
             "development-key",
         )
-        .with_system_config_values_for_tests(vec![(
-            "keep_priority_on_conversion".to_string(),
-            json!(true),
-        )]);
+        .with_routing_group_repository_for_tests(routing_repository);
         let state = AppState::new()
             .expect("state should build")
             .with_data_state_for_tests(data_state);
@@ -1540,6 +1585,7 @@ mod tests {
             .expect("state should build")
             .with_data_state_for_tests(data_state);
         let auth_snapshot = sample_auth_snapshot();
+        let client_session_affinity = ClientSessionAffinity::from_session_key("session-1");
         let cached_candidate = sample_priority_candidate(
             "provider-cached",
             "endpoint-cached",
@@ -1551,7 +1597,7 @@ mod tests {
         remember_scheduler_affinity_for_candidate(
             PlannerAppState::new(&state),
             Some(&auth_snapshot),
-            None,
+            Some(&client_session_affinity),
             "openai:chat",
             "gpt-4.1",
             &cached_candidate,
@@ -1573,7 +1619,7 @@ mod tests {
             "openai:chat",
             "gpt-4.1",
             Some(&auth_snapshot),
-            None,
+            Some(&client_session_affinity),
             None,
             None,
             None,
@@ -1714,6 +1760,7 @@ mod tests {
             .expect("state should build")
             .with_data_state_for_tests(data_state);
         let auth_snapshot = sample_auth_snapshot();
+        let client_session_affinity = ClientSessionAffinity::from_session_key("session-1");
         let cached_cross_format = sample_priority_candidate(
             "provider-shared",
             "endpoint-openai",
@@ -1725,7 +1772,7 @@ mod tests {
         remember_scheduler_affinity_for_candidate(
             PlannerAppState::new(&state),
             Some(&auth_snapshot),
-            None,
+            Some(&client_session_affinity),
             "claude:messages",
             "gpt-4.1",
             &cached_cross_format,
@@ -1747,7 +1794,7 @@ mod tests {
             "claude:messages",
             "gpt-4.1",
             Some(&auth_snapshot),
-            None,
+            Some(&client_session_affinity),
             None,
             None,
             None,
@@ -1915,6 +1962,7 @@ mod tests {
             .expect("state should build")
             .with_data_state_for_tests(data_state);
         let auth_snapshot = sample_auth_snapshot();
+        let client_session_affinity = ClientSessionAffinity::from_session_key("session-1");
         let cached_candidate = sample_priority_candidate(
             "provider-pool",
             "endpoint-pool",
@@ -1926,7 +1974,7 @@ mod tests {
         remember_scheduler_affinity_for_candidate(
             PlannerAppState::new(&state),
             Some(&auth_snapshot),
-            None,
+            Some(&client_session_affinity),
             "openai:chat",
             "gpt-4.1",
             &cached_candidate,
@@ -1948,7 +1996,7 @@ mod tests {
             "openai:chat",
             Some("gpt-4.1"),
             Some(&auth_snapshot),
-            None,
+            Some(&client_session_affinity),
             None,
             None,
             None,
@@ -2008,6 +2056,7 @@ mod tests {
             .expect("state should build")
             .with_data_state_for_tests(data_state);
         let auth_snapshot = sample_auth_snapshot();
+        let client_session_affinity = ClientSessionAffinity::from_session_key("session-1");
         let cached_candidate = sample_priority_candidate(
             "provider-pool",
             "endpoint-pool",
@@ -2019,7 +2068,7 @@ mod tests {
         remember_scheduler_affinity_for_candidate(
             PlannerAppState::new(&state),
             Some(&auth_snapshot),
-            None,
+            Some(&client_session_affinity),
             "openai:chat",
             "gpt-4.1",
             &cached_candidate,
@@ -2041,7 +2090,7 @@ mod tests {
             "openai:chat",
             Some("gpt-4.1"),
             Some(&auth_snapshot),
-            None,
+            Some(&client_session_affinity),
             None,
             None,
             None,
@@ -2064,7 +2113,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remembers_scheduler_affinity_for_candidate_using_requested_model_key() {
+    async fn ignores_scheduler_affinity_without_client_session_scope() {
         let state = AppState::new().expect("state should build");
         let auth_snapshot = sample_auth_snapshot();
         let candidate = sample_candidate("endpoint-1", "key-1");
@@ -2078,15 +2127,12 @@ mod tests {
             &candidate,
         );
 
-        let remembered = state
+        assert!(state
             .read_scheduler_affinity_target(
                 "scheduler_affinity:api-key-1:openai:chat:gpt-5",
                 SCHEDULER_AFFINITY_TTL,
             )
-            .expect("affinity target should be cached");
-        assert_eq!(remembered.provider_id, "provider-1");
-        assert_eq!(remembered.endpoint_id, "endpoint-1");
-        assert_eq!(remembered.key_id, "key-1");
+            .is_none());
     }
 
     #[tokio::test]

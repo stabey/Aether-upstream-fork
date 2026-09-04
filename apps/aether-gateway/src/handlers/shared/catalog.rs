@@ -1,8 +1,8 @@
 use crate::handlers::shared::{json_string_list, unix_secs_to_rfc3339};
 use crate::provider_key_auth::{
-    provider_key_auth_config_uses_header_authorization, provider_key_auth_semantics,
-    provider_key_can_refresh_oauth, provider_key_configured_api_formats,
-    provider_key_inherits_provider_api_formats,
+    provider_key_auth_config_is_agent_identity, provider_key_auth_config_uses_header_authorization,
+    provider_key_auth_semantics, provider_key_can_export_oauth, provider_key_can_refresh_oauth,
+    provider_key_configured_api_formats, provider_key_inherits_provider_api_formats,
 };
 use crate::AppState;
 use aether_admin::provider::quota as admin_provider_quota_pure;
@@ -38,7 +38,7 @@ pub(crate) fn provider_catalog_key_supports_format(
     }
     formats
         .iter()
-        .any(|candidate| crate::ai_serving::api_format_alias_matches(candidate, api_format))
+        .any(|candidate| crate::ai_serving::api_format_permission_covers(candidate, api_format))
 }
 
 pub(crate) fn decrypt_catalog_secret_with_fallbacks(
@@ -165,6 +165,19 @@ pub(crate) fn masked_catalog_api_key(state: &AppState, key: &StoredProviderCatal
                 })
                 .unwrap_or_else(|| "***ERROR***".to_string())
         }
+    }
+}
+
+pub(crate) fn masked_catalog_api_key_for_provider(
+    state: &AppState,
+    key: &StoredProviderCatalogKey,
+    provider_type: &str,
+) -> String {
+    let auth_config = parse_catalog_auth_config_json(state, key);
+    if provider_key_auth_config_is_agent_identity(provider_type, auth_config.as_ref()) {
+        "[Agent Identity]".to_string()
+    } else {
+        masked_catalog_api_key(state, key)
     }
 }
 
@@ -306,6 +319,18 @@ fn build_provider_key_oauth_status_snapshot(key: &StoredProviderCatalogKey) -> V
     if let Some(reason) =
         tagged_oauth_invalid_reason(invalid_reason.as_deref(), OAUTH_REQUEST_FAILED_PREFIX)
     {
+        if admin_provider_quota_pure::codex_looks_like_token_invalidated(Some(&reason)) {
+            return json!({
+                "code": "invalid",
+                "label": "已失效",
+                "reason": reason,
+                "expires_at": expires_at_unix_secs,
+                "invalid_at": invalid_at_unix_secs,
+                "source": "oauth_invalid",
+                "requires_reauth": true,
+                "expiring_soon": false,
+            });
+        }
         return json!({
             "code": "check_failed",
             "label": "检查失败",
@@ -418,7 +443,18 @@ fn provider_quota_metadata_bucket<'a>(
 fn provider_quota_timestamp_unix_secs(value: Option<&Value>) -> Option<u64> {
     let mut parsed = match value {
         Some(Value::Number(number)) => number.as_f64(),
-        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        Some(Value::String(text)) => {
+            let text = text.trim();
+            if let Ok(timestamp) = text.parse::<f64>() {
+                Some(timestamp)
+            } else {
+                return chrono::DateTime::parse_from_rfc3339(text)
+                    .ok()?
+                    .timestamp()
+                    .try_into()
+                    .ok();
+            }
+        }
         _ => None,
     }?;
     if !parsed.is_finite() || parsed <= 0.0 {
@@ -535,7 +571,10 @@ fn model_quota_window_snapshot(
         .map(|value| value.clamp(0.0, 1.0))
         .or_else(|| used_ratio.map(|value| (1.0 - value).max(0.0)));
     let reset_at = provider_quota_timestamp_unix_secs(
-        item.get("reset_at").or_else(|| item.get("next_reset_at")),
+        item.get("reset_at")
+            .or_else(|| item.get("next_reset_at"))
+            .or_else(|| item.get("reset_time"))
+            .or_else(|| item.get("next_reset_time")),
     );
     let reset_seconds = quota_window_reset_seconds(observed_at_unix_secs, reset_at);
     let is_exhausted = item
@@ -575,6 +614,150 @@ fn model_quota_window_snapshot(
     window.insert("reset_seconds".to_string(), json!(reset_seconds));
     window.insert("is_exhausted".to_string(), json!(is_exhausted));
     Some(Value::Object(window))
+}
+
+fn canonical_antigravity_model_label(model_name: &str) -> Option<&'static str> {
+    match model_name.trim() {
+        "claude-opus-4-6-thinking" => Some("Claude Opus 4.6 (Thinking)"),
+        "claude-sonnet-4-6" | "claude-sonnet-4-6-thinking" => Some("Claude Sonnet 4.6 (Thinking)"),
+        "gemini-3-flash-agent" => Some("Gemini 3.5 Flash (High)"),
+        "gemini-3.5-flash-low" => Some("Gemini 3.5 Flash (Medium)"),
+        "gemini-3.5-flash-extra-low" => Some("Gemini 3.5 Flash (Low)"),
+        "gemini-3.1-pro-high" | "gemini-pro-agent" => Some("Gemini 3.1 Pro (High)"),
+        "gemini-3.1-pro-low" => Some("Gemini 3.1 Pro (Low)"),
+        "gemini-3.1-flash-image" => Some("Gemini 3.1 Flash Image"),
+        "gemini-3.1-flash-lite" => Some("Gemini 3.1 Flash Lite"),
+        "gemini-3-flash" => Some("Gemini 3 Flash"),
+        "gemini-2.5-pro" => Some("Gemini 2.5 Pro"),
+        "gemini-2.5-flash-thinking" | "gemini-2.5-flash" | "gemini-2.5-flash-lite" => {
+            Some("Gemini 3.1 Flash Lite")
+        }
+        "gpt-oss-120b-medium" => Some("GPT-OSS 120B (Medium)"),
+        "tab_flash_lite_preview" => Some("Tab Flash Lite Preview"),
+        "tab_jump_flash_lite_preview" => Some("Tab Jump Flash Lite Preview"),
+        "models/proactive-observer" => Some("Proactive Observer"),
+        _ => None,
+    }
+}
+
+fn antigravity_model_quota_window_snapshot(
+    model_name: &str,
+    item: &Map<String, Value>,
+    observed_at_unix_secs: Option<u64>,
+) -> Option<Value> {
+    let mut window = model_quota_window_snapshot(model_name, item, observed_at_unix_secs)?;
+    if let Some(label) = canonical_antigravity_model_label(model_name) {
+        if let Some(window) = window.as_object_mut() {
+            window.insert("label".to_string(), json!(label));
+        }
+    }
+    Some(window)
+}
+
+fn antigravity_grouped_quota_window_snapshots(
+    metadata: &Map<String, Value>,
+    observed_at_unix_secs: Option<u64>,
+) -> Vec<Value> {
+    let mut windows = Vec::new();
+    let Some(groups) = metadata.get("quota_groups").and_then(Value::as_array) else {
+        return windows;
+    };
+
+    for (group_index, group) in groups.iter().filter_map(Value::as_object).enumerate() {
+        let group_code = group
+            .get("group_id")
+            .or_else(|| group.get("groupId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("group:{group_index}"));
+        let group_label = group
+            .get("display_name")
+            .or_else(|| group.get("displayName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("Quota group {}", group_index + 1));
+        let group_description = group
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        for (bucket_index, bucket) in group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_object)
+            .enumerate()
+        {
+            let bucket_id = bucket
+                .get("bucket_id")
+                .or_else(|| bucket.get("bucketId"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("bucket-{}", bucket_index + 1));
+            let Some(mut window) =
+                model_quota_window_snapshot(&bucket_id, bucket, observed_at_unix_secs)
+            else {
+                continue;
+            };
+            let Some(window) = window.as_object_mut() else {
+                continue;
+            };
+            let period = bucket
+                .get("window")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned);
+            let bucket_detail = bucket
+                .get("display_name")
+                .or_else(|| bucket.get("displayName"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| period.clone());
+            let bucket_label = bucket_detail
+                .filter(|detail| !detail.eq_ignore_ascii_case(&group_label))
+                .map(|detail| format!("{group_label} · {detail}"))
+                .unwrap_or_else(|| group_label.clone());
+            let description = bucket
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .or_else(|| group_description.clone());
+
+            window.insert(
+                "code".to_string(),
+                json!(format!("group:{group_index}:{bucket_id}")),
+            );
+            window.insert("label".to_string(), json!(bucket_label));
+            window.insert("scope".to_string(), json!("quota_group"));
+            window.remove("model");
+            window.insert("quota_group".to_string(), json!(group_code));
+            window.insert("quota_group_label".to_string(), json!(group_label));
+            window.insert("bucket_id".to_string(), json!(bucket_id));
+            if let Some(period) = period {
+                window.insert("window".to_string(), json!(period));
+            }
+            if let Some(description) = description {
+                window.insert("description".to_string(), json!(description));
+            }
+            windows.push(Value::Object(window.clone()));
+        }
+    }
+
+    windows
 }
 
 fn provider_quota_metadata_string(
@@ -768,6 +951,50 @@ fn codex_default_window_minutes(code: &str) -> Option<u64> {
     }
 }
 
+fn codex_quota_period_identity(window_minutes: u64) -> (String, String) {
+    const MINUTES_PER_HOUR: u64 = 60;
+    const MINUTES_PER_DAY: u64 = 24 * MINUTES_PER_HOUR;
+    const MINUTES_PER_WEEK: u64 = 7 * MINUTES_PER_DAY;
+
+    if window_minutes == 5 * MINUTES_PER_HOUR {
+        return ("5h".to_string(), "5H".to_string());
+    }
+    if window_minutes == MINUTES_PER_WEEK {
+        return ("weekly".to_string(), "周".to_string());
+    }
+    if (28 * MINUTES_PER_DAY..=31 * MINUTES_PER_DAY).contains(&window_minutes) {
+        return ("monthly".to_string(), "月".to_string());
+    }
+
+    let label = if window_minutes.is_multiple_of(MINUTES_PER_WEEK) {
+        format!("{}周", window_minutes / MINUTES_PER_WEEK)
+    } else if window_minutes.is_multiple_of(MINUTES_PER_DAY) {
+        format!("{}天", window_minutes / MINUTES_PER_DAY)
+    } else if window_minutes.is_multiple_of(MINUTES_PER_HOUR) {
+        format!("{}H", window_minutes / MINUTES_PER_HOUR)
+    } else {
+        format!("{window_minutes}分钟")
+    };
+    (format!("window_{window_minutes}m"), label)
+}
+
+fn codex_quota_window_identity(
+    fallback_code: &str,
+    fallback_label: &str,
+    window_minutes: Option<u64>,
+) -> (String, String) {
+    let Some(window_minutes) = window_minutes else {
+        return (fallback_code.to_string(), fallback_label.to_string());
+    };
+    let is_spark = fallback_code.to_ascii_lowercase().starts_with("spark_");
+    let (code, label) = codex_quota_period_identity(window_minutes);
+    if is_spark {
+        (format!("spark_{code}"), format!("Spark {label}"))
+    } else {
+        (code, label)
+    }
+}
+
 fn codex_quota_window_snapshot(
     metadata: &Map<String, Value>,
     prefix: &str,
@@ -809,6 +1036,10 @@ fn codex_quota_window_snapshot(
         .get(&window_minutes_key)
         .and_then(admin_provider_quota_pure::coerce_json_u64);
 
+    if explicit_window_minutes == Some(0) {
+        return None;
+    }
+
     if used_percent.is_none()
         && reset_at.is_none()
         && reset_seconds.is_none()
@@ -818,6 +1049,7 @@ fn codex_quota_window_snapshot(
     }
 
     let window_minutes = explicit_window_minutes.or_else(|| codex_default_window_minutes(code));
+    let (code, label) = codex_quota_window_identity(code, label, window_minutes);
     let used_ratio = used_percent.map(|value| (value / 100.0).clamp(0.0, 1.0));
     let remaining_ratio = used_ratio.map(|value| (1.0 - value).max(0.0));
 
@@ -855,8 +1087,15 @@ fn build_codex_quota_status_snapshot(
     let credits_unlimited = metadata
         .get("credits_unlimited")
         .and_then(admin_provider_quota_pure::coerce_json_bool);
+    let allowed = metadata
+        .get("allowed")
+        .and_then(admin_provider_quota_pure::coerce_json_bool);
+    let limit_reached = metadata
+        .get("limit_reached")
+        .and_then(admin_provider_quota_pure::coerce_json_bool);
+    let reset_credits = build_codex_reset_credits_status_snapshot(metadata, observed_at_unix_secs);
 
-    let windows = [
+    let mut windows = [
         codex_quota_window_snapshot(metadata, "primary", "weekly", "周", observed_at_unix_secs),
         codex_quota_window_snapshot(metadata, "secondary", "5h", "5H", observed_at_unix_secs),
         codex_quota_window_snapshot(
@@ -877,12 +1116,26 @@ fn build_codex_quota_status_snapshot(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
+    if let Some(additional_windows) = metadata
+        .get("additional_quota_windows")
+        .and_then(Value::as_array)
+    {
+        windows.extend(
+            additional_windows
+                .iter()
+                .filter(|window| window.is_object())
+                .cloned(),
+        );
+    }
 
     if windows.is_empty()
         && plan_type.is_none()
         && credits_has_credits.is_none()
         && credits_balance.is_none()
         && credits_unlimited.is_none()
+        && allowed.is_none()
+        && limit_reached.is_none()
+        && reset_credits.is_none()
         && observed_at_unix_secs.is_none()
     {
         return None;
@@ -891,12 +1144,16 @@ fn build_codex_quota_status_snapshot(
     let primary_windows = windows
         .iter()
         .filter(|window| {
-            window
+            let code = window
                 .get("code")
                 .and_then(Value::as_str)
-                .is_some_and(|code| {
-                    code.eq_ignore_ascii_case("weekly") || code.eq_ignore_ascii_case("5h")
-                })
+                .unwrap_or_default();
+            let scope = window
+                .get("scope")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            scope.eq_ignore_ascii_case("account")
+                && !code.to_ascii_lowercase().starts_with("spark_")
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -913,11 +1170,19 @@ fn build_codex_quota_status_snapshot(
         .filter_map(admin_provider_quota_pure::coerce_json_u64)
         .min();
     let reset_at = quota_windows_min_reset_at(&primary_windows);
-    let exhausted_by_credits = primary_windows.is_empty()
+    let explicitly_blocked = allowed == Some(false) || limit_reached == Some(true);
+    let explicitly_available =
+        !explicitly_blocked && (allowed == Some(true) || limit_reached == Some(false));
+    let exhausted_by_credits = !explicitly_available
+        && primary_windows.is_empty()
         && credits_unlimited != Some(true)
         && credits_has_credits == Some(false);
-    let exhausted_by_window = usage_ratio.is_some_and(|value| value >= 1.0 - 1e-6);
-    let exhausted = exhausted_by_credits || exhausted_by_window;
+    let exhausted_by_window =
+        !explicitly_available && usage_ratio.is_some_and(|value| value >= 1.0 - 1e-6);
+    let exhausted_by_signal = admin_provider_quota_pure::codex_rate_limit_metadata_exhausted(
+        &Value::Object(metadata.clone()),
+    );
+    let exhausted = exhausted_by_signal || exhausted_by_credits || exhausted_by_window;
 
     let mut credits = Map::new();
     if let Some(value) = credits_has_credits {
@@ -930,7 +1195,9 @@ fn build_codex_quota_status_snapshot(
         credits.insert("unlimited".to_string(), json!(value));
     }
 
-    let reason = if exhausted_by_credits {
+    let reason = if exhausted_by_signal {
+        Some("上游已拒绝继续使用该账号")
+    } else if exhausted_by_credits {
         Some("无可用积分")
     } else if exhausted_by_window {
         Some("额度窗口已耗尽")
@@ -953,11 +1220,14 @@ fn build_codex_quota_status_snapshot(
         "reset_at": reset_at,
         "reset_seconds": reset_seconds,
         "plan_type": plan_type,
+        "allowed": allowed,
+        "limit_reached": limit_reached,
         "credits": if credits.is_empty() {
             Value::Null
         } else {
             Value::Object(credits)
         },
+        "reset_credits": reset_credits,
         "windows": windows,
     }))
 }
@@ -1458,12 +1728,12 @@ fn build_antigravity_quota_status_snapshot(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
-    let windows = provider_quota_model_bucket(metadata)
+    let mut windows = provider_quota_model_bucket(metadata)
         .map(|models| {
             models
                 .iter()
                 .filter_map(|(model_name, item)| {
-                    model_quota_window_snapshot(
+                    antigravity_model_quota_window_snapshot(
                         model_name,
                         item.as_object()?,
                         observed_at_unix_secs,
@@ -1472,6 +1742,13 @@ fn build_antigravity_quota_status_snapshot(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let grouped_observed_at_unix_secs =
+        provider_quota_timestamp_unix_secs(metadata.get("quota_groups_updated_at"))
+            .or(observed_at_unix_secs);
+    windows.extend(antigravity_grouped_quota_window_snapshots(
+        metadata,
+        grouped_observed_at_unix_secs,
+    ));
 
     if windows.is_empty() && observed_at_unix_secs.is_none() && !is_forbidden {
         return None;
@@ -1815,6 +2092,119 @@ fn build_gemini_cli_quota_status_snapshot(
     }))
 }
 
+fn build_codex_reset_credits_status_snapshot(
+    metadata: &Map<String, Value>,
+    observed_at_unix_secs: Option<u64>,
+) -> Option<Value> {
+    let reset_credits = metadata.get("reset_credits").and_then(Value::as_object)?;
+    let available_count = reset_credits
+        .get("available_count")
+        .and_then(admin_provider_quota_pure::coerce_json_u64);
+    let updated_at = reset_credits
+        .get("updated_at")
+        .and_then(admin_provider_quota_pure::coerce_json_u64)
+        .or(observed_at_unix_secs);
+    let detail_source = reset_credits
+        .get("detail_source")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let detail_status = reset_credits
+        .get("detail_status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let detail_error = reset_credits
+        .get("detail_error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    let mut credits = reset_credits
+        .get("credits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let object = item.as_object()?;
+            let expires_at = object
+                .get("expires_at")
+                .and_then(admin_provider_quota_pure::coerce_json_u64)?;
+            let display_key = object
+                .get("display_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let mut out = Map::new();
+            if let Some(id) = object
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                out.insert("id".to_string(), json!(id));
+            }
+            out.insert("display_key".to_string(), json!(display_key));
+            if let Some(status) = object
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                out.insert("status".to_string(), json!(status));
+            }
+            if let Some(granted_at) = object
+                .get("granted_at")
+                .and_then(admin_provider_quota_pure::coerce_json_u64)
+            {
+                out.insert("granted_at".to_string(), json!(granted_at));
+            }
+            out.insert("expires_at".to_string(), json!(expires_at));
+            if let Some(observed_at) = observed_at_unix_secs {
+                out.insert(
+                    "remaining_seconds".to_string(),
+                    json!(expires_at.saturating_sub(observed_at)),
+                );
+            }
+            Some(Value::Object(out))
+        })
+        .collect::<Vec<_>>();
+    credits.sort_by_key(|item| {
+        item.get("expires_at")
+            .and_then(admin_provider_quota_pure::coerce_json_u64)
+            .unwrap_or(u64::MAX)
+    });
+
+    if available_count.is_none()
+        && updated_at.is_none()
+        && detail_source.is_none()
+        && detail_status.is_none()
+        && detail_error.is_none()
+        && credits.is_empty()
+    {
+        return None;
+    }
+
+    let mut out = Map::new();
+    if let Some(value) = available_count {
+        out.insert("available_count".to_string(), json!(value));
+    }
+    if let Some(value) = updated_at {
+        out.insert("updated_at".to_string(), json!(value));
+    }
+    if let Some(value) = detail_source {
+        out.insert("detail_source".to_string(), json!(value));
+    }
+    if let Some(value) = detail_status {
+        out.insert("detail_status".to_string(), json!(value));
+    }
+    if let Some(value) = detail_error {
+        out.insert("detail_error".to_string(), json!(value));
+    }
+    out.insert("credits".to_string(), Value::Array(credits));
+    Some(Value::Object(out))
+}
+
 pub(crate) fn sync_provider_key_quota_status_snapshot(
     status_snapshot: Option<&Value>,
     provider_type: &str,
@@ -1882,6 +2272,12 @@ fn quota_snapshot_has_materialized_data(
     {
         return true;
     }
+    if quota_snapshot
+        .get("reset_credits")
+        .is_some_and(|reset_credits| !reset_credits.is_null())
+    {
+        return true;
+    }
 
     quota_snapshot
         .get("code")
@@ -1892,6 +2288,29 @@ fn quota_snapshot_has_materialized_data(
                 && !code.eq_ignore_ascii_case("unknown")
                 && !code.eq_ignore_ascii_case("ok")
         })
+}
+
+fn codex_upstream_metadata_is_at_least_as_fresh(
+    quota_snapshot: Option<&Map<String, Value>>,
+    upstream_metadata: Option<&Value>,
+) -> bool {
+    let Some(metadata) = provider_quota_metadata_bucket(upstream_metadata, "codex") else {
+        return false;
+    };
+    let Some(metadata_updated_at) = metadata
+        .get("updated_at")
+        .and_then(admin_provider_quota_pure::coerce_json_u64)
+    else {
+        return false;
+    };
+    let snapshot_updated_at = quota_snapshot.and_then(|quota| {
+        quota
+            .get("updated_at")
+            .or_else(|| quota.get("observed_at"))
+            .and_then(admin_provider_quota_pure::coerce_json_u64)
+    });
+
+    snapshot_updated_at.is_none_or(|updated_at| metadata_updated_at >= updated_at)
 }
 
 fn windsurf_quota_snapshot_has_stale_cooldown(quota_snapshot: &Map<String, Value>) -> bool {
@@ -1961,8 +2380,15 @@ pub(crate) fn provider_key_status_snapshot_payload(
         .and_then(Value::as_object)
         .and_then(|snapshot| snapshot.get("quota"))
         .and_then(Value::as_object);
+    let refresh_codex_snapshot = provider_type.trim().eq_ignore_ascii_case("codex")
+        && codex_upstream_metadata_is_at_least_as_fresh(
+            quota_snapshot,
+            key.upstream_metadata.as_ref(),
+        );
 
-    let payload = if quota_snapshot_has_materialized_data(quota_snapshot, provider_type) {
+    let payload = if quota_snapshot_has_materialized_data(quota_snapshot, provider_type)
+        && !refresh_codex_snapshot
+    {
         status_snapshot
             .cloned()
             .unwrap_or_else(default_provider_key_status_snapshot)
@@ -2187,7 +2613,7 @@ pub(crate) fn build_admin_provider_key_response(
     let request_count = u64::from(key.request_count.unwrap_or(0));
     let success_count = u64::from(key.success_count.unwrap_or(0));
     let error_count = u64::from(key.error_count.unwrap_or(0));
-    let total_response_time_ms = f64::from(key.total_response_time_ms.unwrap_or(0));
+    let total_response_time_ms = key.total_response_time_ms.unwrap_or(0) as f64;
     let success_rate = if request_count > 0 {
         success_count as f64 / request_count as f64
     } else {
@@ -2218,6 +2644,8 @@ pub(crate) fn build_admin_provider_key_response(
             .unwrap_or(false);
     let oauth_header_auth = auth_semantics.oauth_managed()
         && provider_key_auth_config_uses_header_authorization(auth_config.as_ref());
+    let agent_identity =
+        provider_key_auth_config_is_agent_identity(provider_type, auth_config.as_ref());
     let oauth_plan_type = derive_catalog_oauth_plan_type(key, provider_type, auth_config.as_ref());
     let (
         health_score,
@@ -2251,7 +2679,11 @@ pub(crate) fn build_admin_provider_key_response(
     );
     payload.insert(
         "api_key_masked".to_string(),
-        json!(masked_catalog_api_key(state, key)),
+        json!(masked_catalog_api_key_for_provider(
+            state,
+            key,
+            provider_type,
+        )),
     );
     payload.insert("api_key_plain".to_string(), serde_json::Value::Null);
     payload.insert("auth_type".to_string(), json!(key.auth_type));
@@ -2275,16 +2707,22 @@ pub(crate) fn build_admin_provider_key_response(
         "oauth_managed".to_string(),
         json!(auth_semantics.oauth_managed()),
     );
+    payload.insert("agent_identity".to_string(), json!(agent_identity));
     payload.insert(
         "can_refresh_oauth".to_string(),
         json!(provider_key_can_refresh_oauth(
             auth_semantics,
+            provider_type,
             auth_config.as_ref()
         )),
     );
     payload.insert(
         "can_export_oauth".to_string(),
-        json!(auth_semantics.can_export_oauth()),
+        json!(provider_key_can_export_oauth(
+            auth_semantics,
+            provider_type,
+            auth_config.as_ref()
+        )),
     );
     payload.insert(
         "can_edit_oauth".to_string(),
@@ -2573,6 +3011,25 @@ mod tests {
     }
 
     #[test]
+    fn responses_key_scope_covers_search_in_one_direction() {
+        let mut responses_key = sample_catalog_key();
+        responses_key.api_formats = Some(json!(["openai:responses"]));
+        assert!(provider_catalog_key_supports_format(
+            &responses_key,
+            "codex",
+            "openai:search",
+        ));
+
+        let mut search_key = sample_catalog_key();
+        search_key.api_formats = Some(json!(["openai:search"]));
+        assert!(!provider_catalog_key_supports_format(
+            &search_key,
+            "codex",
+            "openai:responses",
+        ));
+    }
+
+    #[test]
     fn masked_catalog_api_key_handles_unicode_plaintext_without_panicking() {
         let state = AppState::new().expect("gateway should build");
         let encrypted_api_key =
@@ -2603,6 +3060,46 @@ mod tests {
         let masked = masked_catalog_api_key(&state, &key);
         assert!(masked.contains("***"));
         assert_ne!(masked, "***ERROR***");
+    }
+
+    #[test]
+    fn provider_aware_mask_labels_agent_identity_without_exposing_placeholder() {
+        let state = AppState::new().expect("gateway should build");
+        let encrypted_placeholder =
+            encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "__placeholder__")
+                .expect("placeholder ciphertext should build");
+        let encrypted_auth_config = encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"codex","auth_mode":"agentIdentity","agent_runtime_id":"runtime-1","agent_private_key":"base64-private-key","task_id":"task-1"}"#,
+        )
+        .expect("auth config ciphertext should build");
+        let key = StoredProviderCatalogKey::new(
+            "key-agent".to_string(),
+            "provider-codex".to_string(),
+            "agent".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build")
+        .with_transport_fields(
+            Some(json!(["openai:responses"])),
+            encrypted_placeholder,
+            Some(encrypted_auth_config),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("key transport should build");
+
+        assert_eq!(
+            masked_catalog_api_key_for_provider(&state, &key, "codex"),
+            "[Agent Identity]"
+        );
+        assert!(!masked_catalog_api_key_for_provider(&state, &key, "codex").contains("placeholder"));
     }
 
     #[test]
@@ -2641,6 +3138,68 @@ mod tests {
         assert_eq!(
             quota.get("windows").and_then(Value::as_array).map(Vec::len),
             Some(2usize)
+        );
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_backfills_codex_reset_credits() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "codex": {
+                "updated_at": 1_775_553_285u64,
+                "plan_type": "plus",
+                "primary_used_percent": 55.0,
+                "primary_reset_at": 1_900_000_000u64,
+                "has_credits": true,
+                "credits_balance": 42.0,
+                "reset_credits": {
+                    "available_count": 2,
+                    "updated_at": 1_775_553_285u64,
+                    "detail_source": "wham_readonly",
+                    "detail_status": "available",
+                    "credits": [
+                        {
+                            "id": "bbbbbbbb-1111-2222-3333-444444444444",
+                            "display_key": "bbbbbbbb",
+                            "status": "available",
+                            "expires_at": 1_775_900_000u64
+                        },
+                        {
+                            "id": "aaaaaaaa-1111-2222-3333-444444444444",
+                            "display_key": "aaaaaaaa",
+                            "status": "available",
+                            "expires_at": 1_775_700_000u64
+                        }
+                    ]
+                }
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+        let quota = payload
+            .get("quota")
+            .and_then(Value::as_object)
+            .expect("quota snapshot should be object");
+
+        assert_eq!(quota.get("exhausted"), Some(&json!(false)));
+        assert_eq!(
+            payload.pointer("/quota/reset_credits/available_count"),
+            Some(&json!(2u64))
+        );
+        assert_eq!(
+            payload.pointer("/quota/reset_credits/credits/0/display_key"),
+            Some(&json!("aaaaaaaa"))
+        );
+        assert_eq!(
+            payload.pointer("/quota/reset_credits/credits/0/remaining_seconds"),
+            Some(&json!(146_715u64))
+        );
+        assert_eq!(
+            quota
+                .get("credits")
+                .and_then(Value::as_object)
+                .and_then(|credits| credits.get("balance")),
+            Some(&json!(42.0))
         );
     }
 
@@ -2684,6 +3243,52 @@ mod tests {
         assert_eq!(spark_5h.get("remaining_ratio"), Some(&json!(0.6)));
         assert_eq!(spark_weekly.get("label"), Some(&json!("Spark 周")));
         assert_eq!(spark_weekly.get("remaining_ratio"), Some(&json!(0.95)));
+    }
+
+    #[test]
+    fn codex_wham_snapshot_does_not_duplicate_normalized_spark_windows() {
+        let codex = admin_provider_quota_pure::parse_codex_wham_usage_response(
+            &json!({
+                "plan_type": "plus",
+                "rate_limit": {
+                    "primary_window": {"used_percent": 25.0},
+                    "secondary_window": {"used_percent": 10.0}
+                },
+                "additional_rate_limits": [{
+                    "limit_name": "GPT-5.3-Codex-Spark",
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": 40.0,
+                            "limit_window_seconds": 18_000
+                        },
+                        "secondary_window": {
+                            "used_percent": 5.0,
+                            "limit_window_seconds": 604_800
+                        }
+                    }
+                }]
+            }),
+            1_777_000_000,
+        )
+        .expect("Codex WHAM quota should parse");
+        let upstream_metadata = json!({"codex": codex});
+        let payload = sync_provider_key_quota_status_snapshot(
+            None,
+            "codex",
+            Some(&upstream_metadata),
+            "refresh_api",
+        )
+        .expect("Codex quota snapshot should sync");
+        let windows = payload["quota"]["windows"]
+            .as_array()
+            .expect("quota windows should exist");
+        let spark_codes = windows
+            .iter()
+            .filter_map(|window| window.get("code").and_then(Value::as_str))
+            .filter(|code| code.starts_with("spark_"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(spark_codes, vec!["spark_5h", "spark_weekly"]);
     }
 
     #[test]
@@ -3272,6 +3877,58 @@ mod tests {
     }
 
     #[test]
+    fn provider_key_status_snapshot_payload_restores_complete_codex_cache() {
+        let mut key = sample_catalog_key();
+        key.upstream_metadata = Some(json!({
+            "codex": {
+                "updated_at": 200u64,
+                "plan_type": "plus",
+                "primary_used_percent": 89.0,
+                "primary_reset_at": 1_900_000_000u64,
+                "spark_primary_used_percent": 40.0,
+                "spark_primary_reset_at": 1_900_100_000u64,
+                "reset_credits": {
+                    "available_count": 3,
+                    "updated_at": 200u64,
+                    "detail_status": "available",
+                    "credits": []
+                }
+            }
+        }));
+        key.status_snapshot = Some(json!({
+            "quota": {
+                "version": 2,
+                "provider_type": "codex",
+                "updated_at": 200u64,
+                "windows": [{
+                    "code": "weekly",
+                    "used_ratio": 1.0,
+                    "reset_at": 1_900_000_000u64
+                }]
+            }
+        }));
+
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+        let windows = payload["quota"]["windows"]
+            .as_array()
+            .expect("quota windows should exist");
+
+        assert_eq!(payload.pointer("/quota/plan_type"), Some(&json!("plus")));
+        assert_eq!(
+            payload.pointer("/quota/reset_credits/available_count"),
+            Some(&json!(3u64))
+        );
+        assert!(windows.iter().any(|window| window["code"] == "spark_5h"));
+        assert_eq!(
+            windows
+                .iter()
+                .find(|window| window["code"] == "weekly")
+                .and_then(|window| window.get("used_ratio")),
+            Some(&json!(0.89))
+        );
+    }
+
+    #[test]
     fn sync_provider_key_quota_status_snapshot_preserves_codex_usage_state() {
         let current_status_snapshot = json!({
             "quota": {
@@ -3381,6 +4038,28 @@ mod tests {
     }
 
     #[test]
+    fn sync_provider_key_quota_status_snapshot_honors_codex_limit_signal() {
+        let payload = sync_provider_key_quota_status_snapshot(
+            None,
+            "codex",
+            Some(&json!({
+                "codex": {
+                    "updated_at": 1_775_800_000u64,
+                    "allowed": false,
+                    "limit_reached": true
+                }
+            })),
+            "websocket_response_body",
+        )
+        .expect("explicit Codex limit signal should build a quota snapshot");
+
+        assert_eq!(payload.pointer("/quota/code"), Some(&json!("exhausted")));
+        assert_eq!(payload.pointer("/quota/exhausted"), Some(&json!(true)));
+        assert_eq!(payload.pointer("/quota/allowed"), Some(&json!(false)));
+        assert_eq!(payload.pointer("/quota/limit_reached"), Some(&json!(true)));
+    }
+
+    #[test]
     fn sync_provider_key_quota_status_snapshot_drops_codex_usage_state_when_window_resets() {
         let current_status_snapshot = json!({
             "quota": {
@@ -3470,6 +4149,39 @@ mod tests {
     }
 
     #[test]
+    fn sync_provider_key_quota_status_snapshot_labels_actual_monthly_window() {
+        let upstream_metadata = json!({
+            "codex": {
+                "updated_at": 1_784_287_450u64,
+                "plan_type": "team",
+                "primary_used_percent": 14.0,
+                "primary_reset_at": 1_786_915_122u64,
+                "primary_window_minutes": 43_800u64,
+                "secondary_used_percent": 0.0,
+                "secondary_reset_after_seconds": 0u64,
+                "secondary_window_minutes": 0u64
+            }
+        });
+
+        let payload = sync_provider_key_quota_status_snapshot(
+            None,
+            "codex",
+            Some(&upstream_metadata),
+            "response_headers",
+        )
+        .expect("quota snapshot should sync");
+        let windows = payload["quota"]["windows"]
+            .as_array()
+            .expect("quota windows should exist");
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0]["code"], json!("monthly"));
+        assert_eq!(windows[0]["label"], json!("月"));
+        assert_eq!(windows[0]["window_minutes"], json!(43_800u64));
+        assert_eq!(windows[0]["remaining_ratio"], json!(0.86));
+    }
+
+    #[test]
     fn provider_key_status_snapshot_payload_backfills_thin_ok_snapshot_from_upstream_metadata() {
         let mut key = sample_catalog_key();
         key.upstream_metadata = Some(json!({
@@ -3532,6 +4244,150 @@ mod tests {
     }
 
     #[test]
+    fn sync_provider_key_quota_status_snapshot_labels_antigravity_models_by_model_id() {
+        let upstream_metadata = json!({
+            "antigravity": {
+                "updated_at": 1_775_553_285u64,
+                "quota_by_model": {
+                    "gemini-3.5-flash-extra-low": {
+                        "display_name": "Gemini 3.5 Flash (Low)",
+                        "remaining_fraction": 1.0
+                    },
+                    "gemini-3.5-flash-low": {
+                        "display_name": "Gemini 3.5 Flash (Medium)",
+                        "remaining_fraction": 0.75
+                    },
+                    "gemini-3-flash-agent": {
+                        "display_name": "Gemini 3.5 Flash (High)",
+                        "remaining_fraction": 0.5
+                    },
+                    "gemini-2.5-flash": {
+                        "display_name": "Gemini 3.1 Flash Lite",
+                        "remaining_fraction": 0.4
+                    },
+                    "claude-sonnet-4-6": {
+                        "display_name": "Claude Sonnet 4.6 (Thinking)",
+                        "remaining_fraction": 0.3,
+                        "reset_time": "2026-04-07T12:34:56Z"
+                    }
+                }
+            }
+        });
+
+        let payload = sync_provider_key_quota_status_snapshot(
+            None,
+            "antigravity",
+            Some(&upstream_metadata),
+            "refresh_api",
+        )
+        .expect("quota snapshot should sync");
+        let windows = payload["quota"]["windows"]
+            .as_array()
+            .expect("quota windows should exist");
+        let label_for_model = |model: &str| {
+            windows
+                .iter()
+                .filter_map(Value::as_object)
+                .find(|window| window.get("model") == Some(&json!(model)))
+                .and_then(|window| window.get("label"))
+                .cloned()
+        };
+
+        assert_eq!(
+            label_for_model("gemini-3.5-flash-extra-low"),
+            Some(json!("Gemini 3.5 Flash (Low)"))
+        );
+        assert_eq!(
+            label_for_model("gemini-3.5-flash-low"),
+            Some(json!("Gemini 3.5 Flash (Medium)"))
+        );
+        assert_eq!(
+            label_for_model("gemini-3-flash-agent"),
+            Some(json!("Gemini 3.5 Flash (High)"))
+        );
+        assert_eq!(
+            label_for_model("gemini-2.5-flash"),
+            Some(json!("Gemini 3.1 Flash Lite"))
+        );
+        assert_eq!(
+            label_for_model("claude-sonnet-4-6"),
+            Some(json!("Claude Sonnet 4.6 (Thinking)"))
+        );
+        let claude_window = windows
+            .iter()
+            .filter_map(Value::as_object)
+            .find(|window| window.get("model") == Some(&json!("claude-sonnet-4-6")))
+            .expect("Claude quota window should exist");
+        assert_eq!(
+            claude_window.get("reset_at"),
+            Some(&json!(1_775_565_296u64))
+        );
+        assert_eq!(claude_window.get("reset_seconds"), Some(&json!(12_011u64)));
+    }
+
+    #[test]
+    fn sync_provider_key_quota_status_snapshot_materializes_antigravity_group_windows() {
+        let upstream_metadata = json!({
+            "antigravity": {
+                "updated_at": 1_777_000_000u64,
+                "models": {
+                    "gemini-3.7-flash-tiered": {
+                        "remaining_fraction": 0.9
+                    }
+                },
+                "quota_groups": [{
+                    "display_name": "Claude and GPT models",
+                    "description": "Shared quota",
+                    "buckets": [{
+                        "bucket_id": "3p-5h",
+                        "window": "5h",
+                        "remaining_fraction": 0.25,
+                        "reset_time": "2026-05-05T05:00:00Z",
+                        "display_name": "5 hour"
+                    }, {
+                        "bucket_id": "3p-weekly",
+                        "window": "weekly",
+                        "remaining_fraction": 0.8,
+                        "reset_time": "2026-05-11T00:00:00Z"
+                    }]
+                }]
+            }
+        });
+
+        let payload = sync_provider_key_quota_status_snapshot(
+            None,
+            "antigravity",
+            Some(&upstream_metadata),
+            "refresh_api",
+        )
+        .expect("Antigravity quota snapshot should sync");
+        let windows = payload["quota"]["windows"]
+            .as_array()
+            .expect("quota windows should exist");
+        let five_hour = windows
+            .iter()
+            .find(|window| window["code"] == "group:0:3p-5h")
+            .expect("5h grouped quota window should exist");
+        let weekly = windows
+            .iter()
+            .find(|window| window["code"] == "group:0:3p-weekly")
+            .expect("weekly grouped quota window should exist");
+
+        assert_eq!(windows.len(), 3);
+        assert_eq!(five_hour["scope"], json!("quota_group"));
+        assert_eq!(five_hour["bucket_id"], json!("3p-5h"));
+        assert_eq!(five_hour["label"], json!("Claude and GPT models · 5 hour"));
+        assert_eq!(
+            five_hour["quota_group_label"],
+            json!("Claude and GPT models")
+        );
+        assert_eq!(five_hour["remaining_ratio"], json!(0.25));
+        assert_eq!(five_hour["used_ratio"], json!(0.75));
+        assert!(five_hour.get("model").is_none());
+        assert_eq!(weekly["window"], json!("weekly"));
+    }
+
+    #[test]
     fn provider_key_status_snapshot_payload_backfills_account_block_from_oauth_invalid_reason() {
         let mut key = sample_catalog_key();
         key.oauth_invalid_reason = Some("[ACCOUNT_BLOCK] account has been deactivated".to_string());
@@ -3550,6 +4406,26 @@ mod tests {
         );
         assert_eq!(account.get("blocked"), Some(&json!(true)));
         assert_eq!(account.get("source"), Some(&json!("oauth_invalid")));
+    }
+
+    #[test]
+    fn provider_key_status_snapshot_payload_upgrades_deleted_agent_runtime_to_invalid() {
+        let mut key = sample_catalog_key();
+        key.auth_type = "oauth".to_string();
+        key.oauth_invalid_at_unix_secs = Some(1_784_728_663);
+        key.oauth_invalid_reason =
+            Some("[REQUEST_FAILED] Agent runtime has been deleted.".to_string());
+
+        let payload = provider_key_status_snapshot_payload(&key, "codex");
+        let oauth = payload
+            .get("oauth")
+            .and_then(Value::as_object)
+            .expect("oauth snapshot should be object");
+
+        assert_eq!(oauth.get("code"), Some(&json!("invalid")));
+        assert_eq!(oauth.get("label"), Some(&json!("已失效")));
+        assert_eq!(oauth.get("invalid_at"), Some(&json!(1_784_728_663u64)));
+        assert_eq!(oauth.get("requires_reauth"), Some(&json!(true)));
     }
 
     #[test]

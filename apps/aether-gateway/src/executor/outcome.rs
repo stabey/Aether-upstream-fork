@@ -8,6 +8,9 @@ use aether_data_contracts::repository::candidates::{
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
+use aether_data_contracts::repository::usage::{
+    ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY, ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY,
+};
 use aether_usage_runtime::{
     build_usage_event_data_seed, UsageEvent, UsageEventData, UsageEventType,
 };
@@ -18,6 +21,7 @@ use base64::Engine as _;
 use serde_json::{json, Map, Value};
 use tracing::warn;
 
+use crate::ai_serving::{build_core_error_body_for_client_format, LocalCoreSyncErrorKind};
 use crate::constants::{
     EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS, LOCAL_EXECUTION_RUNTIME_MISS_REASON_HEADER,
 };
@@ -31,6 +35,9 @@ pub(crate) enum LocalExecutionRequestOutcome {
     Exhausted(LocalExecutionExhaustion),
     NoPath,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeferredUpstreamResponse;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalExecutionExhaustion {
@@ -70,6 +77,18 @@ impl LocalExecutionRequestOutcome {
     }
 }
 
+pub(crate) fn mark_deferred_upstream_response(mut response: Response<Body>) -> Response<Body> {
+    response.extensions_mut().insert(DeferredUpstreamResponse);
+    response
+}
+
+pub(crate) fn is_deferred_upstream_response(response: &Response<Body>) -> bool {
+    response
+        .extensions()
+        .get::<DeferredUpstreamResponse>()
+        .is_some()
+}
+
 impl LocalExecutionRuntimeMissContext {
     pub(crate) fn persisted_candidate_count(&self) -> usize {
         self.candidate_contexts.len()
@@ -89,6 +108,22 @@ impl LocalExecutionRuntimeMissContext {
                     .as_deref()
                     .map(str::trim)
                     .is_some_and(|value| value == reason)
+        })
+    }
+
+    pub(crate) fn all_candidates_skipped_for_reasons(&self, reasons: &[&str]) -> bool {
+        if reasons.is_empty() || self.candidate_contexts.is_empty() {
+            return false;
+        }
+
+        self.candidate_contexts.iter().all(|candidate| {
+            candidate.candidate.status == RequestCandidateStatus::Skipped
+                && candidate
+                    .candidate
+                    .skip_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|value| reasons.contains(&value))
         })
     }
 
@@ -150,6 +185,7 @@ pub(crate) async fn build_local_execution_exhaustion(
     plan: &ExecutionPlan,
     report_context: Option<&Value>,
 ) -> LocalExecutionExhaustion {
+    let mut exhaustion = build_fast_local_execution_exhaustion(plan, report_context);
     let mut data = build_usage_event_data_seed(plan, report_context);
     let last_failed_candidate = match state
         .read_request_candidates_by_request_id(plan.request_id.as_str())
@@ -178,30 +214,49 @@ pub(crate) async fn build_local_execution_exhaustion(
         data.provider_api_key_id = data
             .provider_api_key_id
             .or_else(|| candidate.key_id.clone());
+        attach_runtime_miss_candidate_usage_metadata(&mut data, candidate);
     }
 
+    exhaustion.data = data;
+    exhaustion.candidate_id = last_failed_candidate
+        .as_ref()
+        .map(|candidate| candidate.id.clone());
+    exhaustion.candidate_index = last_failed_candidate
+        .as_ref()
+        .map(|candidate| candidate.candidate_index);
+    exhaustion.upstream_status_code = last_failed_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.status_code);
+    exhaustion.upstream_error_type = last_failed_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.error_type.clone())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    exhaustion.upstream_error_message = last_failed_candidate
+        .as_ref()
+        .and_then(|candidate| candidate.error_message.clone())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    exhaustion
+}
+
+pub(crate) fn build_fast_local_execution_exhaustion(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> LocalExecutionExhaustion {
+    let data = build_usage_event_data_seed(plan, report_context);
     LocalExecutionExhaustion {
         request_id: plan.request_id.clone(),
+        candidate_id: plan.candidate_id.clone(),
+        candidate_index: report_context
+            .and_then(Value::as_object)
+            .and_then(|value| value.get("candidate_index"))
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
         data,
-        candidate_id: last_failed_candidate
-            .as_ref()
-            .map(|candidate| candidate.id.clone()),
-        candidate_index: last_failed_candidate
-            .as_ref()
-            .map(|candidate| candidate.candidate_index),
-        upstream_status_code: last_failed_candidate
-            .as_ref()
-            .and_then(|candidate| candidate.status_code),
-        upstream_error_type: last_failed_candidate
-            .as_ref()
-            .and_then(|candidate| candidate.error_type.clone())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
-        upstream_error_message: last_failed_candidate
-            .as_ref()
-            .and_then(|candidate| candidate.error_message.clone())
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty()),
+        upstream_status_code: None,
+        upstream_error_type: None,
+        upstream_error_message: None,
     }
 }
 
@@ -221,6 +276,20 @@ pub(crate) async fn build_local_execution_runtime_miss_context(
             state, request_id, decision,
         )
         .await,
+    }
+}
+
+pub(crate) fn build_fast_local_execution_runtime_miss_context(
+    decision: Option<&GatewayControlDecision>,
+) -> LocalExecutionRuntimeMissContext {
+    let auth_context = decision.and_then(|value| value.auth_context.as_ref());
+
+    LocalExecutionRuntimeMissContext {
+        auth_user_id: auth_context.map(|value| value.user_id.clone()),
+        auth_api_key_id: auth_context.map(|value| value.api_key_id.clone()),
+        auth_username: auth_context.and_then(|value| value.username.clone()),
+        auth_api_key_name: auth_context.and_then(|value| value.api_key_name.clone()),
+        candidate_contexts: Vec::new(),
     }
 }
 
@@ -283,12 +352,12 @@ pub(crate) async fn record_failed_usage_for_exhausted_request(
         );
     }
     data.client_response_headers = Some(Value::Object(client_headers));
-    data.client_response_body = Some(json!({
-        "error": {
-            "type": "http_error",
-            "message": beautify_local_execution_client_error_message(local_execution_runtime_miss_detail),
-        }
-    }));
+    let client_message =
+        beautify_local_execution_client_error_message(local_execution_runtime_miss_detail);
+    data.client_response_body = Some(runtime_miss_client_error_body(
+        data.api_format.as_deref(),
+        &client_message,
+    ));
 
     let mut request_metadata = match data.request_metadata.take() {
         Some(Value::Object(object)) => object,
@@ -312,7 +381,7 @@ pub(crate) async fn record_failed_usage_for_exhausted_request(
     state
         .usage_runtime
         .record_terminal_event_direct(
-            state.data.as_ref(),
+            state.usage_lifecycle_data_state().as_ref(),
             UsageEvent::new(UsageEventType::Failed, request_id, data),
         )
         .await;
@@ -336,35 +405,32 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
 
     let selected_candidate =
         select_last_runtime_miss_executed_candidate(&context.candidate_contexts);
-    let api_format = selected_candidate
+    let routing_candidate = selected_candidate
+        .or_else(|| select_last_runtime_miss_routing_candidate(&context.candidate_contexts));
+    let api_format = routing_candidate
         .and_then(|value| value.client_api_format.clone())
         .or_else(|| {
             trimmed_non_empty(decision.and_then(|value| value.auth_endpoint_signature.as_deref()))
         });
-    let provider_api_format = selected_candidate
+    let provider_api_format = routing_candidate
         .and_then(|value| value.provider_api_format.clone())
         .or_else(|| api_format.clone());
-    let provider_name = selected_candidate
+    let provider_name = routing_candidate
         .and_then(|value| value.provider_name.clone())
-        .or_else(|| selected_candidate.and_then(|value| value.candidate.provider_id.clone()))
+        .or_else(|| routing_candidate.and_then(|value| value.candidate.provider_id.clone()))
         .unwrap_or_else(|| "unknown".to_string());
     let model = trimmed_non_empty(diagnostic.and_then(|value| value.requested_model.as_deref()))
-        .or_else(|| selected_candidate.and_then(|value| value.global_model_name.clone()))
-        .or_else(|| selected_candidate.and_then(|value| value.selected_provider_model_name.clone()))
+        .or_else(|| routing_candidate.and_then(|value| value.global_model_name.clone()))
+        .or_else(|| routing_candidate.and_then(|value| value.selected_provider_model_name.clone()))
         .unwrap_or_else(|| "unknown".to_string());
-    let target_model = selected_candidate
+    let target_model = routing_candidate
         .and_then(|value| value.selected_provider_model_name.clone())
         .filter(|value| !value.eq_ignore_ascii_case(model.as_str()));
 
     let status_code = http::StatusCode::SERVICE_UNAVAILABLE.as_u16();
     let client_message =
         beautify_local_execution_client_error_message(local_execution_runtime_miss_detail);
-    let client_body = json!({
-        "error": {
-            "type": "http_error",
-            "message": client_message,
-        }
-    });
+    let client_body = runtime_miss_client_error_body(api_format.as_deref(), &client_message);
     let mut client_headers = Map::from_iter([(
         "content-type".to_string(),
         Value::String("application/json".to_string()),
@@ -392,10 +458,10 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
         provider_name,
         model,
         target_model,
-        provider_id: selected_candidate.and_then(|value| value.candidate.provider_id.clone()),
-        provider_endpoint_id: selected_candidate
+        provider_id: routing_candidate.and_then(|value| value.candidate.provider_id.clone()),
+        provider_endpoint_id: routing_candidate
             .and_then(|value| value.candidate.endpoint_id.clone()),
-        provider_api_key_id: selected_candidate.and_then(|value| value.candidate.key_id.clone()),
+        provider_api_key_id: routing_candidate.and_then(|value| value.candidate.key_id.clone()),
         request_type: Some(infer_request_type(api_format.as_deref())),
         api_format: api_format.clone(),
         api_family: api_format
@@ -415,7 +481,7 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
             .as_deref()
             .and_then(infer_endpoint_kind)
             .map(ToOwned::to_owned),
-        has_format_conversion: selected_candidate.and_then(|value| {
+        has_format_conversion: routing_candidate.and_then(|value| {
             value
                 .client_api_format
                 .as_deref()
@@ -434,13 +500,16 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
         client_response_body: Some(client_body),
         ..UsageEventData::default()
     };
+    if let Some(candidate) = routing_candidate {
+        insert_runtime_miss_candidate_usage_metadata(&mut request_metadata, &candidate.candidate);
+    }
     apply_runtime_miss_usage_routing(
         &mut data,
         &mut request_metadata,
         execution_path,
-        selected_candidate.map(|value| value.candidate.id.as_str()),
-        selected_candidate.map(|value| value.candidate.candidate_index),
-        selected_candidate.and_then(|value| value.key_name.as_deref()),
+        routing_candidate.map(|value| value.candidate.id.as_str()),
+        routing_candidate.map(|value| value.candidate.candidate_index),
+        routing_candidate.and_then(|value| value.key_name.as_deref()),
         diagnostic,
         decision.and_then(|value| value.route_family.as_deref()),
         decision.and_then(|value| value.route_kind.as_deref()),
@@ -451,7 +520,7 @@ pub(crate) async fn record_failed_usage_for_runtime_miss_request(
     state
         .usage_runtime
         .record_terminal_event_direct(
-            state.data.as_ref(),
+            state.usage_lifecycle_data_state().as_ref(),
             UsageEvent::new(UsageEventType::Failed, request_id, data),
         )
         .await;
@@ -593,6 +662,22 @@ fn select_last_runtime_miss_executed_candidate(
         })
 }
 
+fn select_last_runtime_miss_routing_candidate(
+    candidates: &[RuntimeMissCandidateContext],
+) -> Option<&RuntimeMissCandidateContext> {
+    candidates.iter().max_by_key(|candidate| {
+        (
+            candidate.candidate.retry_index,
+            candidate.candidate.candidate_index,
+            candidate
+                .candidate
+                .finished_at_unix_ms
+                .or(candidate.candidate.started_at_unix_ms)
+                .unwrap_or(candidate.candidate.created_at_unix_ms),
+        )
+    })
+}
+
 fn request_candidate_represents_provider_execution(candidate: &StoredRequestCandidate) -> bool {
     matches!(
         candidate.status,
@@ -619,6 +704,30 @@ fn json_header_map() -> Value {
         "content-type".to_string(),
         Value::String("application/json".to_string()),
     )]))
+}
+
+fn runtime_miss_client_error_body(api_format: Option<&str>, message: &str) -> Value {
+    let fallback = json!({
+        "error": {
+            "type": "http_error",
+            "message": message,
+        }
+    });
+    let is_claude = api_format.is_some_and(|format| {
+        crate::ai_serving::normalize_api_format_alias(format)
+            .eq_ignore_ascii_case("claude:messages")
+    });
+    if !is_claude {
+        return fallback;
+    }
+
+    build_core_error_body_for_client_format(
+        "claude:messages",
+        message,
+        None,
+        LocalCoreSyncErrorKind::Overloaded,
+    )
+    .unwrap_or(fallback)
 }
 
 fn runtime_miss_original_headers_json(headers: &HeaderMap) -> Value {
@@ -867,6 +976,66 @@ fn candidate_extra_data_string(candidate: &StoredRequestCandidate, key: &str) ->
         .map(ToOwned::to_owned)
 }
 
+fn attach_runtime_miss_candidate_usage_metadata(
+    data: &mut UsageEventData,
+    candidate: &StoredRequestCandidate,
+) {
+    let mut metadata = match data.request_metadata.take() {
+        Some(Value::Object(object)) => object,
+        Some(other) => Map::from_iter([("seed".to_string(), other)]),
+        None => Map::new(),
+    };
+    insert_runtime_miss_candidate_usage_metadata(&mut metadata, candidate);
+    data.request_metadata = (!metadata.is_empty()).then_some(Value::Object(metadata));
+}
+
+fn insert_runtime_miss_candidate_usage_metadata(
+    metadata: &mut Map<String, Value>,
+    candidate: &StoredRequestCandidate,
+) {
+    if let Some(skip_reason) = candidate
+        .skip_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        metadata.insert(
+            ROUTING_CANDIDATE_SKIP_REASON_METADATA_KEY.to_string(),
+            Value::String(skip_reason.to_string()),
+        );
+    }
+
+    let diagnostic = candidate
+        .extra_data
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|extra_data| {
+            extra_data
+                .get("failure_diagnostic")
+                .filter(|value| {
+                    value.as_object().is_some_and(|diagnostic| {
+                        diagnostic.get("safe_to_show") != Some(&Value::Bool(false))
+                    })
+                })
+                .or_else(|| {
+                    extra_data
+                        .get("request_conversion_error")
+                        .filter(|v| v.is_object())
+                })
+                .or_else(|| {
+                    extra_data
+                        .get("request_body_build_error")
+                        .filter(|v| v.is_object())
+                })
+        });
+    if let Some(diagnostic) = diagnostic {
+        metadata.insert(
+            ROUTING_FAILURE_DIAGNOSTIC_METADATA_KEY.to_string(),
+            diagnostic.clone(),
+        );
+    }
+}
+
 fn runtime_miss_candidate_failure_diagnostic(
     candidate: &RuntimeMissCandidateContext,
 ) -> Option<RuntimeMissFailureDiagnostic> {
@@ -1102,9 +1271,10 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
 mod tests {
     use super::{
         apply_runtime_miss_usage_routing, beautify_local_execution_client_error_message,
-        request_candidate_represents_provider_execution,
-        select_last_runtime_miss_executed_candidate, LocalExecutionRuntimeMissContext,
-        RuntimeMissCandidateContext,
+        insert_runtime_miss_candidate_usage_metadata,
+        request_candidate_represents_provider_execution, runtime_miss_client_error_body,
+        select_last_runtime_miss_executed_candidate, select_last_runtime_miss_routing_candidate,
+        LocalExecutionRuntimeMissContext, RuntimeMissCandidateContext,
     };
     use crate::constants::EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS;
     use crate::state::LocalExecutionRuntimeMissDiagnostic;
@@ -1134,6 +1304,17 @@ mod tests {
             ),
             "没有可用提供商支持模型 gpt-5.4 的流式请求"
         );
+    }
+
+    #[test]
+    fn runtime_miss_usage_body_matches_claude_client_envelope() {
+        let claude = runtime_miss_client_error_body(Some("claude:messages"), "busy");
+        assert_eq!(claude["type"], "error");
+        assert_eq!(claude["error"]["type"], "overloaded_error");
+
+        let openai = runtime_miss_client_error_body(Some("openai:chat"), "busy");
+        assert_eq!(openai["error"]["type"], "http_error");
+        assert!(openai.get("type").is_none());
     }
 
     #[test]
@@ -1184,7 +1365,7 @@ mod tests {
 
     #[test]
     fn runtime_miss_executed_candidate_selection_ignores_skipped_only_histories() {
-        let skipped_candidate = StoredRequestCandidate::new(
+        let mut skipped_candidate = StoredRequestCandidate::new(
             "cand-skipped".to_string(),
             "req-1".to_string(),
             Some("user-1".to_string()),
@@ -1211,6 +1392,26 @@ mod tests {
             None,
         )
         .expect("candidate should build");
+        skipped_candidate.skip_reason = Some("provider_request_body_build_failed".to_string());
+        skipped_candidate.extra_data = Some(json!({
+            "failure_diagnostic": {
+                "kind": "request_body_build",
+                "path": "$.reasoning.summary",
+                "message": "invalid reasoning summary",
+                "safe_to_show": true
+            }
+        }));
+
+        let mut request_metadata = Map::new();
+        insert_runtime_miss_candidate_usage_metadata(&mut request_metadata, &skipped_candidate);
+        assert_eq!(
+            request_metadata["routing_candidate_skip_reason"],
+            "provider_request_body_build_failed"
+        );
+        assert_eq!(
+            request_metadata["routing_failure_diagnostic"]["path"],
+            "$.reasoning.summary"
+        );
 
         assert!(!request_candidate_represents_provider_execution(
             &skipped_candidate
@@ -1228,6 +1429,11 @@ mod tests {
         }];
 
         assert!(select_last_runtime_miss_executed_candidate(&contexts).is_none());
+        assert_eq!(
+            select_last_runtime_miss_routing_candidate(&contexts)
+                .map(|candidate| candidate.candidate.id.as_str()),
+            Some("cand-skipped")
+        );
     }
 
     #[test]

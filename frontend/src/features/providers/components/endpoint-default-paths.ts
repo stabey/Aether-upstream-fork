@@ -90,19 +90,28 @@ function usesVersionedApiRootByDefault(apiFormat: string): boolean {
   return apiFormat === 'openai:chat'
     || apiFormat === 'openai:responses'
     || apiFormat === 'openai:responses:compact'
+    || apiFormat === 'openai:realtime'
+    || apiFormat === 'openai:search'
     || apiFormat === 'openai:embedding'
     || apiFormat === 'openai:rerank'
     || apiFormat === 'openai:image'
     || apiFormat === 'openai:video'
+    || apiFormat === 'codex:live'
     || apiFormat === 'jina:embedding'
     || apiFormat === 'jina:rerank'
     || apiFormat === 'claude:messages'
     || apiFormat === 'gemini:generate_content'
+    || apiFormat === 'gemini:interactions'
     || apiFormat === 'gemini:embedding'
     || apiFormat === 'gemini:video'
 }
 
 function versionedApiRootSuffix(apiFormat: string): '/v1' | '/v1beta' {
+  if (
+    apiFormat === 'gemini:interactions'
+  ) {
+    return '/v1'
+  }
   if (
     apiFormat === 'gemini:generate_content'
     || apiFormat === 'gemini:embedding'
@@ -116,12 +125,14 @@ function versionedApiRootSuffix(apiFormat: string): '/v1' | '/v1beta' {
 function skipsVersionedApiRootDefault(apiFormat: string, baseUrl: string): boolean {
   if (
     apiFormat === 'gemini:generate_content'
+    || apiFormat === 'gemini:interactions'
     || apiFormat === 'gemini:embedding'
     || apiFormat === 'gemini:video'
   ) {
     return false
   }
   return isDeepSeekApiRoot(baseUrl)
+    || isCodexUrl(baseUrl)
     || isBigModelCodingApiRoot(baseUrl)
     || isGoogleOpenAiCompatApiRoot(baseUrl)
     || isVertexOpenAiCompatApiRoot(baseUrl)
@@ -178,9 +189,6 @@ export function getDefaultEndpointPath(params: {
     if (normalizedApiFormat === 'gemini:embedding') {
       return '/v1/projects/{project_id}/locations/{region}/publishers/google/models/{model}:predict'
     }
-    if (normalizedApiFormat === 'claude:messages') {
-      return '/v1/projects/{project_id}/locations/{region}/publishers/anthropic/models/{model}:{action}'
-    }
   }
 
   const format = params.apiFormats.find(f => f.value === normalizedApiFormat)
@@ -190,6 +198,9 @@ export function getDefaultEndpointPath(params: {
     : (!!params.baseUrl && isCodexUrl(params.baseUrl))
   if (normalizedApiFormat === 'openai:responses' && isCodex) {
     return '/responses'
+  }
+  if (normalizedApiFormat === 'openai:search' && isCodex) {
+    return '/alpha/search'
   }
   if (usesVersionedApiRootByDefault(normalizedApiFormat)) {
     return stripVersionPrefixForApiRoot(defaultPath)

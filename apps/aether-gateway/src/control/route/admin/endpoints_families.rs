@@ -82,6 +82,16 @@ pub(super) fn classify_admin_endpoints_family_route(
             false,
         ))
     } else if method == http::Method::GET
+        && normalized_path == "/api/admin/endpoints/health/related"
+    {
+        Some(classified(
+            "admin_proxy",
+            "endpoints_health",
+            "health_related",
+            "admin:endpoints_health",
+            false,
+        ))
+    } else if method == http::Method::GET
         && normalized_path.starts_with("/api/admin/endpoints/rpm/key/")
     {
         Some(classified(
@@ -182,6 +192,17 @@ pub(super) fn classify_admin_endpoints_family_route(
             "admin_proxy",
             "endpoints_manage",
             "reset_cycle_stats",
+            "admin:endpoints_manage",
+            false,
+        ))
+    } else if method == http::Method::POST
+        && normalized_path.starts_with("/api/admin/endpoints/keys/")
+        && normalized_path.ends_with("/codex-reset-credit/consume")
+    {
+        Some(classified(
+            "admin_proxy",
+            "endpoints_manage",
+            "codex_reset_credit_consume",
             "admin:endpoints_manage",
             false,
         ))

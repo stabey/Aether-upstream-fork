@@ -123,6 +123,7 @@
       v-if="isAdminPage"
       :is-open="detailModalOpen"
       :request-id="selectedRequestId"
+      :summary-record="selectedRequestSummary"
       @close="detailModalOpen = false"
       @request-state="handleDetailRequestState"
     />
@@ -155,12 +156,25 @@ import {
 } from '@/features/usage/composables'
 import { reconcileActiveRequestDiscovery } from '@/features/usage/utils/activeRequestDiscovery'
 import {
+  mergeUsageRecordErrorMessage,
+  mergeUsageRecordFirstByteTimeMs,
+  mergeUsageRecordLifecycleSnapshot,
+  mergeUsageRecordResponseTiming,
+  parseUsageTimestampMs,
+} from '@/features/usage/utils/recordSync'
+import {
   hasUsageFallback,
   isUsageRecordFailed,
   isUsageUpstreamStream,
+  isUsageWebSocket,
   normalizeRequestStatus,
   resolveDisplayRequestStatus,
 } from '@/features/usage/utils/status'
+import { matchesUsageRecordSearch } from '@/features/usage/utils/recordSearch'
+import {
+  isUserLocalOnlyRecordStatus,
+  shouldUseServerUserRecordFilters,
+} from '@/features/usage/utils/recordFilterPolicy'
 import type { DateRangeParams, FilterStatusValue, RequestStatus, UsageRecord } from '@/features/usage/types'
 import type { UserOption } from '@/features/usage/components/UsageRecordsTable.vue'
 import { log } from '@/utils/logger'
@@ -381,6 +395,10 @@ const filteredRecords = computed(() => {
     : [...currentRecords.value]
 
   if (!isAdminPage.value) {
+    if (isUserLocalOnlyRecordStatus(filterStatus.value) && filterSearch.value.trim()) {
+      records = records.filter(record => matchesUsageRecordSearch(record, filterSearch.value))
+    }
+
     if (filterModel.value !== '__all__') {
       records = records.filter(record => record.model === filterModel.value)
     }
@@ -396,13 +414,19 @@ const filteredRecords = computed(() => {
     }
 
     if (filterStatus.value !== '__all__') {
-      if (filterStatus.value === 'stream') {
+      if (filterStatus.value === 'websocket') {
+        records = records.filter(record => isUsageWebSocket(record))
+      } else if (filterStatus.value === 'stream') {
         records = records.filter(record =>
-          isUsageUpstreamStream(record) && !isUsageRecordFailed(record)
+          isUsageUpstreamStream(record)
+          && !isUsageWebSocket(record)
+          && !isUsageRecordFailed(record)
         )
       } else if (filterStatus.value === 'standard') {
         records = records.filter(record =>
-          !isUsageUpstreamStream(record) && !isUsageRecordFailed(record)
+          !isUsageUpstreamStream(record)
+          && !isUsageWebSocket(record)
+          && !isUsageRecordFailed(record)
         )
       } else if (filterStatus.value === 'active') {
         records = records.filter(record =>
@@ -493,20 +517,27 @@ async function pollActiveRequests() {
       }
       const currentRank = record.status ? (statusPriority[record.status] ?? 0) : 0
       const newRank = update.status ? (statusPriority[update.status] ?? 0) : 0
-      const shouldApply = newRank >= currentRank
+      const currentUpdatedAtMs = parseUsageTimestampMs(record.updated_at)
+      const updateUpdatedAtMs = parseUsageTimestampMs(update.updated_at)
+      const updateSnapshotIsOlder = currentUpdatedAtMs != null &&
+        updateUpdatedAtMs != null &&
+        updateUpdatedAtMs < currentUpdatedAtMs
+      const shouldApply = !updateSnapshotIsOlder && newRank >= currentRank
       const updateHasFailureSignal =
         (typeof update.status_code === 'number' && update.status_code >= 400) ||
         (typeof update.error_message === 'string' && update.error_message.trim().length > 0) ||
         update.image_progress?.phase === 'failed'
-      const shouldApplyData = shouldApply || updateHasFailureSignal
+      const shouldApplyData = shouldApply || (
+        !updateSnapshotIsOlder && currentRank < 2 && updateHasFailureSignal
+      )
 
       if (shouldApply && record.status !== update.status) {
         record.status = update.status
       }
-      if ('image_progress' in update) {
-        record.image_progress = update.image_progress ?? null
-      }
       if (shouldApplyData) {
+        if ('image_progress' in update) {
+          record.image_progress = update.image_progress ?? null
+        }
         // 进行中状态也需要持续更新（provider/key/TTFB 可能在 streaming 后才落库）
         record.input_tokens = update.input_tokens
         record.effective_input_tokens = update.effective_input_tokens ?? record.effective_input_tokens
@@ -520,25 +551,67 @@ async function pollActiveRequests() {
         record.cost = update.cost
         record.actual_cost = update.actual_cost ?? undefined
         record.rate_multiplier = update.rate_multiplier ?? undefined
-        record.response_time_ms = update.response_time_ms ?? undefined
-        record.first_byte_time_ms = update.first_byte_time_ms ?? undefined
+        const responseTiming = mergeUsageRecordResponseTiming(
+          {
+            response_time_ms: record.response_time_ms,
+            response_time_updated_at: record.response_time_updated_at,
+          },
+          {
+            response_time_ms: update.response_time_ms,
+            response_time_updated_at: update.response_time_updated_at,
+          },
+          {
+            preferNext: update.status === 'completed' ||
+              update.status === 'failed' ||
+              update.status === 'cancelled',
+          },
+        )
+        record.response_time_ms = responseTiming.response_time_ms
+        record.response_time_updated_at = responseTiming.response_time_updated_at
+        record.first_byte_time_ms = mergeUsageRecordFirstByteTimeMs(
+          record.first_byte_time_ms,
+          update.first_byte_time_ms
+        )
         if ('updated_at' in update) {
-          record.updated_at = typeof update.updated_at === 'string' ? update.updated_at : null
-        }
-        if ('response_time_updated_at' in update) {
-          record.response_time_updated_at =
-            typeof update.response_time_updated_at === 'string'
-              ? update.response_time_updated_at
-              : null
+          if (typeof update.updated_at === 'string') {
+            record.updated_at = update.updated_at
+          }
         }
         record.status_code = update.status_code ?? undefined
-        record.error_message = update.error_message ?? undefined
+        record.error_message = mergeUsageRecordErrorMessage(
+          record.error_message,
+          update.error_message,
+          { authoritative: shouldApply },
+        )
         if (typeof update.upstream_is_stream === 'boolean') {
           record.upstream_is_stream = update.upstream_is_stream
           record.is_stream = update.upstream_is_stream
         } else if (typeof update.is_stream === 'boolean') {
           record.is_stream = update.is_stream
           record.upstream_is_stream = update.is_stream
+        }
+        if (typeof update.is_websocket === 'boolean') {
+          record.is_websocket = record.is_websocket === true || update.is_websocket
+        }
+        if (typeof update.websocket_transport === 'string' && update.websocket_transport.trim()) {
+          record.websocket_transport = update.websocket_transport
+        }
+        if (typeof update.usage_available === 'boolean') {
+          record.usage_available = record.usage_available === false || update.usage_available === false
+            ? false
+            : true
+        }
+        if (typeof update.usage_pricing_available === 'boolean') {
+          record.usage_pricing_available = record.usage_pricing_available === false
+            || update.usage_pricing_available === false
+            ? false
+            : true
+        }
+        if (typeof update.input_audio_tokens === 'number') {
+          record.input_audio_tokens = update.input_audio_tokens
+        }
+        if (typeof update.output_audio_tokens === 'number') {
+          record.output_audio_tokens = update.output_audio_tokens
         }
         if (typeof update.client_is_stream === 'boolean') {
           record.client_is_stream = update.client_is_stream
@@ -554,20 +627,28 @@ async function pollActiveRequests() {
         if (typeof update.has_fallback === 'boolean') {
           record.has_fallback = record.has_fallback === true || update.has_fallback
         }
-        // 模型映射：streaming 时已可确定
-        if ('target_model' in update && (typeof update.target_model === 'string' || update.target_model === null)) {
-          record.target_model = update.target_model
+        // Active responses are complete final-provider snapshots. Absence clears facts left by
+        // a previous candidate, while requested reasoning remains tied to the client request.
+        record.target_model = typeof update.target_model === 'string' && update.target_model.trim()
+          ? update.target_model
+          : null
+        record.reasoning_effort = typeof update.reasoning_effort === 'string' && update.reasoning_effort.trim()
+          ? update.reasoning_effort
+          : null
+        if (typeof update.request_type === 'string' && update.request_type.trim()) {
+          record.request_type = update.request_type
         }
-        if ('reasoning_effort' in update) {
-          record.reasoning_effort = typeof update.reasoning_effort === 'string'
-            ? update.reasoning_effort
-            : null
+        if (typeof update.requested_reasoning_effort === 'string' && update.requested_reasoning_effort.trim()) {
+          record.requested_reasoning_effort = update.requested_reasoning_effort
         }
-        if ('service_tier' in update) {
-          record.service_tier = typeof update.service_tier === 'string'
-            ? update.service_tier
-            : null
-        }
+        // Active responses describe the current final provider request. Clear an old Fast fact
+        // when the refreshed snapshot has no request-side tier instead of retaining it forever.
+        record.service_tier = typeof update.service_tier === 'string' && update.service_tier.trim()
+          ? update.service_tier
+          : null
+        record.actual_service_tier = typeof update.actual_service_tier === 'string' && update.actual_service_tier.trim()
+          ? update.actual_service_tier
+          : null
         // 管理员接口返回额外字段
         // 只有当返回的 provider 不是 pending/unknown/unknow 时才更新，避免覆盖已有的正确值
         if ('provider' in update && typeof update.provider === 'string') {
@@ -768,9 +849,21 @@ onUnmounted(() => {
   stopGlobalAutoRefresh()
 })
 
-// 用户页面的前端分页（后端一次性返回所有记录，前端分页+筛选）
+// Retry/fallback are derived from the locally loaded records and are not accepted by the
+// normal-user records API. Keep those statuses entirely local, including when combined with
+// search/API-format filters, so an unsupported status never produces a misleading server total.
+// 普通用户的 API 格式/传输类型/搜索筛选由后端执行，避免只筛选当前已加载页。
+// 模型及后端不支持的 retry/fallback 筛选仍保持现有的本地分页语义。
+const userUsesServerRecordFilters = computed(() => !isAdminPage.value && (
+  shouldUseServerUserRecordFilters({
+    search: filterSearch.value,
+    apiFormat: filterApiFormat.value,
+    status: filterStatus.value,
+  })
+))
+
 const paginatedRecords = computed(() => {
-  if (!isAdminPage.value) {
+  if (!isAdminPage.value && !userUsesServerRecordFilters.value) {
     const start = (currentPage.value - 1) * pageSize.value
     const end = start + pageSize.value
     return filteredRecords.value.slice(start, end)
@@ -780,7 +873,7 @@ const paginatedRecords = computed(() => {
 
 // 用户页面使用前端筛选后的总数，管理员页面使用后端返回的总数
 const effectiveTotalRecords = computed(() => {
-  if (!isAdminPage.value) {
+  if (!isAdminPage.value && !userUsesServerRecordFilters.value) {
     return filteredRecords.value.length
   }
   return totalRecords.value
@@ -802,13 +895,21 @@ const availableClientFamilies = computed(() => {
 // 详情弹窗状态
 const detailModalOpen = ref(false)
 const selectedRequestId = ref<string | null>(null)
+const selectedRequestSummary = computed(() => (
+  currentRecords.value.find(record => record.id === selectedRequestId.value) ?? null
+))
 
 // 初始化加载
 onMounted(async () => {
   document.addEventListener('visibilitychange', handleVisibilityChange)
 
   if (isAdminPage.value) {
-    // 管理员页面优先加载记录，统计面板在后台顺序刷新，避免瞬时并发打满后端。
+    // 管理员页面优先启动热力图加载，避免被统计聚合链路阻塞。
+    const heatmapPromise = loadHeatmapData().catch(err => {
+      log.error('加载热力图数据失败:', err)
+    })
+    const adminUsersPromise = loadAdminUsers()
+
     await loadRecords(
       { page: currentPage.value, pageSize: pageSize.value },
       getCurrentFilters(),
@@ -816,8 +917,7 @@ onMounted(async () => {
     )
     void (async () => {
       await refreshAdminAnalytics({ force: true, preserveOnFailure: false })
-      await loadHeatmapData()
-      await loadAdminUsers()
+      await Promise.all([heatmapPromise, adminUsersPromise])
     })()
   } else {
     // 用户页面：loadStats 已包含记录加载，不需要单独调用 loadRecords
@@ -851,26 +951,26 @@ async function handleTimeRangeChange(value: DateRangeParams) {
     return
   }
   await loadStats(timeRange.value)
-  // 用户页面：loadStats 已包含记录加载
+  if (userUsesServerRecordFilters.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  }
 }
 
 // 处理分页变化
 async function handlePageChange(page: number) {
   currentPage.value = page
-  if (isAdminPage.value) {
+  if (isAdminPage.value || userUsesServerRecordFilters.value) {
     await loadRecords({ page, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
   }
-  // 用户页面使用前端分页，无需重新请求
 }
 
 // 处理每页大小变化
 async function handlePageSizeChange(size: number) {
   pageSize.value = size
   currentPage.value = 1  // 重置到第一页
-  if (isAdminPage.value) {
+  if (isAdminPage.value || userUsesServerRecordFilters.value) {
     await loadRecords({ page: 1, pageSize: size }, getCurrentFilters(), timeRange.value)
   }
-  // 用户页面使用前端分页，无需重新请求
 }
 
 // 获取当前筛选参数
@@ -894,9 +994,11 @@ async function handleFilterSearchChange(value: string) {
 
   if (isAdminPage.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else if (userUsesServerRecordFilters.value) {
+    await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else {
+    await loadStats(timeRange.value)
   }
-  // 用户页面：search 需要重新从后端拉取数据（后端支持 search 参数）
-  // 但通过 filteredRecords 做前端过滤已覆盖，无需额外请求
 }
 
 async function handleFilterUserChange(value: string) {
@@ -933,8 +1035,10 @@ async function handleFilterApiFormatChange(value: string) {
   filterApiFormat.value = value
   currentPage.value = 1
 
-  if (isAdminPage.value) {
+  if (isAdminPage.value || userUsesServerRecordFilters.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else {
+    await loadStats(timeRange.value)
   }
 }
 
@@ -942,8 +1046,10 @@ async function handleFilterStatusChange(value: string) {
   filterStatus.value = value as FilterStatusValue
   currentPage.value = 1
 
-  if (isAdminPage.value) {
+  if (isAdminPage.value || userUsesServerRecordFilters.value) {
     await loadRecords({ page: 1, pageSize: pageSize.value }, getCurrentFilters(), timeRange.value)
+  } else {
+    await loadStats(timeRange.value)
   }
 }
 
@@ -962,7 +1068,7 @@ async function refreshData() {
   if (refreshInFlight) return refreshInFlight
 
   refreshInFlight = (async () => {
-    if (isAdminPage.value) {
+    if (isAdminPage.value || userUsesServerRecordFilters.value) {
       await loadRecords(
         { page: currentPage.value, pageSize: pageSize.value },
         getCurrentFilters(),
@@ -972,7 +1078,6 @@ async function refreshData() {
     }
 
     await loadStats(timeRange.value)
-    // 用户页面：loadStats 已包含记录加载
   })()
 
   try {
@@ -1026,6 +1131,12 @@ function handleDetailRequestState(update: {
   responseTimeMs?: number | null
   firstByteTimeMs?: number | null
   isStream?: boolean | null
+  isWebSocket?: boolean | null
+  websocketTransport?: string | null
+  usageAvailable?: boolean | null
+  usagePricingAvailable?: boolean | null
+  inputAudioTokens?: number | null
+  outputAudioTokens?: number | null
   upstreamIsStream?: boolean | null
   clientRequestedStream?: boolean | null
   clientIsStream?: boolean | null
@@ -1033,33 +1144,30 @@ function handleDetailRequestState(update: {
   endpointApiFormat?: string | null
   hasFormatConversion?: boolean | null
   targetModel?: string | null
+  requestedReasoningEffort?: string | null
   reasoningEffort?: string | null
   serviceTier?: string | null
+  actualServiceTier?: string | null
   imageProgress?: ImageProgress | null
   errorMessage?: string | null
+  updatedAt?: string | null
 }) {
   const record = currentRecords.value.find(record => record.id === update.id)
   if (!record) return
 
   const nextStatus = resolveDetailUpdateStatus(update)
+  const lifecycle = mergeUsageRecordLifecycleSnapshot(record, {
+    ...(nextStatus ? { status: nextStatus } : {}),
+    ...('statusCode' in update ? { statusCode: update.statusCode } : {}),
+    ...('errorMessage' in update ? { errorMessage: update.errorMessage } : {}),
+    ...('updatedAt' in update ? { updatedAt: update.updatedAt } : {}),
+  })
+  record.status = lifecycle.status
+  record.status_code = lifecycle.status_code
+  record.error_message = lifecycle.error_message
+  record.updated_at = lifecycle.updated_at
+  if (!lifecycle.accepted) return
 
-  const statusPriority: Record<RequestStatus, number> = {
-    pending: 0,
-    streaming: 1,
-    completed: 2,
-    failed: 2,
-    cancelled: 2,
-  }
-  if (nextStatus) {
-    const currentRank = record.status ? statusPriority[record.status] : 0
-    const nextRank = statusPriority[nextStatus]
-    if (nextRank >= currentRank) {
-      record.status = nextStatus
-    }
-  }
-  if ('statusCode' in update) {
-    record.status_code = update.statusCode ?? undefined
-  }
   if ('inputTokens' in update && update.inputTokens != null) {
     record.input_tokens = update.inputTokens
   }
@@ -1090,14 +1198,60 @@ function handleDetailRequestState(update: {
   if ('actualCost' in update && update.actualCost != null) {
     record.actual_cost = update.actualCost
   }
-  if ('responseTimeMs' in update && update.responseTimeMs != null) {
-    record.response_time_ms = update.responseTimeMs
+  if ('responseTimeMs' in update) {
+    const responseTiming = mergeUsageRecordResponseTiming(
+      {
+        response_time_ms: record.response_time_ms,
+        response_time_updated_at: record.response_time_updated_at,
+      },
+      {
+        response_time_ms: update.responseTimeMs,
+        response_time_updated_at: null,
+      },
+      {
+        preferNext: lifecycle.accepted && (
+          nextStatus === 'completed' ||
+          nextStatus === 'failed' ||
+          nextStatus === 'cancelled'
+        ),
+      },
+    )
+    record.response_time_ms = responseTiming.response_time_ms
+    record.response_time_updated_at = responseTiming.response_time_updated_at
   }
   if ('firstByteTimeMs' in update) {
-    record.first_byte_time_ms = update.firstByteTimeMs ?? undefined
+    record.first_byte_time_ms = mergeUsageRecordFirstByteTimeMs(
+      record.first_byte_time_ms,
+      update.firstByteTimeMs
+    )
   }
   if ('isStream' in update && typeof update.isStream === 'boolean') {
     record.is_stream = update.isStream
+  }
+  if ('isWebSocket' in update && typeof update.isWebSocket === 'boolean') {
+    record.is_websocket = record.is_websocket === true || update.isWebSocket
+  }
+  if (
+    'websocketTransport' in update
+    && typeof update.websocketTransport === 'string'
+    && update.websocketTransport.trim()
+  ) {
+    record.websocket_transport = update.websocketTransport
+  }
+  if ('usageAvailable' in update && typeof update.usageAvailable === 'boolean') {
+    record.usage_available = update.usageAvailable
+  }
+  if (
+    'usagePricingAvailable' in update
+    && typeof update.usagePricingAvailable === 'boolean'
+  ) {
+    record.usage_pricing_available = update.usagePricingAvailable
+  }
+  if ('inputAudioTokens' in update && typeof update.inputAudioTokens === 'number') {
+    record.input_audio_tokens = update.inputAudioTokens
+  }
+  if ('outputAudioTokens' in update && typeof update.outputAudioTokens === 'number') {
+    record.output_audio_tokens = update.outputAudioTokens
   }
   if ('upstreamIsStream' in update && typeof update.upstreamIsStream === 'boolean') {
     record.upstream_is_stream = update.upstreamIsStream
@@ -1123,17 +1277,24 @@ function handleDetailRequestState(update: {
   if ('reasoningEffort' in update) {
     record.reasoning_effort = typeof update.reasoningEffort === 'string' ? update.reasoningEffort : null
   }
+  if ('requestedReasoningEffort' in update) {
+    record.requested_reasoning_effort = typeof update.requestedReasoningEffort === 'string'
+      ? update.requestedReasoningEffort
+      : null
+  }
   if ('serviceTier' in update) {
     record.service_tier = typeof update.serviceTier === 'string' ? update.serviceTier : null
+  }
+  if ('actualServiceTier' in update) {
+    record.actual_service_tier = typeof update.actualServiceTier === 'string'
+      ? update.actualServiceTier
+      : null
   }
   if ('imageProgress' in update) {
     const nextProgress = update.imageProgress ?? null
     if (!sameImageProgress(record.image_progress, nextProgress)) {
       record.image_progress = nextProgress
     }
-  }
-  if ('errorMessage' in update) {
-    record.error_message = update.errorMessage ?? undefined
   }
 }
 

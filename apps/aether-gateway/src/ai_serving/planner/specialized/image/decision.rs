@@ -5,7 +5,7 @@ use crate::ai_serving::planner::report_context::{
 };
 use crate::ai_serving::planner::spec_metadata::local_openai_image_spec_metadata;
 use crate::ai_serving::planner::{
-    build_ai_execution_decision_response, resolve_transport_request_gzip_policy,
+    build_ai_execution_decision_response, resolve_transport_request_encoding_policy,
     AiExecutionDecisionResponseParts,
 };
 use crate::ai_serving::transport::{
@@ -13,7 +13,8 @@ use crate::ai_serving::transport::{
 };
 use crate::ai_serving::{ai_local_execution_contract_for_formats, PlannerAppState};
 use crate::{
-    append_execution_contract_fields_to_value, AiExecutionDecision, AppState, GatewayError,
+    append_execution_contract_fields_to_value, append_local_failover_policy_to_value,
+    AiExecutionDecision, AppState, GatewayError,
 };
 
 use super::request::resolve_local_openai_image_candidate_payload_parts;
@@ -84,11 +85,7 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
             serde_json::Value::Bool(true),
         );
     }
-    let upstream_is_stream = resolved
-        .provider_request_body
-        .get("stream")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(spec_metadata.require_streaming);
+    let upstream_is_stream = resolved.upstream_is_stream;
     let effective_headers = input.effective_headers(&parts.headers);
     let report_context = append_execution_contract_fields_to_value(
         build_local_execution_report_context(LocalExecutionReportContextParts {
@@ -123,7 +120,9 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
             original_request_body_json: Some(body_json),
             original_request_body_base64: body_base64,
             client_session_affinity: input.client_session_affinity.as_ref(),
+            routing_policy: input.routing_policy.as_ref(),
             scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+            sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
             client_requested_stream: spec_metadata.require_streaming,
             upstream_is_stream,
             has_envelope: false,
@@ -135,7 +134,8 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
         spec_metadata.api_format,
         provider_api_format.as_str(),
     );
-    let request_gzip = resolve_transport_request_gzip_policy(&transport);
+    let report_context = append_local_failover_policy_to_value(report_context, &transport);
+    let request_encoding = resolve_transport_request_encoding_policy(&transport);
 
     let mut decision = build_ai_execution_decision_response(AiExecutionDecisionResponseParts {
         decision_is_stream: spec_metadata.require_streaming,
@@ -145,6 +145,7 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
         request_id: trace_id.to_string(),
         candidate_id: candidate_id.clone(),
         provider_name: transport.provider.name.clone(),
+        provider_type: transport.provider.provider_type.clone(),
         provider_id: candidate.provider_id.clone(),
         endpoint_id: candidate.endpoint_id.clone(),
         key_id: candidate.key_id.clone(),
@@ -162,8 +163,8 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
         provider_request_body: Some(resolved.provider_request_body),
         provider_request_body_base64: None,
         content_type: Some("application/json".to_string()),
-        content_encoding: None,
-        request_gzip,
+        content_encoding: request_encoding.content_encoding,
+        request_gzip: request_encoding.request_gzip,
         proxy,
         transport_profile,
         timeouts: resolve_transport_execution_timeouts(&transport),
@@ -172,6 +173,10 @@ pub(super) async fn maybe_build_local_openai_image_decision_payload_for_candidat
         report_context: Some(report_context),
         auth_context: input.auth_context.clone(),
     });
-    apply_provider_request_routing_policy_to_decision(input, &mut decision)?;
+    apply_provider_request_routing_policy_to_decision(
+        input,
+        &mut decision,
+        Some(transport.as_ref()),
+    )?;
     Ok(Some(decision))
 }

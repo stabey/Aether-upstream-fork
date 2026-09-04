@@ -150,13 +150,16 @@
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="__all__">
-              全部状态
+              全部类型
             </SelectItem>
             <SelectItem value="stream">
-              流式
+              HTTP 流式
             </SelectItem>
             <SelectItem value="standard">
-              标准
+              HTTP 标准
+            </SelectItem>
+            <SelectItem value="websocket">
+              WebSocket (WS)
             </SelectItem>
             <SelectItem value="active">
               活跃
@@ -242,24 +245,12 @@
         <!-- 第一行：模型 + 费用 -->
         <div class="flex items-start justify-between gap-2">
           <div class="min-w-0 flex-1">
-            <div class="flex min-w-0 items-center gap-1.5">
-              <span class="min-w-0 truncate text-[15px] font-semibold leading-5">{{ record.model }}</span>
-              <Badge
-                v-if="getReasoningEffort(record)"
-                variant="outline"
-                class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
-                :title="getReasoningEffortTitle(record)"
-              >
-                {{ getReasoningEffort(record) }}
-              </Badge>
-              <Badge
-                v-if="getFastBadge(record)"
-                variant="outline"
-                class="h-4 rounded-full px-1.5 text-[10px] leading-4 text-foreground flex-shrink-0"
-                :title="getFastBadgeTitle(record)"
-              >
-                fast
-              </Badge>
+            <div class="flex min-w-0 flex-wrap items-center gap-1.5">
+              <UsageModelDisplay
+                :record="record"
+                model-class="text-[15px] font-semibold leading-5"
+                stack-full-width
+              />
               <!-- 状态 Badge -->
               <Badge
                 v-if="isUsageRecordFailed(record)"
@@ -290,6 +281,15 @@
                 取消
               </Badge>
               <Badge
+                v-else-if="isUsageWebSocket(record)"
+                variant="outline"
+                data-usage-transport="websocket"
+                :title="getWebSocketTransportTitle(record)"
+                class="whitespace-nowrap border-sky-500/50 text-sky-600 dark:text-sky-400 text-[10px] px-1.5 h-4 leading-4 inline-flex items-center flex-shrink-0"
+              >
+                WS
+              </Badge>
+              <Badge
                 v-else-if="getStreamModeSegments(record).hasConversion"
                 :variant="streamBadgeVariant(getStreamModeSegments(record).client === '流式')"
                 :class="(streamBadgeVariant(getStreamModeSegments(record).client === '流式') === 'secondary')
@@ -310,15 +310,26 @@
                 {{ getStreamModeLabel(record) }}
               </Badge>
             </div>
-            <span
-              v-if="getActualModel(record)"
-              class="text-[11px] text-muted-foreground truncate block"
-            >-> {{ getActualModel(record) }}</span>
           </div>
           <div class="flex flex-col items-end flex-shrink-0">
-            <span class="text-sm text-primary font-semibold leading-5">{{ formatCurrency(record.cost || 0) }}</span>
             <span
-              v-if="showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
+              v-if="record.usage_available !== false && record.usage_pricing_available !== false"
+              class="text-sm text-primary font-semibold leading-5"
+            >{{ formatCurrency(record.cost || 0) }}</span>
+            <span
+              v-else-if="record.usage_available === false"
+              data-usage-unavailable="cost"
+              class="text-sm text-muted-foreground font-medium leading-5"
+              title="上游未提供可验证的 token/费用用量"
+            >不可用</span>
+            <span
+              v-else
+              data-usage-unpriced="cost"
+              class="text-sm text-muted-foreground font-medium leading-5"
+              title="token 用量可验证，但当前计价规则不支持该音频用量分项"
+            >未计价</span>
+            <span
+              v-if="record.usage_available !== false && record.usage_pricing_available !== false && showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
               class="text-[10px] text-muted-foreground"
             >{{ formatCurrency(record.actual_cost) }}</span>
           </div>
@@ -338,7 +349,22 @@
           </template>
         </div>
 
-        <!-- 第三行：性能指标 -->
+        <!-- 第三行：用户 + 提供商 -->
+        <div
+          v-if="isAdmin"
+          class="mt-1 flex min-w-0 items-center gap-1.5 text-[10px] leading-3.5 text-muted-foreground"
+        >
+          <span
+            class="min-w-0 truncate"
+            :title="formatRecordUserProviderLine(record)"
+          >
+            {{ formatRecordUserSegment(record) }}
+          </span>
+          <span class="shrink-0 text-muted-foreground/40">·</span>
+          <span class="min-w-0 truncate">{{ formatRecordProviderSegment(record) }}</span>
+        </div>
+
+        <!-- 第四行：性能指标 -->
         <div class="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1 text-[10px] leading-3.5 text-muted-foreground">
           <span
             class="min-w-0 truncate whitespace-nowrap tabular-nums text-foreground"
@@ -359,7 +385,7 @@
               <span>{{ formatOutputRate(getRecordDisplayOutputRate(record)) }}</span>
             </template>
             <span
-              v-else-if="record.response_time_ms != null || record.first_byte_time_ms != null"
+              v-else-if="hasRecordDisplayLatency(record)"
               class="ml-1"
             >{{ formatRecordLatencyPair(record) }} / {{ formatOutputRate(getRecordDisplayOutputRate(record)) }}</span>
             <span
@@ -373,10 +399,23 @@
             :title="hasRecordCacheTokens(record) ? getRecordCacheTokensTitle(record) : undefined"
           >
             <span class="text-muted-foreground">Tokens</span>
-            <span class="ml-1">{{ formatTokens(getRecordEffectiveInputTokens(record)) }} / {{ formatTokens(record.output_tokens || 0) }}</span>
-            <template v-if="hasRecordCacheTokens(record)">
+            <span
+              v-if="record.usage_available !== false"
+              class="ml-1"
+            >{{ formatTokens(getRecordEffectiveInputTokens(record)) }} / {{ formatTokens(record.output_tokens || 0) }}</span>
+            <span
+              v-else
+              data-usage-unavailable="tokens"
+              class="ml-1 text-muted-foreground"
+              title="上游未提供可验证的 token/费用用量"
+            >不可用</span>
+            <template v-if="record.usage_available !== false && hasRecordCacheTokens(record)">
               <span class="text-muted-foreground"> | </span>
               <span>{{ formatOptionalTokens(getRecordCacheReadTokens(record)) }} / {{ formatOptionalTokens(getRecordCacheCreationTokens(record)) }}</span>
+            </template>
+            <template v-if="record.usage_available !== false && ((record.input_audio_tokens || 0) > 0 || (record.output_audio_tokens || 0) > 0)">
+              <span class="text-muted-foreground"> | 音频 </span>
+              <span>{{ formatOptionalTokens(record.input_audio_tokens) }} / {{ formatOptionalTokens(record.output_audio_tokens) }}</span>
             </template>
           </span>
         </div>
@@ -612,7 +651,8 @@
             v-if="isColumnVisible('performance')"
             class="h-12 font-semibold w-[9%] text-right"
           >
-            <div class="flex flex-col items-end text-xs gap-0.5">
+            <div class="flex flex-col items-end text-[11px] leading-3">
+              <span class="whitespace-nowrap">端到端</span>
               <span class="whitespace-nowrap">首字/总耗时</span>
               <span class="text-muted-foreground font-normal">输出速度</span>
             </div>
@@ -720,65 +760,10 @@
             :class="[isAdmin ? 'w-[14%]' : 'w-[22%]']"
             :title="getModelTooltip(record)"
           >
-            <div
-              v-if="getActualModel(record)"
-              class="flex flex-col text-xs gap-0.5"
-            >
-              <div class="flex min-w-0 items-center gap-1">
-                <span class="truncate">{{ record.model }}</span>
-                <svg
-                  xmlns="http://www.w3.org/2000/svg"
-                  viewBox="0 0 20 20"
-                  fill="currentColor"
-                  class="w-3 h-3 text-muted-foreground flex-shrink-0"
-                >
-                  <path
-                    fill-rule="evenodd"
-                    d="M3 10a.75.75 0 01.75-.75h10.638L10.23 5.29a.75.75 0 111.04-1.08l5.5 5.25a.75.75 0 010 1.08l-5.5 5.25a.75.75 0 11-1.04-1.08l4.158-3.96H3.75A.75.75 0 013 10z"
-                    clip-rule="evenodd"
-                  />
-                </svg>
-                <Badge
-                  v-if="getReasoningEffort(record)"
-                  variant="outline"
-                  class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
-                  :title="getReasoningEffortTitle(record)"
-                >
-                  {{ getReasoningEffort(record) }}
-                </Badge>
-                <Badge
-                  v-if="getFastBadge(record)"
-                  variant="outline"
-                  class="h-4 rounded-full px-1.5 text-[10px] leading-4 text-foreground flex-shrink-0"
-                  :title="getFastBadgeTitle(record)"
-                >
-                  fast
-                </Badge>
-              </div>
-              <span class="text-muted-foreground truncate">{{ getActualModel(record) }}</span>
-            </div>
-            <span
-              v-else
-              class="flex min-w-0 items-center gap-1"
-            >
-              <span class="truncate">{{ record.model }}</span>
-              <Badge
-                v-if="getReasoningEffort(record)"
-                variant="outline"
-                class="h-4 rounded-full border-primary/30 bg-primary/5 px-1.5 text-[10px] leading-4 text-primary flex-shrink-0"
-                :title="getReasoningEffortTitle(record)"
-              >
-                {{ getReasoningEffort(record) }}
-              </Badge>
-              <Badge
-                v-if="getFastBadge(record)"
-                variant="outline"
-                class="h-4 rounded-full px-1.5 text-[10px] leading-4 text-foreground flex-shrink-0"
-                :title="getFastBadgeTitle(record)"
-              >
-                fast
-              </Badge>
-            </span>
+            <UsageModelDisplay
+              :record="record"
+              class="text-xs"
+            />
           </TableCell>
           <TableCell
             v-if="isAdmin && isColumnVisible('provider')"
@@ -887,6 +872,15 @@
               已取消
             </Badge>
             <Badge
+              v-else-if="isUsageWebSocket(record)"
+              variant="outline"
+              data-usage-transport="websocket"
+              :title="getWebSocketTransportTitle(record)"
+              class="whitespace-nowrap border-sky-500/50 text-sky-600 dark:text-sky-400"
+            >
+              WS
+            </Badge>
+            <Badge
               v-else-if="getStreamModeSegments(record).hasConversion"
               :variant="streamBadgeVariant(getStreamModeSegments(record).client === '流式')"
               :class="(streamBadgeVariant(getStreamModeSegments(record).client === '流式') === 'secondary')
@@ -911,44 +905,63 @@
             v-if="isColumnVisible('tokens')"
             class="py-4 w-[10%]"
           >
-            <div class="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums">
-              <span class="justify-self-end whitespace-nowrap text-right">
-                {{ formatTokens(getRecordEffectiveInputTokens(record)) }}
-              </span>
-              <span class="justify-self-center text-muted-foreground">
-                /
-              </span>
-              <span class="justify-self-start whitespace-nowrap text-left">
-                {{ formatTokens(record.output_tokens || 0) }}
-              </span>
-            </div>
-            <div class="mt-0.5 grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums text-muted-foreground">
-              <span
-                class="justify-self-end whitespace-nowrap text-right"
-                :class="[
-                  hasPositiveTokens(getRecordCacheReadTokens(record)) ? 'text-foreground/70' : ''
-                ]"
+            <template v-if="record.usage_available !== false">
+              <div class="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums">
+                <span class="justify-self-end whitespace-nowrap text-right">
+                  {{ formatTokens(getRecordEffectiveInputTokens(record)) }}
+                </span>
+                <span class="justify-self-center text-muted-foreground">
+                  /
+                </span>
+                <span class="justify-self-start whitespace-nowrap text-left">
+                  {{ formatTokens(record.output_tokens || 0) }}
+                </span>
+              </div>
+              <div class="mt-0.5 grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] gap-x-1 text-xs leading-tight tabular-nums text-muted-foreground">
+                <span
+                  class="justify-self-end whitespace-nowrap text-right"
+                  :class="[
+                    hasPositiveTokens(getRecordCacheReadTokens(record)) ? 'text-foreground/70' : ''
+                  ]"
+                >
+                  {{ formatOptionalTokens(getRecordCacheReadTokens(record)) }}
+                </span>
+                <span class="justify-self-center">
+                  /
+                </span>
+                <span
+                  class="justify-self-start whitespace-nowrap text-left"
+                  :class="[
+                    hasPositiveTokens(getRecordCacheCreationTokens(record)) ? 'text-foreground/70' : ''
+                  ]"
+                >
+                  {{ formatOptionalTokens(getRecordCacheCreationTokens(record)) }}
+                </span>
+              </div>
+              <div
+                v-if="(record.input_audio_tokens || 0) > 0 || (record.output_audio_tokens || 0) > 0"
+                class="mt-0.5 text-right text-[10px] leading-tight tabular-nums text-muted-foreground"
               >
-                {{ formatOptionalTokens(getRecordCacheReadTokens(record)) }}
-              </span>
-              <span class="justify-self-center">
-                /
-              </span>
-              <span
-                class="justify-self-start whitespace-nowrap text-left"
-                :class="[
-                  hasPositiveTokens(getRecordCacheCreationTokens(record)) ? 'text-foreground/70' : ''
-                ]"
-              >
-                {{ formatOptionalTokens(getRecordCacheCreationTokens(record)) }}
-              </span>
+                音频 {{ formatOptionalTokens(record.input_audio_tokens) }} / {{ formatOptionalTokens(record.output_audio_tokens) }}
+              </div>
+            </template>
+            <div
+              v-else
+              data-usage-unavailable="tokens"
+              class="text-right text-xs text-muted-foreground"
+              title="上游未提供可验证的 token/费用用量"
+            >
+              不可用
             </div>
           </TableCell>
           <TableCell
             v-if="isColumnVisible('cost')"
             class="text-right py-4 w-[6%]"
           >
-            <div class="flex flex-col items-end text-xs gap-0.5">
+            <div
+              v-if="record.usage_available !== false && record.usage_pricing_available !== false"
+              class="flex flex-col items-end text-xs gap-0.5"
+            >
               <span class="text-primary font-medium">{{ formatCurrency(record.cost || 0) }}</span>
               <span
                 v-if="showActualCost && record.actual_cost !== undefined && record.rate_multiplier && record.rate_multiplier !== 1.0"
@@ -956,6 +969,22 @@
               >
                 {{ formatCurrency(record.actual_cost) }}
               </span>
+            </div>
+            <div
+              v-else-if="record.usage_available === false"
+              data-usage-unavailable="cost"
+              class="text-xs text-muted-foreground"
+              title="上游未提供可验证的 token/费用用量"
+            >
+              不可用
+            </div>
+            <div
+              v-else
+              data-usage-unpriced="cost"
+              class="text-xs text-muted-foreground"
+              title="token 用量可验证，但当前计价规则不支持该音频用量分项"
+            >
+              未计价
             </div>
           </TableCell>
           <TableCell
@@ -981,7 +1010,7 @@
             </div>
             <!-- 已完成状态：首字 + 总耗时 -->
             <div
-              v-else-if="record.response_time_ms != null || record.first_byte_time_ms != null"
+              v-else-if="hasRecordDisplayLatency(record)"
               class="flex flex-col items-end text-xs gap-0.5"
               :title="getRecordPerformanceTitle(record)"
             >
@@ -1042,8 +1071,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
-import { useDebounceFn, useLocalStorage } from '@vueuse/core'
+import { ref, computed, onBeforeUnmount, watch } from 'vue'
+import { useLocalStorage } from '@vueuse/core'
 import {
   TableCard,
   Badge,
@@ -1077,6 +1106,7 @@ import {
   formatUsageStreamLabel,
   isUsageRecordFailed,
   isUsageUpstreamStream,
+  isUsageWebSocket,
   resolveDisplayRequestStatus,
   resolveUsageStreamLabelSegments
 } from '../utils/status'
@@ -1084,11 +1114,15 @@ import { useRowClick } from '@/composables/useRowClick'
 import { useDarkMode } from '@/composables/useDarkMode'
 import { API_FORMAT_ORDER, formatApiFormat } from '@/api/endpoints/types/api-format'
 import { formatClientFamily } from '@/features/usage/utils/clientFamily'
+import { formatServiceTierFact } from '../utils/service-tier'
+import { isCyberPolicyError } from '../utils/cyberError'
+import { formatUsageWebSocketTransportTitle as getWebSocketTransportTitle } from '../utils/websocketTransport'
 import type { DateRangeParams, UsageRecord } from '../types'
 import { MultiSelect, TimeRangePicker } from '@/components/common'
 import type { MultiSelectOption } from '@/components/common/MultiSelect.vue'
 import ElapsedTimeText from './ElapsedTimeText.vue'
 import ServerUserSelector from './ServerUserSelector.vue'
+import UsageModelDisplay from './UsageModelDisplay.vue'
 
 export interface UserOption {
   id: string
@@ -1244,7 +1278,10 @@ function sanitizeColumnIds(
     seen.add(id as UsageRecordColumnId)
     return true
   })
-  return sanitized.length > 0 ? sanitized : [...fallback]
+  if (sanitized.length === 0) return [...fallback]
+  // Add newly introduced feature column to existing saved layouts, keeping it
+  // immediately before Tokens as the default presentation order.
+  return sanitized
 }
 
 const visibleColumnIds = computed<UsageRecordColumnId[]>({
@@ -1324,9 +1361,10 @@ const apiFormatFilterOptions = computed<FilterOption[]>(() => [
 ])
 
 const statusFilterOptions: FilterOption[] = [
-  { value: '__all__', label: '全部状态' },
-  { value: 'stream', label: '流式' },
-  { value: 'standard', label: '标准' },
+  { value: '__all__', label: '全部类型' },
+  { value: 'stream', label: 'HTTP 流式' },
+  { value: 'standard', label: 'HTTP 标准' },
+  { value: 'websocket', label: 'WebSocket (WS)' },
   { value: 'active', label: '活跃' },
   { value: 'failed', label: '失败' },
   { value: 'cancelled', label: '已取消' },
@@ -1340,10 +1378,26 @@ const timeRangeModel = computed({
 })
 
 // 通用搜索（输入防抖）
+const SEARCH_EMIT_DEBOUNCE_MS = 300
 const localSearch = ref(props.filterSearch)
-const emitSearchDebounced = useDebounceFn((value: string) => {
-  emit('update:filterSearch', value)
-}, 300)
+let searchEmitTimer: ReturnType<typeof setTimeout> | null = null
+
+function cancelPendingSearchEmit() {
+  if (searchEmitTimer !== null) {
+    clearTimeout(searchEmitTimer)
+    searchEmitTimer = null
+  }
+}
+
+function scheduleSearchEmit(value: string) {
+  cancelPendingSearchEmit()
+  searchEmitTimer = setTimeout(() => {
+    searchEmitTimer = null
+    if (value !== props.filterSearch) {
+      emit('update:filterSearch', value)
+    }
+  }, SEARCH_EMIT_DEBOUNCE_MS)
+}
 
 function getDisplayStatus(record: UsageRecord) {
   return resolveDisplayRequestStatus(record)
@@ -1389,14 +1443,36 @@ function formatRecordTime(dateStr: string): string {
   return `${hours}:${minutes}:${seconds}`
 }
 
+function getRecordUserName(record: UsageRecord): string {
+  return record.username || record.user_email || (record.user_id ? `User ${record.user_id}` : '已删除用户')
+}
+
+function formatRecordUserProviderLine(record: UsageRecord): string {
+  return `${formatRecordUserSegment(record)} · ${formatRecordProviderSegment(record)}`
+}
+
+function formatRecordUserSegment(record: UsageRecord): string {
+  return `${getRecordUserName(record)} / ${record.api_key?.name || '-'}`
+}
+
+function formatRecordProviderSegment(record: UsageRecord): string {
+  return `${record.provider || '-'} / ${record.provider_key_name || '-'}`
+}
+
 watch(() => props.filterSearch, (value) => {
   if (value !== localSearch.value) {
+    cancelPendingSearchEmit()
     localSearch.value = value
   }
 })
 
 watch(localSearch, (value) => {
-  emitSearchDebounced(value)
+  if (value === props.filterSearch) return
+  scheduleSearchEmit(value)
+})
+
+onBeforeUnmount(() => {
+  cancelPendingSearchEmit()
 })
 
 // 使用复用的行点击逻辑
@@ -1457,14 +1533,23 @@ function getRecordCacheTokensTitle(record: UsageRecord): string {
 }
 
 function formatRecordLatencyPair(record: UsageRecord): string {
-  const firstByte = formatRecordDurationSeconds(record.first_byte_time_ms)
-  const total = formatRecordDurationSeconds(record.response_time_ms)
+  const firstByte = formatRecordDurationSeconds(
+    record.end_to_end_first_byte_time_ms ?? record.first_byte_time_ms,
+  )
+  const total = formatRecordDurationSeconds(record.end_to_end_time_ms ?? record.response_time_ms)
   return `${firstByte} / ${total}`
 }
 
 function formatRecordDurationSeconds(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms)) return '-'
   return `${(ms / 1000).toFixed(2)}s`
+}
+
+function hasRecordDisplayLatency(record: UsageRecord): boolean {
+  return record.end_to_end_time_ms != null
+    || record.end_to_end_first_byte_time_ms != null
+    || record.response_time_ms != null
+    || record.first_byte_time_ms != null
 }
 
 function getRecordDisplayOutputRate(record: UsageRecord): number | null {
@@ -1480,8 +1565,10 @@ function getRecordDisplayOutputRate(record: UsageRecord): number | null {
 function getRecordPerformanceTitle(record: UsageRecord): string {
   const outputRate = getRecordDisplayOutputRate(record)
   return [
-    `首字: ${formatRecordDurationSeconds(record.first_byte_time_ms)}`,
-    `总耗时: ${formatRecordDurationSeconds(record.response_time_ms)}`,
+    `端到端首字: ${formatRecordDurationSeconds(record.end_to_end_first_byte_time_ms ?? record.first_byte_time_ms)}`,
+    `端到端总耗时: ${formatRecordDurationSeconds(record.end_to_end_time_ms ?? record.response_time_ms)}`,
+    `成功候选首字: ${formatRecordDurationSeconds(record.first_byte_time_ms)}`,
+    `成功候选耗时: ${formatRecordDurationSeconds(record.response_time_ms)}`,
     `生成耗时: ${formatRecordDurationSeconds(getGenerationTimeMs(record))}`,
     `输出速度: ${formatOutputRateTokensPerSecond(outputRate)}`,
   ].join('\n')
@@ -1530,7 +1617,7 @@ function getApiFormatTooltip(record: UsageRecord): string {
     return `用户请求格式: ${displayFormat}\n端点原生格式: ${endpointDisplayFormat}\n${conversionType}`
   }
 
-  return record.api_format
+  return displayFormat
 }
 
 // 获取实际使用的模型（优先 target_model，其次列表接口下发的 model_version）
@@ -1548,35 +1635,85 @@ function getActualModel(record: UsageRecord): string | null {
 }
 
 function getReasoningEffort(record: UsageRecord): string | null {
-  const effort = record.reasoning_effort?.trim()
-  return effort || null
+  const requested = record.requested_reasoning_effort?.trim()
+  const actual = record.reasoning_effort?.trim()
+  if (requested && actual && requested.toLowerCase() !== actual.toLowerCase()) {
+    return `${requested} -> ${actual}`
+  }
+  return actual || requested || null
 }
 
-function getReasoningEffortTitle(record: UsageRecord): string {
-  const effort = getReasoningEffort(record)
-  return effort ? `Reasoning: ${effort}` : ''
+function hasCyberPolicyError(record: UsageRecord): boolean {
+  return isCyberPolicyError(record.error_message)
 }
 
-function getServiceTier(record: UsageRecord): string | null {
-  const serviceTier = record.service_tier?.trim().toLowerCase()
+interface ServiceTierBadgePresentation {
+  label: string
+  className: string
+  title: string
+  ariaLabel: string
+}
+
+function normalizeServiceTier(value: string | null | undefined): string | null {
+  const serviceTier = value?.trim().toLowerCase()
   return serviceTier || null
 }
 
-function getFastBadge(record: UsageRecord): boolean {
-  return getServiceTier(record) === 'priority'
+function canonicalServiceTier(value: string | null): string | null {
+  if (value === 'auto' || value === 'default' || value === 'standard') {
+    return 'standard'
+  }
+  if (value === 'fast') {
+    return 'priority'
+  }
+  return value
 }
 
-function getFastBadgeTitle(record: UsageRecord): string {
-  const serviceTier = getServiceTier(record)
-  return serviceTier ? `Service tier: ${serviceTier}` : ''
+function buildServiceTierBadgePresentation(
+  requestedRaw: string | null,
+): ServiceTierBadgePresentation {
+  const titleLines: string[] = []
+  const requestedLabel = formatServiceTierFact(requestedRaw)
+  if (requestedLabel) titleLines.push(`上游请求档位：${requestedLabel}`)
+  // Billing is resolved from the same final provider request tier. Keep it
+  // explicit in the tooltip without consulting a response-side tier.
+  if (requestedLabel) titleLines.push(`计费档位：${requestedLabel}`)
+  const title = titleLines.join('\n')
+  return {
+    label: 'Fast',
+    className: '!bg-transparent text-blue-500 dark:text-blue-300',
+    title,
+    ariaLabel: titleLines.join('，'),
+  }
+}
+
+function getServiceTierBadge(record: UsageRecord): ServiceTierBadgePresentation | null {
+  const requestedRaw = normalizeServiceTier(record.service_tier)
+  const requested = canonicalServiceTier(requestedRaw)
+  const requestedFast = requested === 'priority'
+  if (!requestedFast) return null
+  return buildServiceTierBadgePresentation(requestedRaw)
+}
+
+function getServiceTierTitle(record: UsageRecord): string {
+  const badge = getServiceTierBadge(record)
+  if (badge) return badge.title
+
+  const requested = formatServiceTierFact(record.service_tier)
+  return [
+    requested ? `上游请求档位：${requested}` : null,
+    requested ? `计费档位：${requested}` : null,
+  ].filter((line): line is string => Boolean(line)).join('\n')
 }
 
 // 获取模型列的 tooltip
 function getModelTooltip(record: UsageRecord): string {
   const actualModel = getActualModel(record)
   const reasoningEffort = getReasoningEffort(record)
-  const fastSuffix = getFastBadge(record) ? '\nService tier: priority' : ''
-  const suffix = `${reasoningEffort ? `\nReasoning: ${reasoningEffort}` : ''}${fastSuffix}`
+  const serviceTierTitle = getServiceTierTitle(record)
+  const tierSuffix = serviceTierTitle ? `\n${serviceTierTitle}` : ''
+  const cyberSuffix = hasCyberPolicyError(record) ? '\nCyber Policy: blocked' : ''
+  const suffix = `${reasoningEffort ? `\nReasoning: ${reasoningEffort}` : ''}${tierSuffix}${cyberSuffix}`
   if (actualModel) {
     return `${record.model} -> ${actualModel}${suffix}`
   }

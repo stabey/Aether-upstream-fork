@@ -1,9 +1,15 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
+use aether_crypto::{
+    decrypt_python_fernet_ciphertext, encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY,
+};
+use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::proxy_nodes::InMemoryProxyNodeRepository;
+use aether_data_contracts::repository::global_models::{
+    AdminProviderModelListQuery, GlobalModelReadRepository,
+};
 use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogReadRepository, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
@@ -22,6 +28,30 @@ use crate::constants::{
     TRUSTED_ADMIN_USER_ROLE_HEADER,
 };
 use crate::data::GatewayDataState;
+
+const PROVIDER_QUOTA_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_provider_quota_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(PROVIDER_QUOTA_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("provider quota test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
 
 #[tokio::test]
 async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_admin_principal() {
@@ -46,7 +76,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
         }),
     );
 
-    let seen_execution_runtime = Arc::new(Mutex::new(None::<SeenExecutionRuntimeRequest>));
+    let seen_execution_runtime = Arc::new(Mutex::new(Vec::<SeenExecutionRuntimeRequest>::new()));
     let seen_execution_runtime_clone = Arc::clone(&seen_execution_runtime);
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
@@ -59,21 +89,22 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
                         .expect("body should read"),
                 )
                 .expect("plan should parse");
-                *seen_execution_runtime_inner
+                seen_execution_runtime_inner
                     .lock()
-                    .expect("mutex should lock") = Some(SeenExecutionRuntimeRequest {
-                    url: plan.url.clone(),
-                    authorization: plan
-                        .headers
-                        .get("authorization")
-                        .cloned()
-                        .unwrap_or_default(),
-                    provider_api_format: plan.provider_api_format.clone(),
-                    total_ms: plan
-                        .timeouts
-                        .as_ref()
-                        .and_then(|timeouts| timeouts.total_ms),
-                });
+                    .expect("mutex should lock")
+                    .push(SeenExecutionRuntimeRequest {
+                        url: plan.url.clone(),
+                        authorization: plan
+                            .headers
+                            .get("authorization")
+                            .cloned()
+                            .unwrap_or_default(),
+                        provider_api_format: plan.provider_api_format.clone(),
+                        total_ms: plan
+                            .timeouts
+                            .as_ref()
+                            .and_then(|timeouts| timeouts.total_ms),
+                    });
                 let result = aether_contracts::ExecutionResult {
                     request_id: plan.request_id,
                     candidate_id: None,
@@ -96,6 +127,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
                             "1900500000".to_string(),
                         ),
                     ]),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "plan_type": "plus",
@@ -199,24 +231,24 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
-    let seen_execution_runtime_request = seen_execution_runtime
+    let seen_execution_runtime_requests = seen_execution_runtime
         .lock()
         .expect("mutex should lock")
-        .clone()
-        .expect("execution runtime request should be captured");
+        .clone();
+    assert_eq!(seen_execution_runtime_requests.len(), 2);
     assert_eq!(
-        seen_execution_runtime_request.url,
+        seen_execution_runtime_requests[0].url,
         "https://chatgpt.com/backend-api/wham/usage"
     );
     assert_eq!(
-        seen_execution_runtime_request.authorization,
-        "Bearer sk-codex-123"
+        seen_execution_runtime_requests[1].url,
+        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
     );
-    assert_eq!(
-        seen_execution_runtime_request.provider_api_format,
-        "openai:responses"
-    );
-    assert_eq!(seen_execution_runtime_request.total_ms, Some(30_000));
+    for request in seen_execution_runtime_requests {
+        assert_eq!(request.authorization, "Bearer sk-codex-123");
+        assert_eq!(request.provider_api_format, "openai:responses");
+        assert_eq!(request.total_ms, Some(30_000));
+    }
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-codex-a".to_string()])
@@ -270,6 +302,467 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_codex_with_trusted_a
     upstream_handle.abort();
 }
 
+#[test]
+fn gateway_codex_quota_refresh_persists_after_automatic_oauth_token_refresh() {
+    run_provider_quota_test(
+        "gateway_codex_quota_refresh_persists_after_automatic_oauth_token_refresh",
+        gateway_codex_quota_refresh_persists_after_automatic_oauth_token_refresh_impl,
+    );
+}
+
+async fn gateway_codex_quota_refresh_persists_after_automatic_oauth_token_refresh_impl() {
+    let token_hits = Arc::new(Mutex::new(0usize));
+    let token_server = Router::new().route(
+        "/oauth/token",
+        post({
+            let token_hits = Arc::clone(&token_hits);
+            move || {
+                let token_hits = Arc::clone(&token_hits);
+                async move {
+                    *token_hits.lock().expect("mutex should lock") += 1;
+                    Json(json!({
+                        "access_token": "refreshed-codex-access-token",
+                        "refresh_token": "rotated-codex-refresh-token",
+                        "token_type": "Bearer",
+                        "expires_in": 3_600,
+                        "account_id": "acct-quota-refresh",
+                        "plan_type": "plus"
+                    }))
+                }
+            }
+        }),
+    );
+
+    let seen_requests = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any({
+            let seen_requests = Arc::clone(&seen_requests);
+            move |request: Request| {
+                let seen_requests = Arc::clone(&seen_requests);
+                async move {
+                    let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                        &to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .expect("body should read"),
+                    )
+                    .expect("plan should parse");
+                    seen_requests.lock().expect("mutex should lock").push((
+                        plan.url.clone(),
+                        plan.headers
+                            .get("authorization")
+                            .cloned()
+                            .unwrap_or_default(),
+                    ));
+                    let body_json = match plan.url.as_str() {
+                        "https://chatgpt.com/backend-api/wham/usage" => json!({
+                            "plan_type": "plus",
+                            "rate_limit": {
+                                "primary_window": {
+                                    "used_percent": 23.0,
+                                    "reset_at": 1_900_000_000u64,
+                                    "window_minutes": 300
+                                }
+                            }
+                        }),
+                        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" => {
+                            json!({"available_count": 0, "credits": []})
+                        }
+                        url => panic!("unexpected execution runtime URL: {url}"),
+                    };
+                    let result = aether_contracts::ExecutionResult {
+                        request_id: plan.request_id,
+                        candidate_id: None,
+                        status_code: 200,
+                        headers: BTreeMap::new(),
+                        response_observation: None,
+                        body: Some(aether_contracts::ResponseBody {
+                            json_body: Some(body_json),
+                            body_bytes_b64: None,
+                        }),
+                        telemetry: None,
+                        error: None,
+                    };
+                    (StatusCode::OK, Json(result))
+                }
+            }
+        }),
+    );
+
+    let mut key = sample_key(
+        "key-codex-expired-quota",
+        "provider-codex-expired-quota",
+        "openai:responses",
+        "expired-codex-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.expires_at_unix_secs = Some(1);
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            &json!({
+                "provider_type": "codex",
+                "refresh_token": "expired-codex-refresh-token",
+                "expires_at": 1,
+                "account_id": "acct-quota-refresh",
+                "plan_type": "plus"
+            })
+            .to_string(),
+        )
+        .expect("auth config should encrypt"),
+    );
+    key.upstream_metadata = Some(json!({
+        "codex": {"credential_generation": "credential-quota-refresh"}
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-codex-expired-quota".to_string(),
+            "codex".to_string(),
+            Some("https://example.com".to_string()),
+            "codex".to_string(),
+        )
+        .expect("provider should build")],
+        vec![sample_endpoint(
+            "endpoint-codex-expired-quota",
+            "provider-codex-expired-quota",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        vec![key],
+    ));
+
+    let (token_url, token_handle) = start_server(token_server).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let oauth_refresh =
+        crate::provider_transport::LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![
+            Arc::new(
+                crate::provider_transport::oauth_refresh::GenericOAuthRefreshAdapter::default()
+                    .with_token_url_for_tests("codex", format!("{token_url}/oauth/token")),
+            ),
+        ]);
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            )
+            .with_oauth_refresh_coordinator_for_tests(oauth_refresh),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/providers/provider-codex-expired-quota/refresh-quota"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["success"], 1, "payload={payload}");
+    assert_eq!(payload["failed"], 0, "payload={payload}");
+    assert_eq!(payload["results"][0]["status"], "success");
+    assert_eq!(*token_hits.lock().expect("mutex should lock"), 1);
+    assert_eq!(
+        seen_requests.lock().expect("mutex should lock").as_slice(),
+        [
+            (
+                "https://chatgpt.com/backend-api/wham/usage".to_string(),
+                "Bearer refreshed-codex-access-token".to_string(),
+            ),
+            (
+                "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits".to_string(),
+                "Bearer refreshed-codex-access-token".to_string(),
+            ),
+        ]
+    );
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-expired-quota".to_string()])
+        .await
+        .expect("key should reload");
+    let persisted = reloaded.first().expect("key should remain installed");
+    let decrypted_api_key = decrypt_python_fernet_ciphertext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        persisted
+            .encrypted_api_key
+            .as_deref()
+            .expect("api key should persist"),
+    )
+    .expect("api key should decrypt");
+    assert_eq!(decrypted_api_key, "refreshed-codex-access-token");
+    let decrypted_auth_config = decrypt_python_fernet_ciphertext(
+        DEVELOPMENT_ENCRYPTION_KEY,
+        persisted
+            .encrypted_auth_config
+            .as_deref()
+            .expect("auth config should persist"),
+    )
+    .expect("auth config should decrypt");
+    let auth_config: serde_json::Value =
+        serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
+    assert_eq!(auth_config["refresh_token"], "rotated-codex-refresh-token");
+    assert_eq!(
+        persisted
+            .upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/codex/credential_generation")),
+        Some(&json!("credential-quota-refresh"))
+    );
+    assert_eq!(
+        persisted
+            .upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/codex/primary_used_percent")),
+        Some(&json!(23.0))
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    token_handle.abort();
+}
+
+#[test]
+fn gateway_codex_reset_credit_retries_until_same_window_usage_drop_is_authoritative() {
+    run_provider_quota_test(
+        "gateway_codex_reset_credit_retries_until_same_window_usage_drop_is_authoritative",
+        gateway_codex_reset_credit_retries_until_same_window_usage_drop_is_authoritative_impl,
+    );
+}
+
+async fn gateway_codex_reset_credit_retries_until_same_window_usage_drop_is_authoritative_impl() {
+    const RESET_FENCE_UNIX_MS: u64 = 1_800_000_000_000;
+    const RESET_AT_UNIX_SECS: u64 = 2_000_000_000;
+
+    let usage_hits = Arc::new(Mutex::new(0usize));
+    let detail_hits = Arc::new(Mutex::new(0usize));
+    let seen_urls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any({
+            let usage_hits = Arc::clone(&usage_hits);
+            let detail_hits = Arc::clone(&detail_hits);
+            let seen_urls = Arc::clone(&seen_urls);
+            move |request: Request| {
+                let usage_hits = Arc::clone(&usage_hits);
+                let detail_hits = Arc::clone(&detail_hits);
+                let seen_urls = Arc::clone(&seen_urls);
+                async move {
+                    let plan: aether_contracts::ExecutionPlan = serde_json::from_slice(
+                        &to_bytes(request.into_body(), usize::MAX)
+                            .await
+                            .expect("body should read"),
+                    )
+                    .expect("plan should parse");
+                    seen_urls
+                        .lock()
+                        .expect("mutex should lock")
+                        .push(plan.url.clone());
+                    assert_eq!(
+                        plan.headers.get("authorization").map(String::as_str),
+                        Some("Bearer codex-reset-access-token")
+                    );
+
+                    let (body_json, response_observation) = match plan.url.as_str() {
+                        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume" => {
+                            assert_eq!(plan.method, "POST");
+                            assert_eq!(
+                                plan.body.json_body,
+                                Some(json!({"redeem_request_id": "reset-e2e"}))
+                            );
+                            (
+                                json!({"outcome": "reset"}),
+                                Some(aether_contracts::ExecutionResponseObservation {
+                                    request_started_at_unix_ms: RESET_FENCE_UNIX_MS - 100,
+                                    response_headers_observed_at_unix_ms: RESET_FENCE_UNIX_MS,
+                                    request_order_id: "consume-reset-e2e".to_string(),
+                                }),
+                            )
+                        }
+                        "https://chatgpt.com/backend-api/wham/usage" => {
+                            let hit = {
+                                let mut hits = usage_hits.lock().expect("mutex should lock");
+                                *hits += 1;
+                                *hits
+                            };
+                            let used_percent = match hit {
+                                1 => 100.0,
+                                2 => 0.0,
+                                _ => panic!("unexpected wham/usage request #{hit}"),
+                            };
+                            (
+                                json!({
+                                    "plan_type": "plus",
+                                    "rate_limit": {
+                                        "primary_window": {
+                                            "used_percent": used_percent,
+                                            "reset_at": RESET_AT_UNIX_SECS,
+                                            "window_minutes": 300
+                                        }
+                                    }
+                                }),
+                                Some(aether_contracts::ExecutionResponseObservation {
+                                    request_started_at_unix_ms: RESET_FENCE_UNIX_MS
+                                        + (hit as u64 * 1_000),
+                                    response_headers_observed_at_unix_ms: RESET_FENCE_UNIX_MS
+                                        + (hit as u64 * 1_000)
+                                        + 100,
+                                    request_order_id: format!("usage-reset-e2e-{hit}"),
+                                }),
+                            )
+                        }
+                        "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" => {
+                            *detail_hits.lock().expect("mutex should lock") += 1;
+                            (json!({"available_count": 0, "credits": []}), None)
+                        }
+                        url => panic!("unexpected execution runtime URL: {url}"),
+                    };
+                    let result = aether_contracts::ExecutionResult {
+                        request_id: plan.request_id,
+                        candidate_id: None,
+                        status_code: 200,
+                        headers: BTreeMap::new(),
+                        response_observation,
+                        body: Some(aether_contracts::ResponseBody {
+                            json_body: Some(body_json),
+                            body_bytes_b64: None,
+                        }),
+                        telemetry: None,
+                        error: None,
+                    };
+                    (StatusCode::OK, Json(result))
+                }
+            }
+        }),
+    );
+
+    let mut key = sample_key(
+        "key-codex-reset",
+        "provider-codex-reset",
+        "openai:responses",
+        "codex-reset-access-token",
+    );
+    key.auth_type = "oauth".to_string();
+    key.expires_at_unix_secs = Some(4_102_444_800);
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            &json!({
+                "provider_type": "codex",
+                "refresh_token": "codex-reset-refresh-token",
+                "expires_at": 4_102_444_800u64,
+                "account_id": "acct-reset-e2e",
+                "plan_type": "plus"
+            })
+            .to_string(),
+        )
+        .expect("auth config should encrypt"),
+    );
+    key.upstream_metadata = Some(json!({
+        "codex": {
+            "credential_generation": "credential-reset-e2e",
+            "plan_type": "plus",
+            "primary_used_percent": 100.0,
+            "primary_reset_at": RESET_AT_UNIX_SECS,
+            "primary_window_minutes": 300,
+            "updated_at": (RESET_FENCE_UNIX_MS / 1_000) - 1,
+            "account_quota_request_started_at_unix_ms": RESET_FENCE_UNIX_MS - 1_000,
+            "account_quota_request_id": "usage-before-reset"
+        }
+    }));
+
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![StoredProviderCatalogProvider::new(
+            "provider-codex-reset".to_string(),
+            "codex".to_string(),
+            Some("https://example.com".to_string()),
+            "codex".to_string(),
+        )
+        .expect("provider should build")],
+        vec![sample_endpoint(
+            "endpoint-codex-reset",
+            "provider-codex-reset",
+            "openai:responses",
+            "https://chatgpt.com/backend-api",
+        )],
+        vec![key],
+    ));
+
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                GatewayDataState::with_provider_catalog_repository_for_tests(
+                    provider_catalog_repository.clone(),
+                )
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{gateway_url}/api/admin/endpoints/keys/key-codex-reset/codex-reset-credit/consume"
+        ))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "idempotency_key": "reset-e2e",
+            "expected_credential_generation": "credential-reset-e2e"
+        }))
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["status"], "success", "payload={payload}");
+    assert_eq!(payload["outcome"], "reset");
+    assert_eq!(payload["refresh_status"], "success");
+    assert_eq!(*usage_hits.lock().expect("mutex should lock"), 2);
+    assert_eq!(*detail_hits.lock().expect("mutex should lock"), 2);
+    assert_eq!(
+        seen_urls.lock().expect("mutex should lock").as_slice(),
+        [
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
+            "https://chatgpt.com/backend-api/wham/usage",
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+            "https://chatgpt.com/backend-api/wham/usage",
+            "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+        ]
+    );
+
+    let reloaded = provider_catalog_repository
+        .list_keys_by_ids(&["key-codex-reset".to_string()])
+        .await
+        .expect("key should reload");
+    let codex = reloaded[0]
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("codex"))
+        .expect("codex metadata should persist");
+    assert_eq!(codex["primary_used_percent"], json!(0.0));
+    assert_eq!(codex["primary_reset_at"], json!(RESET_AT_UNIX_SECS));
+    assert_eq!(codex["account_quota_reset_pending"], json!(false));
+    assert_eq!(
+        codex["account_quota_reset_processed_ids"],
+        json!(["reset-e2e"])
+    );
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+}
+
 #[tokio::test]
 async fn gateway_marks_codex_quota_exhausted_when_wham_usage_returns_payment_required() {
     let upstream = Router::new().route(
@@ -293,6 +786,7 @@ async fn gateway_marks_codex_quota_exhausted_when_wham_usage_returns_payment_req
                 candidate_id: None,
                 status_code: 402,
                 headers: BTreeMap::new(),
+                response_observation: None,
                 body: Some(aether_contracts::ResponseBody {
                     json_body: Some(json!({
                         "error": {
@@ -392,7 +886,7 @@ async fn gateway_marks_codex_quota_exhausted_when_wham_usage_returns_payment_req
 }
 
 #[tokio::test]
-async fn gateway_retains_codex_key_when_quota_only_reports_oauth_invalid() {
+async fn gateway_auto_removes_codex_key_when_quota_proves_oauth_invalid() {
     let upstream = Router::new().route(
         "/api/admin/endpoints/providers/provider-codex/refresh-quota",
         any(move |_request: Request| async move {
@@ -414,6 +908,7 @@ async fn gateway_retains_codex_key_when_quota_only_reports_oauth_invalid() {
                 candidate_id: None,
                 status_code: 401,
                 headers: BTreeMap::new(),
+                response_observation: None,
                 body: Some(aether_contracts::ResponseBody {
                     json_body: Some(json!({
                         "error": {
@@ -449,11 +944,18 @@ async fn gateway_retains_codex_key_when_quota_only_reports_oauth_invalid() {
         "stale-access-token",
     );
     key.auth_type = "oauth".to_string();
-    key.expires_at_unix_secs = Some(1);
+    key.expires_at_unix_secs = Some(4_102_444_800);
     key.oauth_invalid_at_unix_secs = Some(1);
     key.oauth_invalid_reason = Some(
         "[REFRESH_FAILED] Token 续期失败 (401): refresh_token 无效、已过期或已撤销，请重新登录授权"
             .to_string(),
+    );
+    key.encrypted_auth_config = Some(
+        encrypt_python_fernet_plaintext(
+            DEVELOPMENT_ENCRYPTION_KEY,
+            r#"{"provider_type":"codex","refresh_token":"invalid-refresh-token","expires_at":4102444800}"#,
+        )
+        .expect("auth config should encrypt"),
     );
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
@@ -496,19 +998,15 @@ async fn gateway_retains_codex_key_when_quota_only_reports_oauth_invalid() {
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["success"], 0);
     assert_eq!(payload["failed"], 1);
-    assert_eq!(payload["auto_removed"], 0);
+    assert_eq!(payload["auto_removed"], 1, "payload={payload}");
     assert_eq!(payload["results"][0]["status"], "auth_invalid");
-    assert!(payload["results"][0].get("auto_removed").is_none());
+    assert_eq!(payload["results"][0]["auto_removed"], true);
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-codex-expired".to_string()])
         .await
         .expect("keys should read");
-    assert_eq!(reloaded.len(), 1);
-    assert!(reloaded[0]
-        .oauth_invalid_reason
-        .as_deref()
-        .is_some_and(|reason| reason.starts_with("[OAUTH_EXPIRED]")));
+    assert!(reloaded.is_empty());
 
     gateway_handle.abort();
     execution_runtime_handle.abort();
@@ -566,6 +1064,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_requested_codex_keys
                             "1900000000".to_string(),
                         ),
                     ]),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "plan_type": "plus",
@@ -655,7 +1154,10 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_requested_codex_keys
             .lock()
             .expect("mutex should lock")
             .clone(),
-        vec!["Bearer sk-codex-a".to_string()]
+        vec![
+            "Bearer sk-codex-a".to_string(),
+            "Bearer sk-codex-a".to_string(),
+        ]
     );
 
     let reloaded = provider_catalog_repository
@@ -709,6 +1211,7 @@ async fn gateway_refreshes_admin_provider_quota_for_codex_proxy_with_extended_ti
                     candidate_id: None,
                     status_code: 200,
                     headers: BTreeMap::new(),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "plan_type": "plus",
@@ -866,6 +1369,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_kiro_with_trusted_ad
                     candidate_id: None,
                     status_code: 200,
                     headers: BTreeMap::new(),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "subscriptionInfo": {
@@ -1249,6 +1753,7 @@ async fn gateway_refresh_kiro_quota_reconciles_missing_fixed_endpoint_before_ref
                     candidate_id: None,
                     status_code: 200,
                     headers: BTreeMap::new(),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "subscriptionInfo": {
@@ -1412,6 +1917,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_gemini_cli_with_trus
                     candidate_id: None,
                     status_code: 200,
                     headers: BTreeMap::new(),
+                    response_observation: None,
                     body: Some(aether_contracts::ResponseBody {
                         json_body: Some(json!({
                             "buckets": [
@@ -1570,13 +2076,13 @@ async fn gateway_refresh_quota_reconciles_unsupported_fixed_provider_endpoints_b
             "claude_code",
             1usize,
             "claude:messages",
-            "https://api.anthropic.com",
+            "https://api.anthropic.com/v1",
             "Claude Code 暂不支持自动刷新额度",
         ),
         (
             "provider-vertex-ai-reconcile",
             "vertex_ai",
-            3usize,
+            2usize,
             "gemini:generate_content",
             "https://aiplatform.googleapis.com",
             "Vertex AI 暂不支持自动刷新额度",
@@ -1748,13 +2254,22 @@ async fn gateway_reports_codex_quota_runtime_failures_locally_without_falling_ba
     upstream_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal(
+#[test]
+fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal() {
+    run_provider_quota_test(
+        "gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal",
+        gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal_inner,
+    );
+}
+
+async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_trusted_admin_principal_inner(
 ) {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeRequest {
         url: String,
         authorization: String,
+        user_agent: String,
+        x_client_version: String,
         provider_api_format: String,
         request_body: Option<serde_json::Value>,
     }
@@ -1772,7 +2287,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         }),
     );
 
-    let seen_execution_runtime = Arc::new(Mutex::new(None::<SeenExecutionRuntimeRequest>));
+    let seen_execution_runtime = Arc::new(Mutex::new(Vec::<SeenExecutionRuntimeRequest>::new()));
     let seen_execution_runtime_clone = Arc::clone(&seen_execution_runtime);
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
@@ -1785,25 +2300,30 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                         .expect("body should read"),
                 )
                 .expect("plan should parse");
-                *seen_execution_runtime_inner
+                let request_body = plan.body.json_body.clone();
+                seen_execution_runtime_inner
                     .lock()
-                    .expect("mutex should lock") = Some(SeenExecutionRuntimeRequest {
-                    url: plan.url.clone(),
-                    authorization: plan
-                        .headers
-                        .get("authorization")
-                        .cloned()
-                        .unwrap_or_default(),
-                    provider_api_format: plan.provider_api_format.clone(),
-                    request_body: plan.body.json_body.clone(),
-                });
-                let result = aether_contracts::ExecutionResult {
-                    request_id: plan.request_id,
-                    candidate_id: None,
-                    status_code: 200,
-                    headers: BTreeMap::new(),
-                    body: Some(aether_contracts::ResponseBody {
-                        json_body: Some(json!({
+                    .expect("mutex should lock")
+                    .push(SeenExecutionRuntimeRequest {
+                        url: plan.url.clone(),
+                        authorization: plan
+                            .headers
+                            .get("authorization")
+                            .cloned()
+                            .unwrap_or_default(),
+                        user_agent: plan.headers.get("user-agent").cloned().unwrap_or_default(),
+                        x_client_version: plan
+                            .headers
+                            .get("x-client-version")
+                            .cloned()
+                            .unwrap_or_default(),
+                        provider_api_format: plan.provider_api_format.clone(),
+                        request_body: request_body.clone(),
+                    });
+                let (status_code, json_body) = match plan.provider_api_format.as_str() {
+                    "antigravity:fetch_available_models" => (
+                        200,
+                        json!({
                             "models": {
                                 "claude-sonnet-4": {
                                     "displayName": "Claude Sonnet 4",
@@ -1814,9 +2334,55 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                                 },
                                 "gemini-2.5-pro": {
                                     "displayName": "Gemini 2.5 Pro"
+                                },
+                                "gemini-3.7-flash-tiered": {
+                                    "displayName": "Gemini 3.7 Flash"
+                                },
+                                "chat_23310": {
+                                    "displayName": "Internal Chat"
                                 }
                             }
-                        })),
+                        }),
+                    ),
+                    "antigravity:retrieve_user_quota_summary"
+                        if request_body
+                            .as_ref()
+                            .and_then(|body| body.get("project"))
+                            .is_some() =>
+                    {
+                        (403, json!({"error": {"message": "project not accepted"}}))
+                    }
+                    "antigravity:retrieve_user_quota_summary" => (
+                        200,
+                        json!({
+                            "groups": [{
+                                "displayName": "Claude and GPT models",
+                                "description": "Shared quota",
+                                "buckets": [{
+                                    "bucketId": "3p-5h",
+                                    "window": "5h",
+                                    "remainingFraction": 0.25,
+                                    "resetTime": "2026-05-05T05:00:00Z",
+                                    "displayName": "5 hour"
+                                }, {
+                                    "bucketId": "3p-weekly",
+                                    "window": "weekly",
+                                    "remainingFraction": 0.8,
+                                    "resetTime": "2026-05-11T00:00:00Z"
+                                }]
+                            }]
+                        }),
+                    ),
+                    unexpected => panic!("unexpected quota request format: {unexpected}"),
+                };
+                let result = aether_contracts::ExecutionResult {
+                    request_id: plan.request_id,
+                    candidate_id: None,
+                    status_code,
+                    headers: BTreeMap::new(),
+                    response_observation: None,
+                    body: Some(aether_contracts::ResponseBody {
+                        json_body: Some(json_body),
                         body_bytes_b64: None,
                     }),
                     telemetry: None,
@@ -1875,6 +2441,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         )],
         vec![key],
     ));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::default());
 
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
@@ -1884,6 +2451,7 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
                 GatewayDataState::with_provider_catalog_repository_for_tests(
                     provider_catalog_repository.clone(),
                 )
+                .with_global_model_repository_for_tests(global_model_repository.clone())
                 .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
             ),
     );
@@ -1919,31 +2487,55 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
         payload["results"][0]["quota_snapshot"]["windows"]
             .as_array()
             .map(Vec::len),
-        Some(1usize)
+        Some(3usize)
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
-    let seen_execution_runtime_request = seen_execution_runtime
+    let seen_execution_runtime_requests = seen_execution_runtime
         .lock()
         .expect("mutex should lock")
-        .clone()
-        .expect("execution runtime request should be captured");
+        .clone();
+    assert_eq!(seen_execution_runtime_requests.len(), 3);
+    let fetch_models_request = &seen_execution_runtime_requests[0];
     assert_eq!(
-        seen_execution_runtime_request.url,
+        fetch_models_request.url,
         "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
     );
+    assert_eq!(fetch_models_request.authorization, "Bearer ya29.ant-token");
     assert_eq!(
-        seen_execution_runtime_request.authorization,
-        "Bearer ya29.ant-token"
+        fetch_models_request.user_agent,
+        "vscode/1.X.X (Antigravity/4.3.0)"
     );
+    assert_eq!(fetch_models_request.x_client_version, "4.3.0");
     assert_eq!(
-        seen_execution_runtime_request.provider_api_format,
+        fetch_models_request.provider_api_format,
         "antigravity:fetch_available_models"
     );
     assert_eq!(
-        seen_execution_runtime_request.request_body,
+        fetch_models_request.request_body,
         Some(json!({ "project": "project-ant-123" }))
     );
+    let grouped_with_project = &seen_execution_runtime_requests[1];
+    let grouped_without_project = &seen_execution_runtime_requests[2];
+    assert_eq!(
+        grouped_with_project.url,
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+    );
+    assert_eq!(
+        grouped_with_project.provider_api_format,
+        "antigravity:retrieve_user_quota_summary"
+    );
+    assert_eq!(
+        grouped_with_project.request_body,
+        Some(json!({"project": "project-ant-123"}))
+    );
+    assert_eq!(grouped_without_project.url, grouped_with_project.url);
+    assert_eq!(grouped_without_project.request_body, Some(json!({})));
+    assert!(seen_execution_runtime_requests.iter().all(|request| {
+        request.authorization == "Bearer ya29.ant-token"
+            && request.user_agent == "vscode/1.X.X (Antigravity/4.3.0)"
+            && request.x_client_version == "4.3.0"
+    }));
 
     let reloaded = provider_catalog_repository
         .list_keys_by_ids(&["key-antigravity-a".to_string()])
@@ -1956,21 +2548,58 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .upstream_metadata
             .as_ref()
             .and_then(|value| value.get("antigravity"))
-            .and_then(|value| value.get("models"))
+            .and_then(|value| value.get("quota_by_model"))
             .and_then(|value| value.get("claude-sonnet-4"))
             .and_then(|value| value.get("remaining_fraction")),
         Some(&json!(0.25))
     );
+    let imported_provider_models = global_model_repository
+        .list_admin_provider_models(&AdminProviderModelListQuery {
+            provider_id: "provider-antigravity".to_string(),
+            is_active: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .expect("imported Antigravity provider models should read");
+    let imported_model_names = imported_provider_models
+        .iter()
+        .map(|model| model.provider_model_name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(imported_model_names.contains("claude-sonnet-4"));
+    assert!(imported_model_names.contains("gemini-2.5-pro"));
+    assert!(imported_model_names.contains("gemini-3.7-flash-tiered"));
+    assert!(!imported_model_names.contains("chat_23310"));
     assert_eq!(
         reloaded[0]
             .upstream_metadata
             .as_ref()
             .and_then(|value| value.get("antigravity"))
-            .and_then(|value| value.get("models"))
+            .and_then(|value| value.get("quota_by_model"))
             .and_then(|value| value.get("claude-sonnet-4"))
             .and_then(|value| value.get("used_percent")),
         Some(&json!(75.0))
     );
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.pointer("/antigravity/quota_groups/0/buckets/0/bucket_id")),
+        Some(&json!("3p-5h"))
+    );
+    assert_eq!(
+        reloaded[0]
+            .upstream_metadata
+            .as_ref()
+            .and_then(|value| value.pointer("/antigravity/project_id")),
+        Some(&json!("project-ant-123"))
+    );
+    assert!(reloaded[0]
+        .upstream_metadata
+        .as_ref()
+        .and_then(|value| value.pointer("/antigravity/quota_groups_updated_at"))
+        .and_then(serde_json::Value::as_u64)
+        .is_some());
     assert_eq!(
         reloaded[0]
             .status_snapshot
@@ -1995,7 +2624,19 @@ async fn gateway_refreshes_admin_provider_quota_locally_for_antigravity_with_tru
             .and_then(|value| value.get("windows"))
             .and_then(|value| value.as_array())
             .map(Vec::len),
-        Some(1usize)
+        Some(3usize)
+    );
+    assert_eq!(
+        reloaded[0]
+            .status_snapshot
+            .as_ref()
+            .and_then(|value| value.pointer("/quota/windows"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|windows| windows
+                .iter()
+                .find(|window| window["code"] == "group:0:3p-5h"))
+            .and_then(|window| window.get("remaining_ratio")),
+        Some(&json!(0.25))
     );
 
     gateway_handle.abort();

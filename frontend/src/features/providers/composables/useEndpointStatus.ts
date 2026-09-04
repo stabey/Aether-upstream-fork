@@ -1,33 +1,15 @@
 import type { EndpointHealthDetail } from '@/api/endpoints'
+import { compareApiFormats, formatApiFormat } from '@/api/endpoints/types/api-format'
+import { defaultLocale, translateLegacyText, type Locale } from '@/i18n/messages'
 
 // 端点状态枚举
 export type EndpointStatus = 'disabled' | 'no_keys' | 'keys_disabled' | 'available'
-
-const ENDPOINT_SORT_ORDER = [
-  'claude:messages',
-  'openai:chat',
-  'openai:responses',
-  'openai:responses:compact',
-  'openai:embedding',
-  'openai:rerank',
-  'gemini:generate_content',
-  'gemini:embedding',
-  'openai:video',
-  'gemini:video',
-  'gemini:files',
-  'jina:embedding',
-  'jina:rerank',
-  'doubao:embedding',
-  'aliyun:multimodal_embedding',
-]
 
 /**
  * 端点排序
  */
 export function sortEndpoints<T extends { api_format: string }>(endpoints: T[]): T[] {
-  return [...endpoints].sort((a, b) => {
-    return ENDPOINT_SORT_ORDER.indexOf(a.api_format) - ENDPOINT_SORT_ORDER.indexOf(b.api_format)
-  })
+  return [...endpoints].sort((a, b) => compareApiFormats(a.api_format, b.api_format))
 }
 
 /**
@@ -75,23 +57,24 @@ export function getEndpointDotColor(endpoint: EndpointHealthDetail): string {
 /**
  * 端点提示文本
  */
-export function getEndpointTooltip(endpoint: EndpointHealthDetail): string {
-  const format = endpoint.api_format
+export function getEndpointTooltip(endpoint: EndpointHealthDetail, locale: Locale = defaultLocale): string {
+  const format = formatApiFormat(endpoint.api_format)
   const status = getEndpointStatus(endpoint)
+  const t = (value: string) => translateLegacyText(value, locale)
 
   switch (status) {
     case 'disabled':
-      return `${format}: 端点禁用`
+      return `${format}: ${t('端点禁用')}`
     case 'no_keys':
-      return `${format}: 未配置密钥`
+      return `${format}: ${t('未配置密钥')}`
     case 'keys_disabled':
-      return `${format}: 无可用密钥`
+      return `${format}: ${t('无可用密钥')}`
     case 'available': {
       const score = endpoint.health_score
       if (score === undefined || score === null) {
-        return `${format}: 暂无健康数据`
+        return `${format}: ${t('暂无健康数据')}`
       }
-      return `${format}: 健康度 ${(score * 100).toFixed(0)}%`
+      return `${format}: ${t('健康度')} ${(score * 100).toFixed(0)}%`
     }
   }
 }

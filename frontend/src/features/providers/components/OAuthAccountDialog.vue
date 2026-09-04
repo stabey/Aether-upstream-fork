@@ -1,7 +1,7 @@
 <template>
   <Dialog
     :model-value="isOpen"
-    title="添加账号"
+    :title="legacyT('添加账号')"
     :icon="UserPlus"
     size="md"
     @update:model-value="handleDialogUpdate"
@@ -18,7 +18,7 @@
             :class="selectedProxyNodeId
               ? 'text-blue-500 bg-blue-500/10 hover:bg-blue-500/20'
               : 'text-muted-foreground hover:text-foreground hover:bg-muted'"
-            :title="selectedProxyNodeId ? `代理: ${getSelectedNodeLabel()}` : '设置代理节点'"
+            :title="selectedProxyNodeId ? `${legacyT('代理')}: ${getSelectedNodeLabel()}` : legacyT('设置代理节点')"
           >
             <Globe class="w-4 h-4" />
           </button>
@@ -31,18 +31,18 @@
           <div class="space-y-2">
             <div class="flex items-center justify-between">
               <div class="flex items-center gap-1.5">
-                <span class="text-xs font-medium">代理节点</span>
+                <span class="text-xs font-medium">{{ legacyT('代理节点') }}</span>
                 <span
                   v-if="!proxyNodesStore.loading && proxyNodesStore.onlineNodes.length === 0"
                   class="text-[10px] text-muted-foreground"
-                >· 前往「模块管理 · 代理节点」添加</span>
+                >· {{ legacyT('前往「模块管理 · 代理节点」添加') }}</span>
               </div>
               <button
                 v-if="selectedProxyNodeId"
                 class="text-[10px] text-muted-foreground hover:text-foreground transition-colors"
                 @click="selectedProxyNodeId = ''; proxyPopoverOpen = false"
               >
-                清除
+                {{ legacyT('清除') }}
               </button>
             </div>
             <ProxyNodeSelect
@@ -51,7 +51,7 @@
               @update:model-value="(v: string) => { selectedProxyNodeId = v; proxyPopoverOpen = false }"
             />
             <p class="text-[10px] text-muted-foreground">
-              {{ selectedProxyNodeId ? `${providerCredentialActionLabel}、刷新、额度查询均走此代理` : '未设置，依次回退到提供商代理 → 系统代理' }}
+              {{ selectedProxyNodeId ? proxyUsageDescription : legacyT('未设置，依次回退到提供商代理 → 系统代理') }}
             </p>
           </div>
         </PopoverContent>
@@ -62,27 +62,52 @@
       <!-- Tab 切换 -->
       <div
         v-if="showAuthorizationMode"
-        class="flex rounded-lg border border-border p-0.5 bg-muted/30"
+        class="grid rounded-lg border border-border p-0.5 bg-muted/30"
+        :class="isCodexProvider || isClaudeCodeProvider ? 'grid-cols-3' : 'grid-cols-2'"
       >
         <button
-          class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-all"
+          class="min-w-0 min-h-8 px-2 py-1.5 text-xs font-medium leading-4 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-60"
           :class="[
             mode === 'oauth'
               ? 'bg-background text-foreground shadow-sm'
               : 'text-muted-foreground hover:text-foreground',
           ]"
+          :disabled="importing || creatingAgentIdentity || cookieAuthorizing"
           @click="switchMode('oauth')"
         >
-          {{ isDeviceBrowserProvider ? (isWindsurfProvider ? '浏览器登录' : '设备授权') : '获取授权' }}
+          {{ authorizationModeLabel }}
         </button>
         <button
-          class="flex-1 px-3 py-1.5 text-xs font-medium rounded-md transition-all"
+          v-if="isClaudeCodeProvider"
+          class="min-w-0 min-h-8 px-2 py-1.5 text-xs font-medium leading-4 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-60"
+          :class="mode === 'cookie'
+            ? 'bg-background text-foreground shadow-sm'
+            : 'text-muted-foreground hover:text-foreground'"
+          :disabled="importing || creatingAgentIdentity || cookieAuthorizing"
+          @click="switchMode('cookie')"
+        >
+          {{ legacyT('Cookie授权') }}
+        </button>
+        <button
+          class="min-w-0 min-h-8 px-2 py-1.5 text-xs font-medium leading-4 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-60"
           :class="mode === 'import'
             ? 'bg-background text-foreground shadow-sm'
             : 'text-muted-foreground hover:text-foreground'"
+          :disabled="importing || creatingAgentIdentity || cookieAuthorizing"
           @click="switchMode('import')"
         >
           {{ importModeLabel }}
+        </button>
+        <button
+          v-if="isCodexProvider"
+          class="min-w-0 min-h-8 px-2 py-1.5 text-xs font-medium leading-4 rounded-md transition-all disabled:cursor-not-allowed disabled:opacity-60"
+          :class="mode === 'agent_identity'
+            ? 'bg-background text-foreground shadow-sm'
+            : 'text-muted-foreground hover:text-foreground'"
+          :disabled="importing || creatingAgentIdentity || cookieAuthorizing"
+          @click="switchMode('agent_identity')"
+        >
+          {{ legacyT('Agent Identity') }}
         </button>
       </div>
 
@@ -92,6 +117,8 @@
         <div
           class="space-y-4 transition-opacity duration-150"
           :class="mode === 'oauth' ? 'opacity-100' : 'opacity-0 pointer-events-none'"
+          :inert="mode !== 'oauth' ? '' : undefined"
+          :aria-hidden="mode !== 'oauth'"
         >
           <!-- Windsurf: 浏览器 session/poll 授权 -->
           <template v-if="isWindsurfProvider">
@@ -110,7 +137,7 @@
                     : 'border-border text-muted-foreground hover:text-foreground hover:border-foreground/20'"
                   @click="selectWindsurfLoginOption(opt.key)"
                 >
-                  {{ opt.label }}
+                  {{ legacyT(opt.label) }}
                 </button>
               </div>
 
@@ -124,10 +151,10 @@
                   </div>
                   <div class="space-y-1">
                     <p class="text-sm font-medium text-destructive">
-                      {{ device.status === 'expired' ? '授权已过期' : '授权失败' }}
+                      {{ legacyT(device.status === 'expired' ? '授权已过期' : '授权失败') }}
                     </p>
                     <p class="text-xs text-muted-foreground">
-                      {{ device.error || '请重试' }}
+                      {{ legacyT(device.error || '请重试') }}
                     </p>
                   </div>
                   <Button
@@ -135,7 +162,7 @@
                     variant="outline"
                     @click="resetDevice"
                   >
-                    重新开始
+                    {{ legacyT('重新开始') }}
                   </Button>
                 </div>
               </div>
@@ -147,7 +174,7 @@
                 <div class="text-center">
                   <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mx-auto mb-3" />
                   <p class="text-xs text-muted-foreground">
-                    正在准备登录...
+                    {{ legacyT('正在准备登录...') }}
                   </p>
                 </div>
               </div>
@@ -159,7 +186,7 @@
                 <div class="space-y-2">
                   <div class="flex items-center gap-2">
                     <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">1</span>
-                    <span class="text-xs font-medium">前往登录</span>
+                    <span class="text-xs font-medium">{{ legacyT('前往登录') }}</span>
                   </div>
                   <div class="flex gap-2 pl-6">
                     <Button
@@ -168,7 +195,7 @@
                       @click="openDeviceVerificationUrl"
                     >
                       <ExternalLink class="w-3 h-3 mr-1" />
-                      打开
+                      {{ legacyT('打开') }}
                     </Button>
                     <Button
                       size="sm"
@@ -177,7 +204,7 @@
                       @click="copyToClipboard(device.verification_uri_complete)"
                     >
                       <Copy class="w-3 h-3 mr-1" />
-                      复制
+                      {{ legacyT('复制') }}
                     </Button>
                     <Button
                       v-if="!device.session_id"
@@ -186,7 +213,7 @@
                       :disabled="device.starting"
                       @click="startDeviceAuth"
                     >
-                      开始
+                      {{ legacyT('开始') }}
                     </Button>
                   </div>
                 </div>
@@ -194,7 +221,7 @@
                 <div class="space-y-2">
                   <div class="flex items-center gap-2">
                     <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">2</span>
-                    <span class="text-xs font-medium">粘贴回调 URL 或 token</span>
+                    <span class="text-xs font-medium">{{ legacyT('粘贴回调 URL 或 token') }}</span>
                   </div>
                   <div class="pl-6">
                     <Textarea
@@ -210,7 +237,7 @@
                     class="pl-6 flex items-center gap-1.5 text-[11px] text-muted-foreground"
                   >
                     <div class="animate-spin rounded-full h-3 w-3 border-[1.5px] border-primary/30 border-t-primary" />
-                    <span>会话剩余 {{ deviceCountdownFormatted }}</span>
+                    <span>{{ sessionRemainingText }}</span>
                   </div>
                 </div>
               </div>
@@ -253,10 +280,10 @@
                     </div>
                     <div class="space-y-1">
                       <p class="text-sm font-medium text-destructive">
-                        {{ device.status === 'expired' ? '授权已过期' : '授权失败' }}
+                        {{ legacyT(device.status === 'expired' ? '授权已过期' : '授权失败') }}
                       </p>
                       <p class="text-xs text-muted-foreground">
-                        {{ device.error || '请重试' }}
+                        {{ legacyT(device.error || '请重试') }}
                       </p>
                     </div>
                     <Button
@@ -264,7 +291,7 @@
                       variant="outline"
                       @click="resetDevice"
                     >
-                      重新开始
+                      {{ legacyT('重新开始') }}
                     </Button>
                   </div>
                 </div>
@@ -277,7 +304,7 @@
                   <div class="text-center">
                     <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mx-auto mb-3" />
                     <p class="text-xs text-muted-foreground">
-                      正在注册设备...
+                      {{ legacyT('正在注册设备...') }}
                     </p>
                   </div>
                 </div>
@@ -290,7 +317,7 @@
                   <div class="space-y-2 shrink-0">
                     <div class="flex items-center gap-2">
                       <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">1</span>
-                      <span class="text-xs font-medium">前往授权</span>
+                      <span class="text-xs font-medium">{{ legacyT('前往授权') }}</span>
                     </div>
                     <div class="flex gap-2 pl-6">
                       <Button
@@ -299,7 +326,7 @@
                         @click="openDeviceVerificationUrl"
                       >
                         <ExternalLink class="w-3 h-3 mr-1" />
-                        打开
+                        {{ legacyT('打开') }}
                       </Button>
                       <Button
                         size="sm"
@@ -308,7 +335,7 @@
                         @click="copyToClipboard(device.verification_uri_complete)"
                       >
                         <Copy class="w-3 h-3 mr-1" />
-                        复制
+                        {{ legacyT('复制') }}
                       </Button>
                     </div>
                   </div>
@@ -316,7 +343,7 @@
                   <div class="flex min-h-0 flex-1 flex-col gap-2">
                     <div class="flex items-center gap-2">
                       <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">2</span>
-                      <span class="text-xs font-medium">粘贴回调 URL</span>
+                      <span class="text-xs font-medium">{{ legacyT('粘贴回调 URL') }}</span>
                     </div>
                     <div class="min-h-0 flex-1 pl-6">
                       <Textarea
@@ -345,16 +372,16 @@
 
                     <div class="space-y-1">
                       <p class="text-sm font-medium">
-                        在浏览器中完成授权
+                        {{ legacyT('在浏览器中完成授权') }}
                       </p>
                       <p class="text-xs text-muted-foreground">
-                        授权完成后此页面将自动更新
+                        {{ legacyT('授权完成后此页面将自动更新') }}
                       </p>
                     </div>
 
                     <div class="flex items-center gap-1.5 text-xs text-muted-foreground">
                       <div class="animate-spin rounded-full h-3 w-3 border-[1.5px] border-primary/30 border-t-primary" />
-                      <span>剩余 {{ deviceCountdownFormatted }}</span>
+                      <span>{{ remainingText }}</span>
                     </div>
 
                     <div
@@ -364,7 +391,7 @@
                       <div class="flex items-center justify-between">
                         <div class="flex items-center gap-2">
                           <ShieldCheck class="w-3.5 h-3.5 text-primary" />
-                          <span class="text-[10px] text-muted-foreground">MFA 验证码</span>
+                          <span class="text-[10px] text-muted-foreground">{{ legacyT('MFA 验证码') }}</span>
                         </div>
                         <div class="flex items-center gap-1.5">
                           <span
@@ -372,7 +399,7 @@
                           >{{ totp.code.value }}</span>
                           <button
                             class="p-1 rounded hover:bg-muted transition-colors"
-                            title="复制验证码"
+                            :title="legacyT('复制验证码')"
                             @click="copyToClipboard(totp.code.value)"
                           >
                             <Copy class="w-3 h-3 text-muted-foreground" />
@@ -401,7 +428,7 @@
                         @click="openDeviceVerificationUrl"
                       >
                         <ExternalLink class="w-3.5 h-3.5 mr-1.5" />
-                        打开授权页面
+                        {{ legacyT('打开授权页面') }}
                       </Button>
                       <Button
                         size="sm"
@@ -423,14 +450,14 @@
                     v-if="isSocialDeviceAuth"
                     class="text-xs text-muted-foreground text-center"
                   >
-                    授权后复制浏览器地址栏的 localhost 回调 URL。
+                    {{ legacyT('授权后复制浏览器地址栏的 localhost 回调 URL。') }}
                   </p>
 
                   <p
                     v-else-if="device.auth_type === 'builder_id'"
                     class="text-xs text-muted-foreground text-center"
                   >
-                    使用个人 AWS Builder ID 进行设备授权，无需额外配置。
+                    {{ legacyT('使用个人 AWS Builder ID 进行设备授权，无需额外配置。') }}
                   </p>
 
                   <div
@@ -458,7 +485,7 @@
                         <ComboboxAnchor class="relative w-full">
                           <ComboboxInput
                             :display-value="() => device.region"
-                            placeholder="输入或选择 Region"
+                            :placeholder="legacyT('输入或选择 Region')"
                             class="w-full h-8 px-2 pr-7 text-xs rounded-md border border-border bg-background font-mono focus:outline-none focus:ring-1 focus:ring-ring focus:relative focus:z-10"
                             spellcheck="false"
                             @input="(e: Event) => regionSearch = (e.target as HTMLInputElement).value"
@@ -474,7 +501,7 @@
                         >
                           <ComboboxViewport>
                             <ComboboxEmpty class="px-2 py-1.5 text-xs text-muted-foreground">
-                              {{ awsRegionsLoaded ? '无匹配结果，回车使用自定义值' : '加载中...' }}
+                              {{ awsRegionsLoaded ? legacyT('无匹配结果，回车使用自定义值') : legacyT('加载中...') }}
                             </ComboboxEmpty>
                             <ComboboxItem
                               v-for="r in filteredRegions"
@@ -493,7 +520,7 @@
                       </ComboboxRoot>
                     </div>
                     <div class="space-y-1.5">
-                      <label class="text-xs font-medium text-muted-foreground">TOTP Secret (可选, 2FA认证)</label>
+                      <label class="text-xs font-medium text-muted-foreground">{{ legacyT('TOTP Secret (可选, 2FA认证)') }}</label>
                       <input
                         v-model="device.totp_secret"
                         type="text"
@@ -509,7 +536,7 @@
                     :disabled="device.starting || (device.auth_type === 'identity_center' && !device.start_url.trim())"
                     @click="startDeviceAuth"
                   >
-                    {{ device.starting ? '正在准备授权...' : '开始授权' }}
+                    {{ device.starting ? legacyT('正在准备授权...') : legacyT('开始授权') }}
                   </Button>
                 </div>
               </div>
@@ -525,16 +552,19 @@
               <div class="text-center">
                 <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-primary mx-auto mb-3" />
                 <p class="text-xs text-muted-foreground">
-                  正在准备授权...
+                  {{ legacyT('正在准备授权...') }}
                 </p>
               </div>
             </div>
 
-            <template v-else-if="oauth.authorization_url">
-              <div class="space-y-2">
+            <div
+              v-else-if="oauth.authorization_url"
+              class="flex h-full min-h-0 flex-col gap-4"
+            >
+              <div class="shrink-0 space-y-2">
                 <div class="flex items-center gap-2">
                   <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">1</span>
-                  <span class="text-xs font-medium">前往授权</span>
+                  <span class="text-xs font-medium">{{ legacyT('前往授权') }}</span>
                 </div>
                 <div class="flex gap-2 pl-6">
                   <Button
@@ -543,7 +573,7 @@
                     @click="openAuthorizationUrl"
                   >
                     <ExternalLink class="w-3 h-3 mr-1" />
-                    打开
+                    {{ legacyT('打开') }}
                   </Button>
                   <Button
                     size="sm"
@@ -552,34 +582,74 @@
                     @click="copyToClipboard(oauth.authorization_url)"
                   >
                     <Copy class="w-3 h-3 mr-1" />
-                    复制
+                    {{ legacyT('复制') }}
                   </Button>
                 </div>
               </div>
 
-              <div class="space-y-2">
-                <div class="flex items-center gap-2">
+              <div class="flex min-h-0 flex-1 flex-col gap-2">
+                <div class="flex shrink-0 items-center gap-2">
                   <span class="flex items-center justify-center w-4 h-4 rounded-full bg-primary/10 text-primary text-[10px] font-semibold shrink-0">2</span>
-                  <span class="text-xs font-medium">粘贴回调 URL</span>
+                  <span class="text-xs font-medium">{{ oauthCallbackLabel }}</span>
                 </div>
-                <div class="pl-6">
+                <div class="min-h-0 flex-1 pl-6">
                   <Textarea
                     v-model="oauth.callback_url"
                     :disabled="oauthBusy"
-                    placeholder="http://localhost:xxx/callback?code=..."
-                    class="min-h-[120px] text-xs font-mono break-all !rounded-xl"
+                    :placeholder="oauthCallbackPlaceholder"
+                    class="h-full min-h-[120px] overflow-y-auto text-xs font-mono break-all !rounded-xl"
+                    data-testid="oauth-callback-textarea"
                     spellcheck="false"
                   />
                 </div>
               </div>
-            </template>
+            </div>
           </template>
+        </div>
+
+        <!-- ===== Cookie 授权 ===== -->
+        <div
+          v-if="isClaudeCodeProvider"
+          class="flex flex-col gap-3 justify-center transition-opacity duration-150"
+          :class="mode === 'cookie' ? 'opacity-100' : 'opacity-0 pointer-events-none'"
+          :inert="mode !== 'cookie' ? '' : undefined"
+          :aria-hidden="mode !== 'cookie'"
+        >
+          <label
+            class="sr-only"
+            for="claude-session-cookie"
+          >
+            {{ legacyT('Claude sessionKey Cookie') }}
+          </label>
+          <div class="relative">
+            <Textarea
+              id="claude-session-cookie"
+              v-model="cookieInput"
+              :disabled="cookieAuthorizing"
+              :placeholder="legacyT('每行粘贴一个 sessionKey Cookie 值或完整 Cookie 请求头，最多 20 个')"
+              aria-describedby="claude-session-cookie-status"
+              class="h-[200px] min-h-[200px] overflow-y-auto pb-7 text-xs font-mono break-words !rounded-xl"
+              data-testid="claude-cookie-input"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <p
+              id="claude-session-cookie-status"
+              class="pointer-events-none absolute bottom-2 right-3 text-[10px]"
+              :class="cookieInputOverLimit ? 'text-destructive' : 'text-muted-foreground'"
+              aria-live="polite"
+            >
+              {{ cookieInputStatusText }}
+            </p>
+          </div>
         </div>
 
         <!-- ===== 导入授权 ===== -->
         <div
           class="flex flex-col gap-3 justify-center transition-opacity duration-150"
           :class="mode === 'import' ? 'opacity-100' : 'opacity-0 pointer-events-none'"
+          :inert="mode !== 'import' ? '' : undefined"
+          :aria-hidden="mode !== 'import'"
         >
           <div
             v-if="isWindsurfProvider"
@@ -598,7 +668,7 @@
               :disabled="importing"
               @click="setWindsurfImportMethod(method.key)"
             >
-              {{ method.label }}
+              {{ legacyT(method.label) }}
             </button>
           </div>
 
@@ -607,7 +677,7 @@
             class="space-y-3"
           >
             <div class="space-y-1.5">
-              <label class="text-xs font-medium">邮箱</label>
+              <label class="text-xs font-medium">{{ legacyT('邮箱') }}</label>
               <input
                 v-model="windsurfEmail"
                 type="email"
@@ -619,44 +689,45 @@
               >
             </div>
             <div class="space-y-1.5">
-              <label class="text-xs font-medium">密码</label>
+              <label class="text-xs font-medium">{{ legacyT('密码') }}</label>
               <input
                 v-model="windsurfPassword"
                 type="password"
                 autocomplete="current-password"
                 :disabled="importing"
-                placeholder="Windsurf 密码"
+                :placeholder="legacyT('Windsurf 密码')"
                 class="w-full h-9 px-2.5 text-xs rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring focus:relative focus:z-10"
               >
             </div>
             <div class="space-y-1.5">
-              <label class="text-xs font-medium text-muted-foreground">名称（可选）</label>
+              <label class="text-xs font-medium text-muted-foreground">{{ legacyT('名称（可选）') }}</label>
               <input
                 v-model="windsurfAccountName"
                 type="text"
                 autocomplete="off"
                 :disabled="importing"
-                placeholder="未填写时使用邮箱"
+                :placeholder="legacyT('未填写时使用邮箱')"
                 class="w-full h-9 px-2.5 text-xs rounded-md border border-border bg-background focus:outline-none focus:ring-1 focus:ring-ring focus:relative focus:z-10"
                 spellcheck="false"
               >
             </div>
           </div>
 
-          <JsonImportInput
-            v-else
-            v-model="importText"
-            :disabled="importing"
-            :reset-key="importInputResetKey"
-            :drop-title="importDropTitle"
-            :drop-hint="importDropHint"
-            :manual-placeholder="importManualPlaceholder"
-            :manual-description="importManualDescription"
-            :paste-toggle-text="importPasteToggleText"
-            :file-toggle-text="importFileToggleText"
-            textarea-class="min-h-[200px] text-xs font-mono break-all !rounded-xl"
-            @error="handleImportInputError"
-          />
+          <template v-else>
+            <JsonImportInput
+              v-model="importText"
+              :disabled="importing"
+              :reset-key="importInputResetKey"
+              :drop-title="importDropTitle"
+              :drop-hint="importDropHint"
+              :manual-placeholder="importManualPlaceholder"
+              :manual-description="importManualDescription"
+              :paste-toggle-text="importPasteToggleText"
+              :file-toggle-text="importFileToggleText"
+              textarea-class="min-h-[200px] text-xs font-mono break-all !rounded-xl"
+              @error="handleImportInputError"
+            />
+          </template>
 
           <div
             v-if="importTask && !isWindsurfEmailPasswordImport"
@@ -677,31 +748,49 @@
               />
             </div>
             <div class="flex items-center justify-between text-[11px] text-muted-foreground">
-              <span>进度 {{ importTask.processed }}/{{ importTask.total }}</span>
-              <span>成功 {{ importTask.success }} · 失败 {{ importTask.failed }}</span>
+              <span>{{ importProgressText(importTask) }}</span>
+              <span>{{ importResultSummaryText(importTask) }}</span>
             </div>
             <p
-              v-if="importTask.message"
+              v-if="importTaskMessageText"
               class="text-[11px] text-muted-foreground"
             >
-              {{ importTask.message }}
+              {{ importTaskMessageText }}
             </p>
             <div
               v-if="importTask.error_samples.length > 0"
               class="space-y-1"
             >
               <p class="text-[11px] text-destructive">
-                最近错误
+                {{ legacyT('最近错误') }}
               </p>
               <p
                 v-for="item in importTask.error_samples.slice(0, 3)"
                 :key="`${item.index}-${item.error || item.status}`"
                 class="text-[11px] text-destructive/90"
               >
-                #{{ item.index + 1 }} {{ item.error || '导入失败' }}
+                {{ importErrorSampleText(item) }}
               </p>
             </div>
           </div>
+        </div>
+
+        <!-- ===== 创建 Agent Identity ===== -->
+        <div
+          v-if="isCodexProvider"
+          class="flex flex-col gap-3 justify-center transition-opacity duration-150"
+          :class="mode === 'agent_identity' ? 'opacity-100' : 'opacity-0 pointer-events-none'"
+          :inert="mode !== 'agent_identity' ? '' : undefined"
+          :aria-hidden="mode !== 'agent_identity'"
+        >
+          <Textarea
+            v-model="agentIdentityInput"
+            :disabled="creatingAgentIdentity"
+            :placeholder="legacyT('粘贴 AT 或 ChatGPT auth/session JSON')"
+            class="min-h-[200px] text-xs font-mono break-all !rounded-xl"
+            autocomplete="off"
+            spellcheck="false"
+          />
         </div>
       </div>
     </div>
@@ -711,21 +800,28 @@
         variant="outline"
         @click="handleClose"
       >
-        取消
+        {{ legacyT('取消') }}
       </Button>
       <Button
         v-if="mode === 'oauth' && showAuthorizationMode && !isDeviceBrowserProvider"
         :disabled="!canCompleteOAuth"
         @click="handleCompleteOAuth"
       >
-        {{ oauth.completing ? '验证中...' : '验证' }}
+        {{ oauth.completing ? legacyT('验证中...') : legacyT('验证') }}
       </Button>
       <Button
         v-if="mode === 'oauth' && isManualDeviceCallbackMode"
         :disabled="!canCompleteDeviceAuth"
         @click="completeDeviceAuth"
       >
-        {{ device.completing ? '验证中...' : '验证' }}
+        {{ device.completing ? legacyT('验证中...') : legacyT('验证') }}
+      </Button>
+      <Button
+        v-if="mode === 'cookie' && isClaudeCodeProvider"
+        :disabled="!canAuthorizeWithCookie"
+        @click="handleCookieAuthorize"
+      >
+        {{ cookieAuthorizeButtonText }}
       </Button>
       <Button
         v-if="mode === 'import'"
@@ -733,6 +829,13 @@
         @click="handleImport"
       >
         {{ importButtonText }}
+      </Button>
+      <Button
+        v-if="mode === 'agent_identity'"
+        :disabled="!canCreateAgentIdentity"
+        @click="handleCreateAgentIdentity"
+      >
+        {{ creatingAgentIdentity ? legacyT('创建中...') : legacyT('创建') }}
       </Button>
     </template>
   </Dialog>
@@ -751,14 +854,27 @@ import {
   ComboboxTrigger,
   ComboboxViewport,
 } from 'radix-vue'
-import { UserPlus, Copy, ExternalLink, Globe, AlertCircle, ShieldCheck, ChevronsUpDown, Check } from 'lucide-vue-next'
+import {
+  UserPlus,
+  Copy,
+  ExternalLink,
+  Globe,
+  AlertCircle,
+  ShieldCheck,
+  ChevronsUpDown,
+  Check,
+} from 'lucide-vue-next'
 import { useToast } from '@/composables/useToast'
 import { useClipboard } from '@/composables/useClipboard'
 import { useTotp } from '@/composables/useTotp'
 import { parseApiError } from '@/utils/errorParser'
+import { useI18n } from '@/i18n'
 import {
   startProviderLevelOAuth,
   completeProviderLevelOAuth,
+  authorizeProviderWithCookie,
+  startProviderCookieAuthorizeTask,
+  getProviderCookieAuthorizeTaskStatus,
   importProviderRefreshToken,
   startBatchImportOAuthTask,
   getBatchImportOAuthTaskStatus,
@@ -769,6 +885,7 @@ import {
 } from '@/api/endpoints'
 import type {
   OAuthBatchImportTaskStatus,
+  OAuthBatchImportTaskStartResponse,
   OAuthBatchImportTaskStatusResponse,
 } from '@/api/endpoints/provider_oauth'
 import ProxyNodeSelect from './ProxyNodeSelect.vue'
@@ -786,8 +903,9 @@ const emit = defineEmits<{
   saved: []
 }>()
 
-const { success, error: showError } = useToast()
+const { success, warning, error: showError } = useToast()
 const { copyToClipboard } = useClipboard()
+const { legacyT, locale } = useI18n()
 const proxyNodesStore = useProxyNodesStore()
 const totp = useTotp()
 
@@ -834,8 +952,16 @@ function getSelectedNodeLabel(): string {
   return node ? node.name : `${selectedProxyNodeId.value.slice(0, 8)  }...`
 }
 
+function isEnglishLocale(): boolean {
+  return locale.value === 'en-US'
+}
+
+function localizedApiError(error: unknown, fallback: string): string {
+  return legacyT(parseApiError(error, fallback))
+}
+
 // 模式
-type DialogMode = 'oauth' | 'import'
+type DialogMode = 'oauth' | 'cookie' | 'import' | 'agent_identity'
 const mode = ref<DialogMode>((props.providerType || '').toLowerCase() === 'grok' ? 'import' : 'oauth')
 type WindsurfImportMethod = 'email_password' | 'token_json'
 
@@ -926,16 +1052,30 @@ const importInputResetKey = ref(0)
 const importTask = ref<OAuthBatchImportTaskStatusResponse | null>(null)
 let importPollTimer: ReturnType<typeof setTimeout> | null = null
 const importPolling = ref(false)
+const redundantImportTaskMessagePattern = /^处理中(?:\s+\d+\s*\/\s*\d+)?$/
 const windsurfImportMethod = ref<WindsurfImportMethod>('email_password')
 const windsurfEmail = ref('')
 const windsurfPassword = ref('')
 const windsurfAccountName = ref('')
+const agentIdentityInput = ref('')
+const creatingAgentIdentity = ref(false)
+let agentIdentityRequestId = 0
+const cookieInput = ref('')
+const cookieAuthorizing = ref(false)
+let cookieAuthorizeRequestId = 0
+const cookieAuthorizeTask = ref<OAuthBatchImportTaskStartResponse | OAuthBatchImportTaskStatusResponse | null>(null)
+const cookieAuthorizeSubmittedEntries = ref<string[]>([])
+let cookieAuthorizePollTimer: ReturnType<typeof setTimeout> | null = null
+const cookieAuthorizePolling = ref(false)
+const CLAUDE_COOKIE_BATCH_LIMIT = 20
 
 const isOpen = computed(() => props.open)
 
 const isKiroProvider = computed(() => (props.providerType || '').toLowerCase() === 'kiro')
 const isGrokProvider = computed(() => (props.providerType || '').toLowerCase() === 'grok')
 const isWindsurfProvider = computed(() => (props.providerType || '').toLowerCase() === 'windsurf')
+const isCodexProvider = computed(() => (props.providerType || '').toLowerCase() === 'codex')
+const isClaudeCodeProvider = computed(() => (props.providerType || '').toLowerCase() === 'claude_code')
 const isDeviceBrowserProvider = computed(() => isKiroProvider.value || isWindsurfProvider.value)
 const showAuthorizationMode = computed(() => !isGrokProvider.value)
 const defaultMode = computed<DialogMode>(() => (isGrokProvider.value ? 'import' : 'oauth'))
@@ -958,9 +1098,25 @@ const isManualDeviceCallbackPending = computed(() =>
   && device.value.status === 'pending'
 )
 
+const authorizationModeLabel = computed(() => {
+  if (isWindsurfProvider.value) return legacyT('浏览器登录')
+  if (isDeviceBrowserProvider.value) return legacyT('设备授权')
+  return legacyT('获取授权')
+})
+
+const oauthCallbackLabel = computed(() =>
+  legacyT(isClaudeCodeProvider.value ? '粘贴回调 URL 或授权码' : '粘贴回调 URL')
+)
+
+const oauthCallbackPlaceholder = computed(() =>
+  isClaudeCodeProvider.value
+    ? legacyT('粘贴完整回调 URL 或授权码（code#state）')
+    : 'http://localhost:xxx/callback?code=...'
+)
+
 const deviceCallbackPlaceholder = computed(() =>
   isWindsurfProvider.value
-    ? `粘贴包含 token=...&state=... 的回调 URL；session token/apiKey 也可直接粘贴，普通 token 请用导入授权`
+    ? legacyT('粘贴包含 token=...&state=... 的回调 URL；session token/apiKey 也可直接粘贴，普通 token 请用导入授权')
     : `http://localhost:49153/oauth/callback?login_option=${device.value.auth_type}&code=...&state=...`
 )
 
@@ -970,6 +1126,18 @@ const deviceCountdownFormatted = computed(() => {
   const sec = s % 60
   return `${min}:${String(sec).padStart(2, '0')}`
 })
+
+const sessionRemainingText = computed(() => (
+  isEnglishLocale()
+    ? `Session remaining ${deviceCountdownFormatted.value}`
+    : `会话剩余 ${deviceCountdownFormatted.value}`
+))
+
+const remainingText = computed(() => (
+  isEnglishLocale()
+    ? `${deviceCountdownFormatted.value} remaining`
+    : `剩余 ${deviceCountdownFormatted.value}`
+))
 
 const oauthBusy = computed(() =>
   oauth.value.starting || oauth.value.completing
@@ -996,45 +1164,116 @@ const canImport = computed(() => {
   return importText.value.trim().length > 0 && !importing.value
 })
 
-const importModeLabel = computed(() => (isGrokProvider.value ? '导入账号' : '导入授权'))
-const importButtonLabel = computed(() => (isGrokProvider.value ? '导入账号' : '导入'))
+const cookieEntries = computed(() => cookieInput.value
+  .split(/\r?\n/)
+  .map(value => value.trim())
+  .filter(Boolean)
+)
+const cookieInputOverLimit = computed(() => cookieEntries.value.length > CLAUDE_COOKIE_BATCH_LIMIT)
+const canAuthorizeWithCookie = computed(() =>
+  isClaudeCodeProvider.value
+  && cookieEntries.value.length > 0
+  && !cookieInputOverLimit.value
+  && !cookieAuthorizing.value
+)
+const cookieAuthorizeButtonText = computed(() => {
+  if (cookieAuthorizing.value) return legacyT('授权中...')
+  return cookieEntries.value.length > 1 ? legacyT('批量授权') : legacyT('授权')
+})
+const cookieInputStatusText = computed(() => {
+  const task = cookieAuthorizeTask.value
+  if (cookieAuthorizing.value && task) {
+    return isEnglishLocale()
+      ? `${task.processed}/${task.total} · ${task.success} succeeded · ${task.failed} failed`
+      : `进度 ${task.processed}/${task.total} · 成功 ${task.success} · 失败 ${task.failed}`
+  }
+  const count = cookieEntries.value.length
+  if (count === 0) return legacyT('每行一个，最多 20 个')
+  if (isEnglishLocale()) return `${count} entered, maximum ${CLAUDE_COOKIE_BATCH_LIMIT}`
+  return `已输入 ${count} 个，最多 ${CLAUDE_COOKIE_BATCH_LIMIT} 个`
+})
+
+const canCreateAgentIdentity = computed(() =>
+  isCodexProvider.value
+  && agentIdentityInput.value.trim().length > 0
+  && !creatingAgentIdentity.value
+)
+
+const importModeLabel = computed(() => legacyT(isGrokProvider.value ? '导入账号' : '导入授权'))
+const importButtonLabel = computed(() => legacyT(isGrokProvider.value ? '导入账号' : '导入'))
 const importDropTitle = computed(() => (
-  isGrokProvider.value ? '拖入 Grok 账号文件或点击选择' : '拖入授权文件或点击选择'
+  legacyT(isGrokProvider.value ? '拖入 Grok 账号文件或点击选择' : '拖入授权文件或点击选择')
 ))
 const importDropHint = computed(() => (
-  isGrokProvider.value ? '支持 .json / .txt，可多选、批量导入' : '支持 .json / .txt，可多选'
+  legacyT(isGrokProvider.value ? '支持 .json / .txt，可多选、批量导入' : '支持 .json / .txt，可多选')
 ))
-const importManualPlaceholder = computed(() => (
-  isGrokProvider.value
-    ? '粘贴 Grok sso/session token，支持每行一个；或粘贴包含 token、sso_token、access_token、plan_type、pool_tier 的 JSON'
-    : isWindsurfProvider.value
-      ? '粘贴 show-auth-token Token、API key 或 JSON 内容'
-      : '粘贴 Refresh Token / Access Token 或 JSON 内容'
-))
+const importManualPlaceholder = computed(() => {
+  if (isGrokProvider.value) {
+    return legacyT('粘贴 Grok sso/session token，支持每行一个；或粘贴包含 token、sso_token、access_token、plan_type、pool_tier 的 JSON')
+  }
+  if (isClaudeCodeProvider.value) {
+    return legacyT('粘贴 Claude Refresh Token 或 Claude Code .credentials.json 内容')
+  }
+  if (isWindsurfProvider.value) {
+    return legacyT('粘贴 show-auth-token Token、API key 或 JSON 内容')
+  }
+  return legacyT('粘贴 Refresh Token / Access Token / Agent Identity JSON 内容')
+})
 const importManualDescription = computed(() => (
   isGrokProvider.value
-    ? 'plan_type / pool_tier 会作为账号套餐与能力特征保存，不是路由池选择。'
+    ? legacyT('plan_type / pool_tier 会作为账号套餐与能力特征保存，不是路由池选择。')
     : ''
 ))
 const importPasteToggleText = computed(() => (
-  isGrokProvider.value ? '或手动粘贴 Grok Token' : '或手动粘贴 Token'
+  legacyT(isGrokProvider.value ? '或手动粘贴 Grok Token' : '或手动粘贴 Token')
 ))
 const importFileToggleText = computed(() => (
-  isGrokProvider.value ? '或选择 Grok Token 文件导入' : '或选择 JSON 文件导入'
+  legacyT(isGrokProvider.value ? '或选择 Grok Token 文件导入' : '或选择 JSON 文件导入')
 ))
-const providerCredentialActionLabel = computed(() => (isGrokProvider.value ? '导入' : '授权'))
+const proxyUsageDescription = computed(() => {
+  if (isEnglishLocale()) {
+    return isGrokProvider.value
+      ? 'Import, refresh, and quota queries use this proxy'
+      : 'Authorization, refresh, and quota queries use this proxy'
+  }
+  return isGrokProvider.value
+    ? '导入、刷新、额度查询均走此代理'
+    : '授权、刷新、额度查询均走此代理'
+})
 const isWindsurfEmailPasswordImport = computed(() =>
   isWindsurfProvider.value && windsurfImportMethod.value === 'email_password'
 )
-
 const importButtonText = computed(() => {
   if (importing.value) {
     return importTask.value && !isWindsurfEmailPasswordImport.value
-      ? `导入中 ${importTask.value.progress_percent}%`
-      : '导入中...'
+      ? (isEnglishLocale() ? `Importing ${importTask.value.progress_percent}%` : `导入中 ${importTask.value.progress_percent}%`)
+      : legacyT('导入中...')
   }
-  return isWindsurfEmailPasswordImport.value ? '登录并导入' : importButtonLabel.value
+  return isWindsurfEmailPasswordImport.value ? legacyT('登录并导入') : importButtonLabel.value
 })
+
+const importTaskMessageText = computed(() => {
+  const message = importTask.value?.message?.trim()
+  if (!message) return ''
+  // 后端进度 message 已由“进度 x/y”展示，避免在导入中重复显示“处理中 x/y”。
+  return redundantImportTaskMessagePattern.test(message) ? '' : legacyT(message)
+})
+
+function importProgressText(task: OAuthBatchImportTaskStatusResponse): string {
+  return isEnglishLocale()
+    ? `Progress ${task.processed}/${task.total}`
+    : `进度 ${task.processed}/${task.total}`
+}
+
+function importResultSummaryText(task: OAuthBatchImportTaskStatusResponse): string {
+  return isEnglishLocale()
+    ? `Success ${task.success} · Failed ${task.failed}`
+    : `成功 ${task.success} · 失败 ${task.failed}`
+}
+
+function importErrorSampleText(item: OAuthBatchImportTaskStatusResponse['error_samples'][number]): string {
+  return `#${item.index + 1} ${legacyT(item.error || '导入失败')}`
+}
 
 function stopImportPolling() {
   if (importPollTimer) {
@@ -1047,24 +1286,37 @@ function stopImportPolling() {
 function getImportTaskStatusText(status: OAuthBatchImportTaskStatus): string {
   switch (status) {
     case 'submitted':
-      return '任务已提交'
+      return legacyT('任务已提交')
     case 'processing':
-      return '正在导入'
+      return legacyT('正在导入')
     case 'completed':
-      return '导入完成'
+      return legacyT('导入完成')
     case 'failed':
-      return '导入失败'
+      return legacyT('导入失败')
     default:
-      return '处理中'
+      return legacyT('处理中')
   }
 }
 
 function getOAuthSuccessMessage(
-  action: '授权' | '导入',
+  action: '授权' | '导入' | '创建',
   options?: { email?: string | null; replaced?: boolean }
 ): string {
   const email = typeof options?.email === 'string' ? options.email.trim() : ''
   const replaced = options?.replaced === true
+  const actionText = legacyT(action)
+
+  if (isEnglishLocale()) {
+    if (email) {
+      return replaced
+        ? `${actionText} succeeded: ${email} (replaced existing account)`
+        : `${actionText} succeeded: ${email}`
+    }
+    return replaced
+      ? `${actionText} succeeded; replaced existing account`
+      : `${actionText} succeeded; account added`
+  }
+
   if (email) {
     return replaced
       ? `${action}成功: ${email}（已替换旧账号）`
@@ -1081,27 +1333,36 @@ function getBatchImportSuccessMessage(task: OAuthBatchImportTaskStatusResponse):
   const parts: string[] = []
 
   if (createdCount > 0) {
-    parts.push(`新增 ${createdCount} 个`)
+    parts.push(isEnglishLocale() ? `${createdCount} added` : `新增 ${createdCount} 个`)
   }
   if (replacedCount > 0) {
-    parts.push(`替换 ${replacedCount} 个`)
+    parts.push(isEnglishLocale() ? `${replacedCount} replaced` : `替换 ${replacedCount} 个`)
   }
   if (task.failed > 0) {
-    parts.push(`失败 ${task.failed} 个`)
+    parts.push(isEnglishLocale() ? `${task.failed} failed` : `失败 ${task.failed} 个`)
   }
 
   if (parts.length === 0) {
+    if (isEnglishLocale()) {
+      return task.failed > 0 ? `Batch import complete: ${task.failed} failed` : 'Batch import complete'
+    }
     return task.failed > 0 ? `批量导入完成：失败 ${task.failed} 个` : '批量导入完成'
   }
   if (task.failed === 0 && createdCount > 0 && replacedCount === 0) {
+    if (isEnglishLocale()) return `Batch import succeeded: ${createdCount} accounts added`
     return `批量导入成功：${createdCount} 个账号已添加`
   }
   if (task.failed === 0 && createdCount === 0 && replacedCount > 0) {
+    if (isEnglishLocale()) return `Batch import succeeded: ${replacedCount} existing accounts replaced`
     return `批量导入成功：已替换 ${replacedCount} 个旧账号`
   }
 
-  const prefix = task.failed > 0 ? '批量导入完成' : '批量导入成功'
-  return `${prefix}：${parts.join('，')}`
+  const prefix = task.failed > 0
+    ? legacyT('批量导入完成')
+    : legacyT('批量导入成功')
+  return isEnglishLocale()
+    ? `${prefix}: ${parts.join(', ')}`
+    : `${prefix}：${parts.join('，')}`
 }
 
 function scheduleImportPoll(taskId: string, delayMs = 1200) {
@@ -1127,7 +1388,7 @@ async function pollImportTaskStatus(taskId: string) {
         emit('saved')
         handleClose()
       } else {
-        showError(task.error || '批量导入失败', '导入失败')
+        showError(legacyT(task.error || '批量导入失败'), legacyT('导入失败'))
       }
       return
     }
@@ -1135,7 +1396,7 @@ async function pollImportTaskStatus(taskId: string) {
     if (task.status === 'failed') {
       stopImportPolling()
       importing.value = false
-      showError(task.error || task.message || '批量导入失败', '导入失败')
+      showError(legacyT(task.error || task.message || '批量导入失败'), legacyT('导入失败'))
       return
     }
 
@@ -1228,8 +1489,11 @@ function resetForm() {
   oauthInitRequestId += 1
   oauthCompleteRequestId += 1
   deviceAuthRequestId += 1
+  agentIdentityRequestId += 1
+  cookieAuthorizeRequestId += 1
   oauth.value = createInitialOAuthState()
   stopImportPolling()
+  stopCookieAuthorizePolling()
   stopDevicePolling()
   totp.stop()
   device.value = createInitialDeviceState()
@@ -1244,6 +1508,12 @@ function resetForm() {
   windsurfEmail.value = ''
   windsurfPassword.value = ''
   windsurfAccountName.value = ''
+  agentIdentityInput.value = ''
+  creatingAgentIdentity.value = false
+  cookieInput.value = ''
+  cookieAuthorizing.value = false
+  cookieAuthorizeTask.value = null
+  cookieAuthorizeSubmittedEntries.value = []
   proxyPopoverOpen.value = false
   selectedProxyNodeId.value = ''
   mode.value = defaultMode.value
@@ -1252,6 +1522,9 @@ function resetForm() {
 function switchMode(newMode: DialogMode) {
   if (mode.value === newMode) return
   if (newMode === 'oauth' && !showAuthorizationMode.value) return
+  if (newMode === 'cookie' && !isClaudeCodeProvider.value) return
+  if (newMode === 'agent_identity' && !isCodexProvider.value) return
+  if (importing.value || creatingAgentIdentity.value || cookieAuthorizing.value) return
 
   mode.value = newMode
   if (newMode === 'oauth') {
@@ -1297,8 +1570,8 @@ async function initOAuth() {
     oauth.value.provider_type = resp.provider_type
   } catch (err: unknown) {
     if (requestId !== oauthInitRequestId) return
-    const errorMessage = parseApiError(err, '初始化授权失败')
-    showError(errorMessage, '错误')
+    const errorMessage = localizedApiError(err, '初始化授权失败')
+    showError(errorMessage, legacyT('错误'))
     mode.value = 'import'
   } finally {
     if (requestId === oauthInitRequestId) {
@@ -1323,11 +1596,203 @@ async function handleCompleteOAuth() {
     handleClose()
   } catch (err: unknown) {
     if (requestId !== oauthCompleteRequestId) return
-    const errorMessage = parseApiError(err, '完成授权失败')
-    showError(errorMessage, '错误')
+    const errorMessage = localizedApiError(err, '完成授权失败')
+    showError(errorMessage, legacyT('错误'))
   } finally {
     if (requestId === oauthCompleteRequestId) {
       oauth.value.completing = false
+    }
+  }
+}
+
+async function handleCookieAuthorize() {
+  if (!canAuthorizeWithCookie.value || !props.providerId) return
+
+  const entries = [...cookieEntries.value]
+  const requestId = ++cookieAuthorizeRequestId
+  cookieAuthorizing.value = true
+  try {
+    if (entries.length === 1) {
+      const result = await authorizeProviderWithCookie(props.providerId, {
+        cookie: entries[0],
+        proxy_node_id: selectedProxyNodeId.value || undefined,
+      })
+      if (requestId !== cookieAuthorizeRequestId) return
+
+      success(getOAuthSuccessMessage('授权', result))
+      emit('saved')
+      handleClose()
+      return
+    }
+
+    const task = await startProviderCookieAuthorizeTask(props.providerId, {
+      cookies: entries,
+      proxy_node_id: selectedProxyNodeId.value || undefined,
+    })
+    if (requestId !== cookieAuthorizeRequestId) return
+
+    cookieAuthorizeTask.value = task
+    cookieAuthorizeSubmittedEntries.value = entries
+    scheduleCookieAuthorizePoll(task.task_id, requestId, 0)
+  } catch (err: unknown) {
+    if (requestId !== cookieAuthorizeRequestId) return
+    const errorMessage = localizedApiError(err, 'Cookie 授权失败')
+    showError(errorMessage, legacyT('错误'))
+  } finally {
+    if (requestId === cookieAuthorizeRequestId && !cookieAuthorizeTask.value) {
+      cookieAuthorizing.value = false
+    }
+  }
+}
+
+function stopCookieAuthorizePolling() {
+  if (cookieAuthorizePollTimer) {
+    clearTimeout(cookieAuthorizePollTimer)
+    cookieAuthorizePollTimer = null
+  }
+  cookieAuthorizePolling.value = false
+}
+
+function scheduleCookieAuthorizePoll(taskId: string, requestId: number, delayMs = 1200) {
+  stopCookieAuthorizePolling()
+  cookieAuthorizePollTimer = setTimeout(() => {
+    void pollCookieAuthorizeTaskStatus(taskId, requestId)
+  }, delayMs)
+}
+
+function cookieAuthorizeBatchSummary(task: OAuthBatchImportTaskStatusResponse): string {
+  const replaced = Math.max(task.replaced_count ?? 0, 0)
+  const created = Math.max(task.created_count ?? task.success - replaced, 0)
+  const successDetail = isEnglishLocale()
+    ? `${task.success} succeeded (${created} added, ${replaced} replaced)`
+    : `成功 ${task.success} 个（新增 ${created} 个，替换 ${replaced} 个）`
+
+  if (isEnglishLocale()) {
+    return task.failed > 0
+      ? `Batch authorization complete: ${successDetail}, ${task.failed} failed`
+      : `Batch authorization succeeded: ${successDetail}`
+  }
+  return task.failed > 0
+    ? `批量授权完成：${successDetail}，失败 ${task.failed} 个`
+    : `批量授权成功：${successDetail}`
+}
+
+function cookieAuthorizeFailureReasons(task: OAuthBatchImportTaskStatusResponse): string[] {
+  const reasons: string[] = []
+  const seenIndexes = new Set<number>()
+  for (const item of task.error_samples) {
+    const index = item.index
+    const detail = item.error?.trim()
+    if (
+      item.status !== 'error'
+      || !Number.isInteger(index)
+      || index < 0
+      || index >= task.total
+      || seenIndexes.has(index)
+      || !detail
+      || detail.length > 512
+    ) {
+      continue
+    }
+
+    const normalized = detail.toLowerCase()
+    if (
+      normalized.includes('sessionkey')
+      || normalized.includes('sk-ant-')
+      || normalized.includes('cookie:')
+    ) {
+      continue
+    }
+
+    seenIndexes.add(index)
+    reasons.push(`#${index + 1} ${legacyT(detail)}`)
+    if (reasons.length === 2) break
+  }
+  return reasons
+}
+
+function cookieAuthorizeBatchResultMessage(task: OAuthBatchImportTaskStatusResponse): string {
+  const summary = cookieAuthorizeBatchSummary(task)
+  const reasons = cookieAuthorizeFailureReasons(task)
+  if (reasons.length === 0) return summary
+  return `${summary}${isEnglishLocale() ? '; ' : '；'}${reasons.join(isEnglishLocale() ? '; ' : '；')}`
+}
+
+function failedCookieAuthorizeEntries(
+  task: OAuthBatchImportTaskStatusResponse,
+  entries: string[],
+): string[] {
+  const failedIndexes = task.error_samples
+    .filter(item => item.status === 'error' && Number.isInteger(item.index))
+    .map(item => item.index)
+    .filter(index => index >= 0 && index < entries.length)
+
+  // Keep every original line if the response is incomplete, so credentials are never discarded.
+  if (new Set(failedIndexes).size !== task.failed) return entries
+  return failedIndexes.map(index => entries[index])
+}
+
+function handleCookieAuthorizeBatchResult(
+  task: OAuthBatchImportTaskStatusResponse,
+  entries: string[],
+) {
+  const message = cookieAuthorizeBatchResultMessage(task)
+  cookieAuthorizeTask.value = null
+  cookieAuthorizeSubmittedEntries.value = []
+
+  if (task.failed === 0) {
+    success(message)
+    emit('saved')
+    handleClose()
+    return
+  }
+
+  if (task.success > 0) {
+    cookieInput.value = failedCookieAuthorizeEntries(task, entries).join('\n')
+    emit('saved')
+    warning(message, legacyT('批量授权'))
+    return
+  }
+
+  showError(message, legacyT('错误'))
+}
+
+async function pollCookieAuthorizeTaskStatus(taskId: string, requestId: number) {
+  if (!props.providerId || cookieAuthorizePolling.value || requestId !== cookieAuthorizeRequestId) return
+
+  cookieAuthorizePolling.value = true
+  try {
+    const task = await getProviderCookieAuthorizeTaskStatus(props.providerId, taskId)
+    if (requestId !== cookieAuthorizeRequestId) return
+    cookieAuthorizeTask.value = task
+
+    if (task.status === 'completed') {
+      stopCookieAuthorizePolling()
+      cookieAuthorizing.value = false
+      handleCookieAuthorizeBatchResult(task, [...cookieAuthorizeSubmittedEntries.value])
+      return
+    }
+
+    if (task.status === 'failed') {
+      stopCookieAuthorizePolling()
+      cookieAuthorizing.value = false
+      cookieAuthorizeTask.value = null
+      cookieAuthorizeSubmittedEntries.value = []
+      showError(
+        legacyT(task.error || task.message || 'Cookie 授权失败'),
+        legacyT('Cookie 授权失败'),
+      )
+      return
+    }
+
+    scheduleCookieAuthorizePoll(taskId, requestId)
+  } catch {
+    if (cookieAuthorizing.value && requestId === cookieAuthorizeRequestId) {
+      scheduleCookieAuthorizePoll(taskId, requestId, 2000)
+    }
+  } finally {
+    if (requestId === cookieAuthorizeRequestId) {
+      cookieAuthorizePolling.value = false
     }
   }
 }
@@ -1396,6 +1861,30 @@ function parseImportText(text: string): {
       // Not JSON: treat as token copied from show-auth-token.
     }
     return { token: trimmed }
+  }
+
+  if (isClaudeCodeProvider.value) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      if (isObjectRecord(parsed) && isObjectRecord(parsed.claudeAiOauth)) {
+        const claudeAiOauth = parsed.claudeAiOauth
+        const refreshToken = normalizeStringField(claudeAiOauth.refreshToken)
+          ?? normalizeStringField(claudeAiOauth.refresh_token)
+        const accessToken = normalizeStringField(claudeAiOauth.accessToken)
+          ?? normalizeStringField(claudeAiOauth.access_token)
+        if (refreshToken || accessToken) {
+          return {
+            refresh_token: refreshToken,
+            access_token: accessToken,
+            expires_at: normalizeClaudeCredentialsExpiry(
+              claudeAiOauth.expiresAt ?? claudeAiOauth.expires_at,
+            ),
+          }
+        }
+      }
+    } catch {
+      // Raw Claude refresh tokens continue through the generic import path.
+    }
   }
 
   try {
@@ -1588,6 +2077,12 @@ function normalizeExpiryField(value: unknown): number | undefined {
   return undefined
 }
 
+function normalizeClaudeCredentialsExpiry(value: unknown): number | undefined {
+  const expiresAt = normalizeExpiryField(value)
+  if (!expiresAt) return undefined
+  return expiresAt >= 10_000_000_000 ? Math.floor(expiresAt / 1000) : expiresAt
+}
+
 function isLikelyJwtToken(token: string): boolean {
   const parts = token.trim().split('.')
   if (parts.length !== 3 || parts.some(part => !part)) return false
@@ -1610,7 +2105,71 @@ function decodeBase64Url(value: string): string {
 }
 
 function handleImportInputError(payload: { message: string; title?: string }) {
-  showError(payload.message, payload.title)
+  showError(legacyT(payload.message), payload.title ? legacyT(payload.title) : undefined)
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+type AgentIdentityAccessTokenResolution =
+  | { ok: true, accessToken: string }
+  | { ok: false, message: string }
+
+function resolveAgentIdentityAccessToken(input: string): AgentIdentityAccessTokenResolution {
+  const normalized = input.trim()
+  if (!normalized.startsWith('{') && !normalized.startsWith('[')) {
+    return { ok: true, accessToken: normalized }
+  }
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(normalized)
+  } catch {
+    return { ok: false, message: 'ChatGPT auth/session JSON 格式无效' }
+  }
+  if (!isObjectRecord(parsed)) {
+    return { ok: false, message: 'ChatGPT auth/session JSON 缺少 accessToken' }
+  }
+
+  const accessToken = normalizeStringField(parsed.accessToken)
+    ?? normalizeStringField(parsed.access_token)
+  return accessToken
+    ? { ok: true, accessToken }
+    : { ok: false, message: 'ChatGPT auth/session JSON 缺少 accessToken' }
+}
+
+function isCodexAgentIdentityObject(root: Record<string, unknown>): boolean {
+  const nestedValue = root.agent_identity ?? root.agentIdentity
+  const nested = isObjectRecord(nestedValue) ? nestedValue : null
+  const authMode = normalizeStringField(root.auth_mode)
+    ?? normalizeStringField(root.authMode)
+    ?? (nested
+      ? normalizeStringField(nested.auth_mode) ?? normalizeStringField(nested.authMode)
+      : undefined)
+  if (authMode?.toLowerCase() === 'agentidentity') return true
+
+  return nested !== null
+    && Boolean(
+      normalizeStringField(nested.agent_runtime_id) ?? normalizeStringField(nested.agentRuntimeId),
+    )
+    && Boolean(
+      normalizeStringField(nested.agent_private_key) ?? normalizeStringField(nested.agentPrivateKey),
+    )
+}
+
+function requiresCodexBatchImport(credentials: string): boolean {
+  if (!isCodexProvider.value) return false
+
+  try {
+    const parsed: unknown = JSON.parse(credentials)
+    if (!isObjectRecord(parsed)) return false
+
+    return isCodexAgentIdentityObject(parsed)
+      || normalizeStringField(parsed.type)?.toLowerCase() === 'sub2api-data'
+  } catch {
+    return false
+  }
 }
 
 function setWindsurfImportMethod(method: WindsurfImportMethod) {
@@ -1625,7 +2184,7 @@ async function handleWindsurfEmailPasswordImport() {
   const email = windsurfEmail.value.trim()
   const password = windsurfPassword.value.trim()
   if (!email || !password) {
-    showError('请输入邮箱和密码', '格式错误')
+    showError(legacyT('请输入邮箱和密码'), legacyT('格式错误'))
     return
   }
 
@@ -1641,8 +2200,8 @@ async function handleWindsurfEmailPasswordImport() {
     emit('saved')
     handleClose()
   } catch (err: unknown) {
-    const errorMessage = parseApiError(err, '导入失败')
-    showError(errorMessage, '错误')
+    const errorMessage = localizedApiError(err, '导入失败')
+    showError(errorMessage, legacyT('错误'))
   } finally {
     importing.value = false
   }
@@ -1657,13 +2216,13 @@ async function handleImport() {
 
   const inputText = importText.value.trim()
   if (!inputText) {
-    showError('请输入凭据数据', '格式错误')
+    showError(legacyT('请输入凭据数据'), legacyT('格式错误'))
     return
   }
 
   const normalizedCredentials = normalizeBatchImportCredentials(inputText)
   if (!normalizedCredentials.ok) {
-    showError(normalizedCredentials.message, '格式错误')
+    showError(legacyT(normalizedCredentials.message), legacyT('格式错误'))
     return
   }
 
@@ -1671,8 +2230,12 @@ async function handleImport() {
   let keepImporting = false
   try {
     const proxyNodeId = selectedProxyNodeId.value || undefined
-    // Kiro 的单条 JSON 凭据也必须走 batch-import 路径，后端需要完整 auth_config。
-    if (isKiroProvider.value || normalizedCredentials.isBatch) {
+    // Kiro, Codex Agent Identity, and sub2api exports need their full JSON on the batch path.
+    if (
+      isKiroProvider.value
+      || normalizedCredentials.isBatch
+      || requiresCodexBatchImport(normalizedCredentials.credentials)
+    ) {
       const task = await startBatchImportOAuthTask(props.providerId, normalizedCredentials.credentials, proxyNodeId)
       importTask.value = {
         task_id: task.task_id,
@@ -1700,7 +2263,7 @@ async function handleImport() {
       // 单条导入
       const parsed = parseImportText(normalizedCredentials.credentials)
       if (!parsed) {
-        showError('无法解析输入内容，请检查格式', '格式错误')
+        showError(legacyT('无法解析输入内容，请检查格式'), legacyT('格式错误'))
         return
       }
       const result = await importProviderRefreshToken(props.providerId, {
@@ -1712,11 +2275,47 @@ async function handleImport() {
       handleClose()
     }
   } catch (err: unknown) {
-    const errorMessage = parseApiError(err, '导入失败')
-    showError(errorMessage, '错误')
+    const errorMessage = localizedApiError(err, '导入失败')
+    showError(errorMessage, legacyT('错误'))
   } finally {
     if (!keepImporting) {
       importing.value = false
+    }
+  }
+}
+
+async function handleCreateAgentIdentity() {
+  if (!canCreateAgentIdentity.value || !props.providerId) return
+
+  const resolvedInput = resolveAgentIdentityAccessToken(agentIdentityInput.value)
+  if (!resolvedInput.ok) {
+    showError(legacyT(resolvedInput.message), legacyT('格式错误'))
+    return
+  }
+  const requestId = ++agentIdentityRequestId
+  creatingAgentIdentity.value = true
+  try {
+    const result = await importProviderRefreshToken(props.providerId, {
+      access_token: resolvedInput.accessToken,
+      create_agent_identity: true,
+      proxy_node_id: selectedProxyNodeId.value || undefined,
+    })
+    if (requestId !== agentIdentityRequestId) return
+
+    if (result.task_ready === false) {
+      warning(legacyT('Agent Identity 已保存，任务将在后台初始化'), legacyT('已保存'))
+    } else {
+      success(getOAuthSuccessMessage('创建', result))
+    }
+    emit('saved')
+    handleClose()
+  } catch (err: unknown) {
+    if (requestId !== agentIdentityRequestId) return
+    const errorMessage = localizedApiError(err, '创建 Agent Identity 失败')
+    showError(errorMessage, legacyT('错误'))
+  } finally {
+    if (requestId === agentIdentityRequestId) {
+      creatingAgentIdentity.value = false
     }
   }
 }
@@ -1788,8 +2387,8 @@ async function startDeviceAuth() {
     }
   } catch (err: unknown) {
     if (requestId !== deviceAuthRequestId || device.value.auth_type !== requestedAuthType) return
-    const errorMessage = parseApiError(err, '发起设备授权失败')
-    showError(errorMessage, '错误')
+    const errorMessage = localizedApiError(err, '发起设备授权失败')
+    showError(errorMessage, legacyT('错误'))
     device.value.status = 'error'
     device.value.error = errorMessage
   } finally {
@@ -1887,8 +2486,8 @@ async function pollDevice(withCallback = false) {
     }
   } catch (err: unknown) {
     if (withCallback) {
-      const errorMessage = parseApiError(err, '完成授权失败')
-      showError(errorMessage, '错误')
+      const errorMessage = localizedApiError(err, '完成授权失败')
+      showError(errorMessage, legacyT('错误'))
     }
     // 网络错误等，继续轮询
     if (!withCallback && !device.value.callback_required) {
@@ -1899,27 +2498,32 @@ async function pollDevice(withCallback = false) {
 
 onBeforeUnmount(() => {
   stopImportPolling()
+  stopCookieAuthorizePolling()
   stopDevicePolling()
 })
 
-watch(() => props.open, (newOpen) => {
-  if (newOpen) {
-    proxyNodesStore.ensureLoaded()
-    mode.value = defaultMode.value
-    if (!showAuthorizationMode.value) {
-      return
-    }
-    if (isWindsurfProvider.value) {
-      device.value.auth_type = 'default'
-    } else if (isKiroProvider.value) {
-      void ensureKiroSocialDeviceAuth()
+watch(
+  () => props.open,
+  (newOpen) => {
+    if (newOpen) {
+      proxyNodesStore.ensureLoaded()
+      mode.value = defaultMode.value
+      if (!showAuthorizationMode.value) {
+        return
+      }
+      if (isWindsurfProvider.value) {
+        device.value.auth_type = 'default'
+      } else if (isKiroProvider.value) {
+        void ensureKiroSocialDeviceAuth()
+      } else {
+        initOAuth()
+      }
     } else {
-      initOAuth()
+      resetForm()
     }
-  } else {
-    resetForm()
-  }
-})
+  },
+  { immediate: true },
+)
 
 watch(
   () => [props.open, props.providerId, props.providerType] as const,
@@ -1927,6 +2531,12 @@ watch(
     if (props.open && !showAuthorizationMode.value) {
       mode.value = 'import'
       return
+    }
+    if (props.open && mode.value === 'agent_identity' && !isCodexProvider.value) {
+      mode.value = defaultMode.value
+    }
+    if (props.open && mode.value === 'cookie' && !isClaudeCodeProvider.value) {
+      mode.value = defaultMode.value
     }
     if (props.open && isWindsurfProvider.value && mode.value === 'oauth') {
       device.value.auth_type = ['default', 'google', 'github'].includes(device.value.auth_type)

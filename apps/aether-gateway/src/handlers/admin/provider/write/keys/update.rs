@@ -1,8 +1,10 @@
+use crate::handlers::admin::provider::oauth::provisioning::rotate_codex_credential_generation;
 use crate::handlers::admin::provider::shared::payloads::AdminProviderKeyUpdatePatch;
 use crate::handlers::admin::provider::write::normalize::{
     normalize_allow_auth_channel_mismatch_formats, normalize_api_format_json_object_keys,
     normalize_api_format_list, normalize_auth_type, normalize_auth_type_by_format,
-    normalize_max_probe_interval_minutes, validate_vertex_api_formats,
+    normalize_max_probe_interval_minutes, normalize_rate_multipliers,
+    reconcile_allow_auth_channel_mismatch_formats, validate_vertex_api_formats,
 };
 use crate::handlers::admin::request::AdminAppState;
 use crate::handlers::admin::shared::{
@@ -12,6 +14,7 @@ use crate::handlers::admin::shared::{
 use crate::handlers::shared::normalize_optional_api_key_concurrent_limit;
 use crate::provider_key_auth::provider_key_is_oauth_managed;
 use aether_data_contracts::repository::provider_catalog::{
+    ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyOAuthCredentialFence,
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_provider_transport::provider_types::provider_type_is_fixed;
@@ -22,6 +25,27 @@ pub(crate) async fn build_admin_update_provider_key_record(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
     existing: &StoredProviderCatalogKey,
+    patch: AdminProviderKeyUpdatePatch,
+) -> Result<StoredProviderCatalogKey, String> {
+    let existing_keys = state
+        .as_ref()
+        .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider.id))
+        .await
+        .map_err(|err| format!("{err:?}"))?;
+    build_admin_update_provider_key_record_with_existing_keys(
+        state,
+        provider,
+        existing,
+        &existing_keys,
+        patch,
+    )
+}
+
+pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
+    state: &AdminAppState<'_>,
+    provider: &StoredProviderCatalogProvider,
+    existing: &StoredProviderCatalogKey,
+    existing_keys: &[StoredProviderCatalogKey],
     patch: AdminProviderKeyUpdatePatch,
 ) -> Result<StoredProviderCatalogKey, String> {
     let state = state.as_ref();
@@ -57,10 +81,15 @@ pub(crate) async fn build_admin_update_provider_key_record(
         .and_then(serde_json::Value::as_object)
         .cloned();
 
-    let existing_keys = state
-        .list_provider_catalog_keys_by_provider_ids(std::slice::from_ref(&provider.id))
-        .await
-        .map_err(|err| format!("{err:?}"))?;
+    if auth_config
+        .as_ref()
+        .is_some_and(aether_provider_transport::is_codex_agent_identity_auth_config_value)
+    {
+        return Err(
+            "Agent Identity 凭据必须通过专属创建或导入接口管理，不能通过通用 Key 接口写入"
+                .to_string(),
+        );
+    }
 
     match target_auth_type.as_str() {
         "api_key" | "bearer" => {
@@ -230,7 +259,7 @@ pub(crate) async fn build_admin_update_provider_key_record(
                 "allow_auth_channel_mismatch_formats",
                 &effective_api_formats,
             )?;
-    } else if fields.contains("api_formats") {
+    } else if fields.contains("api_formats") && !managed_fixed_oauth_key {
         let existing = updated
             .allow_auth_channel_mismatch_formats
             .as_ref()
@@ -243,11 +272,7 @@ pub(crate) async fn build_admin_update_provider_key_record(
                     .collect::<Vec<_>>()
             });
         updated.allow_auth_channel_mismatch_formats =
-            normalize_allow_auth_channel_mismatch_formats(
-                existing,
-                "allow_auth_channel_mismatch_formats",
-                &effective_api_formats,
-            )?;
+            reconcile_allow_auth_channel_mismatch_formats(existing, &effective_api_formats);
     }
 
     updated.auth_type = target_auth_type;
@@ -260,8 +285,7 @@ pub(crate) async fn build_admin_update_provider_key_record(
         updated.name = trimmed.to_string();
     }
     if fields.contains("rate_multipliers") {
-        updated.rate_multipliers =
-            normalize_api_format_json_object_keys(payload.rate_multipliers, "rate_multipliers")?;
+        updated.rate_multipliers = normalize_rate_multipliers(payload.rate_multipliers)?;
     }
     if let Some(internal_priority) = payload.internal_priority {
         updated.internal_priority = internal_priority;
@@ -308,7 +332,7 @@ pub(crate) async fn build_admin_update_provider_key_record(
     if let Some(auto_fetch_models) = payload.auto_fetch_models {
         updated.auto_fetch_models = auto_fetch_models;
     }
-    if auto_fetch_disabled {
+    if auto_fetch_disabled && !fields.contains("allowed_models") {
         updated.allowed_models = None;
     }
     if fields.contains("locked_models") {
@@ -346,7 +370,67 @@ pub(crate) async fn build_admin_update_provider_key_record(
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs());
+    let credential_identity_changed = !updated.auth_type.eq_ignore_ascii_case(&existing.auth_type)
+        || updated.encrypted_api_key != existing.encrypted_api_key
+        || updated.encrypted_auth_config != existing.encrypted_auth_config;
+    if credential_identity_changed {
+        rotate_codex_credential_generation(&mut updated, &provider.provider_type);
+    }
     Ok(updated)
+}
+
+pub(crate) fn admin_provider_key_update_requires_immediate_model_fetch(
+    existing: &StoredProviderCatalogKey,
+    updated: &StoredProviderCatalogKey,
+) -> bool {
+    let filters_changed = existing.model_include_patterns != updated.model_include_patterns
+        || existing.model_exclude_patterns != updated.model_exclude_patterns;
+    let locked_models_changed = existing.locked_models != updated.locked_models;
+    updated.auto_fetch_models
+        && (!existing.auto_fetch_models || filters_changed || locked_models_changed)
+}
+
+pub(crate) fn build_provider_catalog_key_admin_cas_update(
+    existing: &StoredProviderCatalogKey,
+    updated: StoredProviderCatalogKey,
+    provider_type: &str,
+) -> ProviderCatalogKeyAdminCasUpdate {
+    let previous_generation = existing
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/codex/credential_generation"))
+        .and_then(serde_json::Value::as_str);
+    let next_generation = updated
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.pointer("/codex/credential_generation"))
+        .and_then(serde_json::Value::as_str);
+    let credential_changed = existing.auth_type != updated.auth_type
+        || existing.encrypted_api_key != updated.encrypted_api_key
+        || existing.encrypted_auth_config != updated.encrypted_auth_config;
+    let codex_rotation = provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+        .then(|| next_generation.filter(|next| Some(*next) != previous_generation))
+        .flatten()
+        .map(|generation| {
+            json!({
+                aether_admin::provider::quota::CODEX_CREDENTIAL_GENERATION_KEY: generation,
+            })
+        });
+
+    ProviderCatalogKeyAdminCasUpdate {
+        expected_encrypted_auth_config: existing.encrypted_auth_config.clone(),
+        expected_credential: ProviderCatalogKeyOAuthCredentialFence {
+            encrypted_api_key: existing.encrypted_api_key.clone(),
+            auth_type: existing.auth_type.clone(),
+            provider_id: existing.provider_id.clone(),
+            provider_type: provider_type.to_string(),
+        },
+        key: updated,
+        codex_rotation,
+        reset_oauth_runtime: credential_changed,
+    }
 }
 
 fn raw_secret_auth_type(value: &str) -> bool {

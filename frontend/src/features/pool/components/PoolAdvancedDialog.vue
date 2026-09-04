@@ -530,7 +530,8 @@ import { CircleHelp } from 'lucide-vue-next'
 import { Dialog, Button, Input, Label, Switch, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui'
 import { useToast } from '@/composables/useToast'
 import { parseApiError } from '@/utils/errorParser'
-import { updateProvider } from '@/api/endpoints'
+import { getProvider, updateProvider } from '@/api/endpoints'
+import { mergePoolAdvancedPatch } from '@/features/pool/utils/poolSchedulingDialog'
 import {
   buildPoolCooldownFieldLayout,
   buildPoolHealthToggleCards,
@@ -557,6 +558,7 @@ const emit = defineEmits<{
 
 const { success, error: showError } = useToast()
 const loading = ref(false)
+let dialogRevision = 0
 
 const isClaudeCode = computed(() => {
   return (props.providerType || '').trim().toLowerCase() === 'claude_code'
@@ -588,6 +590,7 @@ const form = ref({
   account_self_check_interval_minutes: null as number | null | undefined,
   account_self_check_concurrency: null as number | null | undefined,
   auto_remove_banned_keys: false,
+  auto_remove_quota_exhausted_keys: false,
   skip_exhausted_accounts: false,
 })
 
@@ -625,6 +628,8 @@ function getHealthToggleValue(key: PoolHealthToggleKey): boolean {
       return form.value.account_self_check_enabled
     case 'auto_remove_banned_keys':
       return form.value.auto_remove_banned_keys
+    case 'auto_remove_quota_exhausted_keys':
+      return form.value.auto_remove_quota_exhausted_keys
     case 'skip_exhausted_accounts':
       return form.value.skip_exhausted_accounts
   }
@@ -641,12 +646,17 @@ function updateHealthToggleValue(key: PoolHealthToggleKey, value: boolean): void
     case 'auto_remove_banned_keys':
       form.value.auto_remove_banned_keys = value
       return
+    case 'auto_remove_quota_exhausted_keys':
+      form.value.auto_remove_quota_exhausted_keys = value
+      return
     case 'skip_exhausted_accounts':
       form.value.skip_exhausted_accounts = value
   }
 }
 
-watch(() => props.modelValue, (open) => {
+watch([() => props.modelValue, () => props.providerId], ([open]) => {
+  dialogRevision += 1
+  loading.value = false
   if (!open) return
 
   const cfg = props.currentConfig
@@ -675,6 +685,7 @@ watch(() => props.modelValue, (open) => {
     account_self_check_interval_minutes: cfg?.account_self_check_interval_minutes ?? null,
     account_self_check_concurrency: cfg?.account_self_check_concurrency ?? null,
     auto_remove_banned_keys: cfg?.auto_remove_banned_keys ?? false,
+    auto_remove_quota_exhausted_keys: cfg?.auto_remove_quota_exhausted_keys ?? false,
     skip_exhausted_accounts: cfg?.skip_exhausted_accounts ?? false,
   }
 
@@ -691,12 +702,26 @@ watch(() => props.modelValue, (open) => {
 })
 
 async function handleSave() {
+  const providerId = props.providerId
+  const revision = dialogRevision
   loading.value = true
   try {
+    const latestProvider = await getProvider(providerId)
+    if (!props.modelValue || props.providerId !== providerId || dialogRevision !== revision) return
+    const latestAdvanced = (latestProvider as Record<string, unknown>).pool_advanced
+    const existingPoolAdvanced = mergePoolAdvancedPatch(latestAdvanced, {})
+    const latestScoreRules = typeof existingPoolAdvanced.score_rules === 'object'
+      && existingPoolAdvanced.score_rules !== null
+      ? existingPoolAdvanced.score_rules as Record<string, unknown>
+      : {}
+    const latestScoreWeights = typeof latestScoreRules.weights === 'object'
+      && latestScoreRules.weights !== null
+      ? latestScoreRules.weights as Record<string, unknown>
+      : {}
     const scoreRules = {
-      ...(props.currentConfig?.score_rules ?? {}),
+      ...latestScoreRules,
       weights: {
-        ...(props.currentConfig?.score_rules?.weights ?? {}),
+        ...latestScoreWeights,
         manual_priority: form.value.score_weight_manual_priority ?? undefined,
         health: form.value.score_weight_health ?? undefined,
         probe_freshness: form.value.score_weight_probe_freshness ?? undefined,
@@ -710,31 +735,8 @@ async function handleSave() {
       request_failure_penalty: form.value.request_failure_penalty ?? undefined,
       probe_failure_cooldown_threshold: form.value.probe_failure_cooldown_threshold ?? undefined,
     }
-    const existingPoolAdvanced: Record<string, unknown> = { ...(props.currentConfig ?? {}) }
-    for (const key of [
-      'probing_target_percent',
-      'probing_target_count',
-      'probing_active_target_percent',
-      'probing_active_target_count',
-      'active_probe_target_percent',
-      'active_probe_target_count',
-      'probing_interval_minutes',
-      'account_self_check_method',
-      'self_check_method',
-      'account_self_check_request',
-      'self_check_request',
-      'health_policy_enabled',
-      'sticky_session_ttl_seconds',
-      'global_priority',
-      'cost_window_seconds',
-      'cost_limit_per_key_tokens',
-      'cost_soft_threshold_percent',
-    ]) {
-      delete existingPoolAdvanced[key]
-    }
     // 合并已有配置（保留 scheduling_presets 等不在此对话框编辑的字段）
-    const poolAdvanced: Record<string, unknown> = {
-      ...existingPoolAdvanced,
+    const poolAdvanced = mergePoolAdvancedPatch(existingPoolAdvanced, {
       rate_limit_cooldown_seconds: form.value.rate_limit_cooldown_seconds ?? undefined,
       overload_cooldown_seconds: form.value.overload_cooldown_seconds ?? undefined,
       batch_concurrency: form.value.batch_concurrency ?? undefined,
@@ -751,8 +753,9 @@ async function handleSave() {
         ? (form.value.account_self_check_concurrency ?? undefined)
         : undefined,
       auto_remove_banned_keys: form.value.auto_remove_banned_keys,
+      auto_remove_quota_exhausted_keys: form.value.auto_remove_quota_exhausted_keys,
       skip_exhausted_accounts: form.value.skip_exhausted_accounts,
-    }
+    })
 
     const payload: Parameters<typeof updateProvider>[1] = {
       pool_advanced: poolAdvanced as PoolAdvancedConfig,
@@ -768,14 +771,17 @@ async function handleSave() {
         cli_only_enabled: cf.cli_only_enabled,
       }
     }
-    const updatedProvider = await updateProvider(props.providerId, payload)
+    const updatedProvider = await updateProvider(providerId, payload)
+    if (!props.modelValue || props.providerId !== providerId || dialogRevision !== revision) return
     success('高级设置已保存')
     emit('saved', updatedProvider)
     emit('update:modelValue', false)
   } catch (err) {
     showError(parseApiError(err))
   } finally {
-    loading.value = false
+    if (dialogRevision === revision) {
+      loading.value = false
+    }
   }
 }
 </script>

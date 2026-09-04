@@ -1,16 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io::Error as IoError;
 use std::time::{Duration, Instant};
 
 use aether_contracts::{
-    ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionStreamTerminalSummary,
-    ExecutionTelemetry, StreamFrame, StreamFramePayload, StreamFrameType,
+    ExecutionError, ExecutionErrorKind, ExecutionPhase, ExecutionResponseObservation,
+    ExecutionStreamTerminalSummary, ExecutionTelemetry, StreamFrame, StreamFramePayload,
+    StreamFrameType,
 };
 use async_stream::stream;
 use axum::body::Bytes;
 use base64::Engine as _;
 use futures_util::{Stream, StreamExt};
+use http_body_util::BodyExt;
 use serde_json::Value;
 use tracing::warn;
 
@@ -20,10 +22,13 @@ use crate::ai_serving::api::{
 };
 use crate::execution_runtime::ndjson::encode_stream_frame_ndjson;
 use crate::execution_runtime::transport::{
+    append_upstream_response_body_chunk, decode_response_body_bytes, format_hyper_error_chain,
     format_wreq_upstream_request_error, stream_first_byte_timeout_message, DirectUpstreamResponse,
 };
 use crate::execution_runtime::DirectUpstreamStreamExecution;
 use crate::GatewayError;
+
+const STREAM_USAGE_OBSERVER_MAX_LINE_BYTES: usize = 1024 * 1024;
 
 pub(crate) fn build_direct_execution_frame_stream(
     execution: DirectUpstreamStreamExecution,
@@ -36,10 +41,15 @@ pub(crate) fn build_direct_execution_frame_stream(
             headers,
             provider_api_format,
             stream_summary_report_context,
+            prefetched_body,
+            stream_precommit_committed: _,
             response,
             started_at,
+            response_observation,
             stream_first_byte_timeout,
+            upstream_target_permit,
         } = execution;
+        let _upstream_target_permit = upstream_target_permit;
 
         let mut observer_context = stream_summary_report_context;
         if observer_context
@@ -66,7 +76,14 @@ pub(crate) fn build_direct_execution_frame_stream(
 
         if should_buffer_non_stream_response(&headers, &observer_context) {
             let original_headers = headers.clone();
-            match buffer_non_sse_upstream_body(response, started_at, stream_first_byte_timeout).await {
+            match buffer_non_sse_upstream_body(
+                prefetched_body,
+                response,
+                started_at,
+                stream_first_byte_timeout,
+            )
+            .await
+            {
                 Ok(buffered) => {
                     let mut response_headers = original_headers;
                     let mut response_body = Bytes::from(buffered.body_bytes);
@@ -93,7 +110,11 @@ pub(crate) fn build_direct_execution_frame_stream(
                         }
                     }
 
-                    match encode_headers_frame(status_code, response_headers) {
+                    match encode_headers_frame(
+                        status_code,
+                        response_headers,
+                        &response_observation,
+                    ) {
                         Ok(frame) => yield Ok(frame),
                         Err(err) => {
                             yield Err(err);
@@ -138,7 +159,11 @@ pub(crate) fn build_direct_execution_frame_stream(
                     upstream_bytes,
                     first_byte_timeout,
                 }) => {
-                    match encode_headers_frame(status_code, original_headers) {
+                    match encode_headers_frame(
+                        status_code,
+                        original_headers,
+                        &response_observation,
+                    ) {
                         Ok(frame) => yield Ok(frame),
                         Err(err) => {
                             yield Err(err);
@@ -148,7 +173,7 @@ pub(crate) fn build_direct_execution_frame_stream(
                     let error_frame = if let Some(timeout) = first_byte_timeout {
                         encode_first_byte_timeout_frame(timeout)
                     } else {
-                        encode_error_frame(status_code, message)
+                        encode_error_frame(message)
                     };
                     match error_frame {
                         Ok(frame) => yield Ok(frame),
@@ -177,7 +202,11 @@ pub(crate) fn build_direct_execution_frame_stream(
             return;
         }
 
-        match encode_headers_frame(status_code, headers) {
+        match encode_headers_frame(
+            status_code,
+            headers,
+            &response_observation,
+        ) {
             Ok(frame) => yield Ok(frame),
             Err(err) => {
                 yield Err(err);
@@ -188,6 +217,61 @@ pub(crate) fn build_direct_execution_frame_stream(
         let mut upstream_bytes = 0u64;
         let mut ttfb_ms = None;
         let mut first_chunk_telemetry_emitted = false;
+        let mut prefetched_body_failed = false;
+        for item in prefetched_body {
+            match item {
+                Ok(chunk) => {
+                    if ttfb_ms.is_none() {
+                        ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
+                    }
+                    if !first_chunk_telemetry_emitted {
+                        match encode_telemetry_frame(ttfb_ms, ttfb_ms, upstream_bytes) {
+                            Ok(frame) => yield Ok(frame),
+                            Err(err) => {
+                                yield Err(err);
+                                return;
+                            }
+                        }
+                        first_chunk_telemetry_emitted = true;
+                    }
+                    upstream_bytes += chunk.len() as u64;
+                    observe_stream_chunk(
+                        &mut stream_terminal_observer,
+                        &normalized_observer_context,
+                        private_stream_normalizer.as_mut(),
+                        &mut observer_buffered,
+                        chunk.as_ref(),
+                    );
+                    match encode_data_frame(&chunk) {
+                        Ok(frame) => yield Ok(frame),
+                        Err(err) => {
+                            yield Err(err);
+                            return;
+                        }
+                    }
+                }
+                Err(message) => {
+                    warn!(
+                        event_name = "stream_pump_body_read_error",
+                        log_type = "ops",
+                        status_code,
+                        upstream_bytes,
+                        error = %message,
+                        "upstream body stream read error"
+                    );
+                    match encode_error_frame(message) {
+                        Ok(frame) => yield Ok(frame),
+                        Err(encode_err) => {
+                            yield Err(encode_err);
+                            return;
+                        }
+                    }
+                    prefetched_body_failed = true;
+                    break;
+                }
+            }
+        }
+        if !prefetched_body_failed {
         match response {
             DirectUpstreamResponse::Reqwest(response) => {
                 let mut bytes_stream = response.bytes_stream();
@@ -259,7 +343,89 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 error = %message,
                                 "upstream body stream read error"
                             );
-                            match encode_error_frame(status_code, message) {
+                            match encode_error_frame(message) {
+                                Ok(frame) => yield Ok(frame),
+                                Err(encode_err) => {
+                                    yield Err(encode_err);
+                                    return;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            DirectUpstreamResponse::HyperH2c(response) => {
+                let mut bytes_stream = response.into_body().into_data_stream();
+                loop {
+                    let item = if ttfb_ms.is_none() {
+                        match await_stream_first_byte(
+                            bytes_stream.next(),
+                            started_at,
+                            stream_first_byte_timeout,
+                        )
+                        .await
+                        {
+                            Ok(item) => item,
+                            Err(timeout) => {
+                                match encode_first_byte_timeout_frame(timeout) {
+                                    Ok(frame) => yield Ok(frame),
+                                    Err(err) => {
+                                        yield Err(err);
+                                        return;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        bytes_stream.next().await
+                    };
+                    let Some(item) = item else {
+                        break;
+                    };
+                    match item {
+                        Ok(chunk) => {
+                            if ttfb_ms.is_none() {
+                                ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
+                            }
+                            if !first_chunk_telemetry_emitted {
+                                match encode_telemetry_frame(ttfb_ms, ttfb_ms, upstream_bytes) {
+                                    Ok(frame) => yield Ok(frame),
+                                    Err(err) => {
+                                        yield Err(err);
+                                        return;
+                                    }
+                                }
+                                first_chunk_telemetry_emitted = true;
+                            }
+                            upstream_bytes += chunk.len() as u64;
+                            observe_stream_chunk(
+                                &mut stream_terminal_observer,
+                                &normalized_observer_context,
+                                private_stream_normalizer.as_mut(),
+                                &mut observer_buffered,
+                                chunk.as_ref(),
+                            );
+                            match encode_data_frame(&chunk) {
+                                Ok(frame) => yield Ok(frame),
+                                Err(err) => {
+                                    yield Err(err);
+                                    return;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let message = format_hyper_error_chain(&err);
+                            warn!(
+                                event_name = "stream_pump_body_read_error",
+                                log_type = "ops",
+                                status_code,
+                                upstream_bytes,
+                                error = %message,
+                                "upstream body stream read error"
+                            );
+                            match encode_error_frame(message) {
                                 Ok(frame) => yield Ok(frame),
                                 Err(encode_err) => {
                                     yield Err(encode_err);
@@ -341,7 +507,7 @@ pub(crate) fn build_direct_execution_frame_stream(
                                 error = %message,
                                 "upstream body stream read error"
                             );
-                            match encode_error_frame(status_code, message) {
+                            match encode_error_frame(message) {
                                 Ok(frame) => yield Ok(frame),
                                 Err(encode_err) => {
                                     yield Err(encode_err);
@@ -418,7 +584,7 @@ pub(crate) fn build_direct_execution_frame_stream(
                             error = %message,
                             "upstream body stream read error"
                         );
-                        match encode_error_frame(status_code, message) {
+                        match encode_error_frame(message) {
                             Ok(frame) => yield Ok(frame),
                             Err(encode_err) => {
                                 yield Err(encode_err);
@@ -429,6 +595,7 @@ pub(crate) fn build_direct_execution_frame_stream(
                     }
                 }
             }
+        }
         }
         let summary = finalize_stream_terminal_summary(
             &mut stream_terminal_observer,
@@ -458,12 +625,14 @@ pub(crate) fn build_direct_execution_frame_stream(
 fn encode_headers_frame(
     status_code: u16,
     headers: BTreeMap<String, String>,
+    response_observation: &ExecutionResponseObservation,
 ) -> Result<Bytes, IoError> {
     encode_stream_frame_ndjson(&StreamFrame {
         frame_type: StreamFrameType::Headers,
         payload: StreamFramePayload::Headers {
             status_code,
             headers,
+            response_observation: Some(response_observation.clone()),
         },
     })
 }
@@ -495,17 +664,17 @@ fn encode_data_frame(chunk: &Bytes) -> Result<Bytes, IoError> {
     })
 }
 
-fn encode_error_frame(status_code: u16, message: String) -> Result<Bytes, IoError> {
+fn encode_error_frame(message: String) -> Result<Bytes, IoError> {
     encode_stream_frame_ndjson(&StreamFrame {
         frame_type: StreamFrameType::Error,
         payload: StreamFramePayload::Error {
             error: ExecutionError {
-                kind: ExecutionErrorKind::Internal,
+                kind: ExecutionErrorKind::ProtocolError,
                 phase: ExecutionPhase::StreamRead,
                 message,
-                upstream_status: Some(status_code),
-                retryable: false,
-                failover_recommended: false,
+                upstream_status: None,
+                retryable: true,
+                failover_recommended: true,
             },
         },
     })
@@ -519,7 +688,7 @@ fn encode_first_byte_timeout_frame(timeout: Duration) -> Result<Bytes, IoError> 
                 kind: ExecutionErrorKind::FirstByteTimeout,
                 phase: ExecutionPhase::FirstByte,
                 message: stream_first_byte_timeout_message(timeout),
-                upstream_status: Some(504),
+                upstream_status: None,
                 retryable: true,
                 failover_recommended: true,
             },
@@ -562,6 +731,23 @@ struct BufferedUpstreamBodyError {
     first_byte_timeout: Option<Duration>,
 }
 
+fn append_buffered_upstream_body_chunk(
+    body_bytes: &mut Vec<u8>,
+    chunk: &[u8],
+    ttfb_ms: Option<u64>,
+    upstream_bytes: &mut u64,
+) -> Result<(), BufferedUpstreamBodyError> {
+    *upstream_bytes = upstream_bytes.saturating_add(chunk.len() as u64);
+    append_upstream_response_body_chunk(body_bytes, chunk).map_err(|error| {
+        BufferedUpstreamBodyError {
+            message: error.to_string(),
+            ttfb_ms,
+            upstream_bytes: *upstream_bytes,
+            first_byte_timeout: None,
+        }
+    })
+}
+
 fn response_headers_indicate_sse(headers: &BTreeMap<String, String>) -> bool {
     headers
         .get("content-type")
@@ -590,6 +776,14 @@ fn should_buffer_non_stream_response(
         return false;
     }
 
+    if report_context
+        .get("upstream_is_stream")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return true;
+    }
+
     headers
         .get("content-length")
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -597,6 +791,7 @@ fn should_buffer_non_stream_response(
 }
 
 async fn buffer_non_sse_upstream_body(
+    mut prefetched_body: VecDeque<Result<Bytes, String>>,
     response: DirectUpstreamResponse,
     started_at: Instant,
     stream_first_byte_timeout: Option<Duration>,
@@ -604,6 +799,30 @@ async fn buffer_non_sse_upstream_body(
     let mut body_bytes = Vec::new();
     let mut upstream_bytes = 0u64;
     let mut ttfb_ms = None;
+
+    while let Some(item) = prefetched_body.pop_front() {
+        match item {
+            Ok(chunk) => {
+                if ttfb_ms.is_none() {
+                    ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
+                }
+                append_buffered_upstream_body_chunk(
+                    &mut body_bytes,
+                    &chunk,
+                    ttfb_ms,
+                    &mut upstream_bytes,
+                )?;
+            }
+            Err(message) => {
+                return Err(BufferedUpstreamBodyError {
+                    message,
+                    ttfb_ms,
+                    upstream_bytes,
+                    first_byte_timeout: None,
+                });
+            }
+        }
+    }
 
     match response {
         DirectUpstreamResponse::Reqwest(response) => {
@@ -638,11 +857,73 @@ async fn buffer_non_sse_upstream_body(
                         if ttfb_ms.is_none() {
                             ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
                         }
-                        upstream_bytes += chunk.len() as u64;
-                        body_bytes.extend_from_slice(&chunk);
+                        append_buffered_upstream_body_chunk(
+                            &mut body_bytes,
+                            &chunk,
+                            ttfb_ms,
+                            &mut upstream_bytes,
+                        )?;
                     }
                     Err(err) => {
                         let message = format_error_chain(&err);
+                        warn!(
+                            event_name = "stream_pump_body_read_error",
+                            log_type = "ops",
+                            upstream_bytes,
+                            error = %message,
+                            "upstream body stream read error"
+                        );
+                        return Err(BufferedUpstreamBodyError {
+                            message,
+                            ttfb_ms,
+                            upstream_bytes,
+                            first_byte_timeout: None,
+                        });
+                    }
+                }
+            }
+        }
+        DirectUpstreamResponse::HyperH2c(response) => {
+            let mut bytes_stream = response.into_body().into_data_stream();
+            loop {
+                let item = if ttfb_ms.is_none() {
+                    match await_stream_first_byte(
+                        bytes_stream.next(),
+                        started_at,
+                        stream_first_byte_timeout,
+                    )
+                    .await
+                    {
+                        Ok(item) => item,
+                        Err(timeout) => {
+                            return Err(BufferedUpstreamBodyError {
+                                message: stream_first_byte_timeout_message(timeout),
+                                ttfb_ms,
+                                upstream_bytes,
+                                first_byte_timeout: Some(timeout),
+                            });
+                        }
+                    }
+                } else {
+                    bytes_stream.next().await
+                };
+                let Some(item) = item else {
+                    break;
+                };
+                match item {
+                    Ok(chunk) => {
+                        if ttfb_ms.is_none() {
+                            ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
+                        }
+                        append_buffered_upstream_body_chunk(
+                            &mut body_bytes,
+                            &chunk,
+                            ttfb_ms,
+                            &mut upstream_bytes,
+                        )?;
+                    }
+                    Err(err) => {
+                        let message = format_hyper_error_chain(&err);
                         warn!(
                             event_name = "stream_pump_body_read_error",
                             log_type = "ops",
@@ -692,8 +973,12 @@ async fn buffer_non_sse_upstream_body(
                         if ttfb_ms.is_none() {
                             ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
                         }
-                        upstream_bytes += chunk.len() as u64;
-                        body_bytes.extend_from_slice(&chunk);
+                        append_buffered_upstream_body_chunk(
+                            &mut body_bytes,
+                            &chunk,
+                            ttfb_ms,
+                            &mut upstream_bytes,
+                        )?;
                     }
                     Err(err) => {
                         let message = format_wreq_upstream_request_error(&err);
@@ -741,8 +1026,12 @@ async fn buffer_non_sse_upstream_body(
                     if ttfb_ms.is_none() {
                         ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
                     }
-                    upstream_bytes += chunk.len() as u64;
-                    body_bytes.extend_from_slice(&chunk);
+                    append_buffered_upstream_body_chunk(
+                        &mut body_bytes,
+                        &chunk,
+                        ttfb_ms,
+                        &mut upstream_bytes,
+                    )?;
                 }
                 Ok(None) => break,
                 Err(message) => {
@@ -782,13 +1071,13 @@ fn maybe_bridge_non_sse_sync_json_to_stream(
         return Ok(None);
     }
 
-    let decoded_body_bytes = decode_non_sse_response_body_bytes(headers, body_bytes)
-        .unwrap_or_else(|| body_bytes.to_vec());
-    if !response_body_is_json(headers, &decoded_body_bytes) {
+    let decoded_body_bytes = decode_response_body_bytes(headers, body_bytes)
+        .map_err(|error| GatewayError::Internal(error.to_string()))?;
+    if !response_body_is_json(headers, decoded_body_bytes.as_ref()) {
         return Ok(None);
     }
 
-    let body_json: Value = serde_json::from_slice(&decoded_body_bytes)
+    let body_json: Value = serde_json::from_slice(decoded_body_bytes.as_ref())
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
     let client_api_format = report_context
         .get("client_api_format")
@@ -811,33 +1100,6 @@ fn rewrite_headers_for_bridged_sse_response(
     rewritten.insert("content-type".to_string(), "text/event-stream".to_string());
     rewritten.insert("content-length".to_string(), body_len.to_string());
     rewritten
-}
-
-fn decode_non_sse_response_body_bytes(
-    headers: &BTreeMap<String, String>,
-    body_bytes: &[u8],
-) -> Option<Vec<u8>> {
-    let encoding = headers
-        .get("content-encoding")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_ascii_lowercase());
-    match encoding.as_deref() {
-        Some("gzip") => {
-            let mut decoder = flate2::read::GzDecoder::new(body_bytes);
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out).ok()?;
-            Some(out)
-        }
-        Some("deflate") => {
-            let mut decoder = flate2::read::DeflateDecoder::new(body_bytes);
-            let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut decoder, &mut out).ok()?;
-            Some(out)
-        }
-        _ => None,
-    }
 }
 
 fn response_body_is_json(headers: &BTreeMap<String, String>, body_bytes: &[u8]) -> bool {
@@ -926,16 +1188,39 @@ fn observe_normalized_bytes(
     observer_buffered: &mut Vec<u8>,
     normalized: &[u8],
 ) {
-    if normalized.is_empty() {
+    if normalized.is_empty()
+        || observer
+            .latest_summary()
+            .and_then(|summary| summary.parser_error.as_deref())
+            .is_some()
+    {
         return;
     }
-    observer_buffered.extend_from_slice(normalized);
-    while let Some(line_end) = observer_buffered.iter().position(|byte| *byte == b'\n') {
-        let line = observer_buffered.drain(..=line_end).collect::<Vec<_>>();
-        if let Err(err) = observer.push_line(report_context, line) {
-            observer.disable_with_error(err.to_string());
+
+    let mut remaining = normalized;
+    while !remaining.is_empty() {
+        let line_part_len = remaining
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(remaining.len(), |index| index + 1);
+        if observer_buffered.len().saturating_add(line_part_len)
+            > STREAM_USAGE_OBSERVER_MAX_LINE_BYTES
+        {
+            observer.disable_with_error(format!(
+                "stream usage event exceeded {STREAM_USAGE_OBSERVER_MAX_LINE_BYTES} bytes"
+            ));
             observer_buffered.clear();
-            break;
+            return;
+        }
+        observer_buffered.extend_from_slice(&remaining[..line_part_len]);
+        remaining = &remaining[line_part_len..];
+        if observer_buffered.last() == Some(&b'\n') {
+            let line = std::mem::take(observer_buffered);
+            if let Err(err) = observer.push_line(report_context, line) {
+                observer.disable_with_error(err.to_string());
+                observer_buffered.clear();
+                return;
+            }
         }
     }
 }
@@ -960,9 +1245,11 @@ mod tests {
     use tokio::sync::watch;
 
     use super::{
-        build_direct_execution_frame_stream, should_buffer_non_stream_response,
-        should_treat_upstream_response_as_stream,
+        build_direct_execution_frame_stream, observe_normalized_bytes,
+        should_buffer_non_stream_response, should_treat_upstream_response_as_stream,
+        STREAM_USAGE_OBSERVER_MAX_LINE_BYTES,
     };
+    use crate::ai_serving::api::StreamingStandardTerminalObserver;
     use crate::execution_runtime::transport::{
         execute_stream_plan_via_local_tunnel, DirectSyncExecutionRuntime, DirectUpstreamResponse,
     };
@@ -994,23 +1281,58 @@ mod tests {
     }
 
     #[test]
-    fn buffers_non_sse_response_only_when_content_length_is_known() {
-        let report_context = serde_json::json!({
+    fn buffers_declared_non_stream_responses_without_relying_on_content_length() {
+        let streaming_context = serde_json::json!({
             "provider_api_format": "openai:chat",
             "client_api_format": "openai:chat",
+            "upstream_is_stream": true,
+        });
+        let non_stream_context = serde_json::json!({
+            "provider_api_format": "openai:image",
+            "client_api_format": "openai:responses",
+            "upstream_is_stream": false,
         });
 
         assert!(!should_buffer_non_stream_response(
             &BTreeMap::from([("content-type".into(), "application/json".into())]),
-            &report_context
+            &streaming_context
+        ));
+        assert!(should_buffer_non_stream_response(
+            &BTreeMap::from([("content-type".into(), "application/json".into())]),
+            &non_stream_context
         ));
         assert!(should_buffer_non_stream_response(
             &BTreeMap::from([
                 ("content-type".into(), "application/json".into()),
                 ("content-length".into(), "128".into()),
             ]),
-            &report_context
+            &streaming_context
         ));
+        assert!(!should_buffer_non_stream_response(
+            &BTreeMap::from([("content-type".into(), "text/event-stream".into())]),
+            &non_stream_context
+        ));
+    }
+
+    #[test]
+    fn oversized_usage_line_disables_observation_without_retaining_the_line() {
+        let mut observer = StreamingStandardTerminalObserver::default();
+        let report_context = serde_json::json!({
+            "provider_api_format": "claude:messages",
+            "client_api_format": "claude:messages",
+        });
+        let mut buffered = Vec::new();
+        let oversized = vec![b'x'; STREAM_USAGE_OBSERVER_MAX_LINE_BYTES + 1];
+
+        observe_normalized_bytes(&mut observer, &report_context, &mut buffered, &oversized);
+
+        assert!(buffered.is_empty());
+        assert!(observer
+            .latest_summary()
+            .and_then(|summary| summary.parser_error.as_deref())
+            .is_some_and(|error| error.contains("stream usage event exceeded")));
+        observe_normalized_bytes(&mut observer, &report_context, &mut buffered, b"ignored");
+        assert!(buffered.is_empty());
     }
 
     #[tokio::test]
@@ -1184,6 +1506,13 @@ mod tests {
             .is_some_and(
                 |message| message.contains("provider stream first byte timeout after 50 ms")
             ));
+        let error = error_frame
+            .get("payload")
+            .and_then(|payload| payload.get("error"))
+            .expect("timeout error should exist");
+        assert_eq!(error.get("upstream_status"), None);
+        assert_eq!(error.get("retryable"), Some(&Value::Bool(true)));
+        assert_eq!(error.get("failover_recommended"), Some(&Value::Bool(true)));
     }
 
     #[tokio::test]
@@ -1293,43 +1622,47 @@ mod tests {
             .expect("listener should bind");
         let addr = listener.local_addr().expect("local addr should resolve");
         let server = tokio::spawn(async move {
-            let app = Router::new().route(
-                "/responses",
-                post(|| async {
-                    let body = serde_json::json!({
-                        "id": "resp_sync_bridge_123",
-                        "object": "response",
-                        "model": "gpt-5.4",
-                        "status": "completed",
-                        "output": [{
-                            "type": "message",
-                            "id": "msg_sync_bridge_123",
-                            "role": "assistant",
-                            "content": [{
-                                "type": "output_text",
-                                "text": "Hello from buffered JSON stream",
-                                "annotations": []
-                            }]
-                        }],
-                        "usage": {
-                            "input_tokens": 1,
-                            "output_tokens": 2,
-                            "total_tokens": 3
-                        }
-                    });
-                    let mut response = axum::http::Response::new(Body::from(
-                        serde_json::to_vec(&body).expect("json should encode"),
-                    ));
-                    response.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    );
-                    response
-                }),
-            );
-            axum::serve(listener, app)
+            let (mut socket, _) = listener.accept().await.expect("client should connect");
+            let mut request = [0_u8; 4096];
+            let _ = socket
+                .read(&mut request)
                 .await
-                .expect("server should start");
+                .expect("request should read");
+            let body = serde_json::to_vec(&serde_json::json!({
+                "id": "resp_sync_bridge_123",
+                "object": "response",
+                "model": "gpt-5.4",
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "id": "msg_sync_bridge_123",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Hello from buffered JSON stream",
+                        "annotations": []
+                    }]
+                }],
+                "usage": {
+                    "input_tokens": 1,
+                    "output_tokens": 2,
+                    "total_tokens": 3
+                }
+            }))
+            .expect("json should encode");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("headers should write");
+            socket.flush().await.expect("headers should flush");
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            socket.write_all(&body).await.expect("body should write");
         });
 
         let runtime = DirectSyncExecutionRuntime::new();
@@ -1365,6 +1698,12 @@ mod tests {
             })
             .await
             .expect("stream execution should succeed");
+        let expected_observation = execution.response_observation.clone();
+        assert!(
+            expected_observation.response_headers_observed_at_unix_ms
+                >= expected_observation.request_started_at_unix_ms
+        );
+        assert!(!expected_observation.request_order_id.is_empty());
 
         let frames = build_direct_execution_frame_stream(execution)
             .map(|item| item.expect("frame should encode"))
@@ -1378,6 +1717,10 @@ mod tests {
 
         let header_frame: Value =
             serde_json::from_str(&frames[0]).expect("headers frame should parse");
+        let encoded_observation: aether_contracts::ExecutionResponseObservation =
+            serde_json::from_value(header_frame["payload"]["response_observation"].clone())
+                .expect("headers frame should retain the response observation");
+        assert_eq!(encoded_observation, expected_observation);
         assert_eq!(
             header_frame
                 .get("payload")
@@ -1427,33 +1770,48 @@ mod tests {
             .await
             .expect("listener should bind");
         let addr = listener.local_addr().expect("local addr should resolve");
+        let generated_image = "a".repeat(32 * 1024);
+        let expected_image = generated_image.clone();
         let server = tokio::spawn(async move {
             let app = Router::new().route(
-                "/responses",
-                post(|| async {
-                    let body = serde_json::json!({
-                        "created": 1776971267_u64,
-                        "data": [{
-                            "b64_json": "aGVsbG8="
-                        }],
-                        "usage": {
-                            "total_tokens": 100,
-                            "input_tokens": 50,
-                            "output_tokens": 50,
-                            "input_tokens_details": {
-                                "text_tokens": 10,
-                                "image_tokens": 40
+                "/images/generations",
+                post(move || {
+                    let generated_image = generated_image.clone();
+                    async move {
+                        let body = serde_json::json!({
+                            "created": 1776971267_u64,
+                            "data": [{
+                                "b64_json": generated_image
+                            }],
+                            "usage": {
+                                "total_tokens": 100,
+                                "input_tokens": 50,
+                                "output_tokens": 50,
+                                "input_tokens_details": {
+                                    "text_tokens": 10,
+                                    "image_tokens": 40
+                                }
                             }
-                        }
-                    });
-                    let mut response = axum::http::Response::new(Body::from(
-                        serde_json::to_vec(&body).expect("json should encode"),
-                    ));
-                    response.headers_mut().insert(
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    );
-                    response
+                        });
+                        let encoded = serde_json::to_vec(&body).expect("json should encode");
+                        let chunks = encoded
+                            .chunks(4096)
+                            .map(Bytes::copy_from_slice)
+                            .collect::<Vec<_>>();
+                        let chunked_body = stream! {
+                            for chunk in chunks {
+                                yield Ok::<Bytes, Infallible>(chunk);
+                                tokio::task::yield_now().await;
+                            }
+                        };
+                        let mut response =
+                            axum::http::Response::new(Body::from_stream(chunked_body));
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/json"),
+                        );
+                        response
+                    }
                 }),
             );
             axum::serve(listener, app)
@@ -1471,16 +1829,15 @@ mod tests {
                 endpoint_id: "endpoint-1".to_string(),
                 key_id: "key-1".to_string(),
                 method: "POST".to_string(),
-                url: format!("http://{addr}/responses"),
+                url: format!("http://{addr}/images/generations"),
                 headers: BTreeMap::new(),
                 content_type: None,
                 content_encoding: None,
                 body: RequestBody::from_json(serde_json::json!({
                     "model": "gpt-image-1",
-                    "prompt": "poster",
-                    "stream": true
+                    "prompt": "poster"
                 })),
-                stream: true,
+                stream: false,
                 client_api_format: "openai:image".to_string(),
                 provider_api_format: "openai:image".to_string(),
                 model_name: Some("gpt-image-1".into()),
@@ -1533,7 +1890,8 @@ mod tests {
         let bridged_text = String::from_utf8(bridged_body).expect("bridged body should be utf8");
         assert!(bridged_text.contains("event: image_generation.completed"));
         assert!(bridged_text.contains("\"type\":\"image_generation.completed\""));
-        assert!(bridged_text.contains("\"b64_json\":\"aGVsbG8=\""));
+        assert!(bridged_text.contains(&format!("\"b64_json\":\"{expected_image}\"")));
+        assert!(bridged_text.len() > 32 * 1024);
         assert!(bridged_text.contains("\"total_tokens\":100"));
 
         let eof_frame = frames

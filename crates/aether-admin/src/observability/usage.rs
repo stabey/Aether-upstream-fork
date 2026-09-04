@@ -7,7 +7,10 @@ use aether_billing::{
 use aether_data::repository::users::StoredUserSummary;
 use aether_data_contracts::repository::{
     provider_catalog::{StoredProviderCatalogEndpoint, StoredProviderCatalogProvider},
-    usage::{StoredRequestUsageAudit, StoredUsageAuditSummary, UsageBodyField},
+    usage::{
+        StoredRequestUsageAudit, StoredUsageAuditSummary, UsageBodyField,
+        LIVE_SESSION_METADATA_KEY, REALTIME_SESSION_METADATA_KEY,
+    },
 };
 use axum::{
     body::Body,
@@ -263,12 +266,17 @@ pub fn admin_usage_has_fallback(item: &StoredRequestUsageAudit) -> bool {
 }
 
 pub fn admin_usage_matches_status(item: &StoredRequestUsageAudit, status: Option<&str>) -> bool {
-    let Some(status) = status.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(status) = status
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
+    else {
         return true;
     };
-    match status {
-        "stream" => item.is_stream,
-        "standard" => !item.is_stream,
+    match status.as_str() {
+        "stream" => item.is_stream && !item.is_websocket(),
+        "standard" => !item.is_stream && !item.is_websocket(),
+        "websocket" | "ws" => item.is_websocket(),
         "error" => {
             item.status_code
                 .is_some_and(|value| !(200..300).contains(&value))
@@ -951,14 +959,7 @@ fn admin_usage_api_format_defaults_to_non_stream(item: &StoredRequestUsageAudit)
     let Some(value) = api_format else {
         return false;
     };
-    matches!(
-        aether_ai_formats::normalize_api_format_alias(value).as_str(),
-        "openai:chat"
-            | "openai:responses"
-            | "openai:responses:compact"
-            | "openai:image"
-            | "claude:messages"
-    )
+    aether_ai_formats::api_format_defaults_to_non_stream(value)
 }
 
 fn admin_usage_request_body_implies_default_non_stream(item: &StoredRequestUsageAudit) -> bool {
@@ -1083,6 +1084,14 @@ fn admin_usage_metadata_string<'a>(
         .filter(|value| !value.is_empty())
 }
 
+fn admin_usage_metadata_u64(item: &StoredRequestUsageAudit, key: &str) -> Option<u64> {
+    item.request_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get(key))
+        .and_then(Value::as_u64)
+}
+
 fn infer_client_family_from_user_agent(user_agent: &str) -> Option<&'static str> {
     let normalized = user_agent.trim().to_ascii_lowercase();
     if normalized.is_empty() {
@@ -1195,6 +1204,7 @@ fn admin_usage_active_request_json(
     let mut value = json!({
         "id": item.id,
         "status": item.status,
+        "request_type": item.request_type,
         "input_tokens": item.input_tokens,
         "effective_input_tokens": admin_usage_effective_input_tokens(item),
         "output_tokens": item.output_tokens,
@@ -1214,6 +1224,12 @@ fn admin_usage_active_request_json(
         "api_key_name": api_key_name,
         "provider_key_name": provider_key_name,
         "is_stream": item.is_stream,
+        "is_websocket": item.is_websocket(),
+        "websocket_transport": item.websocket_transport(),
+        "usage_available": item.usage_available(),
+        "usage_pricing_available": item.usage_pricing_available(),
+        "input_audio_tokens": item.realtime_input_audio_tokens(),
+        "output_audio_tokens": item.realtime_output_audio_tokens(),
         "upstream_is_stream": upstream_is_stream,
         "client_requested_stream": client_is_stream,
         "client_is_stream": client_is_stream,
@@ -1224,6 +1240,11 @@ fn admin_usage_active_request_json(
         "request_path_and_query": admin_usage_metadata_string(item, "request_path_and_query"),
         "has_fallback": admin_usage_has_fallback(item),
     });
+    value["end_to_end_time_ms"] = json!(admin_usage_metadata_u64(item, "end_to_end_time_ms"));
+    value["end_to_end_first_byte_time_ms"] = json!(admin_usage_metadata_u64(
+        item,
+        "end_to_end_first_byte_time_ms"
+    ));
     if let Some(api_format) = item.api_format.as_ref() {
         value["api_format"] = json!(api_format);
     }
@@ -1237,8 +1258,14 @@ fn admin_usage_active_request_json(
     if let Some(reasoning_effort) = item.provider_reasoning_effort() {
         value["reasoning_effort"] = json!(reasoning_effort);
     }
+    if let Some(requested_reasoning_effort) = item.requested_reasoning_effort() {
+        value["requested_reasoning_effort"] = json!(requested_reasoning_effort);
+    }
     if let Some(service_tier) = item.provider_service_tier() {
         value["service_tier"] = json!(service_tier);
+    }
+    if let Some(actual_service_tier) = item.provider_actual_service_tier() {
+        value["actual_service_tier"] = json!(actual_service_tier);
     }
     if let Some(image_progress) = image_progress {
         value["image_progress"] = image_progress.clone();
@@ -1301,6 +1328,7 @@ pub fn admin_usage_record_json(
         "response_time_ms": item.response_time_ms,
         "first_byte_time_ms": item.first_byte_time_ms,
         "created_at": unix_secs_to_rfc3339(item.created_at_unix_ms),
+        "updated_at": unix_secs_to_rfc3339(item.updated_at_unix_secs),
         "input_price_per_1m": input_price_per_1m,
         "output_price_per_1m": output_price_per_1m,
         "cache_creation_price_per_1m": cache_creation_price_per_1m,
@@ -1308,6 +1336,7 @@ pub fn admin_usage_record_json(
         "status_code": item.status_code,
         "error_message": item.error_message,
         "status": item.status,
+        "request_type": item.request_type,
         "has_fallback": admin_usage_has_fallback(item),
         "has_retry": false,
         "has_rectified": false,
@@ -1322,6 +1351,35 @@ pub fn admin_usage_record_json(
     let object = payload
         .as_object_mut()
         .expect("admin usage record payload should be an object");
+    object.insert(
+        "end_to_end_time_ms".to_string(),
+        json!(admin_usage_metadata_u64(item, "end_to_end_time_ms")),
+    );
+    object.insert(
+        "end_to_end_first_byte_time_ms".to_string(),
+        json!(admin_usage_metadata_u64(
+            item,
+            "end_to_end_first_byte_time_ms"
+        )),
+    );
+    object.insert("is_websocket".to_string(), json!(item.is_websocket()));
+    object.insert(
+        "websocket_transport".to_string(),
+        json!(item.websocket_transport()),
+    );
+    object.insert("usage_available".to_string(), json!(item.usage_available()));
+    object.insert(
+        "usage_pricing_available".to_string(),
+        json!(item.usage_pricing_available()),
+    );
+    object.insert(
+        "input_audio_tokens".to_string(),
+        json!(item.realtime_input_audio_tokens()),
+    );
+    object.insert(
+        "output_audio_tokens".to_string(),
+        json!(item.realtime_output_audio_tokens()),
+    );
     object.insert("is_stream".to_string(), json!(item.is_stream));
     object.insert(
         UPSTREAM_IS_STREAM_KEY.to_string(),
@@ -1356,8 +1414,20 @@ pub fn admin_usage_record_json(
     if let Some(reasoning_effort) = item.provider_reasoning_effort() {
         object.insert("reasoning_effort".to_string(), json!(reasoning_effort));
     }
+    if let Some(requested_reasoning_effort) = item.requested_reasoning_effort() {
+        object.insert(
+            "requested_reasoning_effort".to_string(),
+            json!(requested_reasoning_effort),
+        );
+    }
     if let Some(service_tier) = item.provider_service_tier() {
         object.insert("service_tier".to_string(), json!(service_tier));
+    }
+    if let Some(actual_service_tier) = item.provider_actual_service_tier() {
+        object.insert(
+            "actual_service_tier".to_string(),
+            json!(actual_service_tier),
+        );
     }
     payload
 }
@@ -1403,8 +1473,15 @@ pub fn admin_usage_effective_input_tokens(item: &StoredRequestUsageAudit) -> u64
         .as_deref()
         .or(item.api_format.as_deref());
     let input_tokens = i64::try_from(item.input_tokens).unwrap_or(i64::MAX);
+    let cache_creation_tokens =
+        i64::try_from(admin_usage_cache_creation_tokens(item)).unwrap_or(i64::MAX);
     let cache_read_tokens = i64::try_from(item.cache_read_input_tokens).unwrap_or(i64::MAX);
-    normalize_input_tokens_for_billing(api_format, input_tokens, cache_read_tokens) as u64
+    normalize_input_tokens_for_billing(
+        api_format,
+        input_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    ) as u64
 }
 
 pub fn admin_usage_token_cache_hit_rate(total_input_context: u64, cache_read_tokens: u64) -> f64 {
@@ -2398,6 +2475,16 @@ pub fn build_admin_usage_detail_payload(
         admin_usage_strip_settlement_metadata(object);
         admin_usage_strip_trace_metadata(object);
     }
+    let live_session = metadata
+        .as_object()
+        .and_then(|object| object.get(LIVE_SESSION_METADATA_KEY))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let realtime_session = metadata
+        .as_object()
+        .and_then(|object| object.get(REALTIME_SESSION_METADATA_KEY))
+        .cloned()
+        .unwrap_or(Value::Null);
     payload["user"] = match item.user_id.as_ref() {
         Some(user_id) => json!({
             "id": user_id,
@@ -2428,6 +2515,11 @@ pub fn build_admin_usage_detail_payload(
     payload["client_response_headers"] =
         item.client_response_headers.clone().unwrap_or(Value::Null);
     payload["metadata"] = metadata;
+    // Session summaries are also first-class detail fields. Keep the original
+    // values in `metadata` for backward compatibility while making the detail
+    // contract independent from the generic metadata viewer.
+    payload[LIVE_SESSION_METADATA_KEY] = live_session;
+    payload[REALTIME_SESSION_METADATA_KEY] = realtime_session;
     payload["routing"] = admin_usage_routing_json(item, provider_key_name);
     payload["body_capture"] = admin_usage_body_capture_json(item);
     payload["settlement"] = admin_usage_settlement_json(item);
@@ -2623,6 +2715,134 @@ mod tests {
     }
 
     #[test]
+    fn admin_usage_payloads_project_end_to_end_timings_from_metadata() {
+        let item = StoredRequestUsageAudit {
+            response_time_ms: Some(626),
+            first_byte_time_ms: Some(120),
+            request_metadata: Some(json!({
+                "end_to_end_time_ms": 10_626,
+                "end_to_end_first_byte_time_ms": 10_120,
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        for payload in [&record, &active] {
+            assert_eq!(payload["response_time_ms"], 626);
+            assert_eq!(payload["first_byte_time_ms"], 120);
+            assert_eq!(payload["end_to_end_time_ms"], 10_626);
+            assert_eq!(payload["end_to_end_first_byte_time_ms"], 10_120);
+        }
+    }
+
+    #[test]
+    fn admin_usage_payloads_expose_websocket_transport() {
+        let item = StoredRequestUsageAudit {
+            request_metadata: Some(json!({
+                "websocket_mode": true,
+                "websocket_transport": "responses",
+                "usage_available": false,
+                "usage_pricing_available": false,
+                "realtime_session": {
+                    "input_audio_tokens": 7,
+                    "output_audio_tokens": 3,
+                },
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
+        let active = admin_usage_active_request_json(&item, None, None, None);
+
+        assert_eq!(record["is_websocket"], true);
+        assert_eq!(active["is_websocket"], true);
+        assert_eq!(record["websocket_transport"], "responses");
+        assert_eq!(active["websocket_transport"], "responses");
+        assert_eq!(record["usage_available"], false);
+        assert_eq!(active["usage_available"], false);
+        assert_eq!(record["usage_pricing_available"], false);
+        assert_eq!(active["usage_pricing_available"], false);
+        assert_eq!(record["input_audio_tokens"], 7);
+        assert_eq!(active["input_audio_tokens"], 7);
+        assert_eq!(record["output_audio_tokens"], 3);
+        assert_eq!(active["output_audio_tokens"], 3);
+        assert!(admin_usage_matches_status(&item, Some("websocket")));
+        assert!(admin_usage_matches_status(&item, Some("ws")));
+        assert!(admin_usage_matches_status(&item, Some("WS")));
+        assert!(!admin_usage_matches_status(&item, Some("standard")));
+        assert!(!admin_usage_matches_status(&item, Some("stream")));
+    }
+
+    #[test]
+    fn admin_usage_detail_preserves_websocket_and_session_metadata() {
+        let live_session = json!({
+            "schema_version": "1",
+            "transport": "websocket",
+            "mode": "direct",
+            "state": "closed",
+            "client_frames": 4,
+            "upstream_frames": 8,
+        });
+        let realtime_session = json!({
+            "schema_version": "1",
+            "transport": "websocket",
+            "usage_state": "authoritative",
+            "input_audio_tokens": 7,
+            "output_audio_tokens": 3,
+        });
+        let item = StoredRequestUsageAudit {
+            request_type: Some("live".to_string()),
+            api_format: Some("codex:live".to_string()),
+            endpoint_api_format: Some("codex:live".to_string()),
+            is_stream: true,
+            request_metadata: Some(json!({
+                "websocket_mode": true,
+                "websocket_transport": "codex_live_direct",
+                "usage_available": false,
+                "usage_pricing_available": false,
+                "live_session": live_session,
+                "realtime_session": realtime_session,
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        let payload = build_admin_usage_detail_payload(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+            false,
+            None,
+            &BTreeMap::new(),
+        );
+
+        assert_eq!(payload["is_websocket"], true);
+        assert_eq!(payload["websocket_transport"], "codex_live_direct");
+        assert_eq!(payload["live_session"], live_session);
+        assert_eq!(payload["realtime_session"], realtime_session);
+        assert_eq!(payload["metadata"]["live_session"], live_session);
+        assert_eq!(payload["metadata"]["realtime_session"], realtime_session);
+    }
+
+    #[test]
     fn admin_usage_record_infers_client_family_from_user_agent() {
         let item = StoredRequestUsageAudit {
             request_metadata: Some(json!({
@@ -2691,10 +2911,13 @@ mod tests {
     }
 
     #[test]
-    fn admin_usage_record_includes_provider_reasoning_effort() {
+    fn admin_usage_record_includes_requested_and_provider_reasoning_efforts() {
         let item = StoredRequestUsageAudit {
+            request_body: Some(json!({
+                "reasoning": { "effort": "xhigh" }
+            })),
             provider_request_body: Some(json!({
-                "reasoning": { "effort": "xhigh" },
+                "reasoning": { "effort": "max" },
                 "service_tier": "priority"
             })),
             ..sample_usage("completed", Some(200), None)
@@ -2710,10 +2933,14 @@ mod tests {
         );
         let active = admin_usage_active_request_json(&item, None, None, None);
 
-        assert_eq!(record["reasoning_effort"], "xhigh");
-        assert_eq!(active["reasoning_effort"], "xhigh");
+        assert_eq!(record["requested_reasoning_effort"], "xhigh");
+        assert_eq!(active["requested_reasoning_effort"], "xhigh");
+        assert_eq!(record["reasoning_effort"], "max");
+        assert_eq!(active["reasoning_effort"], "max");
         assert_eq!(record["service_tier"], "priority");
         assert_eq!(active["service_tier"], "priority");
+        assert!(record["updated_at"].is_string());
+        assert_eq!(record["updated_at"], active["updated_at"]);
     }
 
     #[test]
@@ -2789,6 +3016,33 @@ mod tests {
         );
         assert_eq!(record["is_stream"], true);
         assert_eq!(record["upstream_is_stream"], true);
+        assert_eq!(record["client_requested_stream"], false);
+        assert_eq!(record["client_is_stream"], false);
+    }
+
+    #[test]
+    fn client_requested_stream_defaults_to_non_stream_for_openai_search() {
+        let item = StoredRequestUsageAudit {
+            is_stream: true,
+            api_format: Some("openai:search".to_string()),
+            request_body: Some(json!({
+                "id": "session-search-1",
+                "model": "gpt-5.6-sol",
+                "input": "current documentation"
+            })),
+            ..sample_usage("completed", Some(200), None)
+        };
+
+        assert!(!admin_usage_client_is_stream(&item));
+
+        let record = admin_usage_record_json(
+            &item,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            false,
+            false,
+            None,
+        );
         assert_eq!(record["client_requested_stream"], false);
         assert_eq!(record["client_is_stream"], false);
     }
@@ -3428,7 +3682,7 @@ mod tests {
         assert_eq!(payload["cache_creation_input_tokens"], 20);
         assert_eq!(payload["cache_creation_ephemeral_5m_input_tokens"], 12);
         assert_eq!(payload["cache_creation_ephemeral_1h_input_tokens"], 8);
-        assert_eq!(payload["total_tokens"], 50);
+        assert_eq!(payload["total_tokens"], 40);
     }
 
     #[test]
@@ -3444,7 +3698,7 @@ mod tests {
             ..sample_usage("completed", Some(200), None)
         };
 
-        assert_eq!(admin_usage_total_tokens(&item), 140);
+        assert_eq!(admin_usage_total_tokens(&item), 120);
     }
 
     #[test]
@@ -3470,7 +3724,17 @@ mod tests {
                 "settlement_snapshot": {
                     "schema_version": "3.0",
                     "pricing_snapshot": {
-                        "pricing_source": "provider_override"
+                        "pricing_source": "provider_override",
+                        "tiered_pricing_source": "provider_override",
+                        "billing_processing_tier": "fast",
+                        "processing_tier_price_multiplier": 2.5,
+                        "tiered_pricing": {
+                            "tiers": [{
+                                "up_to": null,
+                                "input_price_per_1m": 7.5,
+                                "output_price_per_1m": 37.5
+                            }]
+                        }
                     }
                 },
                 "billing_snapshot": {
@@ -3510,6 +3774,21 @@ mod tests {
         assert_eq!(
             payload["settlement"]["settlement_snapshot"]["pricing_snapshot"]["pricing_source"],
             "provider_override"
+        );
+        assert_eq!(
+            payload["settlement"]["settlement_snapshot"]["pricing_snapshot"]
+                ["billing_processing_tier"],
+            "fast"
+        );
+        assert_eq!(
+            payload["settlement"]["settlement_snapshot"]["pricing_snapshot"]
+                ["processing_tier_price_multiplier"],
+            2.5
+        );
+        assert_eq!(
+            payload["settlement"]["settlement_snapshot"]["pricing_snapshot"]["tiered_pricing"]
+                ["tiers"][0]["input_price_per_1m"],
+            7.5
         );
         assert_eq!(
             payload["settlement"]["billing_dimensions"]["input_tokens"],

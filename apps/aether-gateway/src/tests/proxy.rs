@@ -18,12 +18,28 @@ use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadReposi
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
+use aether_scheduler_core::{
+    build_scheduler_affinity_cache_key_for_api_key_id_with_client_session_and_scope,
+    SchedulerAffinityScope,
+};
 use sha2::{Digest, Sha256};
 
 fn hash_api_key(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn system_default_affinity_cache_key(api_key_id: &str, api_format: &str, model: &str) -> String {
+    let scope = SchedulerAffinityScope::new("system-default", Some(1));
+    build_scheduler_affinity_cache_key_for_api_key_id_with_client_session_and_scope(
+        api_key_id,
+        api_format,
+        model,
+        None,
+        Some(&scope),
+    )
+    .expect("system-default affinity cache key should build")
 }
 
 fn sample_auth_snapshot(
@@ -89,6 +105,13 @@ fn sample_cli_auth_snapshot(
 }
 
 fn sample_provider(provider_id: &str) -> StoredProviderCatalogProvider {
+    sample_provider_with_request_timeout(provider_id, None)
+}
+
+fn sample_provider_with_request_timeout(
+    provider_id: &str,
+    request_timeout_secs: Option<f64>,
+) -> StoredProviderCatalogProvider {
     StoredProviderCatalogProvider::new(
         provider_id.to_string(),
         provider_id.to_string(),
@@ -96,7 +119,17 @@ fn sample_provider(provider_id: &str) -> StoredProviderCatalogProvider {
         "custom".to_string(),
     )
     .expect("provider should build")
-    .with_transport_fields(true, false, false, None, None, None, None, None, None)
+    .with_transport_fields(
+        true,
+        false,
+        false,
+        None,
+        None,
+        None,
+        request_timeout_secs,
+        None,
+        None,
+    )
 }
 
 fn sample_endpoint(endpoint_id: &str, provider_id: &str) -> StoredProviderCatalogEndpoint {
@@ -367,6 +400,86 @@ async fn gateway_rejects_execution_runtime_loop_guarded_ai_request() {
 }
 
 #[tokio::test]
+async fn gateway_shapes_execution_loop_rejections_for_claude_routes() {
+    let gateway = build_router().expect("gateway should build");
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_url}{path}"))
+            .header(
+                EXECUTION_RUNTIME_LOOP_GUARD_HEADER,
+                EXECUTION_RUNTIME_LOOP_GUARD_VALUE,
+            )
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(r#"{"model":"claude-sonnet-4","messages":[]}"#)
+            .send()
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(response.status(), StatusCode::LOOP_DETECTED, "path: {path}");
+        assert_eq!(
+            response
+                .headers()
+                .get(EXECUTION_PATH_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(EXECUTION_PATH_LOCAL_EXECUTION_LOOP_DETECTED),
+            "path: {path}"
+        );
+        let payload: serde_json::Value = response.json().await.expect("body should parse");
+        assert_eq!(payload["type"], "error", "path: {path}");
+        assert_eq!(payload["error"]["type"], "api_error", "path: {path}");
+        assert_eq!(
+            payload["error"]["message"],
+            "Gateway detected an execution runtime request loop back into the local frontdoor",
+            "path: {path}"
+        );
+    }
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_shapes_wrong_method_rejections_for_claude_routes() {
+    let gateway = build_router().expect("gateway should build");
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        let response = reqwest::Client::new()
+            .get(format!("{gateway_url}{path}"))
+            .send()
+            .await
+            .expect("request should succeed");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "path: {path}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::ALLOW)
+                .and_then(|value| value.to_str().ok()),
+            Some("POST"),
+            "path: {path}"
+        );
+        let payload: serde_json::Value = response.json().await.expect("body should parse");
+        assert_eq!(payload["type"], "error", "path: {path}");
+        assert_eq!(
+            payload["error"]["type"], "invalid_request_error",
+            "path: {path}"
+        );
+        assert_eq!(
+            payload["error"]["message"], "Method not allowed",
+            "path: {path}"
+        );
+    }
+
+    gateway_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_rejects_execution_runtime_via_guarded_ai_request() {
     let gateway = build_router().expect("gateway should build");
     let (gateway_url, gateway_handle) = start_server(gateway).await;
@@ -435,6 +548,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
             async move {
                 let (parts, body) = request.into_parts();
                 let raw_body = to_bytes(body, usize::MAX).await.expect("body should read");
+                tokio::time::sleep(Duration::from_millis(40)).await;
                 *seen_owner_inner.lock().expect("mutex should lock") = Some(SeenOwnerRequest {
                     path: parts
                         .uri
@@ -511,7 +625,10 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
     let (owner_url, owner_handle) = start_server(owner).await;
 
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
-        vec![sample_provider("provider-owner")],
+        vec![sample_provider_with_request_timeout(
+            "provider-owner",
+            Some(0.1),
+        )],
         vec![sample_endpoint("endpoint-owner", "provider-owner")],
         vec![sample_key("key-owner", "provider-owner", "node-owner")],
     ));
@@ -525,6 +642,7 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
         "development-key",
     )
     .with_auth_api_key_reader(auth_repository)
+    .with_system_default_routing_group_for_tests()
     .with_system_config_values_for_tests(vec![(
         tunnel_attachment_key("node-owner"),
         serde_json::to_value(crate::tunnel::TunnelAttachmentRecord {
@@ -540,8 +658,14 @@ async fn gateway_forwards_public_request_to_remote_tunnel_owner_before_fallback_
     state = state
         .with_data_state_for_tests(data_state)
         .with_tunnel_identity_for_tests("gateway-a", Some("http://gateway-a:8080"));
+    let short_timeout_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(10))
+        .build()
+        .expect("test client should build");
+    state.client = short_timeout_client.clone();
+    state.owner_forward_client = short_timeout_client;
     state.remember_scheduler_affinity_target(
-        "scheduler_affinity:api-key-affinity-1:openai:chat:gpt-4.1",
+        &system_default_affinity_cache_key("api-key-affinity-1", "openai:chat", "gpt-4.1"),
         crate::cache::SchedulerAffinityTarget {
             provider_id: "provider-owner".to_string(),
             endpoint_id: "endpoint-owner".to_string(),
@@ -746,6 +870,7 @@ async fn gateway_aggregates_sync_sse_from_remote_tunnel_owner_before_returning_t
         "development-key",
     )
     .with_auth_api_key_reader(auth_repository)
+    .with_system_default_routing_group_for_tests()
     .with_system_config_values_for_tests(vec![(
         tunnel_attachment_key("node-cli-owner"),
         serde_json::to_value(crate::tunnel::TunnelAttachmentRecord {
@@ -762,7 +887,7 @@ async fn gateway_aggregates_sync_sse_from_remote_tunnel_owner_before_returning_t
         .with_data_state_for_tests(data_state)
         .with_tunnel_identity_for_tests("gateway-a", Some("http://gateway-a:8080"));
     state.remember_scheduler_affinity_target(
-        "scheduler_affinity:api-key-affinity-cli-1:openai:responses:gpt-5.4",
+        &system_default_affinity_cache_key("api-key-affinity-cli-1", "openai:responses", "gpt-5.4"),
         crate::cache::SchedulerAffinityTarget {
             provider_id: "provider-cli-owner".to_string(),
             endpoint_id: "endpoint-cli-owner".to_string(),
@@ -922,32 +1047,39 @@ async fn gateway_streamifies_sync_json_from_remote_tunnel_owner_before_returning
                         .unwrap_or_default()
                         .to_string(),
                 });
+                let encoded_response = serde_json::to_vec(&json!({
+                    "id": "resp-codex-affinity-stream-123",
+                    "object": "response",
+                    "model": "gpt-5.4",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "id": "msg-codex-affinity-stream-123",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "Hello from affinity sync json",
+                            "annotations": []
+                        }]
+                    }],
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 2,
+                        "total_tokens": 3
+                    }
+                }))
+                .expect("body should encode");
+                let split_at = encoded_response.len() / 2;
+                let first = axum::body::Bytes::copy_from_slice(&encoded_response[..split_at]);
+                let second = axum::body::Bytes::copy_from_slice(&encoded_response[split_at..]);
+                let response_body = Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(first);
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    yield Ok::<_, std::io::Error>(second);
+                });
                 let mut response = Response::builder()
                     .status(StatusCode::OK)
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "id": "resp-codex-affinity-stream-123",
-                            "object": "response",
-                            "model": "gpt-5.4",
-                            "status": "completed",
-                            "output": [{
-                                "type": "message",
-                                "id": "msg-codex-affinity-stream-123",
-                                "role": "assistant",
-                                "content": [{
-                                    "type": "output_text",
-                                    "text": "Hello from affinity sync json",
-                                    "annotations": []
-                                }]
-                            }],
-                            "usage": {
-                                "input_tokens": 1,
-                                "output_tokens": 2,
-                                "total_tokens": 3
-                            }
-                        }))
-                        .expect("body should encode"),
-                    ))
+                    .body(response_body)
                     .expect("response should build");
                 response.headers_mut().insert(
                     http::header::CONTENT_TYPE,
@@ -986,6 +1118,7 @@ async fn gateway_streamifies_sync_json_from_remote_tunnel_owner_before_returning
         "development-key",
     )
     .with_auth_api_key_reader(auth_repository)
+    .with_system_default_routing_group_for_tests()
     .with_system_config_values_for_tests(vec![(
         tunnel_attachment_key("node-cli-owner"),
         serde_json::to_value(crate::tunnel::TunnelAttachmentRecord {
@@ -1001,8 +1134,12 @@ async fn gateway_streamifies_sync_json_from_remote_tunnel_owner_before_returning
     state = state
         .with_data_state_for_tests(data_state)
         .with_tunnel_identity_for_tests("gateway-a", Some("http://gateway-a:8080"));
+    state.client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(10))
+        .build()
+        .expect("short shared client should build");
     state.remember_scheduler_affinity_target(
-        "scheduler_affinity:api-key-affinity-cli-1:openai:responses:gpt-5.4",
+        &system_default_affinity_cache_key("api-key-affinity-cli-1", "openai:responses", "gpt-5.4"),
         crate::cache::SchedulerAffinityTarget {
             provider_id: "provider-cli-owner".to_string(),
             endpoint_id: "endpoint-cli-owner".to_string(),

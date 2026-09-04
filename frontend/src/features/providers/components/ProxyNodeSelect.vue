@@ -2,16 +2,19 @@
   <div class="space-y-1.5">
     <Select
       :model-value="modelValue"
-      :disabled="proxyNodesStore.loading || nodeOptions.length === 0"
+      :disabled="disabled || proxyNodesStore.loading || nodeOptions.length === 0"
       @update:model-value="(v: string) => $emit('update:modelValue', v)"
     >
-      <SelectTrigger :class="triggerClass">
+      <SelectTrigger
+        :class="triggerClass"
+        :aria-label="triggerAriaLabel"
+      >
         <SelectValue
           :placeholder="proxyNodesStore.loading
-            ? '加载节点列表中...'
+            ? legacyT('加载节点列表中...')
             : nodeOptions.length === 0
-              ? '暂无可用节点'
-              : '选择代理节点...'"
+              ? legacyT('暂无可用节点')
+              : legacyT('选择代理节点...')"
         />
       </SelectTrigger>
       <SelectContent>
@@ -28,7 +31,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import {
   Select,
   SelectTrigger,
@@ -37,18 +40,26 @@ import {
   SelectItem,
 } from '@/components/ui'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
+import { useI18n } from '@/i18n'
 import { formatRegion } from '@/utils/region'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   modelValue: string
   triggerClass?: string
-}>()
+  triggerAriaLabel?: string
+  disabled?: boolean
+}>(), {
+  triggerClass: '',
+  triggerAriaLabel: undefined,
+  disabled: false,
+})
 
 defineEmits<{
   'update:modelValue': [value: string]
 }>()
 
 const proxyNodesStore = useProxyNodesStore()
+const { legacyT } = useI18n()
 
 /** 在线节点 + 保留当前已选节点（可能已离线） */
 const nodeOptions = computed(() => {
@@ -65,8 +76,10 @@ const nodeOptions = computed(() => {
 
 /** 供父组件调用：启用代理时懒加载节点列表 */
 function ensureLoaded() {
-  proxyNodesStore.ensureLoaded()
+  return proxyNodesStore.ensureLoaded()
 }
+
+onMounted(ensureLoaded)
 
 defineExpose({ ensureLoaded })
 </script>

@@ -1,11 +1,12 @@
 use super::{
     any, build_router_with_execution_runtime_override, build_router_with_state,
-    build_state_with_execution_runtime_override, json, start_server, to_bytes, Arc, Body, Bytes,
-    HeaderName, HeaderValue, Json, Mutex, Request, Response, Router, StatusCode,
-    CONTROL_EXECUTED_HEADER, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC, EXECUTION_PATH_HEADER,
-    TRACE_ID_HEADER,
+    build_state_with_execution_runtime_override, json, run_finalize_local_cli_test, start_server,
+    to_bytes, Arc, Body, Bytes, HeaderName, HeaderValue, Json, Mutex, Request, Response, Router,
+    StatusCode, CONTROL_EXECUTED_HEADER, EXECUTION_PATH_EXECUTION_RUNTIME_SYNC,
+    EXECUTION_PATH_HEADER, TRACE_ID_HEADER,
 };
 use crate::data::GatewayDataState;
+use aether_ai_formats::openai_responses_message_item_id;
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::auth::{
     InMemoryAuthApiKeySnapshotRepository, StoredAuthApiKeySnapshot,
@@ -25,8 +26,16 @@ use aether_data_contracts::repository::provider_catalog::{
 };
 use sha2::{Digest, Sha256};
 
-#[tokio::test]
-async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response(
+#[test]
+fn gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response(
+) {
+    run_finalize_local_cli_test(
+        "gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response",
+        gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response_impl,
+    );
+}
+
+async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream_via_local_finalize_response_impl(
 ) {
     use base64::Engine as _;
 
@@ -105,6 +114,7 @@ async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream
                 priority: 1,
                 api_formats: Some(vec!["openai:responses:compact".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -404,7 +414,7 @@ async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream
             "output_text": "Hello Compact",
             "output": [{
                 "type": "message",
-                "id": "resp_compact_openai_family_123_msg",
+                "id": openai_responses_message_item_id("resp_compact_openai_family_123", 0),
                 "role": "assistant",
                 "status": "completed",
                 "content": [{

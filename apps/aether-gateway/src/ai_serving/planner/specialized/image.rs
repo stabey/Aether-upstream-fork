@@ -19,6 +19,7 @@ use crate::ai_serving::{
     resolve_local_image_sync_spec as resolve_sync_spec,
 };
 use crate::{AiExecutionDecision, AppState, GatewayError};
+use aether_routing_core::RoutingExecutionPolicy;
 
 use self::decision::maybe_build_local_openai_image_decision_payload_for_candidate;
 use self::support::{
@@ -252,8 +253,15 @@ pub(crate) async fn build_local_image_stream_attempt_source_for_kind<'a>(
 
 #[async_trait]
 impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalOpenAiImageSyncAttemptSource<'_> {
+    fn routing_execution_policy(&self) -> Option<RoutingExecutionPolicy> {
+        self.input
+            .routing_policy
+            .as_ref()
+            .map(|policy| policy.execution_policy)
+    }
+
     async fn next_execution_attempt(&mut self) -> Result<Option<AiSyncAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             match self.build_sync_attempt(attempt).await? {
                 Some(attempt) => return Ok(Some(attempt)),
                 None => continue,
@@ -271,12 +279,34 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalOpenAiImageSyncAttemptS
         }
         Ok(drained)
     }
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_credential(key_id);
+        Ok(())
+    }
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_endpoint(endpoint_id);
+        Ok(())
+    }
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_provider(provider_id);
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalOpenAiImageStreamAttemptSource<'_> {
+    fn routing_execution_policy(&self) -> Option<RoutingExecutionPolicy> {
+        self.input
+            .routing_policy
+            .as_ref()
+            .map(|policy| policy.execution_policy)
+    }
+
     async fn next_execution_attempt(&mut self) -> Result<Option<AiStreamAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             match self.build_stream_attempt(attempt).await? {
                 Some(attempt) => return Ok(Some(attempt)),
                 None => continue,
@@ -293,6 +323,21 @@ impl LocalExecutionAttemptSource<AiStreamAttempt> for LocalOpenAiImageStreamAtte
             }
         }
         Ok(drained)
+    }
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_credential(key_id);
+        Ok(())
+    }
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_endpoint(endpoint_id);
+        Ok(())
+    }
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_provider(provider_id);
+        Ok(())
     }
 }
 
@@ -421,7 +466,7 @@ pub(crate) async fn maybe_build_sync_local_image_decision_payload(
         return Ok(None);
     };
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         if let Some(payload) = maybe_build_local_openai_image_decision_payload_for_candidate(
             state,
             parts,
@@ -482,7 +527,7 @@ pub(crate) async fn maybe_build_stream_local_image_decision_payload(
         return Ok(None);
     };
 
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         if let Some(payload) = maybe_build_local_openai_image_decision_payload_for_candidate(
             state,
             parts,
@@ -540,7 +585,7 @@ async fn build_local_sync_plan_and_reports(
     };
 
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let Some(payload) = maybe_build_local_openai_image_decision_payload_for_candidate(
             state,
             parts,
@@ -617,7 +662,7 @@ async fn build_local_stream_plan_and_reports(
     };
 
     let mut plans = Vec::new();
-    while let Some(attempt) = source.next_attempt().await {
+    while let Some(attempt) = source.next_attempt().await? {
         let Some(payload) = maybe_build_local_openai_image_decision_payload_for_candidate(
             state,
             parts,

@@ -8,9 +8,18 @@
         <div class="px-4 sm:px-6 py-3 sm:py-3.5 border-b border-border/60">
           <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4">
             <!-- 左侧：标题 -->
-            <h3 class="text-sm sm:text-base font-semibold shrink-0">
-              模型管理
-            </h3>
+            <div class="flex min-w-0 items-baseline gap-2">
+              <h3 class="text-sm sm:text-base font-semibold shrink-0">
+                模型管理
+              </h3>
+              <span
+                v-if="selectedBatchManageModelIds.size > 0"
+                class="text-xs font-medium text-primary"
+                aria-live="polite"
+              >
+                {{ t('models.management.selectedCount', { count: selectedBatchManageModelIds.size }) }}
+              </span>
+            </div>
 
             <!-- 右侧：操作区 -->
             <div class="flex flex-wrap items-center gap-2">
@@ -28,14 +37,20 @@
 
               <!-- 操作按钮 -->
               <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8"
-                title="批量管理"
+                variant="outline"
+                size="sm"
+                class="h-8 gap-1.5 px-2.5"
+                :title="selectedBatchManageModelIds.size > 0
+                  ? t('models.management.manageSelectedTitle', { count: selectedBatchManageModelIds.size })
+                  : t('models.management.batch.title')"
                 @click="openBatchManageDialog"
               >
                 <ListChecks class="w-3.5 h-3.5" />
+                <span>{{ selectedBatchManageModelIds.size > 0
+                  ? t('models.management.batchButtonSelected', { count: selectedBatchManageModelIds.size })
+                  : t('models.management.batchButton') }}</span>
               </Button>
+              <ExternalModelsAccessControl />
               <Button
                 variant="ghost"
                 size="icon"
@@ -56,11 +71,25 @@
         <Table class="hidden xl:table">
           <TableHeader>
             <TableRow>
-              <TableHead class="w-[240px]">
-                模型名称
+              <TableHead class="w-[250px]">
+                <div class="flex items-center gap-2">
+                  <Checkbox
+                    class="h-3.5 w-3.5 shrink-0"
+                    :checked="isCurrentModelPageFullySelected"
+                    :indeterminate="isCurrentModelPagePartiallySelected"
+                    :disabled="paginatedGlobalModels.length === 0 || loading"
+                    :aria-label="t('models.management.selectCurrentPage')"
+                    data-testid="model-select-page-desktop"
+                    @update:checked="toggleCurrentModelPageSelection($event === true)"
+                  />
+                  <span>模型名称</span>
+                </div>
               </TableHead>
               <TableHead class="w-[160px] text-center">
                 价格 ($/M)
+              </TableHead>
+              <TableHead class="w-[170px] text-center">
+                {{ t('models.pricingSource.label') }}
               </TableHead>
               <TableHead class="w-[80px] text-center">
                 提供商
@@ -79,7 +108,7 @@
           <TableBody>
             <TableRow v-if="loading">
               <TableCell
-                colspan="6"
+                colspan="7"
                 class="text-center py-8"
               >
                 <Loader2 class="w-6 h-6 animate-spin mx-auto" />
@@ -87,7 +116,7 @@
             </TableRow>
             <TableRow v-else-if="filteredGlobalModels.length === 0">
               <TableCell
-                colspan="6"
+                colspan="7"
                 class="text-center py-8 text-muted-foreground"
               >
                 没有找到匹配的模型
@@ -98,23 +127,34 @@
                 v-for="model in paginatedGlobalModels"
                 :key="model.id"
                 class="cursor-pointer hover:bg-muted/50 group"
+                :class="selectedBatchManageModelIds.has(model.id) ? 'bg-primary/5' : ''"
                 @mousedown="handleMouseDown"
                 @click="handleRowClick($event, model)"
               >
                 <TableCell>
-                  <div>
-                    <div class="font-medium">
-                      {{ model.display_name }}
-                    </div>
-                    <div class="text-xs text-muted-foreground flex items-center gap-1">
-                      <span>{{ model.name }}</span>
-                      <button
-                        class="p-0.5 rounded hover:bg-muted transition-colors"
-                        title="复制模型 ID"
-                        @click.stop="copyToClipboard(model.name)"
-                      >
-                        <Copy class="w-3 h-3" />
-                      </button>
+                  <div class="flex min-w-0 items-start gap-2">
+                    <Checkbox
+                      class="mt-0.5 h-3.5 w-3.5 shrink-0"
+                      :checked="selectedBatchManageModelIds.has(model.id)"
+                      :aria-label="t('models.management.selectModel', { name: model.display_name || model.name })"
+                      :data-testid="`model-select-desktop-${model.id}`"
+                      @click.stop
+                      @update:checked="setBatchManageModelSelection(model.id, $event === true)"
+                    />
+                    <div class="min-w-0 flex-1">
+                      <div class="font-medium truncate">
+                        {{ model.display_name }}
+                      </div>
+                      <div class="text-xs text-muted-foreground flex items-center gap-1">
+                        <span class="truncate">{{ model.name }}</span>
+                        <button
+                          class="p-0.5 rounded hover:bg-muted transition-colors shrink-0"
+                          title="复制模型 ID"
+                          @click.stop="copyToClipboard(model.name)"
+                        >
+                          <Copy class="w-3 h-3" />
+                        </button>
+                      </div>
                     </div>
                   </div>
                 </TableCell>
@@ -155,6 +195,24 @@
                       -
                     </div>
                   </div>
+                </TableCell>
+                <TableCell
+                  class="text-center"
+                  @mousedown.stop
+                  @click.stop
+                >
+                  <GlobalModelPricingSourceSelect
+                    class="mx-auto max-w-[165px]"
+                    :model-id="model.id"
+                    :source="getModelPricingSource(model)"
+                    :candidates="getModelPricingCandidates(model)"
+                    :loading="batchManageOnlineLoading"
+                    :syncing="isModelPricingSourceSyncing(model.id)"
+                    :local-only="isModelPricingSourceLocalOnly(model)"
+                    @open="handleModelPricingSourceOpen(model, $event)"
+                    @select="syncModelPricingSource(model, $event)"
+                    @resync="resyncModelPricingSource(model)"
+                  />
                 </TableCell>
                 <TableCell class="text-center">
                   <Badge variant="secondary">
@@ -223,28 +281,39 @@
             v-for="model in paginatedGlobalModels"
             :key="model.id"
             class="p-4 space-y-3 hover:bg-muted/50 cursor-pointer transition-colors"
+            :class="selectedBatchManageModelIds.has(model.id) ? 'bg-primary/5' : ''"
             @click="selectModel(model)"
           >
             <!-- 第一行：名称 + 状态 + 操作 -->
             <div class="flex items-start justify-between gap-3">
-              <div class="flex-1 min-w-0">
-                <div class="flex items-center gap-2">
-                  <span class="font-medium truncate">{{ model.display_name }}</span>
-                  <Badge
-                    :variant="model.is_active ? 'default' : 'secondary'"
-                    class="text-xs shrink-0"
-                  >
-                    {{ model.is_active ? '活跃' : '停用' }}
-                  </Badge>
-                </div>
-                <div class="text-xs text-muted-foreground flex items-center gap-1 mt-0.5">
-                  <span class="font-mono truncate">{{ model.name }}</span>
-                  <button
-                    class="p-0.5 rounded hover:bg-muted transition-colors shrink-0"
-                    @click.stop="copyToClipboard(model.name)"
-                  >
-                    <Copy class="w-3 h-3" />
-                  </button>
+              <div class="flex min-w-0 flex-1 items-start gap-2">
+                <Checkbox
+                  class="mt-0.5 h-4 w-4 shrink-0"
+                  :checked="selectedBatchManageModelIds.has(model.id)"
+                  :aria-label="t('models.management.selectModel', { name: model.display_name || model.name })"
+                  :data-testid="`model-select-mobile-${model.id}`"
+                  @click.stop
+                  @update:checked="setBatchManageModelSelection(model.id, $event === true)"
+                />
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-2">
+                    <span class="font-medium truncate">{{ model.display_name }}</span>
+                    <Badge
+                      :variant="model.is_active ? 'default' : 'secondary'"
+                      class="text-xs shrink-0"
+                    >
+                      {{ model.is_active ? '活跃' : '停用' }}
+                    </Badge>
+                  </div>
+                  <div class="text-xs text-muted-foreground flex items-center gap-1 mt-0.5">
+                    <span class="font-mono truncate">{{ model.name }}</span>
+                    <button
+                      class="p-0.5 rounded hover:bg-muted transition-colors shrink-0"
+                      @click.stop="copyToClipboard(model.name)"
+                    >
+                      <Copy class="w-3 h-3" />
+                    </button>
+                  </div>
                 </div>
               </div>
               <div
@@ -289,6 +358,26 @@
                 ${{ getFirstTierPrice(model, 'input')?.toFixed(2) || '-' }}/${{ getFirstTierPrice(model, 'output')?.toFixed(2) || '-' }}
               </span>
             </div>
+
+            <div
+              class="flex items-center gap-2"
+              @mousedown.stop
+              @click.stop
+            >
+              <span class="shrink-0 text-xs text-muted-foreground">{{ t('models.pricingSource.label') }}</span>
+              <GlobalModelPricingSourceSelect
+                class="min-w-0 flex-1"
+                :model-id="model.id"
+                :source="getModelPricingSource(model)"
+                :candidates="getModelPricingCandidates(model)"
+                :loading="batchManageOnlineLoading"
+                :syncing="isModelPricingSourceSyncing(model.id)"
+                :local-only="isModelPricingSourceLocalOnly(model)"
+                @open="handleModelPricingSourceOpen(model, $event)"
+                @select="syncModelPricingSource(model, $event)"
+                @resync="resyncModelPricingSource(model)"
+              />
+            </div>
           </div>
         </div>
 
@@ -311,6 +400,8 @@
       :model="editingModel"
       @update:open="handleModelDialogUpdate"
       @success="handleModelFormSuccess"
+      @edit-model="editModel"
+      @pricing-synced="handleModelPricingSynced"
     />
 
     <!-- 模型详情抽屉 -->
@@ -469,17 +560,16 @@
     <!-- 批量管理全局模型对话框 -->
     <Dialog
       :model-value="batchManageDialogOpen"
-      title="批量管理模型"
-      description="选择要删除的全局模型"
-      :icon="Trash2"
-      icon-class="bg-destructive/10"
+      :title="t('models.management.batch.title')"
+      :description="t('models.management.batch.description')"
+      :icon="ListChecks"
       size="2xl"
       @update:model-value="batchManageDialogOpen = $event"
     >
       <template #default>
         <div class="space-y-4">
-          <!-- 搜索栏 -->
-          <div class="flex items-center gap-2">
+          <!-- 搜索与在线价格来源 -->
+          <div class="grid grid-cols-1 gap-2 sm:grid-cols-[minmax(0,1fr)_220px]">
             <div class="flex-1 relative">
               <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
               <Input
@@ -488,6 +578,27 @@
                 class="pl-8 h-9"
               />
             </div>
+            <Select
+              v-model="batchPricingProviderId"
+              :disabled="batchManageOnlineLoading"
+            >
+              <SelectTrigger class="h-9 text-xs">
+                <SelectValue :placeholder="t('models.management.batch.providerPlaceholder')" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem :value="REMEMBERED_PRICING_PROVIDER_ID">
+                  {{ t('models.management.batch.rememberedProvider') }}
+                </SelectItem>
+                <SelectItem
+                  v-for="provider in batchPricingProviderOptions"
+                  :key="provider.providerId"
+                  :value="provider.providerId"
+                >
+                  {{ provider.providerName }}
+                  <span class="ml-1 text-muted-foreground">({{ provider.matchCount }})</span>
+                </SelectItem>
+              </SelectContent>
+            </Select>
           </div>
 
           <!-- 快捷选中 -->
@@ -497,7 +608,8 @@
               v-for="shortcut in batchManageShortcuts"
               :key="shortcut.label"
               type="button"
-              class="text-xs px-2 py-1 rounded-md border border-border/60 hover:bg-muted transition-colors"
+              class="rounded-md border border-border/60 px-2 py-1 text-xs transition-colors hover:bg-muted active:scale-[0.96]"
+              :class="shortcut.emphasis ? 'border-primary/30 bg-primary/5 text-primary' : ''"
               :title="shortcut.description"
               @click="applyBatchManageShortcut(shortcut.filter)"
             >
@@ -509,7 +621,7 @@
           <div class="border rounded-lg overflow-hidden">
             <div class="max-h-96 overflow-y-auto">
               <div
-                v-if="batchManageLoading"
+                v-if="batchManageLoading || batchManageOnlineLoading"
                 class="flex items-center justify-center py-12"
               >
                 <Loader2 class="w-6 h-6 animate-spin text-primary" />
@@ -556,6 +668,21 @@
                       </p>
                     </div>
                     <div class="flex items-center gap-2 shrink-0">
+                      <span
+                        class="max-w-28 truncate text-[10px] text-muted-foreground"
+                        :title="getBatchPricingSourceLabel(model)"
+                      >{{ getBatchPricingSourceLabel(model) }}</span>
+                      <span
+                        class="inline-flex items-center gap-1.5 text-[11px] font-medium"
+                        :class="getBatchPricingStateClass(model)"
+                        :title="getBatchPricingStateDescription(model)"
+                      >
+                        <span
+                          class="h-1.5 w-1.5 rounded-full"
+                          :class="getBatchPricingStateDotClass(model)"
+                        />
+                        {{ getBatchPricingStateLabel(model) }}
+                      </span>
                       <Badge
                         variant="secondary"
                         class="text-xs"
@@ -588,23 +715,42 @@
         </div>
       </template>
       <template #footer>
-        <div class="flex items-center justify-between w-full">
-          <p class="text-xs text-muted-foreground">
-            {{ selectedBatchManageModelIds.size > 0 ? `已选择 ${selectedBatchManageModelIds.size} 个模型` : '' }}
+        <div class="flex w-full min-w-0 flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+          <p class="min-w-0 break-keep text-pretty text-xs leading-5 text-muted-foreground lg:flex-1">
+            {{ batchManageSelectionSummary }}
           </p>
-          <div class="flex items-center gap-2">
+          <div class="flex w-full min-w-0 flex-col gap-2 sm:flex-row lg:w-auto lg:shrink-0">
             <Button
+              class="w-full whitespace-nowrap sm:flex-1 lg:w-auto lg:flex-none"
+              :disabled="selectedBatchPriceSyncEntries.length === 0 || submittingBatchManage"
+              @click="confirmBatchSyncPrices"
+            >
+              <Loader2
+                v-if="batchManageAction === 'sync-prices'"
+                class="w-4 h-4 mr-1 animate-spin"
+              />
+              <RefreshCw
+                v-else
+                class="w-4 h-4 mr-1"
+              />
+              {{ batchManageAction === 'sync-prices'
+                ? t('models.management.batch.syncing')
+                : t('models.management.batch.syncButton', { count: selectedBatchPriceSyncEntries.length }) }}
+            </Button>
+            <Button
+              class="w-full whitespace-nowrap sm:flex-1 lg:w-auto lg:flex-none"
               variant="destructive"
               :disabled="selectedBatchManageModelIds.size === 0 || submittingBatchManage"
               @click="confirmBatchDeleteModels"
             >
               <Loader2
-                v-if="submittingBatchManage"
+                v-if="batchManageAction === 'delete'"
                 class="w-4 h-4 mr-1 animate-spin"
               />
-              {{ submittingBatchManage ? '删除中...' : '删除选中' }}
+              {{ batchManageAction === 'delete' ? '删除中...' : '删除选中' }}
             </Button>
             <Button
+              class="w-full whitespace-nowrap sm:flex-1 lg:w-auto lg:flex-none"
               variant="outline"
               @click="batchManageDialogOpen = false"
             >
@@ -632,20 +778,25 @@ import {
   Server,
   Check,
   ListChecks,
+  RefreshCw,
 } from 'lucide-vue-next'
 import ModelDetailDrawer from '@/features/models/components/ModelDetailDrawer.vue'
 import GlobalModelFormDialog from '@/features/models/components/GlobalModelFormDialog.vue'
+import GlobalModelPricingSourceSelect from '@/features/models/components/GlobalModelPricingSourceSelect.vue'
+import ExternalModelsAccessControl from '@/features/models/components/ExternalModelsAccessControl.vue'
 import ProviderModelFormDialog from '@/features/providers/components/ProviderModelFormDialog.vue'
 import type { Model } from '@/api/endpoints'
 import { useToast } from '@/composables/useToast'
 import { useConfirm } from '@/composables/useConfirm'
 import { useClipboard } from '@/composables/useClipboard'
 import { useRowClick } from '@/composables/useRowClick'
+import { useI18n } from '@/i18n'
 import { parseApiError } from '@/utils/errorParser'
 import { sortResolutionEntries } from '@/utils/form'
 import {
   Button,
   Card,
+  Checkbox,
   Input,
   Table,
   TableHeader,
@@ -657,6 +808,11 @@ import {
   Dialog,
   Pagination,
   RefreshButton,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
 } from '@/components/ui'
 import {
   listGlobalModels,
@@ -671,6 +827,18 @@ import {
 import { log } from '@/utils/logger'
 import { formatUsageCount } from '@/utils/format'
 import { getProvidersSummary, type ProviderWithEndpointsSummary } from '@/api/endpoints/providers'
+import { getModelsDevList, type ModelsDevModelItem } from '@/api/models-dev'
+import {
+  buildGlobalModelPriceSyncPlan,
+  cloneTieredPricingConfig,
+  type GlobalModelPriceSyncEntry,
+} from '@/features/models/components/global-model-form-helpers'
+import {
+  getModelsDevPricingSourceFromConfig,
+  modelsDevPricingSourcesEqual,
+  useModelsDevPricingSources,
+  withModelsDevPricingSource,
+} from '@/features/models/composables/useModelsDevPricingSources'
 
 
 interface ModelProviderDisplay {
@@ -696,7 +864,14 @@ interface ModelProviderDisplay {
 }
 
 const { success, error: showError } = useToast()
+const { t, locale } = useI18n()
 const { copyToClipboard } = useClipboard()
+const {
+  getSource: getModelsDevPricingSource,
+  getLocalSource: getLocalModelsDevPricingSource,
+  setSource: setModelsDevPricingSource,
+} = useModelsDevPricingSources()
+const REMEMBERED_PRICING_PROVIDER_ID = '__remembered__'
 
 // 状态
 const loading = ref(false)
@@ -712,11 +887,16 @@ const globalModels = ref<GlobalModelResponse[]>([])
 const totalGlobalModels = ref(0)
 const batchManageModels = ref<GlobalModelResponse[]>([])
 const batchManageLoading = ref(false)
+const batchManageOnlineModels = ref<ModelsDevModelItem[]>([])
+const batchManageOnlineLoading = ref(false)
+const modelPricingSourceSyncingIds = ref<Set<string>>(new Set())
 const GLOBAL_MODELS_BATCH_FETCH_PAGE_SIZE = 1000
 let globalModelsRequestId = 0
 let modelSelectionRequestId = 0
 let modelProvidersRequestId = 0
 let batchManageModelsRequestId = 0
+let batchManageOnlineModelsRequest: Promise<void> | null = null
+const pricingSourceMigrationAttemptedIds = new Set<string>()
 let providerOptionsRequest: Promise<void> | null = null
 const GLOBAL_MODELS_LIST_CACHE_TTL_MS = 10 * 1000
 
@@ -746,8 +926,10 @@ const editingProvider = ref<ModelProviderDisplay | null>(null)
 // 批量管理全局模型
 const batchManageDialogOpen = ref(false)
 const batchManageSearchQuery = ref('')
+const batchPricingProviderId = ref(REMEMBERED_PRICING_PROVIDER_ID)
 const selectedBatchManageModelIds = ref<Set<string>>(new Set())
 const submittingBatchManage = ref(false)
+const batchManageAction = ref<'sync-prices' | 'delete' | null>(null)
 
 // 将 provider 数据转换为 Model 类型供 ProviderModelFormDialog 使用
 const editingProviderModel = computed<Model | null>(() => {
@@ -774,7 +956,7 @@ const editingProviderModel = computed<Model | null>(() => {
 })
 
 // 使用全局确认对话框
-const { confirmDanger } = useConfirm()
+const { confirm, confirmDanger } = useConfirm()
 
 // 从 GlobalModel 的 default_tiered_pricing 获取第一阶梯价格
 function getFirstTierPrice(model: GlobalModelResponse, type: 'input' | 'output'): number | null {
@@ -1022,6 +1204,32 @@ const filteredGlobalModels = computed(() => {
 
 // 模型目录分页计算
 const paginatedGlobalModels = computed(() => filteredGlobalModels.value)
+const selectedOnCurrentModelPageCount = computed(() => (
+  paginatedGlobalModels.value.filter(model => selectedBatchManageModelIds.value.has(model.id)).length
+))
+const isCurrentModelPageFullySelected = computed(() => (
+  paginatedGlobalModels.value.length > 0
+  && selectedOnCurrentModelPageCount.value === paginatedGlobalModels.value.length
+))
+const isCurrentModelPagePartiallySelected = computed(() => (
+  selectedOnCurrentModelPageCount.value > 0 && !isCurrentModelPageFullySelected.value
+))
+
+function setBatchManageModelSelection(modelId: string, selected: boolean) {
+  const nextSelection = new Set(selectedBatchManageModelIds.value)
+  if (selected) nextSelection.add(modelId)
+  else nextSelection.delete(modelId)
+  selectedBatchManageModelIds.value = nextSelection
+}
+
+function toggleCurrentModelPageSelection(selected: boolean) {
+  const nextSelection = new Set(selectedBatchManageModelIds.value)
+  for (const model of paginatedGlobalModels.value) {
+    if (selected) nextSelection.add(model.id)
+    else nextSelection.delete(model.id)
+  }
+  selectedBatchManageModelIds.value = nextSelection
+}
 
 watch(searchQuery, () => {
   catalogCurrentPage.value = 1
@@ -1058,6 +1266,7 @@ async function loadGlobalModels(options: { cacheTtlMs?: number } = {}) {
 
     globalModels.value = pageModels
     totalGlobalModels.value = total
+    migrateLegacyModelsDevPricingSources(pageModels)
   } catch (err: unknown) {
     if (requestId !== globalModelsRequestId) return
     log.error('加载模型失败:', err)
@@ -1100,6 +1309,11 @@ async function loadBatchManageModels() {
 
     if (requestId !== batchManageModelsRequestId) return
     batchManageModels.value = allModels
+    const validModelIds = new Set(allModels.map(model => model.id))
+    selectedBatchManageModelIds.value = new Set(
+      [...selectedBatchManageModelIds.value].filter(modelId => validModelIds.has(modelId)),
+    )
+    migrateLegacyModelsDevPricingSources(allModels)
   } catch (err: unknown) {
     if (requestId !== batchManageModelsRequestId) return
     log.error('加载批量管理模型失败:', err)
@@ -1294,6 +1508,341 @@ const filteredBatchManageModels = computed(() => {
   })
 })
 
+const onlinePricingCandidatesByModelName = computed(() => {
+  const candidatesByName = new Map<string, ModelsDevModelItem[]>()
+  for (const onlineModel of batchManageOnlineModels.value) {
+    const normalizedName = onlineModel.modelId.trim().toLowerCase()
+    const existing = candidatesByName.get(normalizedName) ?? []
+    const normalizedProviderId = onlineModel.providerId.trim().toLowerCase()
+    if (!existing.some(candidate => (
+      candidate.providerId.trim().toLowerCase() === normalizedProviderId
+    ))) {
+      existing.push(onlineModel)
+      candidatesByName.set(normalizedName, existing)
+    }
+  }
+  for (const candidates of candidatesByName.values()) {
+    candidates.sort((left, right) => (
+      Number(right.official === true) - Number(left.official === true)
+      || left.providerName.localeCompare(right.providerName)
+      || left.providerId.localeCompare(right.providerId)
+    ))
+  }
+  return candidatesByName
+})
+
+function getModelPricingCandidates(model: GlobalModelResponse): ModelsDevModelItem[] {
+  return onlinePricingCandidatesByModelName.value.get(model.name.trim().toLowerCase()) ?? []
+}
+
+function getModelPricingSource(model: GlobalModelResponse) {
+  return getModelsDevPricingSource(model.id, model.config)
+}
+
+function isModelPricingSourceLocalOnly(model: GlobalModelResponse): boolean {
+  return !getModelsDevPricingSourceFromConfig(model.config)
+    && !!getLocalModelsDevPricingSource(model.id)
+}
+
+function isModelPricingSourceSyncing(modelId: string): boolean {
+  return modelPricingSourceSyncingIds.value.has(modelId)
+}
+
+function setModelPricingSourceSyncing(modelId: string, syncing: boolean) {
+  const nextIds = new Set(modelPricingSourceSyncingIds.value)
+  if (syncing) nextIds.add(modelId)
+  else nextIds.delete(modelId)
+  modelPricingSourceSyncingIds.value = nextIds
+}
+
+function applyGlobalModelUpdate(updatedModel: GlobalModelResponse) {
+  for (const models of [globalModels.value, batchManageModels.value]) {
+    const current = models.find(model => model.id === updatedModel.id)
+    if (current) Object.assign(current, updatedModel)
+  }
+  if (editingModel.value?.id === updatedModel.id) {
+    editingModel.value = { ...editingModel.value, ...updatedModel }
+  }
+  if (selectedModel.value?.id === updatedModel.id) {
+    selectedModel.value = { ...selectedModel.value, ...updatedModel }
+  }
+}
+
+function migrateLegacyModelsDevPricingSources(models: GlobalModelResponse[]) {
+  const tasks = models.flatMap(model => {
+    const localSource = getLocalModelsDevPricingSource(model.id)
+    if (
+      !localSource
+      || getModelsDevPricingSourceFromConfig(model.config)
+      || pricingSourceMigrationAttemptedIds.has(model.id)
+    ) {
+      return []
+    }
+    pricingSourceMigrationAttemptedIds.add(model.id)
+    return [async () => {
+      setModelPricingSourceSyncing(model.id, true)
+      const nextConfig = withModelsDevPricingSource(model.config, localSource)
+      try {
+        const updatedModel = await updateGlobalModel(model.id, { config: nextConfig })
+        applyGlobalModelUpdate({ ...updatedModel, config: nextConfig })
+      } catch (err: unknown) {
+        pricingSourceMigrationAttemptedIds.delete(model.id)
+        log.warn('迁移本地模型价格来源失败:', err)
+      } finally {
+        setModelPricingSourceSyncing(model.id, false)
+      }
+    }]
+  })
+  if (tasks.length > 0) void runBatchTasksWithConcurrency(tasks, 4)
+}
+
+async function handleModelPricingSourceOpen(_model: GlobalModelResponse, open: boolean) {
+  if (open) await loadBatchManageOnlineModels()
+}
+
+async function syncModelPricingSource(model: GlobalModelResponse, providerId: string) {
+  if (!providerId || providerId.startsWith('__') || isModelPricingSourceSyncing(model.id)) return
+  if (batchManageOnlineModels.value.length === 0) await loadBatchManageOnlineModels()
+  const normalizedProviderId = providerId.trim().toLowerCase()
+  const candidate = getModelPricingCandidates(model).find(item => (
+    item.providerId.trim().toLowerCase() === normalizedProviderId
+  ))
+  if (!candidate) {
+    showError(
+      t('models.pricingSource.sourceGone'),
+      t('models.pricingSource.cannotSync'),
+    )
+    return
+  }
+  if (candidate.pricingUnsupportedFields?.length) {
+    showError(
+      t('models.pricingSource.unsupported', { fields: formatBatchUnsupportedPricingFields(candidate) }),
+      t('models.pricingSource.incompatible'),
+    )
+    return
+  }
+  if (!candidate.tieredPricing?.tiers?.length) {
+    showError(
+      t('models.pricingSource.noUsablePrice'),
+      t('models.pricingSource.cannotSync'),
+    )
+    return
+  }
+
+  const source = {
+    provider_id: candidate.providerId,
+    provider_name: candidate.providerName,
+  }
+  const pricing = cloneTieredPricingConfig(candidate.tieredPricing)
+  const nextConfig = withModelsDevPricingSource(model.config, source)
+  setModelPricingSourceSyncing(model.id, true)
+  try {
+    const updatedModel = await updateGlobalModel(model.id, {
+      default_tiered_pricing: pricing,
+      config: nextConfig,
+    })
+    setModelsDevPricingSource(model.id, source)
+    applyGlobalModelUpdate({
+      ...updatedModel,
+      default_tiered_pricing: pricing,
+      config: nextConfig,
+    })
+    success(t('models.pricingSource.selectedAndSynced', { provider: candidate.providerName }))
+  } catch (err: unknown) {
+    log.error('更新模型价格来源失败:', err)
+    showError(
+      parseApiError(err, t('models.pricingSource.updateFailed')),
+      t('models.pricingSource.syncFailed'),
+    )
+  } finally {
+    setModelPricingSourceSyncing(model.id, false)
+  }
+}
+
+async function resyncModelPricingSource(model: GlobalModelResponse) {
+  const source = getModelPricingSource(model)
+  if (!source) return
+  await loadBatchManageOnlineModels()
+  await syncModelPricingSource(model, source.provider_id)
+}
+
+const batchPricingProviderOptions = computed(() => {
+  const existingModelNames = new Set(batchManageModels.value.map(model => model.name.trim().toLowerCase()))
+  const providers = new Map<string, {
+    providerId: string
+    providerName: string
+    matchCount: number
+    official: boolean
+  }>()
+  for (const onlineModel of batchManageOnlineModels.value) {
+    const provider = providers.get(onlineModel.providerId) ?? {
+      providerId: onlineModel.providerId,
+      providerName: onlineModel.providerName,
+      matchCount: 0,
+      official: onlineModel.official === true,
+    }
+    if (
+      (onlineModel.tieredPricing || onlineModel.pricingUnsupportedFields?.length)
+      && existingModelNames.has(onlineModel.modelId.trim().toLowerCase())
+    ) {
+      provider.matchCount += 1
+    }
+    providers.set(onlineModel.providerId, provider)
+  }
+  return [...providers.values()]
+    .filter(provider => provider.matchCount > 0)
+    .sort((left, right) => (
+      Number(right.official) - Number(left.official)
+      || right.matchCount - left.matchCount
+      || left.providerName.localeCompare(right.providerName)
+    ))
+})
+
+const selectedBatchPricingProvider = computed(() => (
+  batchPricingProviderOptions.value.find(provider => provider.providerId === batchPricingProviderId.value)
+))
+
+const batchPricingProviderModels = computed(() => (
+  batchPricingProviderId.value === REMEMBERED_PRICING_PROVIDER_ID
+    ? batchManageOnlineModels.value
+    : batchManageOnlineModels.value.filter(model => model.providerId === batchPricingProviderId.value)
+))
+
+const rememberedBatchPricingProviderIds = computed(() => {
+  if (batchPricingProviderId.value !== REMEMBERED_PRICING_PROVIDER_ID) return undefined
+  const providerIds = new Map<string, string>()
+  for (const model of batchManageModels.value) {
+    const source = getModelsDevPricingSource(model.id, model.config)
+    if (source) providerIds.set(model.id, source.provider_id)
+  }
+  return providerIds
+})
+
+const batchPriceSyncPlan = computed(() => (
+  buildGlobalModelPriceSyncPlan(
+    batchManageModels.value,
+    batchPricingProviderModels.value,
+    rememberedBatchPricingProviderIds.value,
+  )
+))
+
+function doesBatchEntryNeedSourcePersistence(entry: GlobalModelPriceSyncEntry): boolean {
+  return !modelsDevPricingSourcesEqual(
+    getModelsDevPricingSourceFromConfig(entry.model.config),
+    {
+      provider_id: entry.onlineModel.providerId,
+      provider_name: entry.onlineModel.providerName,
+    },
+  )
+}
+
+const batchPricingStateByModelId = computed(() => {
+  const states = new Map<string, 'syncable' | 'source-pending' | 'unchanged' | 'unsupported' | 'unavailable'>()
+  for (const entry of batchPriceSyncPlan.value.syncable) states.set(entry.model.id, 'syncable')
+  for (const entry of batchPriceSyncPlan.value.unchanged) {
+    states.set(
+      entry.model.id,
+      doesBatchEntryNeedSourcePersistence(entry) ? 'source-pending' : 'unchanged',
+    )
+  }
+  for (const entry of batchPriceSyncPlan.value.unsupported) states.set(entry.model.id, 'unsupported')
+  for (const model of batchPriceSyncPlan.value.unavailable) states.set(model.id, 'unavailable')
+  return states
+})
+
+const selectedBatchManageModels = computed(() => (
+  batchManageModels.value.filter(model => selectedBatchManageModelIds.value.has(model.id))
+))
+
+const selectedBatchPriceSyncPlan = computed(() => (
+  buildGlobalModelPriceSyncPlan(
+    selectedBatchManageModels.value,
+    batchPricingProviderModels.value,
+    rememberedBatchPricingProviderIds.value,
+  )
+))
+
+const selectedBatchPriceSyncEntries = computed(() => [
+  ...selectedBatchPriceSyncPlan.value.syncable,
+  ...selectedBatchPriceSyncPlan.value.unchanged.filter(doesBatchEntryNeedSourcePersistence),
+])
+
+const batchManageSelectionSummary = computed(() => {
+  const selectedCount = selectedBatchManageModelIds.value.size
+  if (selectedCount === 0) return t('models.management.batch.selectionEmpty')
+  const plan = selectedBatchPriceSyncPlan.value
+  const sourcePendingCount = plan.unchanged.filter(doesBatchEntryNeedSourcePersistence).length
+  const unchangedCount = plan.unchanged.length - sourcePendingCount
+  return t('models.management.batch.selectionSummary', {
+    selected: selectedCount,
+    syncable: plan.syncable.length,
+    sourcePending: sourcePendingCount,
+    unchanged: unchangedCount,
+    unsupported: plan.unsupported.length,
+    unavailable: plan.unavailable.length,
+  })
+})
+
+function getBatchPricingState(model: GlobalModelResponse) {
+  return batchPricingStateByModelId.value.get(model.id) ?? 'unavailable'
+}
+
+function getBatchPricingStateLabel(model: GlobalModelResponse): string {
+  const state = getBatchPricingState(model)
+  if (state === 'syncable') return t('models.management.batch.state.syncable')
+  if (state === 'source-pending') return t('models.management.batch.state.sourcePending')
+  if (state === 'unchanged') return t('models.management.batch.state.unchanged')
+  if (state === 'unsupported') return t('models.management.batch.state.unsupported')
+  return t('models.management.batch.state.unavailable')
+}
+
+function getBatchPricingStateDescription(model: GlobalModelResponse): string {
+  const providerName = getBatchPricingSourceLabel(model)
+  const unsupportedEntry = batchPriceSyncPlan.value.unsupported.find(entry => entry.model.id === model.id)
+  if (unsupportedEntry) {
+    return `${providerName || unsupportedEntry.onlineModel.providerName} · 不支持独立结算 ${formatBatchUnsupportedPricingFields(unsupportedEntry.onlineModel)}`
+  }
+  return `${providerName} · ${getBatchPricingStateLabel(model)}`
+}
+
+function getBatchPricingSourceLabel(model: GlobalModelResponse): string {
+  if (batchPricingProviderId.value !== REMEMBERED_PRICING_PROVIDER_ID) {
+    return selectedBatchPricingProvider.value?.providerName
+      ?? t('models.management.batch.source.noneSelected')
+  }
+  return getModelsDevPricingSource(model.id, model.config)?.provider_name
+    ?? t('models.management.batch.source.noneRecorded')
+}
+
+function getBatchPricingStateClass(model: GlobalModelResponse): string {
+  const state = getBatchPricingState(model)
+  if (state === 'syncable') return 'text-amber-700 dark:text-amber-300'
+  if (state === 'source-pending') return 'text-sky-700 dark:text-sky-300'
+  if (state === 'unchanged') return 'text-emerald-700 dark:text-emerald-300'
+  if (state === 'unsupported') return 'text-rose-700 dark:text-rose-300'
+  return 'text-muted-foreground'
+}
+
+function getBatchPricingStateDotClass(model: GlobalModelResponse): string {
+  const state = getBatchPricingState(model)
+  if (state === 'syncable') return 'bg-amber-500'
+  if (state === 'source-pending') return 'bg-sky-500'
+  if (state === 'unchanged') return 'bg-emerald-500'
+  if (state === 'unsupported') return 'bg-rose-500'
+  return 'bg-muted-foreground/45'
+}
+
+function formatBatchUnsupportedPricingFields(model: ModelsDevModelItem): string {
+  const labels = {
+    reasoning: t('models.pricingField.reasoning'),
+    input_audio: t('models.pricingField.inputAudio'),
+    output_audio: t('models.pricingField.outputAudio'),
+  }
+  return (model.pricingUnsupportedFields ?? [])
+    .map(field => labels[field])
+    .join(locale.value === 'zh-CN' ? '、' : ', ')
+}
+
 // 批量管理 - 快捷筛选定义
 function hasNoPrice(m: GlobalModelResponse): boolean {
   return !getFirstTierPrice(m, 'input') && !getFirstTierPrice(m, 'output')
@@ -1302,7 +1851,17 @@ function hasNoPrice(m: GlobalModelResponse): boolean {
 
 const batchManageShortcuts = computed(() => {
   const models = batchManageModels.value
-  const defs: { label: string; description: string; filter: (m: GlobalModelResponse) => boolean }[] = [
+  const defs: {
+    label: string
+    description: string
+    filter: (m: GlobalModelResponse) => boolean
+    emphasis?: boolean
+  }[] = [
+    { label: t('models.management.batch.state.syncable'), description: t('models.management.batch.shortcut.syncable'), filter: m => getBatchPricingState(m) === 'syncable', emphasis: true },
+    { label: t('models.management.batch.state.sourcePending'), description: t('models.management.batch.shortcut.sourcePending'), filter: m => getBatchPricingState(m) === 'source-pending', emphasis: true },
+    { label: t('models.management.batch.state.unchanged'), description: t('models.management.batch.shortcut.unchanged'), filter: m => getBatchPricingState(m) === 'unchanged' },
+    { label: t('models.management.batch.state.unsupported'), description: t('models.management.batch.shortcut.unsupported'), filter: m => getBatchPricingState(m) === 'unsupported' },
+    { label: t('models.management.batch.state.unavailable'), description: t('models.management.batch.shortcut.unavailable'), filter: m => getBatchPricingState(m) === 'unavailable' },
     { label: '无提供商', description: '没有关联任何提供商的模型', filter: m => (m.provider_count || 0) === 0 },
     { label: '无活跃提供商', description: '有提供商但没有活跃提供商的模型', filter: m => (m.active_provider_count || 0) === 0 && (m.provider_count || 0) > 0 },
     { label: '禁用', description: '被禁用的模型', filter: m => !m.is_active },
@@ -1352,9 +1911,130 @@ function toggleAllBatchManageModels() {
 // 打开批量管理对话框
 function openBatchManageDialog() {
   batchManageSearchQuery.value = ''
-  selectedBatchManageModelIds.value = new Set()
+  batchPricingProviderId.value = REMEMBERED_PRICING_PROVIDER_ID
   batchManageDialogOpen.value = true
-  loadBatchManageModels()
+  void Promise.all([loadBatchManageModels(), loadBatchManageOnlineModels()])
+}
+
+async function loadBatchManageOnlineModels() {
+  if (batchManageOnlineModels.value.length > 0) return
+  if (batchManageOnlineModelsRequest) return batchManageOnlineModelsRequest
+
+  batchManageOnlineModelsRequest = (async () => {
+    batchManageOnlineLoading.value = true
+    try {
+      batchManageOnlineModels.value = await getModelsDevList(false)
+    } catch (err: unknown) {
+      log.error('加载在线模型价格失败:', err)
+      showError(parseApiError(err, '加载在线模型价格失败'), '加载失败')
+    } finally {
+      batchManageOnlineLoading.value = false
+      batchManageOnlineModelsRequest = null
+    }
+  })()
+  return batchManageOnlineModelsRequest
+}
+
+async function runBatchTasksWithConcurrency(
+  tasks: Array<() => Promise<void>>,
+  concurrency: number = 6,
+) {
+  let cursor = 0
+  const runNext = async (): Promise<void> => {
+    while (cursor < tasks.length) {
+      const taskIndex = cursor++
+      await tasks[taskIndex]()
+    }
+  }
+  await Promise.all(Array.from(
+    { length: Math.min(concurrency, tasks.length) },
+    () => runNext(),
+  ))
+}
+
+async function confirmBatchSyncPrices() {
+  const plan = selectedBatchPriceSyncPlan.value
+  const entries = selectedBatchPriceSyncEntries.value
+  if (entries.length === 0) return
+  const providerName = batchPricingProviderId.value === REMEMBERED_PRICING_PROVIDER_ID
+    ? t('models.management.batch.rememberedProviderLabel')
+    : selectedBatchPricingProvider.value?.providerName
+      || t('models.management.batch.selectedProviderLabel')
+  const sourceOnlyCount = plan.unchanged.filter(doesBatchEntryNeedSourcePersistence).length
+  const skippedCount = plan.unchanged.length - sourceOnlyCount
+    + plan.unsupported.length
+    + plan.unavailable.length
+  const sourceOnlyMessage = sourceOnlyCount > 0
+    ? ` ${t('models.management.batch.confirmSourceOnly', { count: sourceOnlyCount })}`
+    : ''
+  const skippedMessage = skippedCount > 0
+    ? ` ${t('models.management.batch.confirmSkipped', { count: skippedCount })}`
+    : ''
+  const confirmed = await confirm({
+    title: t('models.management.batch.confirmTitle'),
+    message: `${t('models.management.batch.confirmMain', {
+      provider: providerName,
+      count: entries.length,
+    })}${sourceOnlyMessage}${skippedMessage}\n\n${t('models.management.batch.confirmUnchanged')}`,
+    confirmText: t('models.management.batch.confirmButton'),
+    variant: 'info',
+  })
+  if (!confirmed) return
+
+  submittingBatchManage.value = true
+  batchManageAction.value = 'sync-prices'
+  const failedIds = new Set<string>()
+  const failureMessages: string[] = []
+  let successCount = 0
+  try {
+    const tasks = entries.map(entry => async () => {
+      try {
+        const onlinePricing = entry.onlineModel.tieredPricing
+        if (!onlinePricing) {
+          throw new Error(t('models.management.batch.catalogMissingPrice'))
+        }
+        const pricing = cloneTieredPricingConfig(onlinePricing)
+        const source = {
+          provider_id: entry.onlineModel.providerId,
+          provider_name: entry.onlineModel.providerName,
+        }
+        const nextConfig = withModelsDevPricingSource(entry.model.config, source)
+        const updatedModel = await updateGlobalModel(entry.model.id, {
+          default_tiered_pricing: pricing,
+          config: nextConfig,
+        })
+        setModelsDevPricingSource(entry.model.id, source)
+        applyGlobalModelUpdate({
+          ...updatedModel,
+          default_tiered_pricing: pricing,
+          config: nextConfig,
+        })
+        successCount += 1
+      } catch (err: unknown) {
+        failedIds.add(entry.model.id)
+        failureMessages.push(`${entry.model.display_name}: ${parseApiError(err, '更新失败')}`)
+      }
+    })
+    await runBatchTasksWithConcurrency(tasks)
+
+    if (successCount > 0) {
+      success(t('models.management.batch.success', { count: successCount }))
+    }
+    if (failureMessages.length > 0) {
+      showError(
+        t('models.management.batch.partialFailure', {
+          count: failureMessages.length,
+          details: failureMessages.slice(0, 2).join(locale.value === 'zh-CN' ? '；' : '; '),
+        }),
+        '部分失败',
+      )
+    }
+    await Promise.all([loadGlobalModels(), loadBatchManageModels()])
+    selectedBatchManageModelIds.value = failedIds
+  } finally {
+    batchManageAction.value = null
+    submittingBatchManage.value = false
+  }
 }
 
 // 确认批量删除模型
@@ -1369,6 +2049,7 @@ async function confirmBatchDeleteModels() {
   if (!confirmed) return
 
   submittingBatchManage.value = true
+  batchManageAction.value = 'delete'
   try {
     const ids = Array.from(selectedBatchManageModelIds.value)
     const result = await batchDeleteGlobalModels(ids)
@@ -1390,9 +2071,20 @@ async function confirmBatchDeleteModels() {
   } catch (err: unknown) {
     showError(parseApiError(err, '批量删除失败'), '错误')
   } finally {
+    batchManageAction.value = null
     submittingBatchManage.value = false
   }
 }
+
+watch([batchPricingProviderOptions, batchManageDialogOpen], ([options, dialogOpen]) => {
+  if (!dialogOpen) return
+  if (
+    batchPricingProviderId.value !== REMEMBERED_PRICING_PROVIDER_ID
+    && !options.some(provider => provider.providerId === batchPricingProviderId.value)
+  ) {
+    batchPricingProviderId.value = REMEMBERED_PRICING_PROVIDER_ID
+  }
+}, { immediate: true })
 
 // 抽屉控制函数
 function handleDrawerOpenChange(value: boolean) {
@@ -1500,6 +2192,14 @@ async function editModel(model: GlobalModelResponse) {
   createModelDialogOpen.value = true
 }
 
+function handleModelPricingSynced(model: GlobalModelResponse) {
+  applyGlobalModelUpdate({
+    ...model,
+    default_tiered_pricing: cloneTieredPricingConfig(model.default_tiered_pricing),
+    config: model.config ? { ...model.config } : model.config,
+  })
+}
+
 async function deleteModel(model: GlobalModelResponse) {
   const confirmed = await confirmDanger(
     `确定删除模型 "${model.name}" 吗？\n\n此操作不可撤销。`,
@@ -1513,6 +2213,7 @@ async function deleteModel(model: GlobalModelResponse) {
     if (selectedModel.value?.id === model.id) {
       selectedModel.value = null
     }
+    setBatchManageModelSelection(model.id, false)
     await loadGlobalModels()
   } catch (err: unknown) {
     showError(parseApiError(err, '删除失败'), '删除失败')

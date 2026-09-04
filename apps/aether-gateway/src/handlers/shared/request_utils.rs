@@ -221,6 +221,11 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("endpoints_manage"), http::Method::POST, Some("create_endpoint"))
                 | (Some("endpoints_manage"), http::Method::POST, Some("batch_delete_keys"))
                 | (Some("endpoints_manage"), http::Method::POST, Some("refresh_quota"))
+                | (
+                    Some("endpoints_manage"),
+                    http::Method::POST,
+                    Some("codex_reset_credit_consume"),
+                )
                 | (Some("endpoints_manage"), http::Method::PUT, Some("update_key"))
                 | (Some("endpoints_manage"), http::Method::PUT, Some("update_endpoint"))
                 | (Some("modules_manage"), http::Method::PUT, Some("set_enabled"))
@@ -238,6 +243,12 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                     Some("provider_oauth_manage"),
                     http::Method::POST,
                     Some("import_refresh_token"),
+                )
+                | (Some("provider_oauth_manage"), http::Method::POST, Some("cookie_authorize"))
+                | (
+                    Some("provider_oauth_manage"),
+                    http::Method::POST,
+                    Some("start_cookie_authorize_task"),
                 )
                 | (Some("provider_oauth_manage"), http::Method::POST, Some("batch_import_oauth"))
                 | (
@@ -284,6 +295,7 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                     http::Method::POST,
                     Some("import_from_upstream"),
                 )
+                | (Some("model_external_manage"), http::Method::PUT, Some("external_config_set"))
                 | (
                     Some("provider_ops_manage"),
                     http::Method::POST,
@@ -366,6 +378,7 @@ pub(crate) fn admin_proxy_local_requires_buffered_body(
                 | (Some("users_manage"), http::Method::PATCH, Some("lock_user_api_key"))
                 | (Some("pool_manage"), http::Method::POST, Some("batch_import_keys"))
                 | (Some("pool_manage"), http::Method::POST, Some("batch_action_keys"))
+                | (Some("pool_manage"), http::Method::PATCH, Some("batch_update_keys"))
                 | (Some("pool_manage"), http::Method::POST, Some("resolve_selection"))
                 | (Some("usage_manage"), http::Method::POST, Some("replay"))
                 | (Some("wallets_manage"), http::Method::POST, Some("adjust_balance"))
@@ -482,8 +495,14 @@ pub(crate) fn public_support_local_requires_buffered_body(
                     Some(
                         "api_keys_create"
                             | "api_key_install_session_create"
-                            | "management_tokens_create",
+                            | "management_tokens_create"
+                            | "vscodex_pairing_create"
+                            | "vscodex_ws_ticket_create",
                     ),
+                ) | (
+                    Some("vscodex"),
+                    http::Method::POST,
+                    Some("pairing_exchange"),
                 ) | (
                     Some("wallet"),
                     http::Method::POST,

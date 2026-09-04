@@ -4,19 +4,22 @@
  */
 
 import api from './client'
+import {
+  getModelsDevUnsupportedPricingFields,
+  resolveModelsDevTieredPricing,
+  type ModelsDevCost,
+  type ModelsDevTokenCost,
+  type ModelsDevUnsupportedPricingField,
+} from './models-dev-pricing'
+import type { TieredPricingConfig } from './endpoints/types'
+
+export type { ModelsDevCost, ModelsDevCostTier, ModelsDevTokenCost } from './models-dev-pricing'
 
 // 缓存配置
 const CACHE_KEY = 'models_dev_cache'
 const CACHE_DURATION = 15 * 60 * 1000 // 15 分钟
 
 // Models.dev API 数据结构
-export interface ModelsDevCost {
-  input?: number
-  output?: number
-  reasoning?: number
-  cache_read?: number
-}
-
 export interface ModelsDevLimit {
   context?: number
   output?: number
@@ -36,8 +39,23 @@ export interface ModelsDevModel {
   last_updated?: string
   input?: string[] // 输入模态: text, image, audio, video, pdf
   output?: string[] // 输出模态: text, image, audio
+  modalities?: {
+    input?: string[]
+    output?: string[]
+  }
   open_weights?: boolean
   cost?: ModelsDevCost
+  experimental?: {
+    modes?: Record<string, {
+      // models.dev experimental modes use the flat Cost shape; context tiers
+      // belong to the parent model cost only.
+      cost?: ModelsDevTokenCost
+      provider?: {
+        body?: Record<string, unknown>
+        headers?: Record<string, string>
+      }
+    }>
+  }
   limit?: ModelsDevLimit
   deprecated?: boolean
 }
@@ -55,6 +73,14 @@ export interface ModelsDevProvider {
 
 export type ModelsDevData = Record<string, ModelsDevProvider>
 
+export interface ExternalModelsAccessConfig {
+  proxy_node_id: string | null
+}
+
+export interface ExternalModelsAccessConfigUpdate extends ExternalModelsAccessConfig {
+  cache_cleared: boolean
+}
+
 // 扁平化的模型列表项（用于搜索和选择）
 export interface ModelsDevModelItem {
   providerId: string
@@ -64,6 +90,8 @@ export interface ModelsDevModelItem {
   family?: string
   inputPrice?: number
   outputPrice?: number
+  tieredPricing?: TieredPricingConfig
+  pricingUnsupportedFields?: ModelsDevUnsupportedPricingField[]
   contextLimit?: number
   outputLimit?: number
   supportsVision?: boolean
@@ -145,6 +173,29 @@ export async function getModelsDevData(): Promise<ModelsDevData> {
   return data
 }
 
+/**
+ * 获取 models.dev 目录的出站访问配置。
+ */
+export async function getExternalModelsAccessConfig(): Promise<ExternalModelsAccessConfig> {
+  const response = await api.get<ExternalModelsAccessConfig>('/api/admin/models/external/config')
+  return response.data
+}
+
+/**
+ * 更新 models.dev 目录的代理节点。null 表示直连。
+ * 后端会清理共享目录缓存；前端同时清理内存和 localStorage 缓存。
+ */
+export async function updateExternalModelsAccessConfig(
+  proxyNodeId: string | null,
+): Promise<ExternalModelsAccessConfigUpdate> {
+  const response = await api.put<ExternalModelsAccessConfigUpdate>(
+    '/api/admin/models/external/config',
+    { proxy_node_id: proxyNodeId },
+  )
+  clearModelsDevCache()
+  return response.data
+}
+
 // 模型列表缓存（避免重复转换）
 let modelsListCache: ModelsDevModelItem[] | null = null
 let modelsListCacheTimestamp: number | null = null
@@ -165,17 +216,35 @@ export async function getModelsDevList(officialOnly: boolean = true): Promise<Mo
       if (!provider.models) continue
 
       for (const [modelId, model] of Object.entries(provider.models)) {
+        const inputModalities = model.modalities?.input ?? model.input
+        const outputModalities = model.modalities?.output ?? model.output
+        const tieredPricing = resolveModelsDevTieredPricing(
+          providerId,
+          modelId,
+          model.cost,
+          model.experimental?.modes,
+        )
+        const pricingUnsupportedFields = [...new Set([
+          ...getModelsDevUnsupportedPricingFields(model.cost),
+          ...Object.values(model.experimental?.modes ?? {})
+            .flatMap(mode => getModelsDevUnsupportedPricingFields(mode.cost)),
+        ])]
+        const basePricingTier = tieredPricing?.tiers[0]
         items.push({
           providerId,
           providerName: provider.name,
           modelId,
           modelName: model.name || modelId,
           family: model.family,
-          inputPrice: model.cost?.input,
-          outputPrice: model.cost?.output,
+          inputPrice: basePricingTier?.input_price_per_1m ?? model.cost?.input,
+          outputPrice: basePricingTier?.output_price_per_1m ?? model.cost?.output,
+          tieredPricing: tieredPricing ?? undefined,
+          pricingUnsupportedFields: pricingUnsupportedFields.length > 0
+            ? pricingUnsupportedFields
+            : undefined,
           contextLimit: model.limit?.context,
           outputLimit: model.limit?.output,
-          supportsVision: model.input?.includes('image'),
+          supportsVision: inputModalities?.includes('image'),
           supportsToolCall: model.tool_call,
           supportsReasoning: model.reasoning,
           supportsStructuredOutput: model.structured_output,
@@ -190,8 +259,8 @@ export async function getModelsDevList(officialOnly: boolean = true): Promise<Mo
           // display_metadata 相关字段
           knowledgeCutoff: model.knowledge,
           releaseDate: model.release_date,
-          inputModalities: model.input,
-          outputModalities: model.output,
+          inputModalities,
+          outputModalities,
         })
       }
     }
@@ -219,6 +288,18 @@ export async function getModelsDevList(officialOnly: boolean = true): Promise<Mo
     return modelsListCache.filter(m => m.official)
   }
   return modelsListCache
+}
+
+/**
+ * 清理前后端 models.dev 缓存后重新获取模型目录。
+ * 编辑模型的价格同步使用此入口，避免只命中浏览器或网关的旧缓存。
+ */
+export async function refreshModelsDevList(
+  officialOnly: boolean = true,
+): Promise<ModelsDevModelItem[]> {
+  await api.delete('/api/admin/models/external/cache')
+  clearModelsDevCache()
+  return getModelsDevList(officialOnly)
 }
 
 /**

@@ -3,25 +3,40 @@ use aether_ai_serving::{
 };
 use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
 use aether_routing_core::ResolvedRoutingPolicy;
+use aether_runtime::ConcurrencyPermit;
 use aether_scheduler_core::{
     enumerate_minimal_candidate_selection_with_model_directives, normalize_api_format,
-    resolve_requested_global_model_name_with_model_directives,
-    row_supports_requested_model_with_model_directives, ClientSessionAffinity,
-    EnumerateMinimalCandidateSelectionInput, SchedulerMinimalCandidateSelectionCandidate,
+    resolve_requested_global_model_name_with_model_directives_and_request_operation,
+    row_supports_requested_model_with_model_directives_and_request_operation,
+    ClientSessionAffinity, EnumerateMinimalCandidateSelectionInput,
+    SchedulerMinimalCandidateSelectionCandidate,
 };
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
+use crate::ai_serving::planner::candidate_affinity_cache::has_explicit_session_affinity;
 use crate::ai_serving::planner::candidate_resolution::SkippedLocalExecutionCandidate;
 use crate::ai_serving::{GatewayAuthApiKeySnapshot, PlannerAppState};
-use crate::clock::current_unix_secs;
+use crate::cache::{
+    candidate_page_cache_stale_ttl, candidate_page_cache_ttl_from_env,
+    record_candidate_page_cache_follower_wait, record_candidate_page_cache_hit,
+    record_candidate_page_cache_load, record_candidate_page_cache_miss,
+    record_candidate_page_cache_none, record_candidate_row_page_cache_follower_wait,
+    record_candidate_row_page_cache_hit, record_candidate_row_page_cache_load,
+    record_candidate_row_page_cache_miss, record_candidate_row_page_cache_none, CacheLoadObserver,
+    CandidatePageCacheKey, CandidatePageSnapshot, CandidateRowPageCacheKey,
+};
+use crate::clock::request_distribution_seed;
 use crate::data::candidate_selection::{
-    read_requested_model_rows_fast_path_page, requested_model_candidate_names,
-    MinimalCandidateSelectionRowSource, REQUESTED_MODEL_CANDIDATE_PAGE_SIZE,
+    read_api_format_rows_fallback_page, read_requested_model_rows_fast_path_page,
+    requested_model_candidate_names, MinimalCandidateSelectionRowSource,
+    RequestedModelCandidateRowsPage, REQUESTED_MODEL_CANDIDATE_PAGE_SIZE,
     REQUESTED_MODEL_MAX_SCANNED_ROWS,
 };
 use crate::scheduler::candidate::SchedulerSkippedCandidate;
-use crate::scheduler::config::SchedulerOrderingConfig;
+use crate::scheduler::config::{SchedulerOrderingConfig, SchedulerSchedulingMode};
+use crate::stage_metrics::observe_gateway_stage_ms;
 use crate::GatewayError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,10 +45,20 @@ pub(crate) enum LocalCandidatePreselectionKeyMode {
     ProviderEndpointKeyModelAndApiFormat,
 }
 
+impl LocalCandidatePreselectionKeyMode {
+    pub(crate) fn cache_key_name(self) -> &'static str {
+        match self {
+            Self::ProviderEndpointKeyModel => "provider_endpoint_key_model",
+            Self::ProviderEndpointKeyModelAndApiFormat => "provider_endpoint_key_model_api_format",
+        }
+    }
+}
+
 struct GatewayLocalCandidatePreselectionPort<'a> {
     state: PlannerAppState<'a>,
     client_api_format: &'a str,
     requested_model: &'a str,
+    request_operation: Option<&'a str>,
     require_streaming: bool,
     required_capabilities: Option<&'a serde_json::Value>,
     auth_snapshot: &'a GatewayAuthApiKeySnapshot,
@@ -42,7 +67,69 @@ struct GatewayLocalCandidatePreselectionPort<'a> {
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
     candidate_api_formats: Vec<String>,
-    model_directive_enabled_api_formats: BTreeSet<String>,
+    model_directive_routing_models: BTreeMap<String, String>,
+    ranking_seed: u64,
+}
+
+impl GatewayLocalCandidatePreselectionPort<'_> {
+    fn model_directive_base_model(&self, candidate_api_format: &str) -> Option<&str> {
+        self.model_directive_routing_models
+            .get(&crate::ai_serving::normalize_api_format_alias(
+                candidate_api_format,
+            ))
+            .map(String::as_str)
+    }
+
+    fn routing_model(&self, candidate_api_format: &str) -> &str {
+        self.model_directive_base_model(candidate_api_format)
+            .unwrap_or(self.requested_model)
+    }
+}
+
+/// A Responses compaction request carries the OpenAI-only `compaction_trigger`
+/// control item.  It must stay on an OpenAI Responses endpoint: treating it as
+/// an ordinary cross-format request would make Gemini/Claude candidates look
+/// eligible and defer the inevitable lossy-conversion failure until payload
+/// construction.
+fn request_candidate_api_formats_for_operation(
+    client_api_format: &str,
+    require_streaming: bool,
+    request_operation: Option<&str>,
+) -> Vec<String> {
+    let candidate_api_formats =
+        crate::ai_serving::request_candidate_api_formats(client_api_format, require_streaming)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+    restrict_candidate_api_formats_for_operation(
+        client_api_format,
+        request_operation,
+        candidate_api_formats,
+    )
+}
+
+fn restrict_candidate_api_formats_for_operation(
+    client_api_format: &str,
+    request_operation: Option<&str>,
+    candidate_api_formats: Vec<String>,
+) -> Vec<String> {
+    let is_responses_compaction = request_operation.is_some_and(|operation| {
+        operation.eq_ignore_ascii_case(crate::ai_serving::OPENAI_RESPONSES_OPERATION_COMPACT)
+    });
+    let is_standard_responses_client =
+        crate::ai_serving::normalize_api_format_alias(client_api_format) == "openai:responses";
+    if !(is_responses_compaction && is_standard_responses_client) {
+        return candidate_api_formats;
+    }
+
+    candidate_api_formats
+        .into_iter()
+        .filter(|candidate_api_format| {
+            crate::ai_serving::normalize_api_format_alias(candidate_api_format)
+                == "openai:responses"
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -74,14 +161,22 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
         let auth_snapshot = matches_client_format.then_some(self.auth_snapshot);
         let (candidates, skipped_candidates) = self
             .state
-            .list_selectable_candidates_with_skip_reasons(
+            .list_selectable_candidates_with_skip_reasons_for_request_operation(
                 candidate_api_format,
-                self.requested_model,
+                self.routing_model(candidate_api_format),
                 self.require_streaming,
                 self.required_capabilities,
                 auth_snapshot,
-                self.client_session_affinity,
-                current_unix_secs(),
+                self.routing_policy
+                    .is_none()
+                    .then_some(self.client_session_affinity)
+                    .flatten(),
+                self.ranking_seed,
+                false,
+                self.request_operation,
+                super::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                    self.routing_policy,
+                ),
             )
             .await?;
 
@@ -100,16 +195,13 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
         candidate_api_format: &str,
         matches_client_format: bool,
     ) -> bool {
-        let enable_model_directives = self.model_directive_enabled_api_formats.contains(
-            &crate::ai_serving::normalize_api_format_alias(candidate_api_format),
-        );
         routing_policy_allows_provider(self.routing_policy, candidate)
             && (matches_client_format
                 || auth_snapshot_allows_cross_format_candidate(
                     self.auth_snapshot,
                     self.requested_model,
+                    self.model_directive_base_model(candidate_api_format),
                     candidate,
-                    enable_model_directives,
                 ))
     }
 
@@ -119,16 +211,13 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
         candidate_api_format: &str,
         matches_client_format: bool,
     ) -> bool {
-        let enable_model_directives = self.model_directive_enabled_api_formats.contains(
-            &crate::ai_serving::normalize_api_format_alias(candidate_api_format),
-        );
         routing_policy_allows_provider(self.routing_policy, &skipped_candidate.candidate)
             && (matches_client_format
                 || auth_snapshot_allows_cross_format_candidate(
                     self.auth_snapshot,
                     self.requested_model,
+                    self.model_directive_base_model(candidate_api_format),
                     &skipped_candidate.candidate,
-                    enable_model_directives,
                 ))
     }
 
@@ -141,11 +230,30 @@ impl AiCandidatePreselectionPort for GatewayLocalCandidatePreselectionPort<'_> {
     }
 }
 
+fn resolve_model_directive_routing_models(
+    policy: &crate::system_features::ModelDirectivePolicySnapshot,
+    candidate_api_formats: &[String],
+    requested_model: &str,
+) -> BTreeMap<String, String> {
+    candidate_api_formats
+        .iter()
+        .filter_map(|api_format| {
+            let api_format = crate::ai_serving::normalize_api_format_alias(api_format);
+            let resolution = policy.resolve_reasoning(&api_format, Some(requested_model));
+            resolution
+                .base_model()
+                .map(|base_model| (api_format, base_model.to_string()))
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn preselect_local_execution_candidates_with_serving(
     state: PlannerAppState<'_>,
+    model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
     client_api_format: &str,
     requested_model: &str,
+    request_operation: Option<&str>,
     require_streaming: bool,
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
@@ -160,15 +268,17 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
     >,
     GatewayError,
 > {
-    let candidate_api_formats =
-        crate::ai_serving::request_candidate_api_formats(client_api_format, require_streaming)
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+    let candidate_api_formats = request_candidate_api_formats_for_operation(
+        client_api_format,
+        require_streaming,
+        request_operation,
+    );
     preselect_local_execution_candidates_for_api_formats_with_serving(
         state,
+        model_directive_policy,
         client_api_format,
         requested_model,
+        request_operation,
         require_streaming,
         required_capabilities,
         auth_snapshot,
@@ -184,8 +294,10 @@ pub(crate) async fn preselect_local_execution_candidates_with_serving(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_serving(
     state: PlannerAppState<'_>,
+    model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
     client_api_format: &str,
     requested_model: &str,
+    request_operation: Option<&str>,
     require_streaming: bool,
     required_capabilities: Option<&serde_json::Value>,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
@@ -201,23 +313,21 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
     >,
     GatewayError,
 > {
-    let mut model_directive_enabled_api_formats = BTreeSet::new();
-    for api_format in &candidate_api_formats {
-        if crate::system_features::reasoning_model_directive_enabled_for_api_format_and_model(
-            state.app(),
-            api_format,
-            Some(requested_model),
-        )
-        .await
-        {
-            model_directive_enabled_api_formats
-                .insert(crate::ai_serving::normalize_api_format_alias(api_format));
-        }
-    }
+    let candidate_api_formats = restrict_candidate_api_formats_for_operation(
+        client_api_format,
+        request_operation,
+        candidate_api_formats,
+    );
+    let model_directive_routing_models = resolve_model_directive_routing_models(
+        model_directive_policy,
+        &candidate_api_formats,
+        requested_model,
+    );
     let port = GatewayLocalCandidatePreselectionPort {
         state,
         client_api_format,
         requested_model,
+        request_operation,
         require_streaming,
         required_capabilities,
         auth_snapshot,
@@ -226,7 +336,8 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
         use_api_format_alias_match,
         key_mode,
         candidate_api_formats,
-        model_directive_enabled_api_formats,
+        model_directive_routing_models,
+        ranking_seed: request_distribution_seed(),
     };
 
     run_ai_candidate_preselection(&port).await
@@ -234,18 +345,24 @@ pub(crate) async fn preselect_local_execution_candidates_for_api_formats_with_se
 
 pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     state: PlannerAppState<'a>,
+    trace_id: String,
     client_api_format: String,
     requested_model: String,
+    request_operation: Option<String>,
     require_streaming: bool,
     required_capabilities: Option<serde_json::Value>,
     auth_snapshot: GatewayAuthApiKeySnapshot,
     routing_policy: Option<ResolvedRoutingPolicy>,
     client_session_affinity: Option<ClientSessionAffinity>,
+    request_auth_channel: Option<String>,
     use_api_format_alias_match: bool,
     key_mode: LocalCandidatePreselectionKeyMode,
+    allow_priority_page_cache: bool,
     candidate_api_formats: Vec<String>,
-    model_directive_enabled_api_formats: BTreeSet<String>,
+    model_directive_routing_models: BTreeMap<String, String>,
+    model_directive_policy_cache_key: String,
     ordering_config: SchedulerOrderingConfig,
+    ranking_seed: u64,
     priority_page_emitted: bool,
     deferred_pages_by_format: BTreeMap<
         String,
@@ -261,64 +378,78 @@ pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     requested_name_offsets: BTreeMap<String, u32>,
     scanned_rows_by_format: BTreeMap<String, u32>,
     resolved_global_model_names: BTreeMap<String, String>,
-    fallback_scanned_api_formats: BTreeSet<String>,
+    fallback_offsets: BTreeMap<String, u32>,
+    fallback_scan_epoch: u32,
+    exhausted_api_formats: BTreeSet<String>,
     seen_candidate_keys: BTreeSet<String>,
 }
 
 impl<'a> LocalCandidatePreselectionPageCursor<'a> {
+    fn model_directive_base_model(&self, candidate_api_format: &str) -> Option<&str> {
+        self.model_directive_routing_models
+            .get(&crate::ai_serving::normalize_api_format_alias(
+                candidate_api_format,
+            ))
+            .map(String::as_str)
+    }
+
+    fn routing_model(&self, candidate_api_format: &str) -> &str {
+        self.model_directive_base_model(candidate_api_format)
+            .unwrap_or(&self.requested_model)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         state: PlannerAppState<'a>,
+        model_directive_policy: &crate::system_features::ModelDirectivePolicySnapshot,
         client_api_format: &str,
         requested_model: &str,
+        request_operation: Option<&str>,
         require_streaming: bool,
         required_capabilities: Option<&serde_json::Value>,
         auth_snapshot: &GatewayAuthApiKeySnapshot,
         routing_policy: Option<&ResolvedRoutingPolicy>,
         client_session_affinity: Option<&ClientSessionAffinity>,
+        request_auth_channel: Option<&str>,
         use_api_format_alias_match: bool,
         key_mode: LocalCandidatePreselectionKeyMode,
+        allow_priority_page_cache: bool,
+        trace_id: Option<&str>,
     ) -> Self {
-        let candidate_api_formats =
-            crate::ai_serving::request_candidate_api_formats(client_api_format, require_streaming)
-                .into_iter()
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-        let mut model_directive_enabled_api_formats = BTreeSet::new();
-        for api_format in &candidate_api_formats {
-            if crate::system_features::reasoning_model_directive_enabled_for_api_format_and_model(
-                state.app(),
-                api_format,
-                Some(requested_model),
-            )
-            .await
-            {
-                model_directive_enabled_api_formats
-                    .insert(crate::ai_serving::normalize_api_format_alias(api_format));
-            }
-        }
+        let candidate_api_formats = request_candidate_api_formats_for_operation(
+            client_api_format,
+            require_streaming,
+            request_operation,
+        );
+        let model_directive_routing_models = resolve_model_directive_routing_models(
+            model_directive_policy,
+            &candidate_api_formats,
+            requested_model,
+        );
 
         let ordering_config =
-            super::candidate_ranking::scheduler_ordering_config_for_routing_policy(
-                state,
-                routing_policy,
-            )
-            .await;
+            super::candidate_ranking::scheduler_ordering_config_for_routing_policy(routing_policy);
 
         Self {
             state,
+            trace_id: trace_id.unwrap_or_default().to_string(),
             client_api_format: client_api_format.to_string(),
             requested_model: requested_model.to_string(),
+            request_operation: request_operation.map(str::to_string),
             require_streaming,
             required_capabilities: required_capabilities.cloned(),
             auth_snapshot: auth_snapshot.clone(),
             routing_policy: routing_policy.cloned(),
             client_session_affinity: client_session_affinity.cloned(),
+            request_auth_channel: request_auth_channel.map(str::to_string),
             use_api_format_alias_match,
             key_mode,
+            allow_priority_page_cache,
             candidate_api_formats,
-            model_directive_enabled_api_formats,
+            model_directive_routing_models,
+            model_directive_policy_cache_key: model_directive_policy.cache_key().to_string(),
             ordering_config,
+            ranking_seed: request_distribution_seed(),
             priority_page_emitted: false,
             deferred_pages_by_format: BTreeMap::new(),
             format_index: 0,
@@ -326,7 +457,9 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             requested_name_offsets: BTreeMap::new(),
             scanned_rows_by_format: BTreeMap::new(),
             resolved_global_model_names: BTreeMap::new(),
-            fallback_scanned_api_formats: BTreeSet::new(),
+            fallback_offsets: BTreeMap::new(),
+            fallback_scan_epoch: 0,
+            exhausted_api_formats: BTreeSet::new(),
             seen_candidate_keys: BTreeSet::new(),
         }
     }
@@ -344,17 +477,65 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
     > {
         if !self.priority_page_emitted {
             self.priority_page_emitted = true;
-            let priority_page = self.next_priority_page().await?;
+            let mut priority_page = self.cached_next_priority_page().await?;
+            if self.routing_policy.is_some() {
+                while let Some(mut page) = self.next_page_after_priority().await? {
+                    priority_page.candidates.append(&mut page.candidates);
+                    priority_page
+                        .skipped_candidates
+                        .append(&mut page.skipped_candidates);
+                }
+            }
             if !priority_page.candidates.is_empty() || !priority_page.skipped_candidates.is_empty()
             {
                 return Ok(Some(priority_page));
             }
         }
 
+        self.next_page_after_priority().await
+    }
+
+    async fn next_page_after_priority(
+        &mut self,
+    ) -> Result<
+        Option<
+            AiCandidatePreselectionOutcome<
+                SchedulerMinimalCandidateSelectionCandidate,
+                SkippedLocalExecutionCandidate,
+            >,
+        >,
+        GatewayError,
+    > {
+        // Deferred pages and formats already proven exhausted require no planning
+        // permit. This is the common second-target path for a single-candidate
+        // model, so keep it entirely in memory before joining the shared gate.
         while self.format_index < self.candidate_api_formats.len() {
             let candidate_api_format = self.candidate_api_formats[self.format_index].clone();
             if let Some(outcome) = self.pop_deferred_page(&candidate_api_format) {
                 return Ok(Some(outcome));
+            }
+            if self.api_format_is_exhausted(&candidate_api_format) {
+                self.format_index += 1;
+                continue;
+            }
+            break;
+        }
+        if self.format_index >= self.candidate_api_formats.len() {
+            return Ok(None);
+        }
+
+        // One next_page call may need to confirm exhaustion across several API
+        // formats. Hold one permit for that scan instead of rejoining the gate
+        // once per format.
+        let _permit = acquire_candidate_planning_gate(self.state, &self.trace_id).await?;
+        while self.format_index < self.candidate_api_formats.len() {
+            let candidate_api_format = self.candidate_api_formats[self.format_index].clone();
+            if let Some(outcome) = self.pop_deferred_page(&candidate_api_format) {
+                return Ok(Some(outcome));
+            }
+            if self.api_format_is_exhausted(&candidate_api_format) {
+                self.format_index += 1;
+                continue;
             }
             let Some(outcome) = self.next_page_for_api_format(&candidate_api_format).await? else {
                 self.format_index += 1;
@@ -374,10 +555,154 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         self.requested_name_offsets.clear();
         self.scanned_rows_by_format.clear();
         self.resolved_global_model_names.clear();
-        self.fallback_scanned_api_formats.clear();
+        self.fallback_offsets.clear();
+        self.fallback_scan_epoch = self.fallback_scan_epoch.wrapping_add(1);
+        self.exhausted_api_formats.clear();
         self.seen_candidate_keys.clear();
         self.priority_page_emitted = false;
         self.deferred_pages_by_format.clear();
+    }
+
+    pub(crate) fn resolved_page_cache_preselection_mode(&self) -> &'static str {
+        self.key_mode.cache_key_name()
+    }
+
+    pub(crate) fn resolved_page_cache_request_operation(&self) -> Option<&str> {
+        self.request_operation.as_deref()
+    }
+
+    pub(crate) fn resolved_page_cache_use_api_format_alias_match(&self) -> bool {
+        self.use_api_format_alias_match
+    }
+
+    pub(crate) fn resolved_page_cache_model_directive_policy_hash(&self) -> &str {
+        &self.model_directive_policy_cache_key
+    }
+
+    pub(crate) fn should_cache_current_priority_resolved_page(&self) -> bool {
+        if !(self.priority_page_emitted
+            && self.format_index == 0
+            && self.deferred_pages_by_format.is_empty())
+        {
+            return false;
+        }
+
+        match self.ordering_config.scheduling_mode {
+            SchedulerSchedulingMode::FixedOrder => true,
+            SchedulerSchedulingMode::CacheAffinity => {
+                has_explicit_session_affinity(self.client_session_affinity.as_ref())
+            }
+            SchedulerSchedulingMode::LoadBalance => false,
+        }
+    }
+
+    fn should_cache_current_priority_page(&self) -> bool {
+        self.allow_priority_page_cache && self.should_cache_current_priority_resolved_page()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_priority_page_emitted_for_tests(&mut self) {
+        self.priority_page_emitted = true;
+    }
+
+    async fn cached_next_priority_page(
+        &mut self,
+    ) -> Result<
+        AiCandidatePreselectionOutcome<
+            SchedulerMinimalCandidateSelectionCandidate,
+            SkippedLocalExecutionCandidate,
+        >,
+        GatewayError,
+    > {
+        let page = if self.should_cache_current_priority_page() {
+            self.cached_next_priority_page_snapshot().await?
+        } else {
+            self.next_priority_page_with_planning_gate().await?
+        };
+        self.remember_seen_candidates_from_page(&page);
+        Ok(page)
+    }
+
+    async fn cached_next_priority_page_snapshot(
+        &mut self,
+    ) -> Result<
+        AiCandidatePreselectionOutcome<
+            SchedulerMinimalCandidateSelectionCandidate,
+            SkippedLocalExecutionCandidate,
+        >,
+        GatewayError,
+    > {
+        let key = CandidatePageCacheKey::new(
+            &self.requested_model,
+            self.request_operation.as_deref(),
+            &self.client_api_format,
+            self.require_streaming,
+            &self.auth_snapshot,
+            self.required_capabilities.as_ref(),
+            self.routing_policy.as_ref(),
+            self.request_auth_channel.as_deref(),
+            self.state.app().scheduler_affinity_epoch(),
+            self.key_mode.cache_key_name(),
+            self.use_api_format_alias_match,
+            self.client_session_affinity.as_ref(),
+            &self.model_directive_policy_cache_key,
+        );
+        let cache = self.state.app().candidate_page_cache.clone();
+        let ttl = candidate_page_cache_ttl_from_env();
+        let stale_ttl = candidate_page_cache_stale_ttl(ttl);
+        let cached = cache
+            .get_or_load_once_stale_while_refreshing(
+                key,
+                ttl,
+                stale_ttl,
+                || async {
+                    let page = self.next_priority_page_with_planning_gate().await?;
+                    Ok::<_, GatewayError>(Some(Arc::new(page) as Arc<CandidatePageSnapshot>))
+                },
+                CacheLoadObserver::new()
+                    .on_hit(record_candidate_page_cache_hit)
+                    .on_miss(record_candidate_page_cache_miss)
+                    .on_load(record_candidate_page_cache_load)
+                    .on_follower_wait(record_candidate_page_cache_follower_wait),
+            )
+            .await?;
+
+        match cached {
+            Some(snapshot) => {
+                let page = snapshot.as_ref().clone();
+                if page.candidates.is_empty() && page.skipped_candidates.is_empty() {
+                    record_candidate_page_cache_none();
+                }
+                Ok(page)
+            }
+            None => {
+                record_candidate_page_cache_none();
+                Ok(AiCandidatePreselectionOutcome {
+                    candidates: Vec::new(),
+                    skipped_candidates: Vec::new(),
+                })
+            }
+        }
+    }
+
+    fn remember_seen_candidates_from_page(
+        &mut self,
+        page: &AiCandidatePreselectionOutcome<
+            SchedulerMinimalCandidateSelectionCandidate,
+            SkippedLocalExecutionCandidate,
+        >,
+    ) {
+        for candidate in &page.candidates {
+            self.seen_candidate_keys
+                .insert(local_candidate_preselection_key(candidate, self.key_mode));
+        }
+        for skipped_candidate in &page.skipped_candidates {
+            self.seen_candidate_keys
+                .insert(local_candidate_preselection_key(
+                    &skipped_candidate.candidate,
+                    self.key_mode,
+                ));
+        }
     }
 
     async fn next_priority_page(
@@ -421,6 +746,19 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         }
 
         Ok(priority_page)
+    }
+
+    async fn next_priority_page_with_planning_gate(
+        &mut self,
+    ) -> Result<
+        AiCandidatePreselectionOutcome<
+            SchedulerMinimalCandidateSelectionCandidate,
+            SkippedLocalExecutionCandidate,
+        >,
+        GatewayError,
+    > {
+        let _permit = acquire_candidate_planning_gate(self.state, &self.trace_id).await?;
+        self.next_priority_page().await
     }
 
     async fn split_priority_conversion_page(
@@ -553,16 +891,18 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         if normalized_api_format.is_empty() {
             return Ok(None);
         }
-        let enable_model_directives = self.model_directive_enabled_api_formats.contains(
-            &crate::ai_serving::normalize_api_format_alias(candidate_api_format),
-        );
-        let requested_names =
-            requested_model_candidate_names(&self.requested_model, enable_model_directives);
+        if self.exhausted_api_formats.contains(&normalized_api_format) {
+            return Ok(None);
+        }
+        let routing_model = self.routing_model(candidate_api_format).to_string();
+        let requested_names = requested_model_candidate_names(&routing_model, false);
         let scanned = *self
             .scanned_rows_by_format
             .get(&normalized_api_format)
             .unwrap_or(&0);
         if scanned >= REQUESTED_MODEL_MAX_SCANNED_ROWS {
+            self.exhausted_api_formats
+                .insert(normalized_api_format.clone());
             return Ok(None);
         }
 
@@ -573,11 +913,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 .or_insert(0);
             let Some(requested_name) = requested_names.get(requested_name_index) else {
                 return self
-                    .next_fallback_page_for_api_format(
-                        candidate_api_format,
-                        &normalized_api_format,
-                        enable_model_directives,
-                    )
+                    .next_fallback_page_for_api_format(candidate_api_format, &normalized_api_format)
                     .await;
             };
             if requested_name.trim().is_empty() {
@@ -597,20 +933,20 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 .unwrap_or(&0);
             let remaining = REQUESTED_MODEL_MAX_SCANNED_ROWS.saturating_sub(scanned);
             if remaining == 0 {
+                self.exhausted_api_formats
+                    .insert(normalized_api_format.clone());
                 return Ok(None);
             }
             let limit = REQUESTED_MODEL_CANDIDATE_PAGE_SIZE.min(remaining);
-            let page = read_requested_model_rows_fast_path_page(
-                self.state.app().data.as_ref(),
-                &normalized_api_format,
-                &self.requested_model,
-                requested_name,
-                offset,
-                limit,
-                enable_model_directives,
-            )
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?;
+            let page = self
+                .read_requested_model_rows_fast_path_page_cached(
+                    &normalized_api_format,
+                    requested_name,
+                    &routing_model,
+                    offset,
+                    limit,
+                )
+                .await?;
             self.scanned_rows_by_format.insert(
                 normalized_api_format.clone(),
                 scanned.saturating_add(page.scanned_rows),
@@ -627,7 +963,6 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                         .next_fallback_page_for_api_format(
                             candidate_api_format,
                             &normalized_api_format,
-                            enable_model_directives,
                         )
                         .await;
                 }
@@ -638,7 +973,6 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 .build_page_outcome_from_rows(
                     candidate_api_format,
                     &normalized_api_format,
-                    enable_model_directives,
                     page.rows,
                 )
                 .await?
@@ -648,11 +982,131 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         }
     }
 
+    async fn read_requested_model_rows_fast_path_page_cached(
+        &self,
+        normalized_api_format: &str,
+        requested_name: &str,
+        routing_model: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<RequestedModelCandidateRowsPage, GatewayError> {
+        let key = CandidateRowPageCacheKey::new(
+            normalized_api_format,
+            routing_model,
+            requested_name,
+            offset,
+            limit,
+            false,
+        );
+        let cache = self.state.app().candidate_row_page_cache.clone();
+        let ttl = candidate_page_cache_ttl_from_env();
+        let stale_ttl = candidate_page_cache_stale_ttl(ttl);
+        let cached = cache
+            .get_or_load_once_stale_while_refreshing(
+                key,
+                ttl,
+                stale_ttl,
+                || async {
+                    let page = read_requested_model_rows_fast_path_page(
+                        self.state.app().data.as_ref(),
+                        normalized_api_format,
+                        routing_model,
+                        requested_name,
+                        offset,
+                        limit,
+                        false,
+                    )
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+                    Ok::<_, GatewayError>(Some(Arc::new(page)))
+                },
+                CacheLoadObserver::new()
+                    .on_hit(record_candidate_row_page_cache_hit)
+                    .on_miss(record_candidate_row_page_cache_miss)
+                    .on_load(record_candidate_row_page_cache_load)
+                    .on_follower_wait(record_candidate_row_page_cache_follower_wait),
+            )
+            .await?;
+
+        match cached {
+            Some(page) => {
+                if page.rows.is_empty() {
+                    record_candidate_row_page_cache_none();
+                }
+                Ok(page.as_ref().clone())
+            }
+            None => {
+                record_candidate_row_page_cache_none();
+                Ok(RequestedModelCandidateRowsPage {
+                    rows: Vec::new(),
+                    scanned_rows: 0,
+                    end_of_requested_name: true,
+                })
+            }
+        }
+    }
+
+    async fn read_api_format_rows_fallback_page_cached(
+        &self,
+        normalized_api_format: &str,
+        offset: u32,
+        limit: u32,
+    ) -> Result<RequestedModelCandidateRowsPage, GatewayError> {
+        let key = CandidateRowPageCacheKey::for_api_format_fallback(
+            normalized_api_format,
+            offset,
+            limit,
+            self.fallback_scan_epoch,
+        );
+        let cache = self.state.app().candidate_row_page_cache.clone();
+        let ttl = candidate_page_cache_ttl_from_env();
+        let stale_ttl = candidate_page_cache_stale_ttl(ttl);
+        let cached = cache
+            .get_or_load_once_stale_while_refreshing(
+                key,
+                ttl,
+                stale_ttl,
+                || async {
+                    let page = read_api_format_rows_fallback_page(
+                        self.state.app().data.as_ref(),
+                        normalized_api_format,
+                        offset,
+                        limit,
+                    )
+                    .await
+                    .map_err(|err| GatewayError::Internal(err.to_string()))?;
+                    Ok::<_, GatewayError>(Some(Arc::new(page)))
+                },
+                CacheLoadObserver::new()
+                    .on_hit(record_candidate_row_page_cache_hit)
+                    .on_miss(record_candidate_row_page_cache_miss)
+                    .on_load(record_candidate_row_page_cache_load)
+                    .on_follower_wait(record_candidate_row_page_cache_follower_wait),
+            )
+            .await?;
+
+        match cached {
+            Some(page) => {
+                if page.rows.is_empty() {
+                    record_candidate_row_page_cache_none();
+                }
+                Ok(page.as_ref().clone())
+            }
+            None => {
+                record_candidate_row_page_cache_none();
+                Ok(RequestedModelCandidateRowsPage {
+                    rows: Vec::new(),
+                    scanned_rows: 0,
+                    end_of_requested_name: true,
+                })
+            }
+        }
+    }
+
     async fn next_fallback_page_for_api_format(
         &mut self,
         candidate_api_format: &str,
         normalized_api_format: &str,
-        enable_model_directives: bool,
     ) -> Result<
         Option<
             AiCandidatePreselectionOutcome<
@@ -662,45 +1116,79 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         >,
         GatewayError,
     > {
-        if !self
-            .fallback_scanned_api_formats
-            .insert(normalized_api_format.to_string())
-        {
-            return Ok(None);
+        let routing_model = self.routing_model(candidate_api_format).to_string();
+        loop {
+            let scanned = *self
+                .scanned_rows_by_format
+                .get(normalized_api_format)
+                .unwrap_or(&0);
+            let remaining = REQUESTED_MODEL_MAX_SCANNED_ROWS.saturating_sub(scanned);
+            if remaining == 0 {
+                self.exhausted_api_formats
+                    .insert(normalized_api_format.to_string());
+                return Ok(None);
+            }
+            let limit = REQUESTED_MODEL_CANDIDATE_PAGE_SIZE.min(remaining);
+            let offset = *self
+                .fallback_offsets
+                .get(normalized_api_format)
+                .unwrap_or(&0);
+            let page = self
+                .read_api_format_rows_fallback_page_cached(normalized_api_format, offset, limit)
+                .await?;
+            let page_scanned = page.scanned_rows.min(limit);
+            let end_of_format = page.end_of_requested_name || page_scanned < limit;
+            self.fallback_offsets.insert(
+                normalized_api_format.to_string(),
+                offset.saturating_add(page_scanned),
+            );
+            let total_scanned = scanned.saturating_add(page_scanned);
+            self.scanned_rows_by_format
+                .insert(normalized_api_format.to_string(), total_scanned);
+            if end_of_format || total_scanned >= REQUESTED_MODEL_MAX_SCANNED_ROWS {
+                self.exhausted_api_formats
+                    .insert(normalized_api_format.to_string());
+            }
+            if page_scanned == 0 {
+                return Ok(None);
+            }
+
+            let rows = page
+                .rows
+                .into_iter()
+                .take(page_scanned as usize)
+                .filter(|row| {
+                    row_supports_requested_model_with_model_directives_and_request_operation(
+                        row,
+                        &routing_model,
+                        normalized_api_format,
+                        false,
+                        self.request_operation.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some(outcome) = self
+                .build_page_outcome_from_rows(candidate_api_format, normalized_api_format, rows)
+                .await?
+            {
+                return Ok(Some(outcome));
+            }
+            if self.exhausted_api_formats.contains(normalized_api_format) {
+                return Ok(None);
+            }
         }
+    }
 
-        let rows = self
-            .state
-            .app()
-            .data
-            .read_minimal_candidate_selection_rows_for_api_format(normalized_api_format)
-            .await
-            .map_err(|err| GatewayError::Internal(err.to_string()))?
-            .into_iter()
-            .filter(|row| {
-                row_supports_requested_model_with_model_directives(
-                    row,
-                    &self.requested_model,
-                    normalized_api_format,
-                    enable_model_directives,
-                )
-            })
-            .collect::<Vec<_>>();
-
-        self.build_page_outcome_from_rows(
-            candidate_api_format,
-            normalized_api_format,
-            enable_model_directives,
-            rows,
-        )
-        .await
+    fn api_format_is_exhausted(&self, candidate_api_format: &str) -> bool {
+        let normalized_api_format = normalize_api_format(candidate_api_format);
+        normalized_api_format.is_empty()
+            || self.exhausted_api_formats.contains(&normalized_api_format)
     }
 
     async fn build_page_outcome_from_rows(
         &mut self,
         candidate_api_format: &str,
         normalized_api_format: &str,
-        enable_model_directives: bool,
         rows: Vec<StoredMinimalCandidateSelectionRow>,
     ) -> Result<
         Option<
@@ -723,16 +1211,20 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         if rows.is_empty() {
             return Ok(None);
         }
+        let routing_model = self.routing_model(candidate_api_format).to_string();
         let resolved_global_model_name =
             if let Some(value) = self.resolved_global_model_names.get(normalized_api_format) {
                 value.clone()
             } else {
-                let Some(value) = resolve_requested_global_model_name_with_model_directives(
-                    &rows,
-                    &self.requested_model,
-                    normalized_api_format,
-                    enable_model_directives,
-                ) else {
+                let Some(value) =
+                    resolve_requested_global_model_name_with_model_directives_and_request_operation(
+                        &rows,
+                        &routing_model,
+                        normalized_api_format,
+                        false,
+                        self.request_operation.as_deref(),
+                    )
+                else {
                     return Ok(None);
                 };
                 self.resolved_global_model_names
@@ -755,22 +1247,19 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             EnumerateMinimalCandidateSelectionInput {
                 rows,
                 normalized_api_format,
-                requested_model_name: &self.requested_model,
+                request_operation: self.request_operation.as_deref(),
+                requested_model_name: &routing_model,
                 resolved_global_model_name: resolved_global_model_name.as_str(),
                 require_streaming: self.require_streaming,
                 required_capabilities: self.required_capabilities.as_ref(),
                 auth_constraints: auth_constraints.as_ref(),
             },
-            enable_model_directives,
+            false,
         )
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
         let mut candidates = Vec::new();
         for candidate in enumerated_candidates {
-            if !self.candidate_allowed_for_page(
-                &candidate,
-                candidate_api_format,
-                enable_model_directives,
-            ) {
+            if !self.candidate_allowed_for_page(&candidate, candidate_api_format) {
                 continue;
             }
             if !self
@@ -796,19 +1285,19 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 candidates,
                 self.required_capabilities.as_ref(),
                 auth_snapshot,
-                self.client_session_affinity.as_ref(),
-                current_unix_secs(),
+                self.routing_policy
+                    .is_none()
+                    .then_some(self.client_session_affinity.as_ref())
+                    .flatten(),
+                self.ranking_seed,
+                self.ordering_config,
             )
             .await?;
         let skipped_candidates = skipped_candidates
             .into_iter()
             .map(skipped_local_execution_candidate_from_scheduler_skip)
             .filter(|skipped_candidate| {
-                self.skipped_candidate_allowed_for_page(
-                    skipped_candidate,
-                    candidate_api_format,
-                    enable_model_directives,
-                )
+                self.skipped_candidate_allowed_for_page(skipped_candidate, candidate_api_format)
             })
             .collect::<Vec<_>>();
 
@@ -822,7 +1311,6 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         &self,
         candidate: &SchedulerMinimalCandidateSelectionCandidate,
         candidate_api_format: &str,
-        enable_model_directives: bool,
     ) -> bool {
         routing_policy_allows_provider(self.routing_policy.as_ref(), candidate)
             && (matches_client_api_format(
@@ -832,8 +1320,8 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             ) || auth_snapshot_allows_cross_format_candidate(
                 &self.auth_snapshot,
                 &self.requested_model,
+                self.model_directive_base_model(candidate_api_format),
                 candidate,
-                enable_model_directives,
             ))
     }
 
@@ -841,7 +1329,6 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         &self,
         skipped_candidate: &SkippedLocalExecutionCandidate,
         candidate_api_format: &str,
-        enable_model_directives: bool,
     ) -> bool {
         routing_policy_allows_provider(self.routing_policy.as_ref(), &skipped_candidate.candidate)
             && (matches_client_api_format(
@@ -851,8 +1338,8 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             ) || auth_snapshot_allows_cross_format_candidate(
                 &self.auth_snapshot,
                 &self.requested_model,
+                self.model_directive_base_model(candidate_api_format),
                 &skipped_candidate.candidate,
-                enable_model_directives,
             ))
     }
 }
@@ -894,6 +1381,35 @@ fn local_candidate_preselection_key(
     }
 }
 
+async fn acquire_candidate_planning_gate(
+    state: PlannerAppState<'_>,
+    trace_id: &str,
+) -> Result<Option<ConcurrencyPermit>, GatewayError> {
+    let Some(gate) = state.app().candidate_planning_gate.as_ref() else {
+        return Ok(None);
+    };
+    let budget = state
+        .app()
+        .frontdoor_runtime_guards
+        .internal_gate_queue_budget;
+    let gate_wait_started_at = std::time::Instant::now();
+    match tokio::time::timeout(budget, gate.acquire()).await {
+        Ok(Ok(permit)) => {
+            observe_gateway_stage_ms(
+                "candidate_planning_gate_wait",
+                gate_wait_started_at.elapsed().as_millis() as u64,
+            );
+            Ok(Some(permit))
+        }
+        Ok(Err(err)) => Err(GatewayError::Internal(err.to_string())),
+        Err(_) => Err(GatewayError::AdmissionTimeout {
+            trace_id: trace_id.to_string(),
+            gate: "gateway_candidate_planning",
+            queue_budget_ms: budget.as_millis() as u64,
+        }),
+    }
+}
+
 fn matches_client_api_format(
     use_api_format_alias_match: bool,
     candidate_api_format: &str,
@@ -909,8 +1425,8 @@ fn matches_client_api_format(
 pub(crate) fn auth_snapshot_allows_cross_format_candidate(
     auth_snapshot: &GatewayAuthApiKeySnapshot,
     requested_model: &str,
+    requested_base_model: Option<&str>,
     candidate: &SchedulerMinimalCandidateSelectionCandidate,
-    enable_model_directives: bool,
 ) -> bool {
     if let Some(allowed_providers) = auth_snapshot.effective_allowed_providers() {
         let provider_allowed = allowed_providers.iter().any(|value| {
@@ -927,15 +1443,10 @@ pub(crate) fn auth_snapshot_allows_cross_format_candidate(
     }
 
     if let Some(allowed_models) = auth_snapshot.effective_allowed_models() {
-        let requested_base_model = enable_model_directives
-            .then(|| crate::ai_serving::model_directive_base_model(requested_model))
-            .flatten();
         let model_allowed = allowed_models.iter().any(|value| {
             value == requested_model
                 || value == &candidate.global_model_name
-                || requested_base_model
-                    .as_ref()
-                    .is_some_and(|base_model| value == base_model)
+                || requested_base_model.is_some_and(|base_model| value == base_model)
         });
         if !model_allowed {
             return false;
@@ -964,13 +1475,196 @@ mod tests {
     use crate::AppState;
     use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
     use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
+    use aether_data::DataLayerError;
     use aether_data_contracts::repository::candidate_selection::{
-        MinimalCandidateSelectionReadRepository, StoredProviderModelMapping,
+        MinimalCandidateSelectionReadRepository, StoredApiFormatCandidateRowsQuery,
+        StoredPoolKeyCandidateRowsByKeyIdsQuery, StoredPoolKeyCandidateRowsQuery,
+        StoredProviderModelMapping, StoredRequestedModelCandidateRowsQuery,
     };
     use aether_data_contracts::repository::provider_catalog::{
         StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
     };
-    use std::sync::Arc;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn compaction_operation_excludes_non_responses_provider_formats() {
+        assert_eq!(
+            request_candidate_api_formats_for_operation("openai:responses", true, Some("compact"),),
+            vec!["openai:responses"]
+        );
+        assert_eq!(
+            request_candidate_api_formats_for_operation("openai:responses", true, None),
+            vec![
+                "openai:responses",
+                "openai:chat",
+                "claude:messages",
+                "gemini:generate_content"
+            ]
+        );
+        assert_eq!(
+            request_candidate_api_formats_for_operation(
+                "openai:responses:compact",
+                false,
+                Some("compact"),
+            ),
+            vec!["openai:responses:compact"]
+        );
+    }
+
+    #[derive(Default)]
+    struct EmptyFallbackCountingRepository {
+        fallback_reads: AtomicUsize,
+    }
+
+    struct PagedFallbackRepository {
+        total_rows: u32,
+        page_queries: Mutex<Vec<StoredApiFormatCandidateRowsQuery>>,
+    }
+
+    impl PagedFallbackRepository {
+        fn new(total_rows: u32) -> Self {
+            Self {
+                total_rows,
+                page_queries: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn page_queries(&self) -> Vec<StoredApiFormatCandidateRowsQuery> {
+            self.page_queries
+                .lock()
+                .expect("fallback query lock")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl MinimalCandidateSelectionReadRepository for PagedFallbackRepository {
+        async fn list_for_exact_api_format(
+            &self,
+            _api_format: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            panic!("routing fallback must not use the unbounded API-format query")
+        }
+
+        async fn list_for_exact_api_format_page(
+            &self,
+            query: &StoredApiFormatCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            self.page_queries
+                .lock()
+                .expect("fallback query lock")
+                .push(query.clone());
+            if normalize_api_format(&query.api_format) != "openai:chat" {
+                return Ok(Vec::new());
+            }
+            let end = query
+                .offset
+                .saturating_add(query.limit)
+                .min(self.total_rows);
+            Ok((query.offset..end)
+                .map(|index| {
+                    standard_candidate_row(
+                        format!("fallback-provider-{index:04}").as_str(),
+                        "openai:chat",
+                        i32::try_from(index).expect("test provider priority should fit"),
+                    )
+                })
+                .collect())
+        }
+
+        async fn list_for_exact_api_format_and_global_model(
+            &self,
+            _api_format: &str,
+            _global_model_name: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_for_exact_api_format_and_requested_model(
+            &self,
+            _api_format: &str,
+            _requested_model_name: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_for_exact_api_format_and_requested_model_page(
+            &self,
+            _query: &StoredRequestedModelCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_pool_key_rows_for_group(
+            &self,
+            _query: &StoredPoolKeyCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_pool_key_rows_for_group_key_ids(
+            &self,
+            _query: &StoredPoolKeyCandidateRowsByKeyIdsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+    }
+
+    impl EmptyFallbackCountingRepository {
+        fn fallback_reads(&self) -> usize {
+            self.fallback_reads.load(Ordering::Acquire)
+        }
+    }
+
+    #[async_trait]
+    impl MinimalCandidateSelectionReadRepository for EmptyFallbackCountingRepository {
+        async fn list_for_exact_api_format(
+            &self,
+            _api_format: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            self.fallback_reads.fetch_add(1, Ordering::AcqRel);
+            Ok(Vec::new())
+        }
+
+        async fn list_for_exact_api_format_and_global_model(
+            &self,
+            _api_format: &str,
+            _global_model_name: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_for_exact_api_format_and_requested_model(
+            &self,
+            _api_format: &str,
+            _requested_model_name: &str,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_for_exact_api_format_and_requested_model_page(
+            &self,
+            _query: &StoredRequestedModelCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_pool_key_rows_for_group(
+            &self,
+            _query: &StoredPoolKeyCandidateRowsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+
+        async fn list_pool_key_rows_for_group_key_ids(
+            &self,
+            _query: &StoredPoolKeyCandidateRowsByKeyIdsQuery,
+        ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+            Ok(Vec::new())
+        }
+    }
 
     fn unrestricted_auth_snapshot() -> GatewayAuthApiKeySnapshot {
         GatewayAuthApiKeySnapshot {
@@ -999,6 +1693,366 @@ mod tests {
             api_key_ip_rules: None,
             currently_usable: true,
         }
+    }
+
+    #[tokio::test]
+    async fn empty_fallback_is_scanned_once_and_then_skipped_in_memory() {
+        let repository = Arc::new(EmptyFallbackCountingRepository::default());
+        let data_state =
+            GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository.clone());
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(data_state);
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:search",
+            "missing-model",
+            None,
+            false,
+            None,
+            &auth_snapshot,
+            None,
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
+            None,
+        )
+        .await;
+
+        assert!(cursor
+            .next_page()
+            .await
+            .expect("empty preselection should succeed")
+            .is_none());
+        assert_eq!(repository.fallback_reads(), 1);
+        assert!(cursor.api_format_is_exhausted("openai:search"));
+
+        // The second target must not reacquire the gate or rescan the empty
+        // fallback after the format was proven exhausted.
+        assert!(cursor
+            .next_page()
+            .await
+            .expect("exhausted preselection should succeed")
+            .is_none());
+        assert_eq!(repository.fallback_reads(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_scan_clears_exhaustion_and_allows_fallback_to_be_read_again() {
+        let repository = Arc::new(EmptyFallbackCountingRepository::default());
+        let data_state =
+            GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository.clone());
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(data_state);
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:search",
+            "missing-model",
+            None,
+            false,
+            None,
+            &auth_snapshot,
+            None,
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
+            None,
+        )
+        .await;
+
+        assert!(cursor
+            .next_page()
+            .await
+            .expect("initial scan should succeed")
+            .is_none());
+        assert_eq!(repository.fallback_reads(), 1);
+        cursor.restart_scan();
+        assert!(!cursor.api_format_is_exhausted("openai:search"));
+        assert!(cursor
+            .next_page()
+            .await
+            .expect("restarted scan should succeed")
+            .is_none());
+        assert_eq!(repository.fallback_reads(), 2);
+    }
+
+    #[tokio::test]
+    async fn fallback_can_supply_a_real_second_candidate_after_fast_path_page() {
+        let mut first = standard_candidate_row("provider-first", "openai:chat", 0);
+        first.global_model_name = "gpt-5".to_string();
+        first.global_model_mappings = Some(vec!["gpt-5(?:\\.\\d+)?".to_string()]);
+        first.model_provider_model_name = "gpt-5.1".to_string();
+
+        let mut second = standard_candidate_row("provider-second", "openai:chat", 1);
+        second.global_model_name = "gpt-5".to_string();
+        second.global_model_mappings = Some(vec!["gpt-5(?:\\.\\d+)?".to_string()]);
+        second.model_provider_model_name = "gpt-5-secondary".to_string();
+
+        let repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed([
+                first, second,
+            ]));
+        let data_state =
+            GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository);
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(data_state);
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5.1",
+            None,
+            false,
+            None,
+            &auth_snapshot,
+            None,
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
+            None,
+        )
+        .await;
+
+        let first_page = cursor
+            .next_page()
+            .await
+            .expect("fast-path candidate should load")
+            .expect("first candidate should be present");
+        assert_eq!(first_page.candidates.len(), 1);
+        assert_eq!(first_page.candidates[0].provider_id, "provider-first");
+
+        let second_page = cursor
+            .next_page()
+            .await
+            .expect("fallback candidate should load")
+            .expect("second candidate should not be skipped");
+        assert_eq!(second_page.candidates.len(), 1);
+        assert_eq!(second_page.candidates[0].provider_id, "provider-second");
+        assert!(cursor
+            .next_page()
+            .await
+            .expect("exhausted formats should finish in memory")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn routing_policy_collects_candidate_pages_before_final_ranking() {
+        let rows = (0..300)
+            .map(|index| {
+                standard_candidate_row(
+                    format!("provider-{index:03}").as_str(),
+                    "openai:chat",
+                    index,
+                )
+            })
+            .collect::<Vec<_>>();
+        let repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows));
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository),
+            );
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let routing_policy = ResolvedRoutingPolicy {
+            group_id: Some("routing-group-1".to_string()),
+            group_version: Some(1),
+            selection_source: "test".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
+            scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
+            keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
+            ranking_overlay: Default::default(),
+            mutation_plan: Default::default(),
+            pool_policy_overrides: Default::default(),
+            matched_rules: Vec::new(),
+        };
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5",
+            None,
+            false,
+            None,
+            &auth_snapshot,
+            Some(&routing_policy),
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
+            None,
+        )
+        .await;
+
+        let candidates = cursor
+            .next_page()
+            .await
+            .expect("routing candidate scan should succeed")
+            .expect("routing candidates should be present")
+            .candidates;
+
+        assert_eq!(candidates.len(), 300);
+        assert!(cursor
+            .next_page()
+            .await
+            .expect("routing scan should be exhausted")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn routing_fallback_uses_bounded_api_format_pages() {
+        let repository = Arc::new(PagedFallbackRepository::new(
+            REQUESTED_MODEL_MAX_SCANNED_ROWS + REQUESTED_MODEL_CANDIDATE_PAGE_SIZE,
+        ));
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_minimal_candidate_selection_reader_for_tests(
+                    repository.clone(),
+                ),
+            );
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let routing_policy = ResolvedRoutingPolicy {
+            group_id: Some("routing-group-fallback".to_string()),
+            group_version: Some(1),
+            selection_source: "test".to_string(),
+            requested_model: "gpt-5".to_string(),
+            resolved_model: "gpt-5".to_string(),
+            priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
+            scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
+            keep_priority_on_conversion: false,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
+            ranking_overlay: Default::default(),
+            mutation_plan: Default::default(),
+            pool_policy_overrides: Default::default(),
+            matched_rules: Vec::new(),
+        };
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5",
+            None,
+            false,
+            None,
+            &auth_snapshot,
+            Some(&routing_policy),
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
+            None,
+        )
+        .await;
+
+        let candidates = cursor
+            .next_page()
+            .await
+            .expect("routing fallback scan should succeed")
+            .expect("routing fallback candidates should be present")
+            .candidates;
+
+        assert_eq!(candidates.len(), REQUESTED_MODEL_MAX_SCANNED_ROWS as usize);
+        assert!(cursor
+            .next_page()
+            .await
+            .expect("bounded routing fallback should be exhausted")
+            .is_none());
+        let page_queries = repository
+            .page_queries()
+            .into_iter()
+            .filter(|query| normalize_api_format(&query.api_format) == "openai:chat")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            page_queries.len(),
+            (REQUESTED_MODEL_MAX_SCANNED_ROWS / REQUESTED_MODEL_CANDIDATE_PAGE_SIZE) as usize
+        );
+        for (index, query) in page_queries.iter().enumerate() {
+            assert_eq!(query.limit, REQUESTED_MODEL_CANDIDATE_PAGE_SIZE);
+            assert_eq!(
+                query.offset,
+                u32::try_from(index).expect("page index should fit")
+                    * REQUESTED_MODEL_CANDIDATE_PAGE_SIZE
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_page_cache_requires_fixed_order_or_explicit_affinity() {
+        let repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(
+                Vec::<StoredMinimalCandidateSelectionRow>::new(),
+            ));
+        let data_state =
+            GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository);
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(data_state);
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5",
+            None,
+            true,
+            None,
+            &auth_snapshot,
+            None,
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            true,
+            None,
+        )
+        .await;
+        cursor.mark_priority_page_emitted_for_tests();
+
+        cursor.ordering_config.scheduling_mode = SchedulerSchedulingMode::CacheAffinity;
+        assert!(!cursor.should_cache_current_priority_resolved_page());
+
+        cursor.client_session_affinity =
+            Some(aether_scheduler_core::ClientSessionAffinity::from_session_key("session-1"));
+        assert!(cursor.should_cache_current_priority_resolved_page());
+
+        cursor.ordering_config.scheduling_mode = SchedulerSchedulingMode::FixedOrder;
+        assert!(cursor.should_cache_current_priority_resolved_page());
+
+        cursor.ordering_config.scheduling_mode = SchedulerSchedulingMode::LoadBalance;
+        assert!(!cursor.should_cache_current_priority_resolved_page());
     }
 
     fn openai_responses_mapping_row() -> StoredMinimalCandidateSelectionRow {
@@ -1188,6 +2242,7 @@ mod tests {
                 priority: 1,
                 api_formats: None,
                 endpoint_ids: Some(vec!["endpoint-opg-openai".to_string()]),
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -1211,17 +2266,24 @@ mod tests {
             .expect("gateway state should build")
             .with_data_state_for_tests(data_state);
         let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
         let mut cursor = LocalCandidatePreselectionPageCursor::new(
             PlannerAppState::new(&app),
+            &model_directive_policy,
             "claude:messages",
             "gpt-5.5-xhigh",
+            None,
             false,
             None,
             &auth_snapshot,
             None,
             None,
+            None,
             true,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            true,
+            None,
         )
         .await;
 
@@ -1238,6 +2300,142 @@ mod tests {
         assert_eq!(
             page.candidates[0].selected_provider_model_name,
             "gpt-5-upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn paged_preselection_prefers_operation_scoped_mapping_for_compaction() {
+        let mut row = openai_responses_mapping_row();
+        row.global_model_mappings = None;
+        row.global_model_name = "gpt-5.6-sol".to_string();
+        row.model_provider_model_name = "gpt-5.6-sol".to_string();
+        row.model_provider_model_mappings = Some(vec![
+            StoredProviderModelMapping {
+                name: "gpt-5.6-sol".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:responses".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+            },
+            StoredProviderModelMapping {
+                name: "gpt-5.6-terra".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:responses".to_string()]),
+                endpoint_ids: None,
+                operations: Some(vec!["compact".to_string()]),
+            },
+        ]);
+        let repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed([row]));
+        let data_state =
+            GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository);
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(data_state);
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:responses",
+            "gpt-5.6-sol",
+            Some("compact"),
+            false,
+            None,
+            &auth_snapshot,
+            None,
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            true,
+            None,
+        )
+        .await;
+
+        let page = cursor
+            .next_page()
+            .await
+            .expect("preselection should succeed")
+            .expect("compact mapping should find a provider");
+
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(
+            page.candidates[0].selected_provider_model_name,
+            "gpt-5.6-terra"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_policy_suffix_uses_the_same_base_model_for_candidate_selection() {
+        let mut row = openai_responses_mapping_row();
+        row.global_model_name = "deployment-alias".to_string();
+        row.global_model_mappings = None;
+        row.model_provider_model_name = "gpt-5.6-sol".to_string();
+        let repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed([row]));
+        let data_state =
+            GatewayDataState::with_minimal_candidate_selection_reader_for_tests(repository)
+                .with_system_config_values_for_tests([
+                    (
+                        crate::system_features::ENABLE_MODEL_DIRECTIVES_CONFIG_KEY.to_string(),
+                        serde_json::json!(true),
+                    ),
+                    (
+                        crate::system_features::MODEL_DIRECTIVES_CONFIG_KEY.to_string(),
+                        serde_json::json!({
+                            "reasoning_effort": {
+                                "api_formats": {
+                                    "openai:responses": {
+                                        "suffixes": ["VendorFuture"],
+                                        "mappings": {
+                                            "VendorFuture": {
+                                                "reasoning": { "context": "all_turns" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }),
+                    ),
+                ]);
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(data_state);
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:responses",
+            "deployment-alias-VendorFuture",
+            None,
+            false,
+            None,
+            &auth_snapshot,
+            None,
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            true,
+            None,
+        )
+        .await;
+
+        let page = cursor
+            .next_page()
+            .await
+            .expect("preselection should succeed")
+            .expect("custom directive base model should resolve a candidate");
+
+        assert_eq!(page.candidates.len(), 1);
+        assert_eq!(page.candidates[0].global_model_name, "deployment-alias");
+        assert_eq!(
+            page.candidates[0].selected_provider_model_name,
+            "gpt-5.6-sol"
         );
     }
 
@@ -1268,17 +2466,24 @@ mod tests {
             .expect("gateway state should build")
             .with_data_state_for_tests(data_state);
         let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
         let mut cursor = LocalCandidatePreselectionPageCursor::new(
             PlannerAppState::new(&app),
+            &model_directive_policy,
             "claude:messages",
             "deepseek-v4-pro",
+            None,
             false,
             None,
             &auth_snapshot,
             None,
             None,
+            None,
             true,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            true,
+            None,
         )
         .await;
 
@@ -1340,17 +2545,24 @@ mod tests {
             .expect("gateway state should build")
             .with_data_state_for_tests(data_state);
         let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
         let mut cursor = LocalCandidatePreselectionPageCursor::new(
             PlannerAppState::new(&app),
+            &model_directive_policy,
             "claude:messages",
             "gpt-5",
+            None,
             false,
             None,
             &auth_snapshot,
             None,
             None,
+            None,
             true,
             LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            true,
+            None,
         )
         .await;
 
@@ -1406,6 +2618,152 @@ mod tests {
                 .map(|candidate| candidate.provider_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["provider-openai-responses-regular"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fixed_order_prefers_codex_responses_when_conversion_keeps_priority() {
+        let mut codex = standard_candidate_row("provider-codex", "openai:responses", 0);
+        codex.provider_type = "codex".to_string();
+        codex.key_auth_type = "oauth".to_string();
+        codex.global_model_name = "gpt-5.4-mini".to_string();
+        codex.model_provider_model_name = "gpt-5.4-mini".to_string();
+        let mut custom_chat = standard_candidate_row("provider-custom", "openai:chat", 10);
+        custom_chat.global_model_name = "gpt-5.4-mini".to_string();
+        custom_chat.model_provider_model_name = "gpt-5.4-mini".to_string();
+
+        let candidate_repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
+            Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed([
+                codex.clone(),
+                custom_chat.clone(),
+            ]));
+        let catalog_items = [
+            provider_catalog_for_standard_row(&codex, false),
+            provider_catalog_for_standard_row(&custom_chat, false),
+        ];
+        let provider_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+            catalog_items
+                .iter()
+                .map(|(provider, _, _)| provider.clone())
+                .collect(),
+            catalog_items
+                .iter()
+                .map(|(_, endpoint, _)| endpoint.clone())
+                .collect(),
+            catalog_items
+                .iter()
+                .map(|(_, _, key)| key.clone())
+                .collect(),
+        ));
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                provider_repository,
+                candidate_repository,
+            )
+            .with_encryption_key_for_tests("development-key")
+            // Legacy keys deliberately disagree with the routing policy: the
+            // resolved policy must be the only source of scheduler ordering.
+            .with_system_config_values_for_tests([
+                (
+                    "scheduling_mode".to_string(),
+                    serde_json::json!("cache_affinity"),
+                ),
+                (
+                    "keep_priority_on_conversion".to_string(),
+                    serde_json::json!(false),
+                ),
+            ]);
+        let app = AppState::new()
+            .expect("gateway state should build")
+            .with_data_state_for_tests(data_state);
+        let auth_snapshot = unrestricted_auth_snapshot();
+        let model_directive_policy =
+            crate::system_features::ModelDirectivePolicySnapshot::load(&app).await;
+        let routing_policy = ResolvedRoutingPolicy {
+            group_id: Some("routing-group-codex-first".to_string()),
+            group_version: Some(1),
+            selection_source: "test".to_string(),
+            requested_model: "gpt-5.4-mini".to_string(),
+            resolved_model: "gpt-5.4-mini".to_string(),
+            priority_mode: aether_routing_core::RoutingSetPriorityMode::Provider,
+            scheduling_mode: aether_routing_core::RoutingSchedulingMode::FixedOrder,
+            keep_priority_on_conversion: true,
+            sticky_key_attempts: aether_routing_core::DEFAULT_STICKY_KEY_ATTEMPTS,
+            execution_policy: Default::default(),
+            ranking_overlay: Default::default(),
+            mutation_plan: Default::default(),
+            pool_policy_overrides: Default::default(),
+            matched_rules: Vec::new(),
+        };
+        let mut cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &model_directive_policy,
+            "openai:chat",
+            "gpt-5.4-mini",
+            None,
+            false,
+            None,
+            &auth_snapshot,
+            Some(&routing_policy),
+            None,
+            None,
+            true,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+            false,
+            None,
+        )
+        .await;
+
+        let first_page = cursor
+            .next_page()
+            .await
+            .expect("preselection should succeed")
+            .expect("Codex and custom candidates should share the priority page");
+        assert!(
+            first_page.skipped_candidates.is_empty(),
+            "priority page unexpectedly skipped candidates: {:?}",
+            first_page
+                .skipped_candidates
+                .iter()
+                .map(|candidate| {
+                    (
+                        candidate.candidate.provider_id.as_str(),
+                        candidate.skip_reason,
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first_page
+                .candidates
+                .iter()
+                .map(|candidate| candidate.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["provider-custom", "provider-codex"]
+        );
+        let (ranked, skipped) =
+            super::super::candidate_resolution::resolve_and_rank_logical_local_execution_candidates(
+                PlannerAppState::new(&app),
+                first_page.candidates,
+                "openai:chat",
+                Some("gpt-5.4-mini"),
+                Some(&auth_snapshot),
+                None,
+                None,
+                Some(&routing_policy),
+                None,
+                None,
+                aether_ai_serving::AiCandidateResolutionMode::Standard,
+            )
+            .await;
+
+        assert!(skipped.is_empty());
+        assert_eq!(
+            ranked
+                .iter()
+                .map(|candidate| candidate.candidate.provider_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["provider-codex", "provider-custom"]
         );
     }
 }

@@ -4,356 +4,32 @@
       variant="default"
       class="overflow-hidden"
     >
-      <!-- Header -->
-      <div class="px-4 sm:px-6 py-3 sm:py-3.5 border-b border-border/60">
-        <!-- Mobile -->
-        <div class="flex flex-col gap-3 xl:hidden">
-          <div class="min-w-0">
-            <h3 class="text-base font-semibold">
-              号池管理
-            </h3>
-            <p
-              v-if="poolHeaderMetaText"
-              class="mt-1 text-xs text-muted-foreground"
-            >
-              {{ poolHeaderMetaText }}
-            </p>
-          </div>
-          <div
-            class="grid grid-cols-3 items-center gap-2"
-          >
-            <Select
-              v-model="selectedProviderIdProxy"
-              :disabled="providerSelectDisabled"
-            >
-              <SelectTrigger
-                class="h-9 text-xs border-border/60"
-                :disabled="providerSelectDisabled"
-              >
-                <SelectValue placeholder="选择 Provider" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem
-                  v-for="item in poolProviders"
-                  :key="item.provider_id"
-                  :value="item.provider_id"
-                >
-                  {{ item.provider_name }}
-                  <span class="text-muted-foreground ml-1">({{ item.total_keys }})</span>
-                  <span
-                    v-if="!item.pool_enabled"
-                    class="ml-1 text-[10px] text-amber-600"
-                  >未启用</span>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <Select v-model="statusFilter">
-              <SelectTrigger class="h-9 w-full text-xs border-border/60">
-                <SelectValue placeholder="状态" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem
-                  v-for="item in poolKeyStatusFilterOptions"
-                  :key="`mobile-${item.value}`"
-                  :value="item.value"
-                >
-                  {{ item.label }}
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <div class="relative min-w-0">
-              <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground z-10 pointer-events-none" />
-              <Input
-                v-model="searchQuery"
-                type="text"
-                placeholder="搜索账号..."
-                class="w-full pl-8 pr-3 h-9 text-sm bg-background/50 border-border/60"
-              />
-            </div>
-          </div>
-          <div
-            v-if="selectedProviderId"
-            class="flex items-center gap-1"
-          >
-            <div class="min-w-0 flex-1 flex justify-center">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8 shrink-0"
-                title="添加账号"
-                @click="showImportDialog = true"
-              >
-                <Upload class="w-3.5 h-3.5" />
-              </Button>
-            </div>
-            <div class="min-w-0 flex-1 flex justify-center">
-              <ProviderProxyPopover
-                :open="providerProxyMobilePopoverOpen"
-                :node-id="selectedProviderData?.proxy?.node_id"
-                :saving="savingProviderProxy"
-                :title="getProviderProxyButtonTitle()"
-                @update:open="(open: boolean) => handleProviderProxyPopoverToggle('mobile', open)"
-                @select="setProviderProxy"
-                @clear="clearProviderProxy"
-              />
-            </div>
-            <div class="min-w-0 flex-1 flex justify-center">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8 shrink-0"
-                title="号池调度"
-                @click="openSchedulingDialog()"
-              >
-                <SlidersHorizontal class="w-3.5 h-3.5" />
-              </Button>
-            </div>
-            <div class="min-w-0 flex-1 flex justify-center">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8 shrink-0"
-                title="账号批量操作"
-                @click="showAccountBatchDialog = true"
-              >
-                <Users class="w-3.5 h-3.5" />
-              </Button>
-            </div>
-            <div class="min-w-0 flex-1 flex justify-center">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8 shrink-0"
-                title="编辑提供商"
-                @click="openProviderEditDialog"
-              >
-                <Edit class="w-3.5 h-3.5" />
-              </Button>
-            </div>
-            <div class="min-w-0 flex-1 flex justify-center">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8 shrink-0"
-                title="编辑端点"
-                @click="openEndpointEditDialog"
-              >
-                <Plug class="w-3.5 h-3.5" />
-              </Button>
-            </div>
-            <div
-              v-if="showAdaptiveHotPoolMetricsButton"
-              class="min-w-0 flex-1 flex justify-center"
-            >
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8 shrink-0"
-                data-testid="pool-demand-metrics-button"
-                title="查看自适应热池指标"
-                @click="showDemandMetricsDialog = true"
-              >
-                <Activity class="w-3.5 h-3.5" />
-              </Button>
-            </div>
-            <div class="min-w-0 flex-1 flex justify-center">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8 shrink-0"
-                title="高级设置"
-                @click="showAdvancedDialog = true"
-              >
-                <Settings2 class="w-3.5 h-3.5" />
-              </Button>
-            </div>
-            <div class="min-w-0 flex-1 flex justify-center">
-              <Button
-                variant="ghost"
-                size="icon"
-                class="h-8 w-8 shrink-0"
-                :class="getProviderToggleButtonClass()"
-                :disabled="togglingProviderStatus"
-                :title="getProviderToggleButtonTitle()"
-                @click="toggleSelectedProviderStatus"
-              >
-                <Power class="w-3.5 h-3.5" />
-              </Button>
-            </div>
-            <div class="min-w-0 flex-1 flex justify-center">
-              <RefreshButton
-                :loading="refreshCurrentPageLoading"
-                :title="refreshButtonTitle"
-                @click="refreshCurrentPage"
-              />
-            </div>
-          </div>
-        </div>
-
-        <!-- Desktop -->
-        <div class="hidden xl:flex items-center justify-between gap-4">
-          <div class="flex items-center gap-2">
-            <h3 class="text-base font-semibold">
-              号池管理
-              <span
-                v-if="poolHeaderMetaText"
-                class="ml-2 text-xs font-normal text-muted-foreground"
-              >
-                | {{ poolHeaderMetaText }}
-              </span>
-            </h3>
-          </div>
-          <div
-            class="flex items-center gap-2"
-            data-testid="pool-header-actions"
-          >
-            <Select
-              v-model="selectedProviderIdProxy"
-              :disabled="providerSelectDisabled"
-            >
-              <SelectTrigger
-                class="w-36 h-8 text-xs border-border/60"
-                :disabled="providerSelectDisabled"
-              >
-                <SelectValue placeholder="选择 Provider" />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem
-                  v-for="item in poolProviders"
-                  :key="item.provider_id"
-                  :value="item.provider_id"
-                >
-                  {{ item.provider_name }}
-                  <span class="text-muted-foreground ml-1">({{ item.total_keys }})</span>
-                  <span
-                    v-if="!item.pool_enabled"
-                    class="ml-1 text-[10px] text-amber-600"
-                  >未启用</span>
-                </SelectItem>
-              </SelectContent>
-            </Select>
-            <div class="h-4 w-px bg-border" />
-            <div
-              v-if="selectedProviderId"
-              class="relative"
-            >
-              <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground z-10 pointer-events-none" />
-              <Input
-                v-model="searchQuery"
-                type="text"
-                placeholder="搜索账号..."
-                class="w-40 pl-8 pr-2 h-8 text-xs bg-background/50 border-border/60"
-              />
-            </div>
-            <div
-              v-if="selectedProviderId"
-              class="h-4 w-px bg-border"
-            />
-            <button
-              v-if="selectedProviderId"
-              class="group inline-flex items-center gap-1.5 px-2.5 h-8 rounded-md border border-border/50 bg-muted/20 hover:bg-muted/40 hover:border-primary/40 transition-all duration-200 text-xs"
-              title="点击调整号池调度"
-              @click="openSchedulingDialog()"
-            >
-              <span class="text-muted-foreground/80 hidden lg:inline">调度:</span>
-              <span class="font-medium text-foreground/90">{{ poolSchedulingLabel }}</span>
-              <ChevronDown class="w-3 h-3 text-muted-foreground/70 group-hover:text-foreground transition-colors" />
-            </button>
-            <div
-              v-if="selectedProviderId"
-              class="h-4 w-px bg-border"
-            />
-            <Button
-              v-if="selectedProviderId"
-              variant="ghost"
-              size="icon"
-              class="h-8 w-8"
-              title="添加账号"
-              @click="showImportDialog = true"
-            >
-              <Upload class="w-3.5 h-3.5" />
-            </Button>
-            <ProviderProxyPopover
-              v-if="selectedProviderId"
-              :open="providerProxyDesktopPopoverOpen"
-              :node-id="selectedProviderData?.proxy?.node_id"
-              :saving="savingProviderProxy"
-              :title="getProviderProxyButtonTitle()"
-              @update:open="(open: boolean) => handleProviderProxyPopoverToggle('desktop', open)"
-              @select="setProviderProxy"
-              @clear="clearProviderProxy"
-            />
-            <Button
-              v-if="selectedProviderId"
-              variant="ghost"
-              size="icon"
-              class="h-8 w-8"
-              title="编辑提供商"
-              @click="openProviderEditDialog"
-            >
-              <Edit class="w-3.5 h-3.5" />
-            </Button>
-            <Button
-              v-if="selectedProviderId"
-              variant="ghost"
-              size="icon"
-              class="h-8 w-8"
-              title="编辑端点"
-              @click="openEndpointEditDialog"
-            >
-              <Plug class="w-3.5 h-3.5" />
-            </Button>
-            <Button
-              v-if="showAdaptiveHotPoolMetricsButton"
-              variant="ghost"
-              size="icon"
-              class="h-8 w-8"
-              data-testid="pool-demand-metrics-button"
-              title="查看自适应热池指标"
-              @click="showDemandMetricsDialog = true"
-            >
-              <Activity class="w-3.5 h-3.5" />
-            </Button>
-            <Button
-              v-if="selectedProviderId"
-              variant="ghost"
-              size="icon"
-              class="h-8 w-8"
-              title="高级设置"
-              @click="showAdvancedDialog = true"
-            >
-              <Settings2 class="w-3.5 h-3.5" />
-            </Button>
-            <Button
-              v-if="selectedProviderId"
-              variant="ghost"
-              size="icon"
-              class="h-8 w-8"
-              title="账号"
-              @click="showAccountBatchDialog = true"
-            >
-              <Users class="w-3.5 h-3.5" />
-            </Button>
-            <Button
-              v-if="selectedProviderId"
-              variant="ghost"
-              size="icon"
-              class="h-8 w-8"
-              :class="getProviderToggleButtonClass()"
-              :disabled="togglingProviderStatus"
-              :title="getProviderToggleButtonTitle()"
-              @click="toggleSelectedProviderStatus"
-            >
-              <Power class="w-3.5 h-3.5" />
-            </Button>
-            <RefreshButton
-              :loading="refreshCurrentPageLoading"
-              :title="refreshButtonTitle"
-              @click="refreshCurrentPage"
-            />
-          </div>
-        </div>
-      </div>
+      <PoolManagementHeader
+        v-model:provider-id="selectedProviderIdProxy"
+        v-model:status="statusFilter"
+        v-model:search="searchQuery"
+        :providers="poolProviders"
+        :provider-select-disabled="providerSelectDisabled"
+        :status-options="poolKeyStatusFilterOptions"
+        :meta-text="poolHeaderMetaText"
+        :pool-scheduling-label="poolSchedulingLabel"
+        :show-adaptive-hot-pool-metrics-button="showAdaptiveHotPoolMetricsButton"
+        :selected-count="selectedKeyCount"
+        :is-all-filtered-selected="isAllFilteredPoolKeysSelected"
+        :selection-disabled="keyPage.total === 0 || poolKeySelectionBusy"
+        :batch-actions-disabled="selectedKeyCount === 0 || poolKeySelectionBusy"
+        :refresh-loading="refreshCurrentPageLoading"
+        :refresh-title="refreshButtonTitle"
+        @view-provider="openProviderDrawer"
+        @prefetch-provider="prefetchProviderDetailDrawer"
+        @import="showImportDialog = true"
+        @scheduling="openSchedulingDialog"
+        @demand-metrics="showDemandMetricsDialog = true"
+        @advanced="openAdvancedDialog"
+        @toggle-select-all="toggleAllFilteredPoolKeys"
+        @batch-action="openAccountBatchDialog"
+        @refresh="refreshCurrentPage"
+      />
 
       <!-- Loading (initial) -->
       <div
@@ -407,13 +83,47 @@
           class="hidden xl:block overflow-x-auto"
         >
           <Table class="w-full table-fixed">
+            <colgroup>
+              <col :style="{ width: desktopColumnWidths.name }">
+              <col
+                v-if="showAccountQuotaColumn"
+                :style="{ width: desktopColumnWidths.quota }"
+              >
+              <col :style="{ width: desktopColumnWidths.stats }">
+              <col :style="{ width: desktopColumnWidths.imported }">
+              <col :style="{ width: desktopColumnWidths.lastUsed }">
+              <col :style="{ width: desktopColumnWidths.score }">
+              <col :style="{ width: desktopColumnWidths.status }">
+              <col :style="{ width: desktopColumnWidths.actions }">
+            </colgroup>
             <TableHeader>
               <TableRow class="border-b border-border/60 hover:bg-transparent">
                 <TableHead
-                  class="font-semibold whitespace-nowrap"
+                  class="px-4 font-semibold whitespace-nowrap"
                   :style="{ width: desktopColumnWidths.name }"
                 >
-                  名称
+                  <div class="flex items-center gap-2">
+                    <Checkbox
+                      class="h-3.5 w-3.5 shrink-0"
+                      :checked="selectAllFilteredPoolKeys || isCurrentPoolKeyPageFullySelected"
+                      :indeterminate="!selectAllFilteredPoolKeys && isCurrentPoolKeyPagePartiallySelected"
+                      :disabled="keyPage.keys.length === 0 || poolKeySelectionBusy || selectAllFilteredPoolKeys"
+                      aria-label="选择当前页账号"
+                      data-testid="pool-select-page-desktop"
+                      @update:checked="toggleCurrentPoolKeyPage"
+                    />
+                    <div class="flex items-baseline gap-2">
+                      <span class="leading-none">名称</span>
+                      <span
+                        v-if="selectedKeyCount > 0"
+                        class="text-[11px] font-medium leading-none tabular-nums text-primary"
+                        aria-live="polite"
+                        data-testid="pool-selected-count-desktop"
+                      >
+                        {{ selectedKeyCountLabel }}
+                      </span>
+                    </div>
+                  </div>
                 </TableHead>
                 <TableHead
                   v-if="showAccountQuotaColumn"
@@ -426,21 +136,7 @@
                   class="px-2 font-semibold text-center whitespace-nowrap"
                   :style="{ width: desktopColumnWidths.stats }"
                 >
-                  <div class="flex items-center justify-center gap-1.5">
-                    <button
-                      v-if="showCodexStatsModeToggle"
-                      type="button"
-                      class="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
-                      :title="poolStatsMode === 'current_cycle' ? '切换为总计统计' : '切换为周期统计'"
-                      :aria-label="poolStatsMode === 'current_cycle' ? '切换为总计统计' : '切换为周期统计'"
-                      :aria-pressed="poolStatsMode === 'current_cycle'"
-                      data-testid="pool-stats-mode-control"
-                      @click.stop="togglePoolStatsMode"
-                    >
-                      <Repeat2 class="h-3.5 w-3.5" />
-                    </button>
-                    <span>统计</span>
-                  </div>
+                  <span>统计</span>
                 </TableHead>
                 <SortableTableHead
                   class="font-semibold text-center whitespace-nowrap"
@@ -513,243 +209,153 @@
                 v-for="key in keyPage.keys"
                 :key="key.key_id"
                 class="border-b border-border/40 last:border-b-0 hover:bg-muted/30 transition-colors"
-                :class="keyUiStateMap[key.key_id]?.rowClass || ''"
+                :class="getPoolKeyRowClass(key.key_id)"
               >
                 <TableCell
-                  class="py-3"
+                  class="px-4 py-3 align-top"
                 >
-                  <div class="min-w-0">
-                    <div class="flex items-center gap-1.5 min-w-0">
-                      <span class="text-sm truncate block">
-                        {{ key.key_name || '未命名' }}
-                      </span>
-                    </div>
-                    <div class="flex items-center flex-wrap gap-1 text-[11px] text-muted-foreground mt-0.5 min-w-0">
-                      <input
-                        v-if="editingPriorityKeyId === key.key_id"
-                        :value="editingPriorityValue"
-                        type="number"
-                        min="1"
-                        max="999999"
-                        autofocus
-                        class="h-[18px] w-10 rounded border border-primary/50 bg-background px-1 text-[10px] tabular-nums text-foreground outline-none ring-1 ring-primary/30 shrink-0 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                        @input="(e) => editingPriorityValue = Number((e.target as HTMLInputElement).value || 0)"
-                        @blur="(e) => finishEditInternalPriority(key, e)"
-                        @keydown.enter.prevent="(e) => finishEditInternalPriority(key, e)"
-                        @keydown.esc.prevent="cancelEditInternalPriority"
-                      >
-                      <button
-                        v-else
-                        type="button"
-                        class="h-4 px-1 rounded text-[10px] tabular-nums text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors shrink-0"
-                        title="点击编辑优先级"
-                        @click="startEditInternalPriority(key)"
-                      >
-                        P{{ key.internal_priority ?? 50 }}
-                      </button>
-                      <Button
-                        v-if="canExportOAuthCredential(key)"
-                        variant="ghost"
-                        size="icon"
-                        class="h-4 w-4 shrink-0"
-                        title="下载 OAuth 授权文件"
-                        @click.stop="downloadRefreshToken(key)"
-                      >
-                        <Download class="w-2.5 h-2.5" />
-                      </Button>
-                      <Button
-                        v-else
-                        variant="ghost"
-                        size="icon"
-                        class="h-4 w-4 shrink-0"
-                        title="复制密钥"
-                        @click.stop="copyFullKey(key)"
-                      >
-                        <Copy class="w-2.5 h-2.5" />
-                      </Button>
-                      <span class="font-mono">
-                        {{ getProviderMaskedSecretLabel(key, selectedProviderType) }}
-                      </span>
-                      <template v-if="keyUiStateMap[key.key_id]?.showOAuthRefreshControl">
+                  <div class="flex min-w-0 items-center gap-2">
+                    <Checkbox
+                      class="h-3.5 w-3.5 shrink-0"
+                      :checked="isPoolKeySelected(key.key_id)"
+                      :disabled="poolKeySelectionBusy || selectAllFilteredPoolKeys"
+                      :aria-label="`选择账号 ${key.key_name || key.key_id}`"
+                      :data-testid="`pool-select-desktop-${key.key_id}`"
+                      @update:checked="togglePoolKeySelection(key.key_id, $event === true)"
+                    />
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center gap-1.5 min-w-0">
+                        <span class="text-sm truncate block">
+                          {{ key.key_name || '未命名' }}
+                        </span>
+                      </div>
+                      <div class="flex items-center flex-wrap gap-1 text-[11px] text-muted-foreground mt-0.5 min-w-0">
+                        <input
+                          v-if="editingPriorityKeyId === key.key_id"
+                          :value="editingPriorityValue"
+                          type="number"
+                          min="1"
+                          max="999999"
+                          autofocus
+                          class="h-[18px] w-10 rounded border border-primary/50 bg-background px-1 text-[10px] tabular-nums text-foreground outline-none ring-1 ring-primary/30 shrink-0 [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                          @input="(e) => editingPriorityValue = Number((e.target as HTMLInputElement).value || 0)"
+                          @blur="(e) => finishEditInternalPriority(key, e)"
+                          @keydown.enter.prevent="(e) => finishEditInternalPriority(key, e)"
+                          @keydown.esc.prevent="cancelEditInternalPriority"
+                        >
+                        <button
+                          v-else
+                          type="button"
+                          class="h-4 px-1 rounded text-[10px] tabular-nums text-muted-foreground hover:text-foreground hover:bg-muted/40 transition-colors shrink-0"
+                          title="点击编辑优先级"
+                          @click="startEditInternalPriority(key)"
+                        >
+                          P{{ key.internal_priority ?? 50 }}
+                        </button>
                         <Button
+                          v-if="canExportOAuthCredential(key)"
                           variant="ghost"
                           size="icon"
                           class="h-4 w-4 shrink-0"
-                          :disabled="refreshingOAuthKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canRefreshToken"
-                          :title="keyUiStateMap[key.key_id]?.oauthRefreshButtonTitle || ''"
-                          @click.stop="handleRefreshOAuth(key)"
+                          title="下载 OAuth 授权文件"
+                          @click.stop="downloadRefreshToken(key)"
                         >
-                          <RefreshCw
-                            class="w-2.5 h-2.5"
-                            :class="{ 'animate-spin': refreshingOAuthKeyId === key.key_id }"
-                          />
+                          <Download class="w-2.5 h-2.5" />
                         </Button>
-                        <span
-                          v-if="keyUiStateMap[key.key_id]?.visibleOAuthState"
-                          class="text-[10px]"
-                          :class="{
-                            'text-destructive': keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid || keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired,
-                            'text-warning': keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpiringSoon && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid,
-                            'text-muted-foreground': !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpiringSoon && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid
-                          }"
-                          :title="keyUiStateMap[key.key_id]?.oauthStatusTitle || ''"
+                        <Button
+                          v-else-if="key.agent_identity !== true"
+                          variant="ghost"
+                          size="icon"
+                          class="h-4 w-4 shrink-0"
+                          title="复制密钥"
+                          @click.stop="copyFullKey(key)"
                         >
-                          {{ keyUiStateMap[key.key_id]?.visibleOAuthState?.text }}
+                          <Copy class="w-2.5 h-2.5" />
+                        </Button>
+                        <span class="font-mono">
+                          {{ getProviderMaskedSecretLabel(key, selectedProviderType) }}
                         </span>
-                      </template>
-                      <Badge
-                        v-if="keyUiStateMap[key.key_id]?.planLabel"
-                        variant="outline"
-                        class="text-[9px] px-1 py-0 h-4 shrink-0"
-                        :class="keyUiStateMap[key.key_id]?.planClass || ''"
-                      >
-                        {{ keyUiStateMap[key.key_id]?.planLabel }}
-                      </Badge>
-                      <Badge
-                        v-if="keyUiStateMap[key.key_id]?.oauthOrgBadge"
-                        variant="secondary"
-                        class="text-[9px] px-1 py-0 h-4 shrink-0"
-                        :title="keyUiStateMap[key.key_id]?.oauthOrgBadge?.title"
-                      >
-                        {{ keyUiStateMap[key.key_id]?.oauthOrgBadge?.label }}
-                      </Badge>
+                        <template v-if="keyUiStateMap[key.key_id]?.showOAuthRefreshControl">
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            class="h-4 w-4 shrink-0"
+                            :disabled="refreshingOAuthKeyId === key.key_id || !keyUiStateMap[key.key_id]?.canRefreshToken"
+                            :title="keyUiStateMap[key.key_id]?.oauthRefreshButtonTitle || ''"
+                            @click.stop="handleRefreshOAuth(key)"
+                          >
+                            <RefreshCw
+                              class="w-2.5 h-2.5"
+                              :class="{ 'animate-spin': refreshingOAuthKeyId === key.key_id }"
+                            />
+                          </Button>
+                          <span
+                            v-if="keyUiStateMap[key.key_id]?.visibleOAuthState"
+                            class="text-[10px]"
+                            :class="{
+                              'text-destructive': keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid || keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired,
+                              'text-warning': keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpiringSoon && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid,
+                              'text-muted-foreground': !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpired && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isExpiringSoon && !keyUiStateMap[key.key_id]?.visibleOAuthState?.isInvalid
+                            }"
+                            :title="keyUiStateMap[key.key_id]?.oauthStatusTitle || ''"
+                          >
+                            {{ keyUiStateMap[key.key_id]?.visibleOAuthState?.text }}
+                          </span>
+                        </template>
+                        <Badge
+                          v-if="keyUiStateMap[key.key_id]?.planLabel"
+                          variant="outline"
+                          class="text-[9px] px-1 py-0 h-4 shrink-0"
+                          :class="keyUiStateMap[key.key_id]?.planClass || ''"
+                        >
+                          {{ keyUiStateMap[key.key_id]?.planLabel }}
+                        </Badge>
+                        <Badge
+                          v-if="keyUiStateMap[key.key_id]?.oauthOrgBadge"
+                          variant="secondary"
+                          class="text-[9px] px-1 py-0 h-4 shrink-0"
+                          :title="keyUiStateMap[key.key_id]?.oauthOrgBadge?.title"
+                        >
+                          {{ keyUiStateMap[key.key_id]?.oauthOrgBadge?.label }}
+                        </Badge>
+                      </div>
                     </div>
                   </div>
                 </TableCell>
                 <TableCell
                   v-if="showAccountQuotaColumn"
-                  class="py-3 align-middle"
+                  class="py-3 align-top"
                 >
-                  <div
-                    v-if="quotaProgressMap[key.key_id]?.length"
-                    class="max-w-[208px] space-y-2"
-                  >
-                    <div
-                      v-for="(item, idx) in quotaProgressMap[key.key_id]"
-                      :key="`${key.key_id}-quota-${idx}`"
-                      class="flex flex-col gap-1 min-w-[140px] max-w-[208px]"
-                    >
-                      <div class="flex items-center justify-between text-[10px] leading-none">
-                        <span class="text-muted-foreground font-medium shrink-0">{{ getQuotaProgressLabel(item.label) }}</span>
-                        <span
-                          v-if="getQuotaProgressResetDisplayText(item)"
-                          data-testid="pool-quota-reset-text"
-                          class="text-muted-foreground/80 tabular-nums truncate"
-                          :title="getQuotaProgressResetDisplayText(item)"
-                        >{{ getQuotaProgressResetDisplayText(item) }}</span>
-                      </div>
-                      <div class="flex items-center gap-1.5">
-                        <div class="relative flex-1 h-1.5 rounded-full bg-border overflow-hidden">
-                          <div
-                            class="absolute left-0 top-0 h-full rounded-full transition-all duration-300"
-                            :class="getQuotaRemainingBarColorByRemaining(item.remainingPercent)"
-                            :style="{ width: `${item.remainingPercent}%` }"
-                          />
-                        </div>
-                        <span
-                          data-testid="pool-quota-meter-text"
-                          class="shrink-0 text-[10px] font-medium tabular-nums leading-none"
-                          :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
-                        >{{ getQuotaProgressMeterDisplayText(item) }}</span>
-                      </div>
-                    </div>
-                    <div
-                      v-if="keyUiStateMap[key.key_id]?.accountQuotaText"
-                      class="text-[10px] leading-none text-muted-foreground tabular-nums"
-                    >
-                      {{ keyUiStateMap[key.key_id]?.accountQuotaText }}
-                    </div>
-                  </div>
-                  <span
-                    v-else-if="keyUiStateMap[key.key_id]?.accountQuotaText || keyUiStateMap[key.key_id]?.quotaFallbackText"
-                    :class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
-                  >
-                    {{ keyUiStateMap[key.key_id]?.accountQuotaText || keyUiStateMap[key.key_id]?.quotaFallbackText }}
-                  </span>
-                  <span
-                    v-else
-                    class="text-xs text-muted-foreground"
-                  >-</span>
+                  <PoolKeyQuotaPanel
+                    :items="quotaProgressDisplayMap[key.key_id] || []"
+                    :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
+                    :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
+                    :text-class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
+                    :reset-credit-text="getCodexResetCreditCountText(key)"
+                    :reset-credit-items="getCodexResetCreditItemTexts(key)"
+                    :can-consume-reset-credit="canConsumeCodexResetCredit(key)"
+                    :consuming-reset-credit="consumingCodexResetCreditKeyId === key.key_id"
+                    @consume-reset-credit="handleConsumeCodexResetCredit(key)"
+                  />
                 </TableCell>
-                <TableCell class="py-3 px-2 align-middle">
-                  <div
-                    v-if="isPoolKeyCycleStatsDisplay(key)"
-                    class="mx-auto w-[188px] text-[10px] leading-4"
-                    data-testid="pool-stats-cycle-groups"
-                  >
-                    <div
-                      class="grid min-h-16 w-[188px] grid-cols-[38px_64px_10px_64px] items-center gap-x-1"
-                      data-testid="pool-stats-cycle-grid"
-                    >
-                      <span aria-hidden="true" />
-                      <span
-                        class="text-center text-[9px] font-semibold text-muted-foreground/80"
-                        data-testid="pool-stats-cycle-group-5h"
-                      >5H</span>
-                      <span class="text-center text-muted-foreground/50">|</span>
-                      <span
-                        class="text-center text-[9px] font-semibold text-muted-foreground/80"
-                        data-testid="pool-stats-cycle-group-weekly"
-                      >周</span>
-
-                      <template
-                        v-for="row in getPoolKeyCycleStatsRows(key)"
-                        :key="`${key.key_id}-${row.key}-desktop-cycle-row`"
-                      >
-                        <span class="text-muted-foreground truncate">{{ row.label }}</span>
-                        <span
-                          class="min-w-0 truncate text-center tabular-nums text-foreground/90"
-                          :class="row.fiveH.missing ? 'text-muted-foreground/80' : ''"
-                          :data-testid="`pool-stats-5h-${row.key}`"
-                          :title="row.fiveH.value"
-                        >{{ row.fiveH.value }}</span>
-                        <span class="text-center text-muted-foreground/50">|</span>
-                        <span
-                          class="min-w-0 truncate text-center tabular-nums text-foreground/90"
-                          :class="row.weekly.missing ? 'text-muted-foreground/80' : ''"
-                          :data-testid="`pool-stats-weekly-${row.key}`"
-                          :title="row.weekly.value"
-                        >{{ row.weekly.value }}</span>
-                      </template>
-                    </div>
-                  </div>
-                  <div
-                    v-else
-                    class="grid min-h-16 w-[188px] grid-rows-4 gap-0 mx-auto text-[10px] leading-4"
-                    data-testid="pool-stats-account-total"
-                  >
-                    <div
-                      class="invisible h-4"
-                      aria-hidden="true"
-                    >
-                      -
-                    </div>
-                    <div
-                      v-for="metric in getPoolKeyAccountStatsMetrics(key)"
-                      :key="`${key.key_id}-${metric.key}-account-total`"
-                      class="grid grid-cols-[64px_124px] items-center"
-                    >
-                      <span class="text-muted-foreground truncate">{{ metric.label }}</span>
-                      <span
-                        class="min-w-0 truncate text-center tabular-nums text-foreground/90"
-                        :title="metric.value"
-                      >
-                        {{ metric.value }}
-                      </span>
-                    </div>
-                  </div>
+                <TableCell class="py-3 px-2 align-top">
+                  <PoolKeyStatsPanel
+                    :cycle="isPoolKeyCycleStatsDisplay(key)"
+                    :cycle-groups="getPoolKeyCycleStatsGroups(key)"
+                    :account-metrics="getPoolKeyAccountStatsMetrics(key)"
+                  />
                 </TableCell>
-                <TableCell class="py-3 text-center">
+                <TableCell class="py-3 text-center align-top">
                   <span class="text-[10px] text-muted-foreground whitespace-nowrap">
                     {{ keyUiStateMap[key.key_id]?.importedAtRelative || '-' }}
                   </span>
                 </TableCell>
-                <TableCell class="py-3 text-center">
+                <TableCell class="py-3 text-center align-top">
                   <span class="text-[10px] text-muted-foreground whitespace-nowrap">
                     {{ keyUiStateMap[key.key_id]?.lastUsedRelative || '-' }}
                   </span>
                 </TableCell>
-                <TableCell class="py-3 text-center align-middle">
+                <TableCell class="py-3 text-center align-top">
                   <div class="inline-flex items-center justify-center gap-1">
                     <span class="font-mono text-xs tabular-nums text-foreground/90">
                       {{ formatPoolScore(key.pool_score?.score) }}
@@ -810,7 +416,7 @@
                     </Popover>
                   </div>
                 </TableCell>
-                <TableCell class="py-3 text-center">
+                <TableCell class="py-3 text-center align-top">
                   <Badge
                     :variant="keyUiStateMap[key.key_id]?.schedulingBadgeVariant || 'default'"
                     class="text-[10px]"
@@ -819,7 +425,7 @@
                     {{ keyUiStateMap[key.key_id]?.schedulingBadgeLabel }}
                   </Badge>
                 </TableCell>
-                <TableCell class="py-3 px-2 align-middle">
+                <TableCell class="py-3 px-2 align-top">
                   <div class="flex justify-center gap-0.5">
                     <Button
                       v-if="key.cooldown_reason"
@@ -917,6 +523,8 @@
                       class="h-7 w-7 text-foreground hover:text-foreground"
                       :disabled="togglingKeyId === key.key_id"
                       :title="key.is_active ? '禁用' : '启用'"
+                      :aria-label="key.is_active ? '禁用账号' : '启用账号'"
+                      :data-testid="`pool-toggle-active-desktop-${key.key_id}`"
                       @click="toggleKeyActive(key)"
                     >
                       <Power class="w-3.5 h-3.5" />
@@ -947,11 +555,21 @@
             v-for="key in keyPage.keys"
             :key="key.key_id"
             class="p-4 sm:p-5 hover:bg-muted/30 transition-colors"
-            :class="keyUiStateMap[key.key_id]?.rowClass || ''"
+            :class="getPoolKeyRowClass(key.key_id)"
           >
             <div class="space-y-3">
-              <div class="text-sm font-medium truncate">
-                {{ key.key_name || '未命名' }}
+              <div class="flex items-center gap-1.5">
+                <Checkbox
+                  class="h-3.5 w-3.5 shrink-0"
+                  :checked="isPoolKeySelected(key.key_id)"
+                  :disabled="poolKeySelectionBusy || selectAllFilteredPoolKeys"
+                  :aria-label="`选择账号 ${key.key_name || key.key_id}`"
+                  :data-testid="`pool-select-mobile-${key.key_id}`"
+                  @update:checked="togglePoolKeySelection(key.key_id, $event === true)"
+                />
+                <div class="min-w-0 truncate text-sm font-medium">
+                  {{ key.key_name || '未命名' }}
+                </div>
               </div>
 
               <div class="flex flex-wrap items-center gap-1.5">
@@ -975,8 +593,8 @@
                   <button
                     v-if="item.key === 'priority'"
                     type="button"
-                    class="inline-flex max-w-full items-center rounded-full border px-2 py-0.5 text-[10px] font-medium leading-4"
-                    :class="`${getMobileTagClass(item)} hover:border-primary/40 hover:text-foreground`"
+                    class="inline-flex max-w-full items-center rounded-full border px-2 py-0.5 text-[10px] font-medium leading-4 hover:border-primary/40 hover:text-foreground"
+                    :class="getMobileTagClass(item)"
                     :title="`${item.label}，点击编辑优先级`"
                     @click="quickEditInternalPriority(key)"
                   >
@@ -1011,60 +629,12 @@
 
               <div class="overflow-x-auto rounded-xl border border-border/50 bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
                 <div class="space-y-1 text-center">
-                  <template v-if="isPoolKeyCycleStatsDisplay(key)">
-                    <div
-                      class="grid min-h-16 w-[188px] grid-cols-[38px_64px_10px_64px] items-center gap-x-1 text-left"
-                      data-testid="pool-mobile-stats-cycle-grid"
-                    >
-                      <span aria-hidden="true" />
-                      <span
-                        class="text-center text-[10px] font-semibold text-foreground"
-                        data-testid="pool-mobile-stats-cycle-group-5h"
-                      >5H</span>
-                      <span class="text-center text-muted-foreground/50">|</span>
-                      <span
-                        class="text-center text-[10px] font-semibold text-foreground"
-                        data-testid="pool-mobile-stats-cycle-group-weekly"
-                      >周</span>
-
-                      <template
-                        v-for="row in getPoolKeyCycleStatsRows(key)"
-                        :key="`${key.key_id}-${row.key}-mobile-cycle-row`"
-                      >
-                        <span class="text-muted-foreground truncate">{{ row.label }}</span>
-                        <span
-                          class="min-w-0 truncate text-center font-medium text-foreground/90 tabular-nums"
-                          :class="row.fiveH.missing ? 'text-muted-foreground/80' : ''"
-                          :title="row.fiveH.value"
-                        >{{ row.fiveH.value }}</span>
-                        <span class="text-center text-muted-foreground/50">|</span>
-                        <span
-                          class="min-w-0 truncate text-center font-medium text-foreground/90 tabular-nums"
-                          :class="row.weekly.missing ? 'text-muted-foreground/80' : ''"
-                          :title="row.weekly.value"
-                        >{{ row.weekly.value }}</span>
-                      </template>
-                    </div>
-                  </template>
-                  <template v-else>
-                    <div
-                      class="invisible h-4"
-                      aria-hidden="true"
-                    >
-                      -
-                    </div>
-                    <div
-                      v-for="metric in getPoolKeyAccountStatsMetrics(key)"
-                      :key="`${key.key_id}-${metric.key}-mobile-account-total`"
-                      class="grid h-4 w-[188px] grid-cols-[64px_124px] items-center text-left"
-                    >
-                      <span class="text-muted-foreground truncate">{{ metric.label }}</span>
-                      <span
-                        class="min-w-0 truncate text-center font-medium text-foreground/90"
-                        :title="metric.value"
-                      >{{ metric.value }}</span>
-                    </div>
-                  </template>
+                  <PoolKeyStatsPanel
+                    :cycle="isPoolKeyCycleStatsDisplay(key)"
+                    :cycle-groups="getPoolKeyCycleStatsGroups(key)"
+                    :account-metrics="getPoolKeyAccountStatsMetrics(key)"
+                    variant="mobile"
+                  />
                   <div class="flex items-center justify-between gap-2 border-t border-border/40 pt-1 mt-1">
                     <span class="text-muted-foreground">导入</span>
                     <span class="font-medium text-foreground/90">{{ keyUiStateMap[key.key_id]?.importedAtRelative || '-' }}</span>
@@ -1138,66 +708,19 @@
                 </div>
               </div>
 
-              <div
+              <PoolKeyQuotaPanel
                 v-if="showAccountQuotaColumn"
-                class="rounded-xl border border-border/50 bg-muted/30 px-3 py-2 text-xs"
-              >
-                <div class="text-muted-foreground mb-1">
-                  配额
-                </div>
-                <div
-                  v-if="quotaProgressMap[key.key_id]?.length"
-                  class="space-y-2"
-                >
-                  <div
-                    v-for="(item, idx) in quotaProgressMap[key.key_id]"
-                    :key="`${key.key_id}-quota-mobile-${idx}`"
-                    class="flex flex-col gap-1 min-w-0"
-                  >
-                    <div class="flex items-center justify-between text-[10px] leading-none">
-                      <span class="text-muted-foreground font-medium shrink-0">{{ getQuotaProgressLabel(item.label) }}</span>
-                      <span
-                        v-if="getQuotaProgressResetDisplayText(item)"
-                        data-testid="pool-quota-reset-text"
-                        class="text-muted-foreground/80 tabular-nums truncate"
-                        :title="getQuotaProgressResetDisplayText(item)"
-                      >{{ getQuotaProgressResetDisplayText(item) }}</span>
-                    </div>
-                    <div class="flex items-center gap-1.5">
-                      <div class="relative flex-1 h-1.5 rounded-full bg-border overflow-hidden">
-                        <div
-                          class="absolute left-0 top-0 h-full rounded-full transition-all duration-300"
-                          :class="getQuotaRemainingBarColorByRemaining(item.remainingPercent)"
-                          :style="{ width: `${item.remainingPercent}%` }"
-                        />
-                      </div>
-                      <span
-                        data-testid="pool-quota-meter-text"
-                        class="shrink-0 text-[10px] font-medium tabular-nums leading-none"
-                        :class="getQuotaRemainingClassByRemaining(item.remainingPercent)"
-                      >{{ getQuotaProgressMeterDisplayText(item) }}</span>
-                    </div>
-                  </div>
-                  <div
-                    v-if="keyUiStateMap[key.key_id]?.accountQuotaText"
-                    class="text-[10px] leading-none text-muted-foreground tabular-nums"
-                  >
-                    {{ keyUiStateMap[key.key_id]?.accountQuotaText }}
-                  </div>
-                </div>
-                <div
-                  v-else-if="keyUiStateMap[key.key_id]?.accountQuotaText || keyUiStateMap[key.key_id]?.quotaFallbackText"
-                  :class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
-                >
-                  {{ keyUiStateMap[key.key_id]?.accountQuotaText || keyUiStateMap[key.key_id]?.quotaFallbackText }}
-                </div>
-                <div
-                  v-else
-                  class="text-muted-foreground"
-                >
-                  -
-                </div>
-              </div>
+                :items="quotaProgressDisplayMap[key.key_id] || []"
+                :account-quota-text="keyUiStateMap[key.key_id]?.accountQuotaText"
+                :fallback-text="keyUiStateMap[key.key_id]?.quotaFallbackText"
+                :text-class="keyUiStateMap[key.key_id]?.quotaTextClass || ''"
+                :reset-credit-text="getCodexResetCreditCountText(key)"
+                :reset-credit-items="getCodexResetCreditItemTexts(key)"
+                :can-consume-reset-credit="canConsumeCodexResetCredit(key)"
+                :consuming-reset-credit="consumingCodexResetCreditKeyId === key.key_id"
+                variant="mobile"
+                @consume-reset-credit="handleConsumeCodexResetCredit(key)"
+              />
 
               <div class="flex items-center gap-0.5">
                 <div
@@ -1216,7 +739,7 @@
                     <Download class="w-3.5 h-3.5" />
                   </Button>
                   <Button
-                    v-else-if="actionId === 'copy_or_download'"
+                    v-else-if="actionId === 'copy_or_download' && key.agent_identity !== true"
                     variant="ghost"
                     size="icon"
                     class="h-7 w-7 shrink-0"
@@ -1338,6 +861,8 @@
                     class="h-7 w-7 shrink-0 text-foreground hover:text-foreground"
                     :disabled="togglingKeyId === key.key_id"
                     :title="key.is_active ? '禁用' : '启用'"
+                    :aria-label="key.is_active ? '禁用账号' : '启用账号'"
+                    :data-testid="`pool-toggle-active-mobile-${key.key_id}`"
                     @click="toggleKeyActive(key)"
                   >
                     <Power class="w-3.5 h-3.5" />
@@ -1435,19 +960,20 @@
       :provider-name="selectedProviderOverview?.provider_name"
       :samples="providerDemandMetricSamples"
     />
+    <ProviderDetailDrawer
+      v-if="providerDrawerMounted && selectedProviderId"
+      :open="providerDrawerOpen"
+      :provider-id="selectedProviderId"
+      :initial-provider="selectedProviderData"
+      @update:open="providerDrawerOpen = $event"
+      @edit="openProviderEditDialog"
+      @toggle-status="toggleSelectedProviderStatus"
+      @refresh="handleProviderDrawerRefresh"
+    />
     <ProviderFormDialog
       v-model="providerEditDialogOpen"
       :provider="providerToEdit"
       @provider-updated="handleProviderEditSaved"
-    />
-    <EndpointFormDialog
-      v-if="selectedProviderData"
-      v-model="endpointEditDialogOpen"
-      :provider="selectedProviderData"
-      :endpoints="providerEndpointsForEdit"
-      :provider-format-conversion-enabled="selectedProviderData.enable_format_conversion"
-      @endpoint-created="handleEndpointEditSaved"
-      @endpoint-updated="handleEndpointEditSaved"
     />
     <PoolAccountBatchDialog
       v-if="selectedProviderId"
@@ -1456,7 +982,23 @@
       :provider-name="selectedProviderData?.name || ''"
       :provider-type="selectedProviderData?.provider_type || selectedProviderType"
       :batch-concurrency="selectedProviderConfig?.batch_concurrency"
+      :selected-keys="selectedPoolKeys"
+      :select-all-filtered="selectAllFilteredPoolKeys"
+      :selected-count="selectedKeyCount"
+      :selection-filters="poolKeySelectionFilters"
+      :initial-action="pendingAccountBatchAction"
       @changed="handleAccountBatchChanged"
+      @edit-config="openKeyBatchEditDialog"
+    />
+    <PoolKeyBatchEditDialog
+      v-if="selectedProviderId"
+      :open="keyBatchEditDialogOpen"
+      :provider-id="selectedProviderId"
+      :provider-name="selectedProviderData?.name || ''"
+      :key-ids="keyBatchEditKeyIds"
+      :available-api-formats="selectedProviderData?.api_formats || []"
+      @close="closeKeyBatchEditDialog"
+      @saved="handleKeyBatchEditSaved"
     />
     <KeyFormDialog
       v-if="selectedProviderId"
@@ -1487,13 +1029,10 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, onMounted, onBeforeUnmount, defineAsyncComponent } from 'vue'
 import {
-  Search,
   Upload,
-  ChevronDown,
   RefreshCw,
-  Activity,
   Power,
   Database,
   KeyRound,
@@ -1501,28 +1040,17 @@ import {
   Copy,
   Shield,
   Globe,
-  Repeat2,
   RotateCcw,
   SquarePen,
   Trash2,
-  Users,
-  Settings2,
-  SlidersHorizontal,
   CircleHelp,
-  Edit,
-  Plug,
 } from 'lucide-vue-next'
 
 import {
   Card,
   Badge,
   Button,
-  Input,
-  Select,
-  SelectTrigger,
-  SelectValue,
-  SelectContent,
-  SelectItem,
+  Checkbox,
   Table,
   TableHeader,
   TableBody,
@@ -1536,12 +1064,13 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from '@/components/ui'
-import RefreshButton from '@/components/ui/refresh-button.vue'
 import { useToast } from '@/composables/useToast'
 import { useClipboard } from '@/composables/useClipboard'
 import { useCountdownTimer, getCodexResetCountdown } from '@/composables/useCountdownTimer'
 import { useConfirm } from '@/composables/useConfirm'
 import { useRouteQuery } from '@/composables/useRouteQuery'
+import { useBatchSelection } from '@/composables/useBatchSelection'
+import { useI18n } from '@/i18n'
 import { parseApiError } from '@/utils/errorParser'
 import {
   getPoolOverview,
@@ -1555,35 +1084,38 @@ import {
   deleteEndpointKey,
   updateProviderKey,
   refreshProviderQuota,
+  consumeCodexResetCredit,
   resetProviderKeyCycleStats,
 } from '@/api/endpoints/keys'
 import { refreshProviderOAuth } from '@/api/endpoints/provider_oauth'
 import type {
   PoolOverviewItem,
   PoolKeyDetail,
+  PoolKeySelectionRequest,
   PoolKeysPageResponse,
   PoolPresetMeta,
 } from '@/api/endpoints/pool'
 import type {
   ClaudeCodeAdvancedConfig,
   EndpointAPIKey,
-  ProviderEndpoint,
   PoolAdvancedConfig,
   ProviderWithEndpointsSummary,
 } from '@/api/endpoints/types/provider'
 import type { QuotaStatusSnapshot, QuotaWindowSnapshot } from '@/api/endpoints/types'
-import { getProvider, getProviderEndpoints, updateProvider } from '@/api/endpoints'
+import { getProvider, updateProvider } from '@/api/endpoints'
 import { useProxyNodesStore } from '@/stores/proxy-nodes'
 import PoolSchedulingDialog from '@/features/pool/components/PoolSchedulingDialog.vue'
 import PoolAdvancedDialog from '@/features/pool/components/PoolAdvancedDialog.vue'
 import PoolDemandMetricsDialog from '@/features/pool/components/PoolDemandMetricsDialog.vue'
 import PoolAccountBatchDialog from '@/features/pool/components/PoolAccountBatchDialog.vue'
-import ProviderProxyPopover from '@/features/pool/components/ProviderProxyPopover.vue'
+import PoolKeyBatchEditDialog from '@/features/pool/components/PoolKeyBatchEditDialog.vue'
+import PoolManagementHeader from '@/features/pool/components/PoolManagementHeader.vue'
+import PoolKeyQuotaPanel from '@/features/pool/components/PoolKeyQuotaPanel.vue'
+import PoolKeyStatsPanel from '@/features/pool/components/PoolKeyStatsPanel.vue'
 import KeyAllowedModelsEditDialog from '@/features/providers/components/KeyAllowedModelsEditDialog.vue'
 import KeyFormDialog from '@/features/providers/components/KeyFormDialog.vue'
 import OAuthKeyEditDialog from '@/features/providers/components/OAuthKeyEditDialog.vue'
 import OAuthAccountDialog from '@/features/providers/components/OAuthAccountDialog.vue'
-import EndpointFormDialog from '@/features/providers/components/EndpointFormDialog.vue'
 import ProviderFormDialog from '@/features/providers/components/ProviderFormDialog.vue'
 import ProxyNodeSelect from '@/features/providers/components/ProxyNodeSelect.vue'
 import {
@@ -1599,17 +1131,35 @@ import {
   resolvePoolManagementPageAfterLoad,
   type PoolManagementSortBy,
   type PoolManagementSortOrder,
-  type PoolManagementStatsMode,
   type PoolManagementViewState,
   writePoolManagementViewState,
 } from '@/features/pool/utils/poolManagementState'
+import type { PoolBatchActionValue } from '@/features/pool/utils/poolBatchActions'
 import {
   buildPoolStatsDisplay,
   type PoolCodexCycleStatsGroup,
   type PoolStatsDisplay,
   type PoolStatsMetric,
 } from '@/features/pool/utils/poolStatsDisplay'
+import { resetCodexCycleUsageWindows } from '@/features/pool/utils/poolCycleStats'
+import { mergePoolKeyQuotaSnapshots } from '@/features/pool/utils/poolQuotaRefresh'
+import { resolveAntigravityQuotaGroupLabel } from '@/features/providers/utils/antigravityQuota'
+import {
+  clearPendingCodexResetCreditIdempotencyKey,
+  clearPendingCodexResetCreditIdempotencyKeyForOutcome,
+  createCodexResetCreditIdempotencyKey,
+  formatCodexResetCreditCount,
+  formatCodexResetCreditExpiresAt,
+  getCodexResetCreditAvailableCount,
+  getCodexResetCreditReservationIdempotencyKey,
+  getVisibleCodexResetCreditItems,
+  mergeCodexQuotaDisplays,
+  readPendingCodexResetCreditIdempotencyKey,
+  rememberPendingCodexResetCreditIdempotencyKey,
+} from '@/features/providers/components/codex-reset-credit-display'
+import { getCodexQuotaWindowPresentation } from '@/utils/codexQuotaWindow'
 import { getOAuthOrgBadge } from '@/utils/oauthIdentity'
+import { formatOAuthPlanType, getOAuthPlanTypeClass } from '@/utils/oauthPlanType'
 import { getOAuthRefreshFeedback } from '@/utils/oauthRefreshFeedback'
 import {
   canEditOAuthCredential,
@@ -1634,9 +1184,17 @@ import {
   getQuotaDisplayText,
 } from '@/utils/providerKeyQuota'
 
+const loadProviderDetailDrawer = () => import('@/features/providers/components/ProviderDetailDrawer.vue')
+const ProviderDetailDrawer = defineAsyncComponent(loadProviderDetailDrawer)
+
+function prefetchProviderDetailDrawer(): void {
+  void loadProviderDetailDrawer().catch(() => {})
+}
+
 type PoolKeyScore = NonNullable<PoolKeyDetail['pool_score']>
 
 const { success, error: showError, warning: showWarning } = useToast()
+const { legacyT, t } = useI18n()
 const { confirm } = useConfirm()
 const { copyToClipboard } = useClipboard()
 const { tick: countdownTick, start: startCountdownTimer } = useCountdownTimer()
@@ -1653,7 +1211,6 @@ const restoredViewState = readPoolManagementViewState(
     pageSize: getQueryValue('pageSize'),
     sortBy: getQueryValue('sortBy'),
     sortOrder: getQueryValue('sortOrder'),
-    statsMode: getQueryValue('statsMode'),
   },
   poolManagementViewStorage,
 )
@@ -1666,6 +1223,9 @@ let selectProviderRequestId = 0
 let providerDataRequestId = 0
 let keysRequestId = 0
 let keysSearchDebounceTimer: number | null = null
+let providerDetailDrawerPrefetchIdleId: number | null = null
+let providerDetailDrawerPrefetchTimer: number | null = null
+const keysSearchPending = ref(false)
 let demandMetricsPollingTimer: number | null = null
 let demandMetricsRequestId = 0
 let suppressFiltersWatch = false
@@ -1675,6 +1235,38 @@ const POOL_KEYS_CACHE_TTL_MS = 10 * 1000
 const POOL_SCHEDULING_PRESETS_CACHE_TTL_MS = 5 * 60 * 1000
 const POOL_DEMAND_METRICS_SAMPLES_LIMIT = 120
 const POOL_DEMAND_METRICS_POLL_INTERVAL_MS = 10 * 1000
+
+type IdleCallbackWindow = typeof window & {
+  requestIdleCallback?: (callback: () => void, options?: { timeout: number }) => number
+  cancelIdleCallback?: (handle: number) => void
+}
+
+function scheduleProviderDetailDrawerPrefetch(): void {
+  const idleWindow = window as IdleCallbackWindow
+  if (idleWindow.requestIdleCallback) {
+    providerDetailDrawerPrefetchIdleId = idleWindow.requestIdleCallback(() => {
+      providerDetailDrawerPrefetchIdleId = null
+      prefetchProviderDetailDrawer()
+    }, { timeout: 1500 })
+    return
+  }
+  providerDetailDrawerPrefetchTimer = window.setTimeout(() => {
+    providerDetailDrawerPrefetchTimer = null
+    prefetchProviderDetailDrawer()
+  }, 800)
+}
+
+function cancelProviderDetailDrawerPrefetch(): void {
+  const idleWindow = window as IdleCallbackWindow
+  if (providerDetailDrawerPrefetchIdleId !== null) {
+    idleWindow.cancelIdleCallback?.(providerDetailDrawerPrefetchIdleId)
+    providerDetailDrawerPrefetchIdleId = null
+  }
+  if (providerDetailDrawerPrefetchTimer !== null) {
+    clearTimeout(providerDetailDrawerPrefetchTimer)
+    providerDetailDrawerPrefetchTimer = null
+  }
+}
 
 interface PoolDemandMetricSample {
   providerId: string
@@ -1779,32 +1371,38 @@ async function loadOverview(options: { cacheTtlMs?: number, silent?: boolean } =
       selectedProviderId.value = null
       selectedProviderData.value = null
       keysLoadedOnce.value = false
-      endpointEditDialogOpen.value = false
-      providerEndpointsForEdit.value = []
+      resetPoolKeySelection(true)
+      providerDrawerOpen.value = false
       showAccountBatchDialog.value = false
-      closeProviderProxyPopovers()
+      keyBatchEditDialogOpen.value = false
+      keyBatchEditKeyIds.value = []
       resetKeyPage()
     }
   } catch (err) {
     if (requestId !== overviewRequestId) return
     if (!options.silent) {
       showError(parseApiError(err))
+    } else {
+      showWarning(parseApiError(err, '同步 Provider 概览失败'))
     }
   } finally {
-    if (requestId === overviewRequestId && !options.silent) {
+    if (requestId === overviewRequestId) {
       overviewLoading.value = false
     }
   }
 }
 
 async function handleSchedulingSaved(updatedProvider: ProviderWithEndpointsSummary) {
+  if (!selectedProviderId.value || updatedProvider.id !== selectedProviderId.value) return
   // 优先回写保存接口返回值，避免弹窗立即重开时读到旧配置。
-  if (selectedProviderId.value && updatedProvider.id === selectedProviderId.value) {
+  if (selectedProviderData.value) {
+    Object.assign(selectedProviderData.value, updatedProvider)
+  } else {
     selectedProviderData.value = updatedProvider
   }
   showSchedulingDialog.value = false
   showAdvancedDialog.value = false
-  await loadOverview()
+  await loadOverview({ silent: true })
 }
 
 // --- Provider Selection ---
@@ -1831,10 +1429,13 @@ const selectedProviderClaudeConfig = computed(() => {
   return (selectedProviderData.value as Record<string, unknown> | null)?.claude_code_advanced as ClaudeCodeAdvancedConfig | null ?? null
 })
 
-const DEFAULT_ENABLED_PRESETS = new Set(['cache_affinity', 'recent_refresh'])
+function defaultEnabledPresetCount(providerType: string): number {
+  return ['codex', 'windsurf'].includes(providerType) ? 2 : 1
+}
 
 const DEFAULT_PRESET_LABELS: Record<string, string> = {
   lru: 'LRU',
+  free_team_first: 'Free/Team',
   free_first: 'Free',
   team_first: 'Team',
   plus_first: 'Plus',
@@ -1972,7 +1573,7 @@ const poolSchedulingLabel = computed(() => {
   const cfg = selectedProviderConfig.value
 
   // No pool_advanced config at all: use default enabled presets count
-  if (!cfg) return `${DEFAULT_ENABLED_PRESETS.size} 维度`
+  if (!cfg) return `${defaultEnabledPresetCount(selectedProviderType.value)} 维度`
 
   const presets = Array.isArray(cfg.scheduling_presets) ? cfg.scheduling_presets : []
   const presetLabels = presetLabelsByName.value
@@ -2008,7 +1609,7 @@ const poolSchedulingLabel = computed(() => {
   if (lruEnabled && stickyEnabled) return 'LRU + 粘性'
   if (lruEnabled) return 'LRU'
   if (!cfg.scheduling_mode && (cfg.lru_enabled === null || cfg.lru_enabled === undefined)) {
-    return `${DEFAULT_ENABLED_PRESETS.size} 维度`
+    return `${defaultEnabledPresetCount(selectedProviderType.value)} 维度`
   }
   if (stickyEnabled) return '粘性'
   return '随机'
@@ -2020,8 +1621,6 @@ const selectedProviderType = computed(() => {
   const fromOverview = selectedProviderOverview.value?.provider_type
   return String(fromOverview || '').trim().toLowerCase()
 })
-
-const showCodexStatsModeToggle = computed(() => selectedProviderType.value === 'codex')
 
 const selectedProviderStatusText = computed(() => {
   if (!selectedProviderId.value) return ''
@@ -2105,9 +1704,9 @@ const showAccountQuotaColumn = computed(() => {
 const desktopColumnWidths = computed(() => {
   if (showAccountQuotaColumn.value) {
     return {
-      name: '21%',
+      name: '19%',
       quota: '18%',
-      stats: '13%',
+      stats: '15%',
       imported: '10%',
       lastUsed: '8%',
       score: '9%',
@@ -2140,14 +1739,17 @@ async function selectProvider(
   hasHydratedInitialProviderSelection = true
   selectedProviderId.value = id
   selectedProviderData.value = null
-  endpointEditDialogOpen.value = false
-  providerEndpointsForEdit.value = []
+  showSchedulingDialog.value = false
+  showAdvancedDialog.value = false
+  resetPoolKeySelection(true)
+  providerDrawerOpen.value = false
   editingKeyDetail.value = null
   showAccountBatchDialog.value = false
+  keyBatchEditDialogOpen.value = false
+  keyBatchEditKeyIds.value = []
   keyPermissionsDialogOpen.value = false
   keyFormDialogOpen.value = false
   oauthKeyEditDialogOpen.value = false
-  closeProviderProxyPopovers()
   proxyDesktopPopoverOpenKeyId.value = null
   proxyMobilePopoverOpenKeyId.value = null
   scoreDesktopPopoverOpenKeyId.value = null
@@ -2167,6 +1769,7 @@ async function selectProvider(
     clearTimeout(keysSearchDebounceTimer)
     keysSearchDebounceTimer = null
   }
+  keysSearchPending.value = false
   keysLoadedOnce.value = false
   resetKeyPage(currentPage.value, pageSize.value)
   const keysTask = loadKeys({ cacheTtlMs: options.cacheTtlMs ?? 0 })
@@ -2176,15 +1779,23 @@ async function selectProvider(
   if (requestId !== selectProviderRequestId) return
 }
 
-async function loadProviderData(id: string) {
+async function loadProviderData(id: string, options: { preserveOnError?: boolean } = {}) {
   const requestId = ++providerDataRequestId
   try {
     const providerData = await getProvider(id)
     if (requestId !== providerDataRequestId || selectedProviderId.value !== id) return
-    selectedProviderData.value = providerData
+    if (selectedProviderData.value?.id === providerData.id) {
+      Object.assign(selectedProviderData.value, providerData)
+    } else {
+      selectedProviderData.value = providerData
+    }
   } catch {
     if (requestId !== providerDataRequestId || selectedProviderId.value !== id) return
-    selectedProviderData.value = null
+    if (options.preserveOnError) {
+      showWarning('同步 Provider 详情失败，已保留当前数据')
+    } else {
+      selectedProviderData.value = null
+    }
   }
 }
 
@@ -2199,18 +1810,75 @@ function createEmptyKeyPage(page = 1, pageSizeValue = 50): PoolKeysPageResponse 
 
 const keyPage = ref<PoolKeysPageResponse>(createEmptyKeyPage())
 const keysLoading = ref(false)
+const poolKeySelectionBusy = computed(() => keysLoading.value || keysSearchPending.value)
 const keysLoadedOnce = ref(false)
+const poolKeyPageItems = computed(() => keyPage.value.keys)
+const poolKeyFilteredTotal = computed(() => keyPage.value.total)
+const {
+  selectedIds: selectedPoolKeyIds,
+  selectedIdSet: selectedPoolKeyIdSet,
+  selectedCount: selectedKeyCount,
+  selectAllFiltered: selectAllFilteredPoolKeys,
+  isAllFilteredSelected: isAllFilteredPoolKeysSelected,
+  isCurrentPageFullySelected: isCurrentPoolKeyPageFullySelected,
+  rememberItems: rememberPoolKeys,
+  knownItemsById: knownPoolKeysById,
+  resetSelection: resetPoolKeySelection,
+  toggleOne: togglePoolKeySelection,
+  toggleSelectFiltered: toggleSelectFilteredPoolKeys,
+  toggleSelectCurrentPage: toggleCurrentPoolKeyPage,
+} = useBatchSelection<PoolKeyDetail>({
+  pageItems: poolKeyPageItems,
+  filteredTotal: poolKeyFilteredTotal,
+  getItemId: key => key.key_id,
+})
+const selectedKeyCountLabel = computed(() => legacyT(`已选 ${selectedKeyCount.value} 个`))
+const selectedPoolKeys = computed(() => selectedPoolKeyIds.value
+  .map(keyId => knownPoolKeysById.value[keyId])
+  .filter((key): key is PoolKeyDetail => Boolean(key)))
+const selectedOnCurrentPoolKeyPageCount = computed(() => poolKeyPageItems.value
+  .filter(key => selectedPoolKeyIdSet.value.has(key.key_id)).length)
+const isCurrentPoolKeyPagePartiallySelected = computed(() => (
+  selectedOnCurrentPoolKeyPageCount.value > 0
+  && !isCurrentPoolKeyPageFullySelected.value
+))
+
+watch(poolKeyPageItems, (keys) => rememberPoolKeys(keys), { immediate: true })
+
+function isPoolKeySelected(keyId: string): boolean {
+  return selectAllFilteredPoolKeys.value || selectedPoolKeyIdSet.value.has(keyId)
+}
+
+function toggleAllFilteredPoolKeys(): void {
+  if (poolKeySelectionBusy.value || keyPage.value.total === 0) return
+  toggleSelectFilteredPoolKeys(!isAllFilteredPoolKeysSelected.value)
+}
+
+function getPoolKeyRowClass(keyId: string): string {
+  return [
+    keyUiStateMap.value[keyId]?.rowClass || '',
+    isPoolKeySelected(keyId) ? 'bg-primary/5' : '',
+  ].filter(Boolean).join(' ')
+}
+
 const refreshingCurrentPageQuota = ref(false)
 const searchQuery = ref(restoredViewState.search)
 const statusFilter = ref(restoredViewState.status)
+const poolKeySelectionFilters = computed<PoolKeySelectionRequest>(() => {
+  const search = searchQuery.value.trim()
+  return {
+    ...(search ? { search } : {}),
+    status: statusFilter.value,
+  }
+})
 const currentPage = ref(restoredViewState.page)
 const pageSize = ref(restoredViewState.pageSize)
 const sortBy = ref<PoolManagementSortBy | null>(restoredViewState.sortBy)
 const sortOrder = ref<PoolManagementSortOrder>(restoredViewState.sortOrder)
-const poolStatsMode = ref<PoolManagementStatsMode>(restoredViewState.statsMode)
 const hasPoolKeyFilters = computed(() => searchQuery.value.trim().length > 0 || statusFilter.value !== 'all')
 const MANUAL_QUOTA_REFRESH_COOLDOWN_SECONDS = 5 * 60
 const refreshingOAuthKeyId = ref<string | null>(null)
+const consumingCodexResetCreditKeyId = ref<string | null>(null)
 const resettingCycleKeyId = ref<string | null>(null)
 const savingProxyKeyId = ref<string | null>(null)
 const proxyDesktopPopoverOpenKeyId = ref<string | null>(null)
@@ -2225,17 +1893,19 @@ const prioritySavingKeyId = ref<string | null>(null)
 
 const keyPermissionsDialogOpen = ref(false)
 const keyFormDialogOpen = ref(false)
+const keyBatchEditDialogOpen = ref(false)
+const keyBatchEditKeyIds = ref<string[]>([])
 const oauthKeyEditDialogOpen = ref(false)
 const editingKeyDetail = ref<PoolKeyDetail | null>(null)
 
-function togglePoolStatsMode() {
-  poolStatsMode.value = poolStatsMode.value === 'current_cycle'
-    ? 'account_total'
-    : 'current_cycle'
-}
-
 function clearPoolKeyFilters() {
   if (!hasPoolKeyFilters.value) return
+  resetPoolKeySelection(true)
+  if (keysSearchDebounceTimer !== null) {
+    clearTimeout(keysSearchDebounceTimer)
+    keysSearchDebounceTimer = null
+  }
+  keysSearchPending.value = false
   suppressFiltersWatch = true
   searchQuery.value = ''
   statusFilter.value = 'all'
@@ -2299,18 +1969,6 @@ watch(
 )
 
 watch(
-  () => readPoolManagementViewState(
-    { statsMode: getQueryValue('statsMode') },
-    poolManagementViewStorage,
-  ).statsMode,
-  (value) => {
-    if (poolStatsMode.value === value) return
-    poolStatsMode.value = value
-  },
-  { immediate: true },
-)
-
-watch(
   () => getQueryValue('providerId'),
   (value) => {
     if (overviewLoading.value) return
@@ -2326,8 +1984,8 @@ watch(
 )
 
 watch(
-  [selectedProviderId, searchQuery, statusFilter, currentPage, pageSize, sortBy, sortOrder, poolStatsMode],
-  ([providerId, search, status, page, pageSizeValue, sortByValue, sortOrderValue, statsMode]) => {
+  [selectedProviderId, searchQuery, statusFilter, currentPage, pageSize, sortBy, sortOrder],
+  ([providerId, search, status, page, pageSizeValue, sortByValue, sortOrderValue]) => {
     const nextState: PoolManagementViewState = {
       providerId,
       search,
@@ -2336,7 +1994,7 @@ watch(
       pageSize: pageSizeValue,
       sortBy: sortByValue,
       sortOrder: sortOrderValue,
-      statsMode: statsMode as PoolManagementStatsMode,
+      statsMode: 'current_cycle',
     }
     patchQuery(buildPoolManagementQueryPatch(nextState))
     writePoolManagementViewState(nextState, poolManagementViewStorage)
@@ -2346,6 +2004,8 @@ watch(
 interface QuotaProgressItem {
   label: string
   remainingPercent: number
+  numericOnly?: boolean
+  sortOrder?: number
   detail?: string
   resetAtSeconds?: number | null
   resetSeconds?: number | null
@@ -2353,18 +2013,14 @@ interface QuotaProgressItem {
   allowDynamicReset?: boolean
 }
 
-interface PoolCodexCycleStatsRow {
-  key: PoolStatsMetric['key']
+interface QuotaProgressDisplayItem {
   label: string
-  fiveH: PoolStatsMetric
-  weekly: PoolStatsMetric
-}
-
-const CODEX_CYCLE_STAT_KEYS: Array<PoolStatsMetric['key']> = ['request_count', 'total_tokens', 'total_cost_usd']
-const CODEX_CYCLE_STAT_LABELS: Record<PoolStatsMetric['key'], string> = {
-  request_count: '请求',
-  total_tokens: 'Token',
-  total_cost_usd: '费用',
+  remainingPercent: number
+  resetText: string
+  meterText: string
+  barClass: string
+  meterClass: string
+  numericOnly?: boolean
 }
 
 type PoolKeyUiState = {
@@ -2394,6 +2050,24 @@ const quotaProgressMap = computed<Record<string, QuotaProgressItem[]>>(() => {
   const map: Record<string, QuotaProgressItem[]> = {}
   for (const key of keyPage.value.keys) {
     map[key.key_id] = parseQuotaProgressItems(key)
+  }
+  return map
+})
+
+const quotaProgressDisplayMap = computed<Record<string, QuotaProgressDisplayItem[]>>(() => {
+  const map: Record<string, QuotaProgressDisplayItem[]> = {}
+  for (const key of keyPage.value.keys) {
+    map[key.key_id] = (quotaProgressMap.value[key.key_id] || []).map(item => ({
+      label: getQuotaProgressLabel(item.label),
+      remainingPercent: item.remainingPercent,
+      resetText: getQuotaProgressResetDisplayText(item),
+      meterText: item.numericOnly
+        ? item.detail || formatQuotaValue(item.remainingPercent)
+        : getQuotaProgressMeterDisplayText(item),
+      barClass: getQuotaRemainingBarColorByRemaining(item.remainingPercent),
+      meterClass: getQuotaRemainingClassByRemaining(item.remainingPercent),
+      numericOnly: item.numericOnly,
+    }))
   }
   return map
 })
@@ -2430,7 +2104,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
         : '',
       importedAtRelative: formatPoolKeyImportedAt(key),
       lastUsedRelative: key.last_used_at ? formatRelativeTime(key.last_used_at) : '-',
-      statsDisplay: buildPoolStatsDisplay(key, selectedProviderType.value, poolStatsMode.value),
+      statsDisplay: buildPoolStatsDisplay(key, selectedProviderType.value, 'current_cycle'),
       mobileTagItems: getMobileTagItems(key),
       mobileActionIds: splitPoolMobileActions({
         canDownloadOrCopy: true,
@@ -2447,7 +2121,7 @@ const keyUiStateMap = computed<Record<string, PoolKeyUiState>>(() => {
 
 function getPoolKeyStatsDisplay(key: PoolKeyDetail): PoolStatsDisplay {
   return keyUiStateMap.value[key.key_id]?.statsDisplay
-    ?? buildPoolStatsDisplay(key, selectedProviderType.value, poolStatsMode.value)
+    ?? buildPoolStatsDisplay(key, selectedProviderType.value, 'current_cycle')
 }
 
 function isPoolKeyCycleStatsDisplay(key: PoolKeyDetail): boolean {
@@ -2457,39 +2131,6 @@ function isPoolKeyCycleStatsDisplay(key: PoolKeyDetail): boolean {
 function getPoolKeyCycleStatsGroups(key: PoolKeyDetail): PoolCodexCycleStatsGroup[] {
   const display = getPoolKeyStatsDisplay(key)
   return display.kind === 'codex_cycle' ? display.groups : []
-}
-
-function createMissingCycleMetric(key: PoolStatsMetric['key']): PoolStatsMetric {
-  return {
-    key,
-    label: CODEX_CYCLE_STAT_LABELS[key],
-    value: '—',
-    missing: true,
-  }
-}
-
-function findCycleMetric(
-  group: PoolCodexCycleStatsGroup | undefined,
-  key: PoolStatsMetric['key'],
-): PoolStatsMetric {
-  return group?.metrics.find(metric => metric.key === key) ?? createMissingCycleMetric(key)
-}
-
-function getPoolKeyCycleStatsRows(key: PoolKeyDetail): PoolCodexCycleStatsRow[] {
-  const groups = getPoolKeyCycleStatsGroups(key)
-  const fiveHGroup = groups.find(group => group.code === '5h')
-  const weeklyGroup = groups.find(group => group.code === 'weekly')
-
-  return CODEX_CYCLE_STAT_KEYS.map((metricKey) => {
-    const fiveH = findCycleMetric(fiveHGroup, metricKey)
-    const weekly = findCycleMetric(weeklyGroup, metricKey)
-    return {
-      key: metricKey,
-      label: CODEX_CYCLE_STAT_LABELS[metricKey],
-      fiveH,
-      weekly,
-    }
-  })
 }
 
 function getPoolKeyAccountStatsMetrics(key: PoolKeyDetail): PoolStatsMetric[] {
@@ -2522,28 +2163,185 @@ function resetKeyPage(page = currentPage.value, pageSizeValue = pageSize.value):
 }
 
 function refreshOverviewInBackground(): void {
-  void loadOverview()
+  void loadOverview({ silent: true })
+}
+
+function clampActiveKeyCount(current: unknown, total: unknown, delta: number): number {
+  const currentValue = Number(current)
+  const nextValue = Math.max(0, (Number.isFinite(currentValue) ? currentValue : 0) + delta)
+  const totalValue = Number(total)
+  if (!Number.isFinite(totalValue)) return nextValue
+  return Math.min(Math.max(0, totalValue), nextValue)
+}
+
+function isManualInactiveReason(reason: { code?: string; source?: string }): boolean {
+  const code = String(reason.code || '').trim().toLowerCase()
+  return code === 'inactive' || code === 'manual_disabled'
+}
+
+function applyPoolKeyActiveState(key: PoolKeyDetail, nextStatus: boolean): void {
+  const previousStatus = key.is_active
+  key.is_active = nextStatus
+
+  if (nextStatus) {
+    const remainingReasons = (key.scheduling_reasons ?? []).filter(
+      reason => !isManualInactiveReason(reason),
+    )
+    key.scheduling_reasons = remainingReasons
+    const remainingBlockingReason = remainingReasons.find(reason => reason.blocking)
+    if (remainingBlockingReason) {
+      key.scheduling_reason = remainingBlockingReason.code
+      key.scheduling_label = remainingBlockingReason.label
+      key.scheduling_status = remainingBlockingReason.code === 'cooldown' ? 'degraded' : 'blocked'
+    } else if (key.cooldown_reason) {
+      key.scheduling_reason = 'cooldown'
+      key.scheduling_label = '冷却中'
+      key.scheduling_status = 'degraded'
+    } else {
+      key.scheduling_reason = 'available'
+      key.scheduling_label = '可用'
+      key.scheduling_status = 'available'
+    }
+  } else {
+    key.scheduling_label = '已禁用'
+    key.scheduling_status = 'blocked'
+    key.scheduling_reason = 'inactive'
+    key.scheduling_reasons = [{
+      code: 'inactive',
+      label: '已禁用',
+      blocking: true,
+      source: 'manual',
+      ttl_seconds: null,
+      detail: null,
+    }]
+  }
+
+  if (previousStatus === nextStatus) return
+  const delta = nextStatus ? 1 : -1
+  const overview = poolProviders.value.find(item => item.provider_id === selectedProviderId.value)
+  if (overview) {
+    overview.active_keys = clampActiveKeyCount(overview.active_keys, overview.total_keys, delta)
+  }
+  if (selectedProviderData.value) {
+    selectedProviderData.value.active_keys = clampActiveKeyCount(
+      selectedProviderData.value.active_keys,
+      selectedProviderData.value.total_keys,
+      delta,
+    )
+  }
 }
 
 function applyQuotaRefreshResultToCurrentPage(result: Awaited<ReturnType<typeof refreshProviderQuota>>): void {
-  const successfulResults = Array.isArray(result.results)
-    ? result.results.filter((item) => item.status === 'success' && item.quota_snapshot)
-    : []
-  if (successfulResults.length === 0) return
+  keyPage.value.keys = mergePoolKeyQuotaSnapshots(keyPage.value.keys, result.results)
+}
 
-  const quotaByKeyId = new Map(successfulResults.map((item) => [item.key_id, item.quota_snapshot!]))
-  keyPage.value.keys = keyPage.value.keys.map((key) => {
-    const quotaSnapshot = quotaByKeyId.get(key.key_id)
-    if (!quotaSnapshot) return key
-    return {
-      ...key,
-      quota_updated_at: quotaSnapshot.updated_at ?? quotaSnapshot.observed_at ?? key.quota_updated_at ?? null,
-      status_snapshot: {
-        ...(key.status_snapshot ?? {}),
-        quota: quotaSnapshot,
-      },
-    }
+function getCodexResetCredits(key: PoolKeyDetail) {
+  if (getQuotaSnapshotProviderType(key) !== 'codex') return null
+
+  const snapshot = key.status_snapshot?.quota?.reset_credits
+  const snapshotUpdatedAt = key.status_snapshot?.quota?.updated_at
+  const snapshotDisplay = snapshot
+    ? {
+        ...(typeof snapshotUpdatedAt === 'number' ? { updated_at: snapshotUpdatedAt } : {}),
+        reset_credits: snapshot,
+      }
+    : null
+  return mergeCodexQuotaDisplays(snapshotDisplay, key.upstream_metadata?.codex)?.reset_credits ?? null
+}
+
+function getCodexCredentialGeneration(key: PoolKeyDetail): string | null | undefined {
+  const codex = key.upstream_metadata?.codex
+  return codex && typeof codex === 'object'
+    ? codex.credential_generation?.trim() || null
+    : undefined
+}
+
+function getPendingCodexResetCreditIdempotencyKey(key: PoolKeyDetail): string | null {
+  const codex = key.upstream_metadata?.codex
+  const serverReservation = getCodexResetCreditReservationIdempotencyKey(codex)
+  if (serverReservation) return serverReservation
+  const generation = getCodexCredentialGeneration(key)
+  return generation === undefined
+    ? null
+    : readPendingCodexResetCreditIdempotencyKey(key.key_id, generation)
+}
+
+function getCodexResetCreditCountText(key: PoolKeyDetail): string | null {
+  const count = getCodexResetCreditAvailableCount(getCodexResetCredits(key))
+  return count === null && !getPendingCodexResetCreditIdempotencyKey(key)
+    ? null
+    : formatCodexResetCreditCount(count)
+}
+
+function getCodexResetCreditItemTexts(key: PoolKeyDetail): string[] {
+  return getVisibleCodexResetCreditItems(getCodexResetCredits(key), undefined, 3)
+    .map(item => `${item.displayKey} ${formatCodexResetCreditExpiresAt(item.expiresAt)}`)
+}
+
+function canConsumeCodexResetCredit(key: PoolKeyDetail): boolean {
+  return getQuotaSnapshotProviderType(key) === 'codex'
+    && getCodexCredentialGeneration(key) !== undefined
+    && (getPendingCodexResetCreditIdempotencyKey(key) !== null
+      || (getCodexResetCreditAvailableCount(getCodexResetCredits(key)) ?? 0) > 0)
+    && consumingCodexResetCreditKeyId.value === null
+}
+
+async function handleConsumeCodexResetCredit(key: PoolKeyDetail): Promise<void> {
+  if (!canConsumeCodexResetCredit(key)) return
+  const generation = getCodexCredentialGeneration(key)
+  if (generation === undefined) return
+  const pendingIdempotencyKey = getPendingCodexResetCreditIdempotencyKey(key)
+  const confirmed = await confirm({
+    title: '确认使用 Codex 重置机会',
+    message: pendingIdempotencyKey
+      ? '将继续确认上次尚未完成的 Codex 重置请求。'
+      : '将消耗 1 次 Codex 重置机会，完成后自动刷新账号额度。',
+    confirmText: '确认重置',
+    cancelText: '取消',
+    variant: 'warning',
   })
+  if (!confirmed) return
+
+  consumingCodexResetCreditKeyId.value = key.key_id
+  try {
+    const idempotencyKey = pendingIdempotencyKey
+      || readPendingCodexResetCreditIdempotencyKey(key.key_id, generation)
+      || createCodexResetCreditIdempotencyKey()
+    rememberPendingCodexResetCreditIdempotencyKey(key.key_id, idempotencyKey, generation)
+    const result = await consumeCodexResetCredit(key.key_id, {
+      idempotency_key: idempotencyKey,
+      expected_credential_generation: generation,
+    })
+    clearPendingCodexResetCreditIdempotencyKeyForOutcome(key.key_id, result.outcome)
+    keyPage.value.keys = mergePoolKeyQuotaSnapshots(keyPage.value.keys, [{
+      key_id: result.key_id,
+      key_name: key.key_name,
+      status: result.refresh_status === 'success' ? 'success' : result.status as 'success',
+      metadata: result.metadata,
+      quota_snapshot: result.quota_snapshot,
+    }])
+    if (result.outcome === 'reset' || result.outcome === 'already_redeemed') {
+      success('Codex 重置机会已使用，账号额度已刷新')
+    } else {
+      showWarning(result.message || '重置请求已处理，请查看最新额度')
+    }
+  } catch (err: unknown) {
+    const responseData = typeof err === 'object' && err !== null && 'response' in err
+      ? (err as { response?: { data?: Record<string, unknown> } }).response?.data
+      : undefined
+    if (responseData?.outcome === 'credential_changed') {
+      clearPendingCodexResetCreditIdempotencyKey(key.key_id)
+    } else if (typeof responseData?.active_idempotency_key === 'string') {
+      rememberPendingCodexResetCreditIdempotencyKey(
+        key.key_id,
+        responseData.active_idempotency_key,
+        generation,
+      )
+    }
+    showError(parseApiError(err, 'Codex 重置机会使用失败'))
+  } finally {
+    consumingCodexResetCreditKeyId.value = null
+  }
 }
 
 function normalizeQuotaUpdatedAt(raw: number | null | undefined): number | null {
@@ -2590,7 +2388,7 @@ const currentPageQuotaRefreshStats = computed(() => {
 })
 
 async function refreshCurrentPageQuotaInBackground(
-  options: { silent?: boolean; reloadAfter?: boolean } = {},
+  options: { silent?: boolean; reloadAfter?: boolean | 'silent' } = {},
 ): Promise<boolean> {
   if (!selectedProviderId.value || !quotaRefreshSupported.value) return false
 
@@ -2620,7 +2418,7 @@ async function refreshCurrentPageQuotaInBackground(
 
     // 刷新当前页数据，展示最新额度与状态
     if (selectedProviderId.value === providerId && options.reloadAfter !== false) {
-      await loadKeys()
+      await loadKeys({ silent: options.reloadAfter === 'silent' })
     }
 
     if (!options.silent) {
@@ -2667,7 +2465,7 @@ async function refreshCurrentPage() {
   }
 }
 
-async function loadKeys(options: { cacheTtlMs?: number } = {}) {
+async function loadKeys(options: { cacheTtlMs?: number, silent?: boolean } = {}) {
   if (!selectedProviderId.value) return
   const requestId = ++keysRequestId
   const providerId = selectedProviderId.value
@@ -2676,7 +2474,9 @@ async function loadKeys(options: { cacheTtlMs?: number } = {}) {
   const search = searchQuery.value || undefined
   const status = statusFilter.value
   const sortByValue = sortBy.value || undefined
-  keysLoading.value = true
+  if (!options.silent) {
+    keysLoading.value = true
+  }
   try {
     const nextPage = await listPoolKeys(providerId, {
       page,
@@ -2702,9 +2502,13 @@ async function loadKeys(options: { cacheTtlMs?: number } = {}) {
     keysLoadedOnce.value = true
   } catch (err) {
     if (requestId !== keysRequestId || selectedProviderId.value !== providerId) return
-    resetKeyPage(page, pageSizeValue)
-    keysLoadedOnce.value = true
-    showError(parseApiError(err))
+    if (!options.silent) {
+      resetKeyPage(page, pageSizeValue)
+      keysLoadedOnce.value = true
+      showError(parseApiError(err))
+    } else {
+      showWarning(parseApiError(err, '同步账号列表失败'))
+    }
   } finally {
     if (requestId === keysRequestId) {
       keysLoading.value = false
@@ -2712,12 +2516,22 @@ async function loadKeys(options: { cacheTtlMs?: number } = {}) {
   }
 }
 
-watch([currentPage, pageSize], () => {
+watch(currentPage, () => {
+  void loadKeys({ cacheTtlMs: POOL_KEYS_CACHE_TTL_MS })
+})
+
+watch(pageSize, () => {
   void loadKeys({ cacheTtlMs: POOL_KEYS_CACHE_TTL_MS })
 })
 
 watch(statusFilter, () => {
   if (suppressFiltersWatch) return
+  resetPoolKeySelection(true)
+  if (keysSearchDebounceTimer !== null) {
+    clearTimeout(keysSearchDebounceTimer)
+    keysSearchDebounceTimer = null
+  }
+  keysSearchPending.value = false
   currentPage.value = 1
   void loadKeys({ cacheTtlMs: POOL_KEYS_CACHE_TTL_MS })
 })
@@ -2732,12 +2546,15 @@ watch([sortBy, sortOrder], () => {
 
 watch(searchQuery, () => {
   if (suppressFiltersWatch) return
+  resetPoolKeySelection(true)
   currentPage.value = 1
   if (keysSearchDebounceTimer !== null) {
     clearTimeout(keysSearchDebounceTimer)
   }
+  keysSearchPending.value = true
   keysSearchDebounceTimer = window.setTimeout(() => {
     keysSearchDebounceTimer = null
+    keysSearchPending.value = false
     void loadKeys({ cacheTtlMs: POOL_KEYS_CACHE_TTL_MS })
   }, 300)
 })
@@ -2761,6 +2578,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     credential_kind: key.credential_kind ?? null,
     runtime_auth_kind: key.runtime_auth_kind ?? null,
     oauth_managed: key.oauth_managed ?? undefined,
+    agent_identity: key.agent_identity ?? undefined,
     oauth_header_auth: key.oauth_header_auth ?? undefined,
     can_refresh_oauth: key.can_refresh_oauth ?? undefined,
     can_export_oauth: key.can_export_oauth ?? undefined,
@@ -2769,6 +2587,7 @@ function toEndpointApiKey(key: PoolKeyDetail): EndpointAPIKey {
     rate_multipliers: key.rate_multipliers ?? null,
     internal_priority: key.internal_priority ?? 50,
     rpm_limit: key.rpm_limit ?? null,
+    concurrent_limit: key.concurrent_limit ?? null,
     allowed_models: key.allowed_models ?? null,
     capabilities: key.capabilities ?? null,
     cache_ttl_minutes: key.cache_ttl_minutes ?? 5,
@@ -2890,9 +2709,24 @@ function handleKeyPermissions(key: PoolKeyDetail) {
   keyPermissionsDialogOpen.value = true
 }
 
+function openKeyBatchEditDialog(keyIds: string[]): void {
+  keyBatchEditKeyIds.value = [...new Set(keyIds)]
+  keyBatchEditDialogOpen.value = keyBatchEditKeyIds.value.length > 0
+}
+
+function closeKeyBatchEditDialog(): void {
+  keyBatchEditDialogOpen.value = false
+  keyBatchEditKeyIds.value = []
+}
+
+async function handleKeyBatchEditSaved(): Promise<void> {
+  resetPoolKeySelection(true)
+  await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
+}
+
 async function handleDialogSaved() {
   editingKeyDetail.value = null
-  await loadKeys()
+  await loadKeys({ silent: true })
 }
 
 function closeKeyFormDialog() {
@@ -2995,6 +2829,7 @@ async function handleDeleteKey(key: PoolKeyDetail) {
   try {
     await deleteEndpointKey(key.key_id)
     success('账号已删除')
+    togglePoolKeySelection(key.key_id, false)
     // 乐观更新：直接从本地列表移除，避免等待网络重载
     keyPage.value.keys = keyPage.value.keys.filter(k => k.key_id !== key.key_id)
     keyPage.value.total = Math.max(0, keyPage.value.total - 1)
@@ -3068,7 +2903,7 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
     if (target) {
       target.oauth_expires_at = refreshedExpiresAt
     }
-    await loadKeys()
+    await loadKeys({ silent: true })
     if (refreshedExpiresAt != null) {
       const reloadedTarget = keyPage.value.keys.find(k => k.key_id === key.key_id)
       if (
@@ -3092,7 +2927,7 @@ async function handleRefreshOAuth(key: PoolKeyDetail) {
     }
   } catch (err) {
     showError(parseApiError(err, 'Token 刷新失败'))
-    await loadKeys()
+    await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
   } finally {
     refreshingOAuthKeyId.value = null
   }
@@ -3104,8 +2939,20 @@ async function clearCooldown(keyId: string) {
   try {
     const res = await clearPoolCooldown(selectedProviderId.value, keyId)
     success(res.message)
-    await loadKeys()
-    refreshOverviewInBackground()
+    const key = keyPage.value.keys.find(item => item.key_id === keyId)
+    if (key) {
+      key.cooldown_reason = null
+      key.cooldown_ttl_seconds = null
+      if (key.scheduling_reason === 'cooldown') {
+        key.scheduling_reason = key.is_active ? 'available' : 'inactive'
+        key.scheduling_status = key.is_active ? 'available' : 'blocked'
+        key.scheduling_label = key.is_active ? '可用' : '已禁用'
+      }
+      key.scheduling_reasons = key.scheduling_reasons?.filter(
+        item => item.code !== 'cooldown',
+      )
+    }
+    await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
   } catch (err) {
     showError(parseApiError(err))
   }
@@ -3125,7 +2972,17 @@ async function handleResetCycleStats(key: PoolKeyDetail) {
   try {
     const result = await resetProviderKeyCycleStats(key.key_id)
     success(result.message || '周期统计已重置')
-    await loadKeys()
+    if (key.status_snapshot?.quota?.windows) {
+      const resetAt = Number(result.reset_at)
+      key.status_snapshot = {
+        ...key.status_snapshot,
+        quota: {
+          ...key.status_snapshot.quota,
+          windows: resetCodexCycleUsageWindows(key.status_snapshot.quota.windows, resetAt),
+        },
+      }
+    }
+    await loadKeys({ silent: true })
   } catch (err) {
     showError(parseApiError(err, '重置周期统计失败'))
   } finally {
@@ -3139,21 +2996,9 @@ async function toggleKeyActive(key: PoolKeyDetail) {
   try {
     const nextStatus = !key.is_active
     await updateProviderKey(key.key_id, { is_active: nextStatus })
-    key.is_active = nextStatus
-    if (nextStatus) {
-      delete key.scheduling_label
-      delete key.scheduling_status
-      if (key.scheduling_reason === 'manual_disabled') {
-        delete key.scheduling_reason
-      }
-    } else {
-      key.scheduling_label = '禁用'
-      key.scheduling_status = 'blocked'
-      key.scheduling_reason = 'manual_disabled'
-    }
+    applyPoolKeyActiveState(key, nextStatus)
+    await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
     success(nextStatus ? '账号已启用' : '账号已停用')
-    await loadKeys()
-    refreshOverviewInBackground()
   } catch (err) {
     showError(parseApiError(err))
   } finally {
@@ -3165,37 +3010,88 @@ async function toggleKeyActive(key: PoolKeyDetail) {
 const showImportDialog = ref(false)
 const showSchedulingDialog = ref(false)
 const showAdvancedDialog = ref(false)
+const providerDrawerOpen = ref(false)
+const providerDrawerMounted = ref(false)
 const providerEditDialogOpen = ref(false)
 const providerToEdit = ref<ProviderWithEndpointsSummary | null>(null)
-const endpointEditDialogOpen = ref(false)
-const providerEndpointsForEdit = ref<ProviderEndpoint[]>([])
 const showAccountBatchDialog = ref(false)
-const providerProxyMobilePopoverOpen = ref(false)
-const providerProxyDesktopPopoverOpen = ref(false)
-const savingProviderProxy = ref(false)
+const pendingAccountBatchAction = ref<PoolBatchActionValue | null>(null)
 const togglingProviderStatus = ref(false)
-let endpointEditRequestId = 0
 
-function openSchedulingDialog() {
-  showSchedulingDialog.value = true
+async function ensureSelectedProviderDetail(): Promise<boolean> {
+  const providerId = selectedProviderId.value
+  if (!providerId) return false
+  if (selectedProviderData.value?.id !== providerId) {
+    await loadProviderData(providerId, { preserveOnError: true })
+  }
+  if (selectedProviderData.value?.id === providerId) return true
+  showWarning('Provider 详情尚未加载，无法编辑调度配置')
+  return false
 }
 
-async function openProviderEditDialog(): Promise<void> {
+async function openSchedulingDialog() {
+  if (await ensureSelectedProviderDetail()) {
+    showSchedulingDialog.value = true
+  }
+}
+
+async function openAdvancedDialog() {
+  if (await ensureSelectedProviderDetail()) {
+    showAdvancedDialog.value = true
+  }
+}
+
+function openAccountBatchDialog(action: PoolBatchActionValue = 'refresh_quota'): void {
+  if (!selectedProviderId.value || selectedKeyCount.value === 0) return
+  pendingAccountBatchAction.value = action
+  showAccountBatchDialog.value = true
+}
+
+watch(showAccountBatchDialog, (open) => {
+  if (!open) pendingAccountBatchAction.value = null
+})
+
+function openProviderDrawer(): void {
+  prefetchProviderDetailDrawer()
+  if (!selectedProviderId.value) return
+  providerDrawerMounted.value = true
+  providerDrawerOpen.value = true
+}
+
+async function handleProviderDrawerRefresh(): Promise<void> {
   const providerId = selectedProviderId.value
+  if (!providerId) return
+
+  await Promise.all([
+    loadKeys({ silent: true }),
+    loadOverview({ silent: true }),
+    loadProviderData(providerId, { preserveOnError: true }),
+  ])
+  resetPoolKeySelection(true)
+}
+
+async function openProviderEditDialog(provider?: ProviderWithEndpointsSummary): Promise<void> {
+  const providerId = provider?.id || selectedProviderId.value
   if (!providerId) return
 
   try {
     const latest = await getProvider(providerId)
     if (selectedProviderId.value !== providerId) return
-    selectedProviderData.value = latest
-    providerToEdit.value = latest
+    if (selectedProviderData.value?.id === latest.id) {
+      Object.assign(selectedProviderData.value, latest)
+      providerToEdit.value = selectedProviderData.value
+    } else {
+      selectedProviderData.value = latest
+      providerToEdit.value = latest
+    }
   } catch (err) {
     if (selectedProviderId.value !== providerId) return
-    if (!selectedProviderData.value) {
+    const fallbackProvider = provider ?? selectedProviderData.value
+    if (!fallbackProvider) {
       showError(parseApiError(err, '刷新提供商状态失败'))
       return
     }
-    providerToEdit.value = selectedProviderData.value
+    providerToEdit.value = fallbackProvider
   }
 
   providerEditDialogOpen.value = true
@@ -3203,141 +3099,22 @@ async function openProviderEditDialog(): Promise<void> {
 
 async function handleProviderEditSaved(updatedProvider: ProviderWithEndpointsSummary): Promise<void> {
   if (selectedProviderId.value === updatedProvider.id) {
-    selectedProviderData.value = updatedProvider
-    providerToEdit.value = updatedProvider
+    if (selectedProviderData.value) {
+      Object.assign(selectedProviderData.value, updatedProvider)
+      providerToEdit.value = selectedProviderData.value
+    } else {
+      selectedProviderData.value = updatedProvider
+      providerToEdit.value = updatedProvider
+    }
   }
   providerEditDialogOpen.value = false
-  await loadOverview()
+  await loadOverview({ silent: true })
 }
 
-async function openEndpointEditDialog(): Promise<void> {
-  const providerId = selectedProviderId.value
-  if (!providerId) return
-
-  const requestId = ++endpointEditRequestId
-  try {
-    const [provider, endpoints] = await Promise.all([
-      getProvider(providerId),
-      getProviderEndpoints(providerId),
-    ])
-    if (requestId !== endpointEditRequestId || selectedProviderId.value !== providerId) return
-    selectedProviderData.value = provider
-    providerEndpointsForEdit.value = endpoints
-    endpointEditDialogOpen.value = true
-  } catch (err) {
-    if (requestId !== endpointEditRequestId || selectedProviderId.value !== providerId) return
-    showError(parseApiError(err, '加载端点失败'))
-  }
-}
-
-async function handleEndpointEditSaved(): Promise<void> {
-  const providerId = selectedProviderId.value
-  if (!providerId) return
-
-  const requestId = ++endpointEditRequestId
-  try {
-    const [provider, endpoints] = await Promise.all([
-      getProvider(providerId),
-      getProviderEndpoints(providerId),
-    ])
-    if (requestId !== endpointEditRequestId || selectedProviderId.value !== providerId) return
-    selectedProviderData.value = provider
-    providerEndpointsForEdit.value = endpoints
-    await Promise.all([loadOverview(), loadKeys()])
-  } catch (err) {
-    if (requestId !== endpointEditRequestId || selectedProviderId.value !== providerId) return
-    showError(parseApiError(err, '刷新端点失败'))
-  }
-}
-
-function getProviderProxyNodeName(): string | null {
-  const nodeId = selectedProviderData.value?.proxy?.node_id
-  if (!nodeId) return null
-  const node = proxyNodesStore.nodes.find(n => n.id === nodeId)
-  return node ? node.name : `${nodeId.slice(0, 8)}...`
-}
-
-function getProviderProxyButtonTitle(): string {
-  const nodeName = getProviderProxyNodeName()
-  if (nodeName) return `提供商代理（当前: ${nodeName}）`
-  return '提供商代理（未设置）'
-}
-
-function closeProviderProxyPopovers(): void {
-  providerProxyMobilePopoverOpen.value = false
-  providerProxyDesktopPopoverOpen.value = false
-}
-
-function handleProviderProxyPopoverToggle(scope: 'mobile' | 'desktop', open: boolean): void {
-  if (scope === 'mobile') {
-    providerProxyMobilePopoverOpen.value = open
-    if (open) {
-      providerProxyDesktopPopoverOpen.value = false
-    }
-  } else {
-    providerProxyDesktopPopoverOpen.value = open
-    if (open) {
-      providerProxyMobilePopoverOpen.value = false
-    }
-  }
-  if (open) {
-    proxyNodesStore.ensureLoaded()
-    proxyDesktopPopoverOpenKeyId.value = null
-    proxyMobilePopoverOpenKeyId.value = null
-  }
-}
-
-async function setProviderProxy(nodeId: string): Promise<void> {
-  const providerId = selectedProviderId.value
-  if (!providerId) return
-  savingProviderProxy.value = true
-  try {
-    const updated = await updateProvider(providerId, {
-      proxy: { node_id: nodeId, enabled: true },
-    })
-    if (selectedProviderId.value === providerId) {
-      selectedProviderData.value = updated
-    }
-    closeProviderProxyPopovers()
-    success('提供商代理已设置')
-  } catch (err) {
-    showError(parseApiError(err, '设置提供商代理失败'))
-  } finally {
-    savingProviderProxy.value = false
-  }
-}
-
-async function clearProviderProxy(): Promise<void> {
-  const providerId = selectedProviderId.value
-  if (!providerId) return
-  savingProviderProxy.value = true
-  try {
-    const updated = await updateProvider(providerId, { proxy: null })
-    if (selectedProviderId.value === providerId) {
-      selectedProviderData.value = updated
-    }
-    closeProviderProxyPopovers()
-    success('提供商代理已清除')
-  } catch (err) {
-    showError(parseApiError(err, '清除提供商代理失败'))
-  } finally {
-    savingProviderProxy.value = false
-  }
-}
-
-function getProviderToggleButtonTitle(): string {
-  const active = selectedProviderData.value?.is_active !== false
-  return active ? '当前状态：已启用，点击禁用提供商' : '当前状态：已禁用，点击启用提供商'
-}
-
-function getProviderToggleButtonClass(): string {
-  return ''
-}
-
-async function toggleSelectedProviderStatus(): Promise<void> {
+async function toggleSelectedProviderStatus(provider?: ProviderWithEndpointsSummary): Promise<void> {
   if (togglingProviderStatus.value) return
   const providerId = selectedProviderId.value
-  const current = selectedProviderData.value
+  const current = provider?.id === providerId ? provider : selectedProviderData.value
   if (!providerId || !current) return
 
   const nextStatus = !current.is_active
@@ -3354,11 +3131,16 @@ async function toggleSelectedProviderStatus(): Promise<void> {
   togglingProviderStatus.value = true
   try {
     const updated = await updateProvider(providerId, { is_active: nextStatus })
-    if (selectedProviderId.value === providerId) {
-      selectedProviderData.value = updated
+    Object.assign(current, updated)
+    if (selectedProviderId.value === providerId && selectedProviderData.value !== current) {
+      if (selectedProviderData.value) {
+        Object.assign(selectedProviderData.value, updated)
+      } else {
+        selectedProviderData.value = updated
+      }
     }
     success(nextStatus ? '提供商已启用' : '提供商已禁用')
-    await loadOverview()
+    await loadOverview({ silent: true })
   } catch (err) {
     showError(parseApiError(err, nextStatus ? '启用提供商失败' : '禁用提供商失败'))
   } finally {
@@ -3367,14 +3149,15 @@ async function toggleSelectedProviderStatus(): Promise<void> {
 }
 
 async function handleAccountBatchChanged(): Promise<void> {
-  await Promise.all([loadKeys(), loadOverview()])
+  resetPoolKeySelection(true)
+  await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
 }
 
 async function handleAccountDialogSaved() {
   showImportDialog.value = false
-  await Promise.all([loadKeys(), loadOverview()])
+  await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
   // 导入账号后补一次静默额度刷新，避免新账号在列表里暂无额度信息
-  await refreshCurrentPageQuotaInBackground({ silent: true })
+  await refreshCurrentPageQuotaInBackground({ silent: true, reloadAfter: 'silent' })
 }
 
 // --- Formatting ---
@@ -3618,42 +3401,6 @@ function getMobileTagClass(item: PoolMobileTagItem): string {
   return 'border-border/60 bg-background/80 text-foreground/80'
 }
 
-function formatOAuthPlanType(planType: string): string {
-  const labelMap: Record<string, string> = {
-    plus: 'Plus',
-    pro: 'Pro',
-    free: 'Free',
-    paid: 'Paid',
-    team: 'Team',
-    enterprise: 'Enterprise',
-    ultra: 'Ultra',
-    'pro+': 'Pro+',
-    power: 'Power',
-    basic: 'Basic',
-    super: 'Super',
-    heavy: 'Heavy',
-  }
-  return labelMap[planType.toLowerCase()] || planType
-}
-
-function getOAuthPlanTypeClass(planType: string): string {
-  const classes: Record<string, string> = {
-    plus: 'border-green-500/50 text-green-600 dark:text-green-400',
-    pro: 'border-blue-500/50 text-blue-600 dark:text-blue-400',
-    free: 'border-primary/50 text-primary',
-    paid: 'border-blue-500/50 text-blue-600 dark:text-blue-400',
-    team: 'border-purple-500/50 text-purple-600 dark:text-purple-400',
-    enterprise: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
-    ultra: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
-    'pro+': 'border-purple-500/50 text-purple-600 dark:text-purple-400',
-    power: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
-    basic: 'border-primary/50 text-primary',
-    super: 'border-green-500/50 text-green-600 dark:text-green-400',
-    heavy: 'border-amber-500/50 text-amber-600 dark:text-amber-400',
-  }
-  return classes[planType.toLowerCase()] || ''
-}
-
 function getVisibleOAuthState(key: PoolKeyDetail) {
   return getOAuthStatusDisplayWithFallback(key, countdownTick.value)
 }
@@ -3741,6 +3488,7 @@ function getQuotaProgressLabel(label: string): string {
   if (label === '日') return '日'
   if (label === '5H') return '5H'
   if (label === '周') return '周'
+  if (label === '月') return '月'
   if (label === 'Spark5H') return 'Spark5H'
   if (label === 'Spark周') return 'Spark周'
   if (label === '最低') return '最低'
@@ -3749,7 +3497,7 @@ function getQuotaProgressLabel(label: string): string {
 }
 
 function getQuotaProgressCountdown(item: QuotaProgressItem) {
-  const staticResetLabels = ['日', '5H', '周', 'Spark5H', 'Spark周', 'Auto', 'Fast', 'Expert', 'Heavy', 'Grok 4.3', '生图']
+  const staticResetLabels = ['日', '5H', '周', '月', 'Spark5H', 'Spark周', 'Spark月', 'Auto', 'Fast', 'Expert', 'Heavy', 'Grok 4.3', '生图']
   if (!item.allowDynamicReset && !staticResetLabels.includes(item.label)) return null
   if (item.resetAtSeconds == null && item.resetSeconds == null) return null
   return getCodexResetCountdown(
@@ -3811,15 +3559,17 @@ function getQuotaLabelOrder(label: string): number {
   if (label === '日') return 5
   if (label === '5H') return 6
   if (label === '周') return 7
-  if (label === 'Spark5H') return 8
-  if (label === 'Spark周') return 9
-  if (label === 'Prompt') return 10
-  if (label === 'Flex') return 11
-  if (label === '剩余') return 12
-  if (label === '最低') return 13
-  if (label === '生图') return 14
-  if (label === '速率') return 15
-  if (label === '模型') return 16
+  if (label === '月') return 8
+  if (label === 'Spark5H') return 9
+  if (label === 'Spark周') return 10
+  if (label === 'Spark月') return 11
+  if (label === 'Prompt') return 12
+  if (label === 'Flex') return 13
+  if (label === '剩余') return 14
+  if (label === '最低') return 15
+  if (label === '生图') return 16
+  if (label === '速率') return 17
+  if (label === '模型') return 18
   return 20
 }
 
@@ -3987,27 +3737,24 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
   const providerType = getQuotaSnapshotProviderType(key)
 
   if (providerType === 'codex') {
-    const items: QuotaProgressItem[] = []
     const quotaResetAtSeconds = getQuotaSnapshotResetAtSeconds(quota)
     const quotaResetSeconds = getQuotaSnapshotResetSeconds(quota)
-    for (const [label, code] of [
-      ['5H', '5h'],
-      ['周', 'weekly'],
-      ['Spark5H', 'spark_5h'],
-      ['Spark周', 'spark_weekly'],
-    ] as const) {
-      const window = getQuotaSnapshotWindow(quota, code)
-      const remainingPercent = getQuotaWindowRemainingPercent(window)
-      if (remainingPercent == null) continue
-      items.push({
-        label,
-        remainingPercent,
-        resetAtSeconds: normalizeUnixSeconds(window?.reset_at ?? quotaResetAtSeconds ?? null),
-        resetSeconds: normalizeRemainingSeconds(window?.reset_seconds ?? quotaResetSeconds ?? null),
-        updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+    return (quota.windows ?? [])
+      .map((window): QuotaProgressItem | null => {
+        const presentation = getCodexQuotaWindowPresentation(window)
+        const remainingPercent = getQuotaWindowRemainingPercent(window)
+        if (!presentation || remainingPercent == null) return null
+        return {
+          label: presentation.label,
+          sortOrder: presentation.sortOrder,
+          remainingPercent,
+          resetAtSeconds: normalizeUnixSeconds(window.reset_at ?? quotaResetAtSeconds ?? null),
+          resetSeconds: normalizeRemainingSeconds(window.reset_seconds ?? quotaResetSeconds ?? null),
+          updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+          allowDynamicReset: true,
+        }
       })
-    }
-    return items
+      .filter((item): item is QuotaProgressItem => item != null)
   }
 
   if (providerType === 'kiro') {
@@ -4122,22 +3869,25 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
   }
 
   if (providerType === 'antigravity') {
-    const windows = getQuotaSnapshotWindowsByScope(quota, 'model')
+    const windows = getQuotaSnapshotWindowsByScope(quota, 'quota_group')
     if (windows.length === 0) return []
-
-    const remainingPercents = windows
-      .map(getQuotaWindowRemainingPercent)
-      .filter((value): value is number => value != null)
-    if (remainingPercents.length === 0) return []
-
-    return [{
-      label: '最低',
-      remainingPercent: Math.min(...remainingPercents),
-      detail: `${windows.length} 模型`,
-      resetAtSeconds: null,
-      resetSeconds: null,
-      updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
-    }]
+    return windows
+      .map((window, index): QuotaProgressItem | null => {
+        const remainingPercent = getQuotaWindowRemainingPercent(window)
+        if (remainingPercent == null) return null
+        const label = resolveAntigravityQuotaGroupLabel(window, t)
+        if (!label) return null
+        return {
+          label,
+          sortOrder: index,
+          remainingPercent,
+          resetAtSeconds: normalizeUnixSeconds(window.reset_at ?? quota.reset_at ?? null),
+          resetSeconds: normalizeRemainingSeconds(window.reset_seconds ?? quota.reset_seconds ?? null),
+          updatedAtSeconds: getQuotaSnapshotUpdatedAtSeconds(quota),
+          allowDynamicReset: true,
+        }
+      })
+      .filter((item): item is QuotaProgressItem => item != null)
   }
 
   if (providerType === 'gemini_cli') {
@@ -4247,7 +3997,7 @@ function parseQuotaProgressItems(key: PoolKeyDetail): QuotaProgressItem[] {
   const snapshotItems = buildQuotaProgressItemsFromSnapshot(key)
   if (snapshotItems.length > 0) {
     return snapshotItems.sort((a, b) => {
-      const orderDiff = getQuotaLabelOrder(a.label) - getQuotaLabelOrder(b.label)
+      const orderDiff = (a.sortOrder ?? getQuotaLabelOrder(a.label)) - (b.sortOrder ?? getQuotaLabelOrder(b.label))
       if (orderDiff !== 0) return orderDiff
       return a.label.localeCompare(b.label, 'zh-Hans-CN')
     })
@@ -4373,14 +4123,17 @@ onMounted(() => {
   startCountdownTimer()
   void loadSchedulingPresetMetas({ cacheTtlMs: POOL_SCHEDULING_PRESETS_CACHE_TTL_MS })
   void loadOverview({ cacheTtlMs: POOL_OVERVIEW_CACHE_TTL_MS })
+  scheduleProviderDetailDrawerPrefetch()
 })
 
 onBeforeUnmount(() => {
+  cancelProviderDetailDrawerPrefetch()
   stopDemandMetricsPolling()
   if (keysSearchDebounceTimer !== null) {
     clearTimeout(keysSearchDebounceTimer)
     keysSearchDebounceTimer = null
   }
+  keysSearchPending.value = false
   overviewRequestId += 1
   selectProviderRequestId += 1
   providerDataRequestId += 1

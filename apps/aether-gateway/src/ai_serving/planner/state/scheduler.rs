@@ -8,9 +8,13 @@ use crate::constants::{
     API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS, API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS,
 };
 use crate::scheduler::candidate::SchedulerSkippedCandidate;
+use crate::scheduler::config::SchedulerOrderingConfig;
 use crate::GatewayError;
 
 impl<'a> PlannerAppState<'a> {
+    /// `ordering_config` is the immutable scheduler snapshot derived from the
+    /// request's resolved routing policy.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates(
         self,
         api_format: &str,
@@ -20,14 +24,9 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
+        enable_model_directives: bool,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
-        let enable_model_directives =
-            crate::system_features::reasoning_model_directive_enabled_for_api_format_and_model(
-                self.app(),
-                api_format,
-                Some(global_model_name),
-            )
-            .await;
         crate::scheduler::candidate::list_selectable_candidates(
             self.app().data.as_ref(),
             self.app(),
@@ -39,10 +38,12 @@ impl<'a> PlannerAppState<'a> {
             client_session_affinity,
             now_unix_secs,
             enable_model_directives,
+            ordering_config,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates_with_skip_reasons(
         self,
         api_format: &str,
@@ -52,6 +53,43 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
+        enable_model_directives: bool,
+        ordering_config: SchedulerOrderingConfig,
+    ) -> Result<
+        (
+            Vec<SchedulerMinimalCandidateSelectionCandidate>,
+            Vec<SchedulerSkippedCandidate>,
+        ),
+        GatewayError,
+    > {
+        self.list_selectable_candidates_with_skip_reasons_for_request_operation(
+            api_format,
+            global_model_name,
+            require_streaming,
+            required_capabilities,
+            auth_snapshot,
+            client_session_affinity,
+            now_unix_secs,
+            enable_model_directives,
+            None,
+            ordering_config,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn list_selectable_candidates_with_skip_reasons_for_request_operation(
+        self,
+        api_format: &str,
+        global_model_name: &str,
+        require_streaming: bool,
+        required_capabilities: Option<&serde_json::Value>,
+        auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+        client_session_affinity: Option<&ClientSessionAffinity>,
+        now_unix_secs: u64,
+        enable_model_directives: bool,
+        request_operation: Option<&str>,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -63,16 +101,8 @@ impl<'a> PlannerAppState<'a> {
         let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
         let wait_deadline = Instant::now() + wait_timeout;
         let mut attempt_now_unix_secs = now_unix_secs;
-        let enable_model_directives =
-            crate::system_features::reasoning_model_directive_enabled_for_api_format_and_model(
-                self.app(),
-                api_format,
-                Some(global_model_name),
-            )
-            .await;
-
         loop {
-            let result = crate::scheduler::candidate::list_selectable_candidates_with_skip_reasons(
+            let result = crate::scheduler::candidate::list_selectable_candidates_with_skip_reasons_for_request_operation(
                 self.app().data.as_ref(),
                 self.app(),
                 api_format,
@@ -83,6 +113,8 @@ impl<'a> PlannerAppState<'a> {
                 client_session_affinity,
                 attempt_now_unix_secs,
                 enable_model_directives,
+                request_operation,
+                ordering_config,
             )
             .await?;
 
@@ -103,6 +135,7 @@ impl<'a> PlannerAppState<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_enumerated_candidates_with_skip_reasons(
         self,
         api_format: &str,
@@ -112,6 +145,7 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<
         (
             Vec<SchedulerMinimalCandidateSelectionCandidate>,
@@ -128,10 +162,12 @@ impl<'a> PlannerAppState<'a> {
             auth_snapshot,
             client_session_affinity,
             now_unix_secs,
+            ordering_config,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn list_selectable_candidates_for_required_capability_without_requested_model(
         self,
         candidate_api_format: &str,
@@ -140,6 +176,7 @@ impl<'a> PlannerAppState<'a> {
         auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
         client_session_affinity: Option<&ClientSessionAffinity>,
         now_unix_secs: u64,
+        ordering_config: SchedulerOrderingConfig,
     ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, GatewayError> {
         let wait_timeout = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_TIMEOUT_MS);
         let wait_interval = Duration::from_millis(API_KEY_CONCURRENCY_WAIT_POLL_INTERVAL_MS.max(1));
@@ -156,6 +193,7 @@ impl<'a> PlannerAppState<'a> {
                 auth_snapshot,
                 client_session_affinity,
                 attempt_now_unix_secs,
+                ordering_config,
             )
             .await?;
 

@@ -13,35 +13,72 @@ pub(crate) async fn resolve_wallet_auth_gate(
     state: &AppState,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
 ) -> Result<Option<WalletAccessDecision>, GatewayError> {
+    resolve_wallet_auth_gate_with_cache(state, auth_snapshot, true).await
+}
+
+pub(crate) async fn resolve_wallet_auth_gate_uncached(
+    state: &AppState,
+    auth_snapshot: &GatewayAuthApiKeySnapshot,
+) -> Result<Option<WalletAccessDecision>, GatewayError> {
+    resolve_wallet_auth_gate_with_cache(state, auth_snapshot, false).await
+}
+
+async fn resolve_wallet_auth_gate_with_cache(
+    state: &AppState,
+    auth_snapshot: &GatewayAuthApiKeySnapshot,
+    use_cache: bool,
+) -> Result<Option<WalletAccessDecision>, GatewayError> {
     if !state.has_wallet_data_reader() {
         return Ok(None);
     }
 
-    let wallet = state
-        .read_wallet_snapshot_for_auth(
-            &auth_snapshot.user_id,
-            &auth_snapshot.api_key_id,
-            auth_snapshot.api_key_is_standalone,
-        )
-        .await?;
+    let wallet = if use_cache {
+        state
+            .read_wallet_snapshot_for_auth(
+                &auth_snapshot.user_id,
+                &auth_snapshot.api_key_id,
+                auth_snapshot.api_key_is_standalone,
+            )
+            .await?
+    } else {
+        state
+            .read_wallet_snapshot_for_auth_uncached(
+                &auth_snapshot.user_id,
+                &auth_snapshot.api_key_id,
+                auth_snapshot.api_key_is_standalone,
+            )
+            .await?
+    };
 
     let decision = match wallet.as_ref() {
         Some(wallet) => map_wallet_snapshot(wallet).access_decision(false),
         None => WalletAccessDecision::wallet_unavailable(None),
     };
     if !auth_snapshot.api_key_is_standalone {
-        if let Some(quota) = state
-            .find_user_daily_quota_availability(&auth_snapshot.user_id)
-            .await?
-            .filter(|quota| quota.has_active_daily_quota)
-        {
+        let wallet_is_unlimited = wallet
+            .as_ref()
+            .is_some_and(|wallet| wallet.limit_mode.eq_ignore_ascii_case("unlimited"));
+        let quota = if use_cache {
+            state
+                .find_user_daily_quota_availability_for_auth(&auth_snapshot.user_id)
+                .await?
+        } else {
+            state
+                .find_user_daily_quota_availability_for_auth_uncached(&auth_snapshot.user_id)
+                .await?
+        };
+        if let Some(quota) = quota.filter(|quota| quota.has_active_daily_quota) {
             let has_remaining_quota = quota.remaining_usd > DAILY_QUOTA_EPSILON_USD;
             if decision.failure == Some(WalletAccessFailure::BalanceDenied) && has_remaining_quota {
                 return Ok(Some(WalletAccessDecision::allowed(Some(
                     quota.remaining_usd,
                 ))));
             }
-            if decision.failure.is_none() && !quota.allow_wallet_overage && !has_remaining_quota {
+            if !wallet_is_unlimited
+                && decision.failure.is_none()
+                && !quota.allow_wallet_overage
+                && !has_remaining_quota
+            {
                 return Ok(Some(WalletAccessDecision::balance_denied(Some(0.0))));
             }
         }
@@ -81,6 +118,7 @@ fn map_wallet_snapshot(snapshot: &StoredWalletSnapshot) -> WalletSnapshot {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data::repository::wallet::{InMemoryWalletRepository, StoredWalletSnapshot};
@@ -88,6 +126,7 @@ mod tests {
         BillingReadRepository, StoredBillingModelContext, UserDailyQuotaAvailabilityRecord,
     };
     use aether_data_contracts::DataLayerError;
+    use aether_runtime::ConcurrencyGate;
     use aether_wallet::{WalletAccessFailure, WalletLimitMode, WalletSnapshot, WalletStatus};
     use async_trait::async_trait;
 
@@ -230,6 +269,96 @@ mod tests {
         assert!(decision.allowed);
         assert_eq!(decision.failure, None);
         assert_eq!(decision.remaining, Some(4.0));
+    }
+
+    #[tokio::test]
+    async fn unlimited_wallet_ignores_exhausted_non_overage_quota() {
+        let mut wallet = empty_user_wallet();
+        wallet.limit_mode = "unlimited".to_string();
+        let state = state_with_wallet_and_quota(wallet, Some(quota_availability(10.0, 0.0, false)));
+        let auth_snapshot = ordinary_user_api_key_snapshot();
+
+        let decision = resolve_wallet_auth_gate(&state, &auth_snapshot)
+            .await
+            .expect("wallet gate should resolve")
+            .expect("wallet gate should return a decision");
+
+        assert!(decision.allowed);
+        assert_eq!(decision.failure, None);
+        assert_eq!(decision.remaining, None);
+    }
+
+    #[tokio::test]
+    async fn disabled_auth_capacity_cache_still_gates_wallet_reads() {
+        let mut state = state_with_wallet_and_quota(empty_user_wallet(), None);
+        let mut guard_config = (*state.frontdoor_runtime_guards).clone();
+        guard_config.auth_capacity_cache_ttl = Duration::ZERO;
+        state = state.with_frontdoor_runtime_guard_config_for_tests(guard_config);
+        state.auth_snapshot_load_gate =
+            Some(Arc::new(ConcurrencyGate::new("test_auth_wallet_load", 1)));
+        let held = state
+            .acquire_auth_snapshot_load_gate()
+            .await
+            .expect("auth gate acquisition should succeed")
+            .expect("auth gate should be configured");
+
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(25),
+            state.read_wallet_snapshot_for_auth("user-1", "api-key-1", false),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "zero-TTL wallet reads must wait for the auth DB gate"
+        );
+
+        drop(held);
+        let wallet = tokio::time::timeout(
+            Duration::from_secs(1),
+            state.read_wallet_snapshot_for_auth("user-1", "api-key-1", false),
+        )
+        .await
+        .expect("wallet read should resume after releasing the auth gate")
+        .expect("wallet read should succeed");
+        assert!(wallet.is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_wallet_recharge_invalidates_cached_auth_capacity_state() {
+        let wallet = empty_user_wallet();
+        let state =
+            state_with_wallet_and_quota(wallet.clone(), None).with_auth_wallets_for_tests([wallet]);
+        let auth_snapshot = ordinary_user_api_key_snapshot();
+
+        let denied = resolve_wallet_auth_gate(&state, &auth_snapshot)
+            .await
+            .expect("wallet gate should resolve")
+            .expect("wallet gate should return a decision");
+
+        assert!(!denied.allowed);
+        assert_eq!(denied.failure, Some(WalletAccessFailure::BalanceDenied));
+
+        let recharge = state
+            .admin_create_manual_wallet_recharge(
+                "wallet-user-1",
+                10.0,
+                "admin_manual",
+                Some("admin-1"),
+                Some("manual recharge"),
+            )
+            .await
+            .expect("wallet recharge should complete");
+
+        assert!(recharge.is_some());
+
+        let refreshed = resolve_wallet_auth_gate(&state, &auth_snapshot)
+            .await
+            .expect("wallet gate should resolve after recharge")
+            .expect("wallet gate should return a decision after recharge");
+
+        assert!(refreshed.allowed);
+        assert_eq!(refreshed.failure, None);
+        assert_eq!(refreshed.remaining, Some(10.0));
     }
 
     fn state_with_wallet_and_quota(

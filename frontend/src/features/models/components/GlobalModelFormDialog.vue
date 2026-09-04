@@ -4,20 +4,20 @@
     :title="isEditMode ? '编辑模型' : '创建统一模型'"
     :description="isEditMode ? '修改模型配置和价格信息' : ''"
     :icon="isEditMode ? SquarePen : Layers"
-    size="4xl"
+    :size="isEditMode ? '4xl' : '3xl'"
     @update:model-value="handleDialogUpdate"
   >
     <div
       class="flex gap-4"
-      :class="isEditMode ? '' : 'h-[600px]'"
+      :class="isEditMode ? '' : 'h-[600px] flex-col'"
     >
-      <!-- 左侧：模型选择（仅创建模式） -->
-      <div
-        v-if="!isEditMode"
-        class="w-[260px] shrink-0 flex flex-col h-full"
+      <!-- 上方：搜索和加载预设（仅创建模式） -->
+      <section
+        v-if="!isEditMode && !presetPanelCollapsed"
+        class="h-full flex flex-col space-y-3"
       >
         <!-- 搜索框 -->
-        <div class="relative mb-3">
+        <div class="relative">
           <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
             v-model="searchQuery"
@@ -27,84 +27,268 @@
           />
         </div>
 
-        <!-- 模型列表（两级结构） -->
-        <div class="flex-1 overflow-y-auto border rounded-lg min-h-0 scrollbar-thin">
+        <!-- 横向提供商 Logo 与模型列表 -->
+        <div class="flex-1 min-h-0 overflow-hidden border rounded-lg flex flex-col">
           <div
             v-if="loading"
-            class="flex items-center justify-center h-32"
+            class="flex items-center justify-center flex-1"
           >
             <Loader2 class="w-5 h-5 animate-spin text-muted-foreground" />
           </div>
           <template v-else>
-            <!-- 提供商分组 -->
+            <!-- 提供商 Logo 横向选择 -->
             <div
-              v-for="group in groupedModels"
-              :key="group.providerId"
-              class="border-b last:border-b-0"
+              v-if="groupedModels.length > 0"
+              class="relative shrink-0 border-b"
             >
-              <!-- 提供商标题行 -->
-              <div
-                class="flex items-center gap-2 px-2.5 py-2 cursor-pointer hover:bg-muted text-sm"
-                @click="toggleProvider(group.providerId)"
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                class="absolute left-1 top-1/2 z-10 h-8 w-8 -translate-y-1/2 bg-background/95 shadow-sm"
+                title="向左滚动"
+                aria-label="向左滚动提供商"
+                @click="scrollProviderLogos(-1)"
               >
-                <ChevronRight
-                  class="w-3.5 h-3.5 text-muted-foreground transition-transform shrink-0"
-                  :class="expandedProvider === group.providerId ? 'rotate-90' : ''"
-                />
-                <img
-                  :src="getProviderLogoUrl(group.providerId)"
-                  :alt="group.providerName"
-                  class="w-4 h-4 rounded shrink-0 dark:invert dark:brightness-90"
-                  @error="handleLogoError"
+                <ChevronLeft class="h-4 w-4" />
+              </Button>
+              <div
+                ref="providerLogoScroller"
+                class="mx-11 flex gap-2 overflow-x-auto p-2 scrollbar-hide"
+              >
+                <button
+                  v-for="group in groupedModels"
+                  :key="group.providerId"
+                  type="button"
+                  class="w-[76px] shrink-0 rounded-md border px-2 py-1.5 flex flex-col items-center gap-1 transition-colors"
+                  :class="expandedProvider === group.providerId
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-transparent hover:border-border hover:bg-muted'"
+                  :title="`${group.providerName}（${group.models.length}）`"
+                  @click="toggleProvider(group.providerId)"
                 >
-                <span class="truncate font-medium text-xs flex-1">{{ group.providerName }}</span>
-                <span class="text-[10px] text-muted-foreground shrink-0">{{ group.models.length }}</span>
+                  <img
+                    :src="getProviderLogoUrl(group.providerId)"
+                    :alt="group.providerName"
+                    class="w-7 h-7 rounded object-contain dark:invert dark:brightness-90"
+                    @error="handleLogoError"
+                  >
+                  <span class="w-full truncate text-[10px] font-medium text-center">{{ group.providerName }}</span>
+                </button>
               </div>
-              <!-- 模型列表 -->
-              <div
-                v-if="expandedProvider === group.providerId"
-                class="bg-muted/30"
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                class="absolute right-1 top-1/2 z-10 h-8 w-8 -translate-y-1/2 bg-background/95 shadow-sm"
+                title="向右滚动"
+                aria-label="向右滚动提供商"
+                @click="scrollProviderLogos(1)"
               >
+                <ChevronRight class="h-4 w-4" />
+              </Button>
+            </div>
+
+            <!-- 当前提供商模型 -->
+            <div
+              v-if="expandedProviderGroup"
+              class="flex-1 min-h-0 overflow-y-auto p-2 scrollbar-thin"
+            >
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div
-                  v-for="item in group.models"
+                  v-for="item in expandedProviderGroup.models"
                   :key="item.modelId"
-                  class="flex flex-col gap-0.5 pl-7 pr-2.5 py-1.5 cursor-pointer text-xs border-t"
-                  :class="selectedModel?.modelId === item.modelId && selectedModel?.providerId === item.providerId
-                    ? 'bg-primary text-primary-foreground'
-                    : 'hover:bg-muted'"
-                  @click="selectModel(item)"
+                  class="relative min-w-0"
                 >
-                  <span class="truncate font-medium">{{ item.modelName }}</span>
-                  <span
-                    class="truncate text-[10px]"
-                    :class="selectedModel?.modelId === item.modelId && selectedModel?.providerId === item.providerId
-                      ? 'text-primary-foreground/70'
-                      : 'text-muted-foreground'"
-                  >{{ item.modelId }}</span>
+                  <button
+                    type="button"
+                    class="group relative flex h-full min-h-[152px] w-full min-w-0 flex-col rounded-lg border bg-card p-4 text-left shadow-sm transition-[border-color,box-shadow,transform,background-color] duration-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                    :class="getExistingModel(item)
+                      ? 'cursor-default border-border/70'
+                      : selectedModel?.modelId === item.modelId && selectedModel?.providerId === item.providerId
+                        ? 'cursor-pointer border-primary bg-primary/5 ring-1 ring-primary hover:-translate-y-0.5 hover:border-primary/35 hover:shadow-md active:scale-[0.96]'
+                        : 'cursor-pointer border-border/70 hover:-translate-y-0.5 hover:border-primary/35 hover:shadow-md active:scale-[0.96]'"
+                    :disabled="!!getExistingModel(item)"
+                    @click="selectModel(item)"
+                  >
+                    <span
+                      v-if="selectedModel?.modelId === item.modelId && selectedModel?.providerId === item.providerId"
+                      class="absolute right-2.5 top-2.5 flex h-5 w-5 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-sm"
+                    >
+                      <Check class="h-3 w-3" />
+                    </span>
+
+                    <span
+                      class="flex w-full items-start gap-2"
+                      :class="getExistingModel(item)
+                        ? 'pr-24'
+                        : selectedModel?.modelId === item.modelId && selectedModel?.providerId === item.providerId
+                          ? 'pr-7'
+                          : ''"
+                    >
+                      <span class="min-w-0 flex-1">
+                        <span class="block truncate text-sm font-semibold leading-5">{{ item.modelName }}</span>
+                        <span class="block truncate font-mono text-[10px] text-muted-foreground">{{ item.modelId }}</span>
+                      </span>
+                    </span>
+
+                    <span class="mt-2 flex min-h-5 flex-wrap gap-1">
+                      <span
+                        v-if="item.supportsReasoning"
+                        class="inline-flex items-center gap-1 rounded-md border border-violet-500/20 bg-violet-500/10 px-1.5 py-0.5 text-[9px] font-medium text-violet-700 dark:text-violet-300"
+                      >
+                        <BrainCircuit class="h-2.5 w-2.5" />推理
+                      </span>
+                      <span
+                        v-if="item.supportsVision"
+                        class="inline-flex items-center gap-1 rounded-md border border-sky-500/20 bg-sky-500/10 px-1.5 py-0.5 text-[9px] font-medium text-sky-700 dark:text-sky-300"
+                      >
+                        <Eye class="h-2.5 w-2.5" />视觉
+                      </span>
+                      <span
+                        v-if="item.supportsToolCall"
+                        class="inline-flex items-center gap-1 rounded-md border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-medium text-amber-700 dark:text-amber-300"
+                      >
+                        <Wrench class="h-2.5 w-2.5" />工具
+                      </span>
+                      <span
+                        v-if="item.supportsStructuredOutput"
+                        class="inline-flex items-center gap-1 rounded-md border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 text-[9px] font-medium text-emerald-700 dark:text-emerald-300"
+                      >
+                        <Braces class="h-2.5 w-2.5" />结构化
+                      </span>
+                      <span
+                        v-if="item.supportsEmbedding"
+                        class="inline-flex items-center gap-1 rounded-md border border-fuchsia-500/20 bg-fuchsia-500/10 px-1.5 py-0.5 text-[9px] font-medium text-fuchsia-700 dark:text-fuchsia-300"
+                      >
+                        <Database class="h-2.5 w-2.5" />Embedding
+                      </span>
+                      <span
+                        v-if="item.openWeights"
+                        class="inline-flex items-center gap-1 rounded-md border border-border bg-muted/70 px-1.5 py-0.5 text-[9px] font-medium text-muted-foreground"
+                      >
+                        <PackageOpen class="h-2.5 w-2.5" />开放权重
+                      </span>
+                    </span>
+
+                    <span class="mt-auto flex w-full items-end justify-between gap-2 border-t border-border/60 pt-2 text-[9px] text-muted-foreground">
+                      <span class="flex min-w-0 flex-col">
+                        <span v-if="item.contextLimit">上下文 {{ formatTokenLimit(item.contextLimit) }}</span>
+                        <span v-else>上下文未知</span>
+                        <span v-if="item.outputLimit">输出 {{ formatTokenLimit(item.outputLimit) }}</span>
+                      </span>
+                      <span
+                        v-if="item.inputPrice !== undefined || item.outputPrice !== undefined"
+                        class="shrink-0 text-right font-medium tabular-nums text-foreground/70"
+                      >
+                        <span class="block">输入 ${{ formatModelPrice(item.inputPrice) }}/M</span>
+                        <span class="block">输出 ${{ formatModelPrice(item.outputPrice) }}/M</span>
+                      </span>
+                      <span
+                        v-else-if="item.releaseDate"
+                        class="shrink-0"
+                      >{{ item.releaseDate }}</span>
+                    </span>
+                  </button>
+                  <div
+                    v-if="getExistingModel(item)"
+                    class="absolute right-2.5 top-2.5 z-10 flex items-center gap-1.5"
+                  >
+                    <span class="inline-flex h-6 items-center rounded-md bg-muted px-2 text-[10px] font-medium text-muted-foreground">已添加</span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      class="h-7 w-7 bg-background/90 text-muted-foreground shadow-sm hover:text-foreground"
+                      title="去编辑"
+                      :aria-label="`编辑 ${item.modelName}`"
+                      :data-testid="`edit-existing-model-${item.modelId}`"
+                      @click="editExistingModel(item)"
+                    >
+                      <SquarePen class="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
                 </div>
               </div>
             </div>
             <div
-              v-if="groupedModels.length === 0"
-              class="text-center py-8 text-sm text-muted-foreground"
+              v-else-if="groupedModels.length > 0"
+              class="flex flex-1 items-center justify-center text-xs text-muted-foreground"
             >
-              {{ searchQuery ? '未找到模型' : '加载中...' }}
+              点击提供商 Logo 展开模型
+            </div>
+            <div
+              v-else
+              class="flex flex-1 items-center justify-center text-sm text-muted-foreground"
+            >
+              {{ searchQuery ? '未找到模型' : '暂无可用模型' }}
             </div>
           </template>
         </div>
-      </div>
+      </section>
 
-      <!-- 右侧：表单 -->
+      <!-- 第二步：详细信息表单 -->
       <div
-        class="flex-1 overflow-y-auto h-full scrollbar-thin"
+        v-if="isEditMode || presetPanelCollapsed"
+        class="flex-1 min-h-0 overflow-y-auto scrollbar-thin"
         :class="isEditMode ? 'max-h-[70vh]' : ''"
       >
+        <div
+          v-if="!isEditMode"
+          class="mb-4 flex items-center gap-3 rounded-lg border bg-muted/20 px-4 py-3"
+        >
+          <div
+            v-if="selectedModel"
+            class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border bg-background"
+          >
+            <img
+              :src="getProviderLogoUrl(selectedModel.providerId)"
+              :alt="selectedModel.providerName"
+              class="h-7 w-7 rounded object-contain dark:invert dark:brightness-90"
+              @error="handleLogoError"
+            >
+          </div>
+          <div
+            v-else
+            class="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border bg-background"
+          >
+            <SquarePen class="h-5 w-5 text-muted-foreground" />
+          </div>
+          <div class="min-w-0 flex-1">
+            <div class="text-xs text-muted-foreground">
+              {{ selectedModel ? `已加载 ${selectedModel.providerName} 预设` : '手动填写模式' }}
+            </div>
+            <div class="truncate text-sm font-medium">
+              {{ selectedModel ? selectedModel.modelName : '填写模型详细信息' }}
+            </div>
+            <div
+              v-if="selectedModel"
+              class="truncate text-xs text-muted-foreground"
+            >
+              {{ selectedModel.modelId }}
+            </div>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              class="shrink-0"
+              @click="reopenPresetPanel"
+            >
+              返回选择模型
+            </Button>
+          </div>
+        </div>
         <form
           class="space-y-5"
           @submit.prevent="handleSubmit"
         >
           <!-- 基本信息 -->
-          <section class="space-y-3">
+          <section
+            ref="basicInfoSection"
+            class="space-y-3 rounded-lg border bg-card p-4"
+          >
             <h4 class="font-medium text-sm">
               基本信息
             </h4>
@@ -203,138 +387,341 @@
                   </div>
                 </div>
               </div>
-              <div class="flex items-start gap-2 border-t border-border/60 pt-3">
-                <Checkbox
-                  :checked="isImageGenerationEnabled"
-                  class="mt-0.5"
-                  @update:checked="setImageGenerationEnabled"
-                />
-                <div class="space-y-1">
-                  <div class="text-sm font-medium">
-                    图片模型
-                  </div>
-                  <p class="text-xs text-muted-foreground">
-                    启用图片输出计费，并展开尺寸 × 质量矩阵价格。
-                  </p>
-                </div>
-              </div>
             </div>
           </section>
 
           <!-- 价格配置 -->
-          <section class="space-y-3">
-            <h4 class="font-medium text-sm">
-              价格配置
-            </h4>
-            <TieredPricingEditor
-              ref="tieredPricingEditorRef"
-              v-model="tieredPricing"
-              :show-cache1h="true"
-              :show-image-pricing="isImageGenerationEnabled"
-            />
-            <div class="flex items-center gap-3 pt-2 border-t">
-              <Label class="text-xs whitespace-nowrap">按次计费</Label>
-              <Input
-                :model-value="form.default_price_per_request ?? ''"
-                type="number"
-                step="0.001"
-                min="0"
-                class="w-24"
-                placeholder="$/次"
-                @update:model-value="(v) => form.default_price_per_request = parseNumberInput(v, { allowFloat: true })"
-              />
-              <span class="text-xs text-muted-foreground">可与 Token 计费叠加</span>
-            </div>
-
-            <!-- 视频计费（分辨率 × 时长） -->
-            <div class="pt-3 border-t space-y-2">
-              <div class="text-sm font-medium">
-                视频计费（分辨率 × 时长）
-              </div>
-
-              <div class="flex items-center gap-1.5 flex-wrap">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  class="h-7 text-xs"
-                  @click="fillVideoResolutionPricePreset('common')"
-                >
-                  通用
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  class="h-7 text-xs"
-                  @click="fillVideoResolutionPricePreset('sora')"
-                >
-                  Sora
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  class="h-7 text-xs"
-                  @click="fillVideoResolutionPricePreset('veo')"
-                >
-                  Veo
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  class="h-7 text-xs"
-                  @click="addVideoResolutionPriceRow"
-                >
-                  <Plus class="w-3.5 h-3.5 mr-0.5" />
-                  自定义
-                </Button>
-              </div>
-
-              <div
-                v-if="videoResolutionPrices.length > 0"
-                class="rounded-lg border border-border overflow-hidden"
+          <section
+            class="space-y-3 rounded-lg border bg-card p-4"
+          >
+            <div class="flex items-center justify-between gap-2">
+              <h4 class="font-medium text-sm">
+                选择计费模式
+              </h4>
+              <Popover
+                v-if="isEditMode"
+                :open="onlinePricingSourcePopoverOpen"
+                :modal="false"
+                @update:open="handleOnlinePricingSourcePopoverUpdate"
               >
-                <div class="grid grid-cols-[1fr_1fr_32px] gap-0 text-xs text-muted-foreground bg-muted/50 px-3 py-1.5 border-b border-border">
-                  <span>分辨率</span>
-                  <span>单价（$/秒）</span>
-                  <span />
-                </div>
-                <div class="divide-y divide-border">
-                  <div
-                    v-for="(row, idx) in videoResolutionPrices"
-                    :key="idx"
-                    class="grid grid-cols-[1fr_1fr_32px] gap-2 items-center px-3 py-1.5"
+                <PopoverTrigger as-child>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    class="h-8 min-w-0 max-w-56 shrink-0 gap-1.5 px-2.5"
+                    :disabled="syncingOnlinePricing || submitting"
+                    :title="syncingOnlinePricing
+                      ? t('models.pricingSource.syncingTitle')
+                      : currentOnlinePricingSource
+                        ? t('models.pricingSource.editCurrentTitle', { provider: currentOnlinePricingSource.provider_name })
+                        : t('models.pricingSource.editChooseTitle')"
+                    aria-label="同步最新在线价格"
+                    data-testid="sync-online-pricing"
+                    @click="syncOnlinePricing"
                   >
-                    <Input
-                      v-model="row.resolution"
-                      class="h-7 text-sm"
-                      placeholder="如 720p"
+                    <RefreshCw
+                      class="h-4 w-4"
+                      :class="syncingOnlinePricing ? 'animate-spin' : ''"
                     />
-                    <Input
-                      :model-value="row.price_per_second ?? ''"
-                      type="number"
-                      step="0.0001"
-                      min="0"
-                      class="h-7 text-sm"
-                      placeholder="0"
-                      @update:model-value="(v) => row.price_per_second = parseNumberInput(v, { allowFloat: true })"
-                    />
+                    <span class="truncate text-xs">
+                      {{ currentOnlinePricingSource
+                        ? t('models.pricingSource.buttonCurrent', { provider: currentOnlinePricingSource.provider_name })
+                        : t('models.pricingSource.choose') }}
+                    </span>
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  class="z-[130] w-80 max-w-[calc(100vw-2rem)] p-3"
+                  side="bottom"
+                  align="end"
+                >
+                  <div class="space-y-3">
+                    <div class="flex items-center justify-between gap-3">
+                      <div class="min-w-0">
+                        <div class="truncate text-xs font-medium">
+                          选择在线价格来源
+                        </div>
+                        <div class="truncate text-[10px] text-muted-foreground">
+                          {{ props.model?.display_name || props.model?.name || '当前模型' }}
+                        </div>
+                      </div>
+                      <Loader2
+                        v-if="syncingOnlinePricing"
+                        class="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground"
+                      />
+                    </div>
+
+                    <div
+                      v-if="syncingOnlinePricing && onlinePricingCandidates.length === 0"
+                      class="flex items-center justify-center py-5 text-xs text-muted-foreground"
+                    >
+                      正在刷新在线价格...
+                    </div>
+                    <div
+                      v-else
+                      class="max-h-64 space-y-1.5 overflow-y-auto pr-0.5"
+                      role="radiogroup"
+                      aria-label="在线价格来源"
+                      @keydown="handleOnlinePricingSourcePopoverKeydown"
+                    >
+                      <button
+                        v-for="candidate in onlinePricingCandidates"
+                        :key="candidate.providerId"
+                        type="button"
+                        role="radio"
+                        class="flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-55"
+                        :class="selectedOnlinePricingProviderId === candidate.providerId
+                          ? 'border-primary bg-primary/5 ring-1 ring-primary'
+                          : 'border-border/70 hover:border-primary/35 hover:bg-muted/40'"
+                        :aria-checked="selectedOnlinePricingProviderId === candidate.providerId"
+                        :disabled="syncingOnlinePricing || !isOnlinePricingCandidateSyncable(candidate)"
+                        :tabindex="selectedOnlinePricingProviderId === candidate.providerId
+                          || (!selectedOnlinePricingProviderId
+                            && firstSyncableOnlinePricingProviderId === candidate.providerId)
+                          ? 0
+                          : -1"
+                        data-online-pricing-source-control
+                        data-online-pricing-source-option
+                        :data-provider-id="candidate.providerId"
+                        :data-testid="`online-pricing-source-${candidate.providerId}`"
+                        @click="selectedOnlinePricingProviderId = candidate.providerId"
+                      >
+                        <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded border bg-background">
+                          <img
+                            :src="getProviderLogoUrl(candidate.providerId)"
+                            :alt="candidate.providerName"
+                            class="h-5 w-5 rounded object-contain dark:invert dark:brightness-90"
+                            @error="handleLogoError"
+                          >
+                        </span>
+                        <span class="min-w-0 flex-1">
+                          <span class="block truncate text-xs font-medium">{{ candidate.providerName }}</span>
+                          <span class="block truncate font-mono text-[9px] text-muted-foreground">{{ candidate.providerId }}</span>
+                          <span
+                            v-if="getOnlinePricingCandidateUnavailableReason(candidate)"
+                            class="block truncate text-[10px] text-rose-600 dark:text-rose-400"
+                          >{{ getOnlinePricingCandidateUnavailableReason(candidate) }}</span>
+                        </span>
+                        <span
+                          v-if="isOnlinePricingCandidateSyncable(candidate)"
+                          class="shrink-0 text-right text-[9px] tabular-nums text-muted-foreground"
+                        >
+                          <span class="block">输入 ${{ formatModelPrice(candidate.inputPrice) }}/M</span>
+                          <span class="block">输出 ${{ formatModelPrice(candidate.outputPrice) }}/M</span>
+                        </span>
+                        <span
+                          class="flex h-4 w-4 shrink-0 items-center justify-center rounded-full border"
+                          :class="selectedOnlinePricingProviderId === candidate.providerId
+                            ? 'border-primary bg-primary text-primary-foreground'
+                            : 'border-border'"
+                        >
+                          <Check
+                            v-if="selectedOnlinePricingProviderId === candidate.providerId"
+                            class="h-2.5 w-2.5"
+                          />
+                        </span>
+                      </button>
+                      <div
+                        v-if="onlinePricingCandidates.length === 0"
+                        class="py-4 text-center text-xs text-muted-foreground"
+                      >
+                        暂无可用在线价格来源
+                      </div>
+                    </div>
+
+                    <div class="flex justify-end gap-2 border-t border-border/60 pt-2">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        :disabled="syncingOnlinePricing"
+                        data-online-pricing-source-control
+                        data-testid="online-pricing-source-cancel"
+                        @keydown="handleOnlinePricingSourcePopoverKeydown"
+                        @click="closeOnlinePricingSourcePopover"
+                      >
+                        取消
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        :disabled="!selectedOnlinePricingCandidate
+                          || !isOnlinePricingCandidateSyncable(selectedOnlinePricingCandidate)
+                          || syncingOnlinePricing"
+                        data-online-pricing-source-control
+                        @keydown="handleOnlinePricingSourcePopoverKeydown"
+                        @click="confirmOnlinePricingSource"
+                      >
+                        <Loader2
+                          v-if="syncingOnlinePricing"
+                          class="mr-1.5 h-3.5 w-3.5 animate-spin"
+                        />
+                        {{ syncingOnlinePricing ? '同步中...' : '同步此来源' }}
+                      </Button>
+                    </div>
+                  </div>
+                </PopoverContent>
+              </Popover>
+            </div>
+            <Tabs
+              v-model="billingMode"
+              @update:model-value="handleBillingModeChange"
+            >
+              <TabsList class="grid w-full grid-cols-4">
+                <TabsTrigger value="token">
+                  Token
+                </TabsTrigger>
+                <TabsTrigger value="request">
+                  按次
+                </TabsTrigger>
+                <TabsTrigger value="image">
+                  图片
+                </TabsTrigger>
+                <TabsTrigger value="video">
+                  视频
+                </TabsTrigger>
+              </TabsList>
+
+              <TieredPricingEditor
+                v-show="billingMode === 'token' || billingMode === 'image'"
+                ref="tieredPricingEditorRef"
+                v-model="tieredPricing"
+                class="mt-3"
+                :auto-fill-missing-cache-prices="autoFillMissingCachePrices"
+                :show-token-pricing="billingMode === 'token'"
+                :show-image-pricing="isImageGenerationEnabled"
+                :show-image-editor="billingMode === 'image'"
+                :show-processing-tier-controls="false"
+                :show-processing-tier-multiplier-controls="true"
+              />
+
+              <TabsContent
+                value="request"
+                class="pt-2"
+              >
+                <div class="rounded-lg border bg-muted/20 p-4 space-y-2">
+                  <Label class="text-xs">每次请求价格（美元）</Label>
+                  <Input
+                    :model-value="form.default_price_per_request ?? ''"
+                    type="number"
+                    step="0.001"
+                    min="0"
+                    class="max-w-48"
+                    placeholder="如 0.01"
+                    @update:model-value="(v) => form.default_price_per_request = parseNumberInput(v, { allowFloat: true })"
+                  />
+                  <p class="text-xs text-muted-foreground">
+                    按每次 API 请求收取固定费用，可与 Token 计费同时使用。
+                  </p>
+                </div>
+              </TabsContent>
+
+              <TabsContent
+                value="video"
+                class="pt-2"
+              >
+                <div class="space-y-3 rounded-lg border bg-muted/20 p-4">
+                  <div>
+                    <div class="text-sm font-medium">
+                      视频计费（分辨率 × 时长）
+                    </div>
+                    <p class="mt-1 text-xs text-muted-foreground">
+                      根据输出分辨率配置每秒视频价格。
+                    </p>
+                  </div>
+
+                  <div class="flex items-center gap-1.5 flex-wrap">
                     <Button
                       type="button"
-                      variant="ghost"
-                      size="icon"
-                      class="h-7 w-7"
-                      title="删除"
-                      @click="removeVideoResolutionPriceRow(idx)"
+                      variant="outline"
+                      size="sm"
+                      class="h-7 text-xs"
+                      @click="fillVideoResolutionPricePreset('common')"
                     >
-                      <Trash2 class="w-3.5 h-3.5" />
+                      通用
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      class="h-7 text-xs"
+                      @click="fillVideoResolutionPricePreset('sora')"
+                    >
+                      Sora
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      class="h-7 text-xs"
+                      @click="fillVideoResolutionPricePreset('veo')"
+                    >
+                      Veo
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      class="h-7 text-xs"
+                      @click="addVideoResolutionPriceRow"
+                    >
+                      <Plus class="w-3.5 h-3.5 mr-0.5" />
+                      自定义
                     </Button>
                   </div>
+
+                  <div
+                    v-if="videoResolutionPrices.length > 0"
+                    class="rounded-lg border border-border overflow-hidden"
+                  >
+                    <div class="grid grid-cols-[1fr_1fr_32px] gap-0 text-xs text-muted-foreground bg-muted/50 px-3 py-1.5 border-b border-border">
+                      <span>分辨率</span>
+                      <span>单价（$/秒）</span>
+                      <span />
+                    </div>
+                    <div class="divide-y divide-border">
+                      <div
+                        v-for="(row, idx) in videoResolutionPrices"
+                        :key="idx"
+                        class="grid grid-cols-[1fr_1fr_32px] gap-2 items-center px-3 py-1.5"
+                      >
+                        <Input
+                          v-model="row.resolution"
+                          class="h-7 text-sm"
+                          placeholder="如 720p"
+                        />
+                        <Input
+                          :model-value="row.price_per_second ?? ''"
+                          type="number"
+                          step="0.0001"
+                          min="0"
+                          class="h-7 text-sm"
+                          placeholder="0"
+                          @update:model-value="(v) => row.price_per_second = parseNumberInput(v, { allowFloat: true })"
+                        />
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          class="h-7 w-7"
+                          title="删除"
+                          @click="removeVideoResolutionPriceRow(idx)"
+                        >
+                          <Trash2 class="w-3.5 h-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                  <div
+                    v-else
+                    class="rounded-lg border border-dashed py-8 text-center text-xs text-muted-foreground"
+                  >
+                    选择一个价格预设或添加自定义分辨率
+                  </div>
                 </div>
-              </div>
-            </div>
+              </TabsContent>
+            </Tabs>
           </section>
         </form>
       </div>
@@ -349,7 +736,16 @@
         取消
       </Button>
       <Button
-        :disabled="submitting || !form.name || !form.display_name"
+        v-if="!isEditMode && !presetPanelCollapsed"
+        type="button"
+        variant="outline"
+        @click="enterManualEntryMode"
+      >
+        手动填写
+      </Button>
+      <Button
+        v-if="isEditMode || presetPanelCollapsed"
+        :disabled="submitting || syncingOnlinePricing || !form.name || !form.display_name"
         @click="handleSubmit"
       >
         <Loader2
@@ -359,7 +755,7 @@
         {{ isEditMode ? '保存' : '添加' }}
       </Button>
       <Button
-        v-if="selectedModel && !isEditMode"
+        v-if="selectedModel && !isEditMode && presetPanelCollapsed"
         type="button"
         variant="ghost"
         @click="clearSelection"
@@ -371,14 +767,20 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch } from 'vue'
+import { ref, computed, nextTick, watch } from 'vue'
 import {
   Loader2, Layers, SquarePen,
-  Search, ChevronRight, Plus, Trash2
+  Search, ChevronLeft, ChevronRight, Plus, Trash2, Check,
+  BrainCircuit, Eye, Wrench, Braces, Database, PackageOpen, RefreshCw
 } from 'lucide-vue-next'
-import { Dialog, Button, Input, Label, Checkbox } from '@/components/ui'
+import {
+  Dialog, Button, Input, Label, Checkbox,
+  Tabs, TabsContent, TabsList, TabsTrigger,
+  Popover, PopoverTrigger, PopoverContent,
+} from '@/components/ui'
 import { useToast } from '@/composables/useToast'
 import { useFormDialog } from '@/composables/useFormDialog'
+import { useI18n } from '@/i18n'
 import { parseNumberInput, sortResolutionEntries } from '@/utils/form'
 import { log } from '@/utils/logger'
 import { parseApiError } from '@/utils/errorParser'
@@ -386,10 +788,12 @@ import TieredPricingEditor from './TieredPricingEditor.vue'
 import {
   getModelsDevList,
   getProviderLogoUrl,
+  refreshModelsDevList,
   type ModelsDevModelItem,
 } from '@/api/models-dev'
 import {
   createGlobalModel,
+  listGlobalModels,
   updateGlobalModel,
   type GlobalModelResponse,
 } from '@/api/global-models'
@@ -398,7 +802,17 @@ import {
   EMBEDDING_API_FORMATS,
   buildGlobalModelCreatePayload,
   buildGlobalModelUpdatePayload,
+  cloneTieredPricingConfig,
+  findGlobalModelByName,
+  tieredPricingConfigsEqual,
 } from './global-model-form-helpers'
+import { tieredPricingHasImageOutputPricing } from '../utils/tiered-pricing'
+import {
+  getModelsDevPricingSourceFromConfig,
+  modelsDevPricingSourcesEqual,
+  useModelsDevPricingSources,
+  withModelsDevPricingSource,
+} from '../composables/useModelsDevPricingSources'
 
 const props = defineProps<{
   open: boolean
@@ -408,18 +822,78 @@ const props = defineProps<{
 const emit = defineEmits<{
   'update:open': [value: boolean]
   'success': []
+  'editModel': [model: GlobalModelResponse]
+  'pricingSynced': [model: GlobalModelResponse]
 }>()
 
 const { success, error: showError } = useToast()
+const { t } = useI18n()
+const { getSource, setSource } = useModelsDevPricingSources()
 const submitting = ref(false)
+const syncingOnlinePricing = ref(false)
 const tieredPricingEditorRef = ref<InstanceType<typeof TieredPricingEditor> | null>(null)
+const basicInfoSection = ref<HTMLElement | null>(null)
 
 // 模型列表相关
 const loading = ref(false)
 const searchQuery = ref('')
 const allModelsCache = ref<ModelsDevModelItem[]>([]) // 全部模型（缓存）
+const existingModelsCache = ref<GlobalModelResponse[]>([])
 const selectedModel = ref<ModelsDevModelItem | null>(null)
 const expandedProvider = ref<string | null>(null)
+const providerLogoScroller = ref<HTMLElement | null>(null)
+const presetPanelCollapsed = ref(false)
+const billingMode = ref('token')
+const editingOnlinePricingSource = ref<{
+  model_id: string
+  provider_id: string
+  provider_name: string
+} | null>(null)
+const onlinePricingSourcePopoverOpen = ref(false)
+const onlinePricingCandidates = ref<ModelsDevModelItem[]>([])
+const selectedOnlinePricingProviderId = ref('')
+
+const selectedOnlinePricingCandidate = computed(() => (
+  onlinePricingCandidates.value.find(candidate => (
+    candidate.providerId === selectedOnlinePricingProviderId.value
+  )) ?? null
+))
+const currentOnlinePricingSource = computed(() => (
+  props.model ? getSource(props.model.id, props.model.config) : null
+))
+const firstSyncableOnlinePricingProviderId = computed(() => (
+  onlinePricingCandidates.value.find(isOnlinePricingCandidateSyncable)?.providerId ?? ''
+))
+
+watch([onlinePricingSourcePopoverOpen, syncingOnlinePricing], ([open, syncing]) => {
+  if (!open || syncing) return
+  void nextTick().then(() => {
+    if (onlinePricingSourcePopoverOpen.value && !syncingOnlinePricing.value) {
+      focusOnlinePricingSourcePopover()
+    }
+  })
+}, { flush: 'post' })
+
+function getExistingModel(model: ModelsDevModelItem): GlobalModelResponse | undefined {
+  return findGlobalModelByName(existingModelsCache.value, model.modelId)
+}
+
+function formatTokenLimit(value: number): string {
+  if (value >= 1_000_000) {
+    return `${Number((value / 1_000_000).toFixed(1))}M`
+  }
+  if (value >= 1_000) {
+    return `${Number((value / 1_000).toFixed(1))}K`
+  }
+  return String(value)
+}
+
+function formatModelPrice(value?: number): string {
+  if (value === undefined) return '-'
+  if (value === 0) return '0'
+  const precision = value < 0.01 ? 4 : value < 1 ? 3 : 2
+  return value.toFixed(precision).replace(/\.?0+$/, '')
+}
 
 // 当前显示的模型列表：有搜索词时用全部，否则只用官方
 const allModels = computed(() => {
@@ -434,6 +908,25 @@ interface ProviderGroup {
   providerId: string
   providerName: string
   models: ModelsDevModelItem[]
+}
+
+const PROVIDER_PRIORITY_KEYWORDS = [
+  ['anthropic', 'claude'],
+  ['openai'],
+  ['google', 'gemini'],
+]
+
+function getProviderPriority(group: ProviderGroup): number {
+  const searchableText = `${group.providerId} ${group.providerName}`.toLowerCase()
+  const priority = PROVIDER_PRIORITY_KEYWORDS.findIndex(keywords => (
+    keywords.some(keyword => searchableText.includes(keyword))
+  ))
+  return priority === -1 ? PROVIDER_PRIORITY_KEYWORDS.length : priority
+}
+
+function getDefaultProviderId(groups: ProviderGroup[]): string | null {
+  const claudeProvider = groups.find(group => getProviderPriority(group) === 0)
+  return claudeProvider?.providerId ?? groups[0]?.providerId ?? null
 }
 
 const groupedModels = computed(() => {
@@ -463,35 +956,80 @@ const groupedModels = computed(() => {
   // 转换为数组并排序
   const result = Array.from(groups.values())
 
-  // 如果有搜索词，把提供商名称/ID匹配的排在前面
-  if (searchQuery.value) {
-    const keywords = searchQuery.value.toLowerCase().split(/\s+/).filter(k => k.length > 0)
-    result.sort((a, b) => {
+  const searchKeywords = searchQuery.value.toLowerCase().split(/\s+/).filter(k => k.length > 0)
+  result.sort((a, b) => {
+    // 搜索时，优先展示提供商名称或 ID 直接匹配的结果
+    if (searchKeywords.length > 0) {
       const aText = `${a.providerId} ${a.providerName}`.toLowerCase()
       const bText = `${b.providerId} ${b.providerName}`.toLowerCase()
-      const aProviderMatch = keywords.some(k => aText.includes(k))
-      const bProviderMatch = keywords.some(k => bText.includes(k))
+      const aProviderMatch = searchKeywords.some(keyword => aText.includes(keyword))
+      const bProviderMatch = searchKeywords.some(keyword => bText.includes(keyword))
       if (aProviderMatch && !bProviderMatch) return -1
       if (!aProviderMatch && bProviderMatch) return 1
-      return a.providerName.localeCompare(b.providerName)
-    })
-  } else {
-    result.sort((a, b) => a.providerName.localeCompare(b.providerName))
-  }
+    }
+
+    // Claude（Anthropic）、OpenAI、Google 固定排在最前
+    const priorityDifference = getProviderPriority(a) - getProviderPriority(b)
+    if (priorityDifference !== 0) return priorityDifference
+    return a.providerName.localeCompare(b.providerName)
+  })
 
   return result
 })
 
+const expandedProviderGroup = computed(() => (
+  groupedModels.value.find(group => group.providerId === expandedProvider.value) ?? null
+))
+
 // 搜索时如果只有一个提供商，自动展开
 watch(groupedModels, (groups) => {
+  if (expandedProvider.value && !groups.some(group => group.providerId === expandedProvider.value)) {
+    expandedProvider.value = null
+  }
   if (searchQuery.value && groups.length === 1) {
     expandedProvider.value = groups[0].providerId
+  } else if (!searchQuery.value && !expandedProvider.value) {
+    expandedProvider.value = getDefaultProviderId(groups)
   }
 })
 
 // 切换提供商展开状态
 function toggleProvider(providerId: string) {
   expandedProvider.value = expandedProvider.value === providerId ? null : providerId
+}
+
+function scrollProviderLogos(direction: -1 | 1) {
+  providerLogoScroller.value?.scrollBy({
+    left: direction * 280,
+    behavior: 'smooth',
+  })
+}
+
+function handleBillingModeChange(mode: string) {
+  billingMode.value = mode
+  if (mode === 'image' && !isImageGenerationEnabled.value) {
+    setImageGenerationEnabled(true)
+  }
+}
+
+function scrollToBasicInformation() {
+  nextTick(() => {
+    basicInfoSection.value?.scrollIntoView({
+      behavior: 'smooth',
+      block: 'nearest',
+    })
+  })
+}
+
+function enterManualEntryMode() {
+  clearSelection()
+  presetPanelCollapsed.value = true
+  scrollToBasicInformation()
+}
+
+function reopenPresetPanel() {
+  clearSelection()
+  presetPanelCollapsed.value = false
 }
 
 // 阶梯计费配置
@@ -750,34 +1288,55 @@ function fillVideoResolutionPricePreset(preset: 'common' | 'sora' | 'veo') {
 }
 
 
-// 加载模型列表
+async function loadExistingModels() {
+  const models: GlobalModelResponse[] = []
+  let total = 0
+  do {
+    const response = await listGlobalModels({ skip: models.length, limit: 1000 })
+    models.push(...response.models)
+    total = response.total
+    if (response.models.length === 0) break
+  } while (models.length < total)
+  existingModelsCache.value = models
+}
+
+// 加载在线目录和已有模型列表
 async function loadModels() {
-  if (allModelsCache.value.length > 0) return
   loading.value = true
-  try {
-    // 只加载一次全部模型，过滤在 computed 中完成
-    allModelsCache.value = await getModelsDevList(false)
-  } catch (err) {
-    log.error('Failed to load models:', err)
-  } finally {
-    loading.value = false
-  }
+  await Promise.all([
+    allModelsCache.value.length > 0
+      ? Promise.resolve()
+      : getModelsDevList(false)
+          .then(models => { allModelsCache.value = models })
+          .catch(err => log.error('Failed to load online models:', err)),
+    loadExistingModels()
+      .catch(err => log.error('Failed to load existing models:', err)),
+  ])
+  loading.value = false
 }
 
 // 打开对话框时加载数据
-watch(() => props.open, (isOpen) => {
+watch(() => props.open, async (isOpen) => {
+  if (!isOpen) {
+    editingOnlinePricingSource.value = null
+    resetOnlinePricingSourceSelection()
+    return
+  }
   if (isOpen && !props.model) {
-    loadModels()
+    await loadModels()
+    if (!expandedProvider.value) {
+      expandedProvider.value = getDefaultProviderId(groupedModels.value)
+    }
   }
 })
 
 // 选择模型并填充表单
 function selectModel(model: ModelsDevModelItem) {
+  if (getExistingModel(model)) return
+
   imageGenerationExplicitOverride.value = null
   selectedModel.value = model
   expandedProvider.value = model.providerId
-  form.value.name = model.modelId
-  form.value.display_name = model.modelName
 
   // 构建 config
   const config: Record<string, unknown> = {
@@ -797,26 +1356,282 @@ function selectModel(model: ModelsDevModelItem) {
   if (model.releaseDate) config.release_date = model.releaseDate
   if (model.inputModalities?.length) config.input_modalities = model.inputModalities
   if (model.outputModalities?.length) config.output_modalities = model.outputModalities
-  form.value.config = config
   const supportedCapabilities = new Set<string>()
   if (model.supportsEmbedding) supportedCapabilities.add('embedding')
   if (model.outputModalities?.includes('image')) supportedCapabilities.add('image_generation')
-  form.value.supported_capabilities = [...supportedCapabilities]
+  form.value = {
+    ...defaultForm(),
+    name: model.modelId,
+    display_name: model.modelName,
+    config,
+    supported_capabilities: [...supportedCapabilities],
+  }
   if (model.supportsEmbedding) {
     setEmbeddingEnabled(true)
   }
+  if (model.outputModalities?.includes('image')) {
+    billingMode.value = 'image'
+  } else if (model.outputModalities?.includes('video')) {
+    billingMode.value = 'video'
+  } else {
+    billingMode.value = 'token'
+  }
   loadVideoPricingFromConfig()
 
-  if (model.inputPrice !== undefined || model.outputPrice !== undefined) {
-    tieredPricing.value = {
-      tiers: [{
-        up_to: null,
-        input_price_per_1m: model.inputPrice || 0,
-        output_price_per_1m: model.outputPrice || 0,
-      }]
+  tieredPricing.value = model.tieredPricing
+    ? cloneTieredPricingConfig(model.tieredPricing)
+    : null
+
+  presetPanelCollapsed.value = true
+  scrollToBasicInformation()
+}
+
+function editExistingModel(model: ModelsDevModelItem) {
+  const existingModel = getExistingModel(model)
+  if (!existingModel) return
+  editingOnlinePricingSource.value = {
+    model_id: model.modelId,
+    provider_id: model.providerId,
+    provider_name: model.providerName,
+  }
+  emit('editModel', existingModel)
+}
+
+function normalizeModelId(value: string): string {
+  return value.trim().toLowerCase()
+}
+
+function formatUnsupportedPricingFields(
+  fields: ModelsDevModelItem['pricingUnsupportedFields'],
+): string {
+  const labels = {
+    reasoning: '推理 Token',
+    input_audio: '输入音频 Token',
+    output_audio: '输出音频 Token',
+  }
+  return (fields ?? []).map(field => labels[field]).join('、')
+}
+
+function getOnlinePricingCandidates(
+  models: ModelsDevModelItem[],
+  model: GlobalModelResponse,
+): ModelsDevModelItem[] {
+  const modelId = normalizeModelId(model.name)
+  return models.filter(item => normalizeModelId(item.modelId) === modelId)
+}
+
+function resolveOnlinePricingModel(
+  candidates: ModelsDevModelItem[],
+  model: GlobalModelResponse,
+): ModelsDevModelItem | null {
+  const modelId = normalizeModelId(model.name)
+  const transientSource = editingOnlinePricingSource.value
+  const storedSource = getSource(model.id, model.config)
+  const preferredProviderId = transientSource?.model_id && normalizeModelId(transientSource.model_id) === modelId
+    ? transientSource.provider_id
+    : storedSource?.provider_id
+
+  if (preferredProviderId) {
+    const preferred = candidates.find(item => (
+      item.providerId.trim().toLowerCase() === preferredProviderId.trim().toLowerCase()
+    ))
+    if (preferred && isOnlinePricingCandidateSyncable(preferred)) return preferred
+  }
+  if (candidates.length === 1) return candidates[0]
+  if (candidates.length === 0) {
+    throw new Error('models.dev 未找到该模型的在线价格')
+  }
+  return null
+}
+
+function isOnlinePricingCandidateSyncable(model: ModelsDevModelItem): boolean {
+  return !model.pricingUnsupportedFields?.length && !!model.tieredPricing?.tiers?.length
+}
+
+function getOnlinePricingCandidateUnavailableReason(model: ModelsDevModelItem): string {
+  if (model.pricingUnsupportedFields?.length) {
+    return `不支持：${formatUnsupportedPricingFields(model.pricingUnsupportedFields)}`
+  }
+  if (!model.tieredPricing?.tiers?.length) return '在线目录未提供 Token 价格'
+  return ''
+}
+
+function resetOnlinePricingSourceSelection() {
+  onlinePricingSourcePopoverOpen.value = false
+  onlinePricingCandidates.value = []
+  selectedOnlinePricingProviderId.value = ''
+}
+
+function getOnlinePricingSourceControls(): HTMLElement[] {
+  return [...document.querySelectorAll<HTMLElement>(
+    '[data-online-pricing-source-control]:not([disabled]):not([tabindex="-1"])',
+  )]
+}
+
+function focusOnlinePricingSourcePopover() {
+  getOnlinePricingSourceControls()[0]?.focus()
+}
+
+function handleOnlinePricingSourcePopoverKeydown(event: KeyboardEvent) {
+  const target = event.target instanceof HTMLElement
+    ? event.target.closest<HTMLElement>('[data-online-pricing-source-control]')
+    : null
+  if (!target) return
+
+  if (event.key === 'Tab') {
+    const controls = getOnlinePricingSourceControls()
+    const currentIndex = controls.indexOf(target)
+    if (currentIndex === -1 || controls.length === 0) return
+    if (event.shiftKey && currentIndex === 0) {
+      event.preventDefault()
+      controls[controls.length - 1]?.focus()
+    } else if (!event.shiftKey && currentIndex === controls.length - 1) {
+      event.preventDefault()
+      controls[0]?.focus()
+    }
+    return
+  }
+
+  if (!['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End'].includes(event.key)) {
+    return
+  }
+  const options = [...document.querySelectorAll<HTMLButtonElement>(
+    '[data-online-pricing-source-option]:not([disabled])',
+  )]
+  const currentIndex = options.indexOf(target as HTMLButtonElement)
+  if (currentIndex === -1 || options.length === 0) return
+
+  event.preventDefault()
+  const nextIndex = event.key === 'Home'
+    ? 0
+    : event.key === 'End'
+      ? options.length - 1
+      : ['ArrowDown', 'ArrowRight'].includes(event.key)
+        ? (currentIndex + 1) % options.length
+        : (currentIndex - 1 + options.length) % options.length
+  const nextOption = options[nextIndex]
+  const providerId = nextOption?.dataset.providerId
+  if (!nextOption || !providerId) return
+  selectedOnlinePricingProviderId.value = providerId
+  nextTick(() => nextOption.focus())
+}
+
+function handleOnlinePricingSourcePopoverUpdate(open: boolean) {
+  if (open) {
+    // The trigger starts the async refresh. Only show the popover once the
+    // refresh is in progress or source candidates are available.
+    if (syncingOnlinePricing.value || onlinePricingCandidates.value.length > 0) {
+      onlinePricingSourcePopoverOpen.value = true
+    }
+    return
+  }
+  if (!syncingOnlinePricing.value) resetOnlinePricingSourceSelection()
+}
+
+function closeOnlinePricingSourcePopover() {
+  if (syncingOnlinePricing.value) return
+  resetOnlinePricingSourceSelection()
+}
+
+async function applyOnlinePricingModel(onlineModel: ModelsDevModelItem) {
+  if (!props.model) return
+  if (onlineModel.pricingUnsupportedFields?.length) {
+    throw new Error(
+      `在线价格包含当前计费引擎无法独立结算的${formatUnsupportedPricingFields(onlineModel.pricingUnsupportedFields)}`,
+    )
+  }
+  if (!onlineModel.tieredPricing?.tiers?.length) {
+    throw new Error('在线目录未提供该模型的价格配置')
+  }
+
+  const pricing = cloneTieredPricingConfig(onlineModel.tieredPricing)
+  const pricingChanged = !tieredPricingConfigsEqual(
+    props.model.default_tiered_pricing,
+    pricing,
+  )
+  const pricingSource = {
+    provider_id: onlineModel.providerId,
+    provider_name: onlineModel.providerName,
+  }
+  const sourceChanged = !modelsDevPricingSourcesEqual(
+    getModelsDevPricingSourceFromConfig(props.model.config),
+    pricingSource,
+  )
+  const nextConfig = withModelsDevPricingSource(props.model.config, pricingSource)
+  let syncedModel: GlobalModelResponse
+  if (pricingChanged || sourceChanged) {
+    const updatedModel = await updateGlobalModel(props.model.id, {
+      default_tiered_pricing: pricing,
+      config: nextConfig,
+    })
+    syncedModel = {
+      ...updatedModel,
+      default_tiered_pricing: pricing,
+      config: nextConfig,
     }
   } else {
-    tieredPricing.value = null
+    syncedModel = {
+      ...props.model,
+      default_tiered_pricing: pricing,
+      config: nextConfig,
+    }
+  }
+  tieredPricing.value = cloneTieredPricingConfig(pricing)
+  form.value.config = { ...nextConfig }
+  billingMode.value = 'token'
+  setSource(props.model.id, pricingSource)
+  emit('pricingSynced', syncedModel)
+  success(
+    pricingChanged
+      ? `已同步 ${onlineModel.providerName} 的最新价格`
+      : sourceChanged
+        ? t('models.pricingSource.savedNoPriceChange', { provider: onlineModel.providerName })
+        : `当前价格已是 ${onlineModel.providerName} 的最新价格`,
+  )
+}
+
+async function confirmOnlinePricingSource() {
+  const onlineModel = selectedOnlinePricingCandidate.value
+  if (!onlineModel || syncingOnlinePricing.value || submitting.value) return
+
+  syncingOnlinePricing.value = true
+  let synced = false
+  try {
+    await applyOnlinePricingModel(onlineModel)
+    synced = true
+  } catch (err: unknown) {
+    log.error('同步在线模型价格失败:', err)
+    showError(parseApiError(err, '同步在线价格失败'), '同步失败')
+  } finally {
+    syncingOnlinePricing.value = false
+    if (synced) resetOnlinePricingSourceSelection()
+  }
+}
+
+async function syncOnlinePricing() {
+  if (!isEditMode.value || !props.model || syncingOnlinePricing.value || submitting.value) return
+
+  syncingOnlinePricing.value = true
+  try {
+    const onlineModels = await refreshModelsDevList(false)
+    allModelsCache.value = onlineModels
+    const candidates = getOnlinePricingCandidates(onlineModels, props.model)
+    const onlineModel = resolveOnlinePricingModel(candidates, props.model)
+    if (onlineModel) {
+      await applyOnlinePricingModel(onlineModel)
+      resetOnlinePricingSourceSelection()
+      return
+    }
+
+    onlinePricingCandidates.value = candidates
+    selectedOnlinePricingProviderId.value = ''
+    onlinePricingSourcePopoverOpen.value = true
+  } catch (err: unknown) {
+    resetOnlinePricingSourceSelection()
+    log.error('同步在线模型价格失败:', err)
+    showError(parseApiError(err, '同步在线价格失败'), '同步失败')
+  } finally {
+    syncingOnlinePricing.value = false
   }
 }
 
@@ -826,6 +1641,8 @@ function clearSelection() {
   selectedModel.value = null
   form.value = defaultForm()
   tieredPricing.value = null
+  videoResolutionPrices.value = []
+  billingMode.value = 'token'
 }
 
 // Logo 加载失败处理
@@ -836,43 +1653,58 @@ function handleLogoError(event: Event) {
 
 // 重置表单
 function resetForm() {
+  resetOnlinePricingSourceSelection()
   imageGenerationExplicitOverride.value = null
+  editingOnlinePricingSource.value = null
   form.value = defaultForm()
   tieredPricing.value = null
   videoResolutionPrices.value = []
   searchQuery.value = ''
   selectedModel.value = null
   expandedProvider.value = null
+  presetPanelCollapsed.value = false
+  billingMode.value = 'token'
 }
 
-// 加载模型数据（编辑模式）
-function loadModelData() {
-  if (!props.model) return
+function populateFormFromGlobalModel(model: GlobalModelResponse) {
   imageGenerationExplicitOverride.value = null
-  // 先重置创建模式的残留状态
-  selectedModel.value = null
-  searchQuery.value = ''
-  expandedProvider.value = null
-
-  const modelTieredPricing = props.model.default_tiered_pricing
-    ? JSON.parse(JSON.stringify(props.model.default_tiered_pricing))
+  const modelTieredPricing = model.default_tiered_pricing
+    ? cloneTieredPricingConfig(model.default_tiered_pricing)
     : null
-  const supportedCapabilities = new Set(props.model.supported_capabilities || [])
+  const supportedCapabilities = new Set(model.supported_capabilities || [])
   if (tieredPricingHasImageOutputPricing(modelTieredPricing)) {
     supportedCapabilities.add('image_generation')
   }
 
   form.value = {
-    name: props.model.name,
-    display_name: props.model.display_name,
-    default_price_per_request: props.model.default_price_per_request,
+    name: model.name,
+    display_name: model.display_name,
+    default_price_per_request: model.default_price_per_request,
     supported_capabilities: [...supportedCapabilities],
-    config: props.model.config ? { ...props.model.config } : { streaming: true },
-    is_active: props.model.is_active,
+    config: model.config ? { ...model.config } : { streaming: true },
+    is_active: model.is_active,
   }
-  // 确保 tieredPricing 也被正确设置或重置
   tieredPricing.value = modelTieredPricing
   loadVideoPricingFromConfig()
+  billingMode.value = 'token'
+}
+
+// 加载模型数据（编辑模式）
+function loadModelData() {
+  if (!props.model) return
+  resetOnlinePricingSourceSelection()
+  if (
+    editingOnlinePricingSource.value
+    && normalizeModelId(editingOnlinePricingSource.value.model_id) !== normalizeModelId(props.model.name)
+  ) {
+    editingOnlinePricingSource.value = null
+  }
+  // 先重置创建模式的残留状态
+  selectedModel.value = null
+  searchQuery.value = ''
+  expandedProvider.value = null
+  presetPanelCollapsed.value = false
+  populateFormFromGlobalModel(props.model)
 }
 
 // 使用 useFormDialog 统一处理对话框逻辑
@@ -883,11 +1715,23 @@ const { isEditMode, handleDialogUpdate, handleCancel } = useFormDialog({
   onClose: () => emit('update:open', false),
   loadData: loadModelData,
   resetForm,
+  extraLoadingStates: [syncingOnlinePricing],
 })
 
+const autoFillMissingCachePrices = computed(() => (
+  !isEditMode.value && selectedModel.value === null
+))
+
 async function handleSubmit() {
+  if (syncingOnlinePricing.value) return
   if (!form.value.name || !form.value.display_name) {
     showError('请填写模型ID和名称')
+    return
+  }
+
+  const pricingValidationError = tieredPricingEditorRef.value?.getValidationError()
+  if (pricingValidationError) {
+    showError(pricingValidationError, '价格配置错误')
     return
   }
 
@@ -903,24 +1747,10 @@ async function handleSubmit() {
 
   // Auto-infer supported_capabilities from tiered pricing config
   const caps = new Set(form.value.supported_capabilities || [])
-  const has1hPricing = finalTieredPricing?.tiers?.some(
-    (t: Record<string, unknown>) => Array.isArray(t.cache_ttl_pricing)
-      && (t.cache_ttl_pricing as Array<Record<string, unknown>>).some(c => c.ttl_minutes === 60)
-  )
-  if (has1hPricing) {
-    caps.add('cache_1h')
-  } else {
-    caps.delete('cache_1h')
-  }
   if (tieredPricingHasImageOutputPricing(finalTieredPricing)) {
     caps.add('image_generation')
   }
   form.value.supported_capabilities = caps.size > 0 ? [...caps] : []
-
-  // 清理空的 config
-  const cleanConfig = form.value.config && Object.keys(form.value.config).length > 0
-    ? form.value.config
-    : undefined
 
   submitting.value = true
   try {
@@ -930,7 +1760,20 @@ async function handleSubmit() {
       success('模型更新成功')
     } else {
       const createData = buildGlobalModelCreatePayload(form.value, finalTieredPricing)
-      await createGlobalModel(createData)
+      if (selectedModel.value) {
+        createData.config = withModelsDevPricingSource(createData.config, {
+          provider_id: selectedModel.value.providerId,
+          provider_name: selectedModel.value.providerName,
+        })
+      }
+      const createdModel = await createGlobalModel(createData)
+      existingModelsCache.value.unshift(createdModel)
+      if (selectedModel.value) {
+        setSource(createdModel.id, {
+          provider_id: selectedModel.value.providerId,
+          provider_name: selectedModel.value.providerName,
+        })
+      }
       success('模型创建成功')
       clearSelection()
       emit('success')
@@ -945,28 +1788,4 @@ async function handleSubmit() {
   }
 }
 
-function tieredPricingHasImageOutputPricing(pricing: TieredPricingConfig | null | undefined): boolean {
-  if (!pricing) return false
-  if (toFinitePrice(pricing.image_output_price_default) !== null) return true
-  if (Object.values(pricing.image_output_prices || {}).some((prices) => {
-    if (!prices || typeof prices !== 'object') return false
-    return Object.values(prices).some((price) => toFinitePrice(price) !== null)
-  })) return true
-  return (pricing.image_output_price_ranges || []).some((range) => {
-    if (!range || typeof range !== 'object') return false
-    const prices = range.prices && typeof range.prices === 'object'
-      ? range.prices
-      : range as Record<string, unknown>
-    return Object.values(prices).some((price) => toFinitePrice(price) !== null)
-  })
-}
-
-function toFinitePrice(value: unknown): number | null {
-  if (typeof value === 'number' && Number.isFinite(value)) return value
-  if (typeof value === 'string' && value.trim()) {
-    const parsed = Number(value)
-    return Number.isFinite(parsed) ? parsed : null
-  }
-  return null
-}
 </script>

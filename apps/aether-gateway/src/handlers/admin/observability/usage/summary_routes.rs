@@ -52,19 +52,27 @@ fn apply_admin_usage_status_filter(query: &mut UsageAuditListQuery, status: Opti
     let Some(status) = status
         .map(str::trim)
         .filter(|candidate| !candidate.is_empty())
+        .map(str::to_ascii_lowercase)
     else {
         return;
     };
 
-    match status {
-        "stream" => query.is_stream = Some(true),
-        "standard" => query.is_stream = Some(false),
+    match status.as_str() {
+        "stream" => {
+            query.is_stream = Some(true);
+            query.is_websocket = Some(false);
+        }
+        "standard" => {
+            query.is_stream = Some(false);
+            query.is_websocket = Some(false);
+        }
+        "websocket" | "ws" => query.is_websocket = Some(true),
         "error" | "failed" => query.error_only = true,
         "active" => {
             query.statuses = Some(vec!["pending".to_string(), "streaming".to_string()]);
         }
         "pending" | "streaming" | "completed" | "cancelled" => {
-            query.statuses = Some(vec![status.to_string()]);
+            query.statuses = Some(vec![status]);
         }
         "has_fallback" | "has_retry" => {}
         _ => {}
@@ -301,10 +309,13 @@ fn admin_usage_unix_millis_to_rfc3339(unix_ms: u64) -> Option<String> {
         .map(|timestamp| timestamp.to_rfc3339())
 }
 
-fn admin_usage_terminal_candidate_state_override(
+pub(super) fn admin_usage_terminal_candidate_state_override(
     candidates: &[StoredRequestCandidate],
 ) -> Option<serde_json::Value> {
     let candidate = admin_usage_current_candidate(candidates)?;
+    if admin_usage_candidate_failure_is_retryable_transition(candidate) {
+        return None;
+    }
 
     let status = match candidate.status {
         RequestCandidateStatus::Success => "completed",
@@ -341,6 +352,73 @@ fn admin_usage_terminal_candidate_state_override(
         payload["error_message"] = json!(error_message);
     }
     Some(payload)
+}
+
+fn admin_usage_candidate_failure_is_retryable_transition(
+    candidate: &StoredRequestCandidate,
+) -> bool {
+    if candidate.status != RequestCandidateStatus::Failed {
+        return false;
+    }
+    let Some(error_flow) = candidate
+        .extra_data
+        .as_ref()
+        .and_then(|value| value.get("error_flow"))
+    else {
+        return false;
+    };
+    let retryable = error_flow
+        .get("retryable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let retry_next_candidate = error_flow
+        .get("decision")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value == "retry_next_candidate");
+    retryable && retry_next_candidate
+}
+
+pub(super) fn apply_admin_usage_state_override(
+    item: &mut StoredRequestUsageAudit,
+    override_payload: &serde_json::Value,
+) {
+    if !matches!(item.status.as_str(), "pending" | "streaming") {
+        return;
+    }
+
+    let Some(object) = override_payload.as_object() else {
+        return;
+    };
+
+    if let Some(status) = object
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| matches!(*value, "completed" | "failed" | "cancelled"))
+    {
+        item.status = status.to_string();
+    }
+    if let Some(status_code) = object
+        .get("status_code")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+    {
+        item.status_code = Some(status_code);
+    }
+    if let Some(response_time_ms) = object
+        .get("response_time_ms")
+        .and_then(serde_json::Value::as_u64)
+    {
+        item.response_time_ms = Some(response_time_ms);
+    }
+    if let Some(error_message) = object
+        .get("error_message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        item.error_message = Some(error_message.to_string());
+    }
 }
 
 fn admin_usage_matches_attempt_status(
@@ -583,7 +661,9 @@ fn build_admin_usage_keyword_search_query(
         client_family: base_query.client_family.clone(),
         exclude_unknown_model_or_provider: base_query.exclude_unknown_model_or_provider,
         statuses: base_query.statuses.clone(),
+        exclude_status_codes: base_query.exclude_status_codes.clone(),
         is_stream: base_query.is_stream,
+        is_websocket: base_query.is_websocket,
         error_only: base_query.error_only,
         keywords,
         matched_user_ids_by_keyword: search_context.matched_user_ids_by_keyword,
@@ -900,6 +980,21 @@ pub(super) async fn maybe_build_local_admin_usage_summary_response(
                 }
             };
 
+            let active_candidate_state =
+                resolve_admin_usage_active_candidate_state(state, &usage).await?;
+            let usage = usage
+                .into_iter()
+                .map(|mut item| {
+                    if let Some(override_payload) = active_candidate_state
+                        .state_overrides_by_request_id
+                        .get(&item.request_id)
+                    {
+                        apply_admin_usage_state_override(&mut item, override_payload);
+                    }
+                    item
+                })
+                .collect::<Vec<_>>();
+
             let user_ids: Vec<String> = usage
                 .iter()
                 .filter_map(|item| item.user_id.clone())
@@ -939,8 +1034,12 @@ mod tests {
     use aether_data_contracts::repository::candidates::{
         RequestCandidateStatus, StoredRequestCandidate,
     };
+    use serde_json::json;
 
-    use super::admin_usage_terminal_candidate_state_override;
+    use super::{
+        admin_usage_terminal_candidate_state_override, build_admin_usage_keyword_search_query,
+        build_admin_usage_records_query, AdminUsageSearchContext,
+    };
 
     fn sample_candidate(
         candidate_index: i32,
@@ -1016,5 +1115,73 @@ mod tests {
         let payload = admin_usage_terminal_candidate_state_override(&[failed, streaming]);
 
         assert!(payload.is_none());
+    }
+
+    #[test]
+    fn admin_usage_active_override_ignores_retryable_candidate_failure() {
+        let mut failed = sample_candidate(
+            0,
+            RequestCandidateStatus::Failed,
+            Some(502),
+            Some(1_000),
+            Some("provider returned HTTP 200 without visible model output"),
+        );
+        failed.extra_data = Some(json!({
+            "error_flow": {
+                "decision": "retry_next_candidate",
+                "retryable": true,
+                "propagation": "suppressed",
+                "classification": "retry_upstream_failure"
+            }
+        }));
+
+        let payload = admin_usage_terminal_candidate_state_override(&[failed]);
+
+        assert!(payload.is_none());
+    }
+
+    #[test]
+    fn admin_usage_transport_statuses_are_disjoint_in_list_and_keyword_queries() {
+        for status in ["websocket", "ws", "WS"] {
+            let raw_query = format!("status={status}");
+            let list_query =
+                build_admin_usage_records_query(100, 200, Some(&raw_query), None, None);
+
+            assert_eq!(list_query.is_websocket, Some(true));
+            assert_eq!(list_query.is_stream, None);
+
+            let keyword_query = build_admin_usage_keyword_search_query(
+                &list_query,
+                vec!["live".to_string()],
+                None,
+                AdminUsageSearchContext::default(),
+                false,
+                false,
+                None,
+                None,
+            );
+            assert_eq!(keyword_query.is_websocket, Some(true));
+        }
+
+        for (status, expected_stream) in [("stream", true), ("standard", false)] {
+            let raw_query = format!("status={status}");
+            let list_query =
+                build_admin_usage_records_query(100, 200, Some(&raw_query), None, None);
+            assert_eq!(list_query.is_stream, Some(expected_stream));
+            assert_eq!(list_query.is_websocket, Some(false));
+
+            let keyword_query = build_admin_usage_keyword_search_query(
+                &list_query,
+                vec!["live".to_string()],
+                None,
+                AdminUsageSearchContext::default(),
+                false,
+                false,
+                None,
+                None,
+            );
+            assert_eq!(keyword_query.is_stream, Some(expected_stream));
+            assert_eq!(keyword_query.is_websocket, Some(false));
+        }
     }
 }

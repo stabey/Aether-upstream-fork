@@ -6,6 +6,7 @@ import {
   hasUsageRetry,
   isUsageRecordFailed,
   isUsageRecordSuccessful,
+  isUsageWebSocket,
   mapRequestStatusToTimelineStatus,
   normalizeRequestStatus,
   resolveDisplayRequestStatus,
@@ -77,6 +78,11 @@ describe('usage status helpers', () => {
     expect(resolveDisplayRequestStatus(buildUsageRecord({
       status: 'streaming',
       first_byte_time_ms: 320,
+    }))).toBe('streaming')
+
+    expect(resolveDisplayRequestStatus(buildUsageRecord({
+      status: 'streaming',
+      first_byte_time_ms: 0,
     }))).toBe('streaming')
   })
 
@@ -172,6 +178,12 @@ describe('usage status helpers', () => {
     expect(hasUsageRetry(buildUsageRecord({ has_retry: undefined }))).toBe(false)
   })
 
+  it('recognizes persisted WebSocket usage records', () => {
+    expect(isUsageWebSocket(buildUsageRecord({ is_websocket: true }))).toBe(true)
+    expect(isUsageWebSocket(buildUsageRecord({ is_websocket: false }))).toBe(false)
+    expect(isUsageWebSocket(buildUsageRecord({ is_websocket: undefined }))).toBe(false)
+  })
+
   it('prefers symmetric stream aliases when present', () => {
     expect(formatUsageStreamLabel(buildUsageRecord({
       is_stream: true,
@@ -196,6 +208,14 @@ describe('usage status helpers', () => {
       client_requested_stream: undefined,
       client_is_stream: undefined,
     }))).toBe('标准->流式')
+
+    expect(formatUsageStreamLabel(buildUsageRecord({
+      api_format: 'openai:search',
+      is_stream: false,
+      upstream_is_stream: false,
+      client_requested_stream: undefined,
+      client_is_stream: undefined,
+    }))).toBe('标准')
 
     expect(formatUsageStreamLabel(buildUsageRecord({
       api_format: 'claude:messages',

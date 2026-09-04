@@ -2,7 +2,8 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use aether_data_contracts::repository::candidate_selection::{
-    StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
+    provider_model_mapping_api_format_covers, StoredMinimalCandidateSelectionRow,
+    StoredProviderModelMapping,
 };
 use aether_data_contracts::DataLayerError;
 use regex::RegexBuilder;
@@ -26,16 +27,32 @@ pub fn resolve_requested_global_model_name_with_model_directives(
     api_format: &str,
     enable_model_directives: bool,
 ) -> Option<String> {
+    resolve_requested_global_model_name_with_model_directives_and_request_operation(
+        rows,
+        requested_model_name,
+        api_format,
+        enable_model_directives,
+        None,
+    )
+}
+
+pub fn resolve_requested_global_model_name_with_model_directives_and_request_operation(
+    rows: &[StoredMinimalCandidateSelectionRow],
+    requested_model_name: &str,
+    api_format: &str,
+    enable_model_directives: bool,
+    request_operation: Option<&str>,
+) -> Option<String> {
     requested_model_name_candidates(requested_model_name, enable_model_directives).find_map(
         |requested_model_name| {
             let requested_model_name = requested_model_name.as_ref();
             resolve_global_model_name_by(rows, |row| {
-                row_has_available_provider_model(row, api_format)
+                row_has_available_provider_model(row, api_format, request_operation)
                     && row.global_model_name == requested_model_name
             })
             .or_else(|| {
                 resolve_global_model_name_by(rows, |row| {
-                    row_default_provider_model_name_available(row, api_format)
+                    row_default_provider_model_name_available(row, api_format, request_operation)
                         && row.model_provider_model_name == requested_model_name
                 })
             })
@@ -45,7 +62,7 @@ pub fn resolve_requested_global_model_name_with_model_directives(
                         .as_ref()
                         .is_some_and(|mappings| {
                             mappings.iter().any(|mapping| {
-                                mapping_scope_matches(mapping, row, api_format)
+                                mapping_scope_matches(mapping, row, api_format, request_operation)
                                     && mapping.name == requested_model_name
                             })
                         })
@@ -53,7 +70,7 @@ pub fn resolve_requested_global_model_name_with_model_directives(
             })
             .or_else(|| {
                 resolve_global_model_name_by(rows, |row| {
-                    row_has_available_provider_model(row, api_format)
+                    row_has_available_provider_model(row, api_format, request_operation)
                         && row.global_model_mappings.as_ref().is_some_and(|patterns| {
                             patterns
                                 .iter()
@@ -79,9 +96,30 @@ pub fn row_supports_requested_model_with_model_directives(
     api_format: &str,
     enable_model_directives: bool,
 ) -> bool {
+    row_supports_requested_model_with_model_directives_and_request_operation(
+        row,
+        requested_model_name,
+        api_format,
+        enable_model_directives,
+        None,
+    )
+}
+
+pub fn row_supports_requested_model_with_model_directives_and_request_operation(
+    row: &StoredMinimalCandidateSelectionRow,
+    requested_model_name: &str,
+    api_format: &str,
+    enable_model_directives: bool,
+    request_operation: Option<&str>,
+) -> bool {
     requested_model_name_candidates(requested_model_name, enable_model_directives).any(
         |requested_model_name| {
-            row_supports_requested_model_exact(row, requested_model_name.as_ref(), api_format)
+            row_supports_requested_model_exact(
+                row,
+                requested_model_name.as_ref(),
+                api_format,
+                request_operation,
+            )
         },
     )
 }
@@ -90,10 +128,11 @@ fn row_supports_requested_model_exact(
     row: &StoredMinimalCandidateSelectionRow,
     requested_model_name: &str,
     api_format: &str,
+    request_operation: Option<&str>,
 ) -> bool {
-    row_has_available_provider_model(row, api_format)
+    row_has_available_provider_model(row, api_format, request_operation)
         && (row.global_model_name == requested_model_name
-            || (row_default_provider_model_name_available(row, api_format)
+            || (row_default_provider_model_name_available(row, api_format, request_operation)
                 && row.model_provider_model_name == requested_model_name)
             || row.global_model_mappings.as_ref().is_some_and(|patterns| {
                 patterns
@@ -105,7 +144,7 @@ fn row_supports_requested_model_exact(
             .as_ref()
             .is_some_and(|mappings| {
                 mappings.iter().any(|mapping| {
-                    mapping_scope_matches(mapping, row, api_format)
+                    mapping_scope_matches(mapping, row, api_format, request_operation)
                         && mapping.name == requested_model_name
                 })
             })
@@ -145,7 +184,24 @@ pub fn resolve_provider_model_name_with_model_directives(
     api_format: &str,
     enable_model_directives: bool,
 ) -> Option<(String, Option<String>)> {
-    let selected_provider_model_name = resolve_selected_provider_model_name(row, api_format)?;
+    resolve_provider_model_name_with_model_directives_and_request_operation(
+        row,
+        requested_model_name,
+        api_format,
+        enable_model_directives,
+        None,
+    )
+}
+
+pub fn resolve_provider_model_name_with_model_directives_and_request_operation(
+    row: &StoredMinimalCandidateSelectionRow,
+    requested_model_name: &str,
+    api_format: &str,
+    enable_model_directives: bool,
+    request_operation: Option<&str>,
+) -> Option<(String, Option<String>)> {
+    let selected_provider_model_name =
+        resolve_selected_provider_model_name(row, api_format, request_operation)?;
     let Some(key_allowed_models) = row.key_allowed_models.as_ref() else {
         return Some((selected_provider_model_name, None));
     };
@@ -175,7 +231,7 @@ pub fn resolve_provider_model_name_with_model_directives(
     sorted_allowed_models.sort_unstable();
 
     for &allowed_model in &sorted_allowed_models {
-        if row_has_candidate_model_name(row, api_format, allowed_model) {
+        if row_has_candidate_model_name(row, api_format, request_operation, allowed_model) {
             let allowed_model = allowed_model.to_owned();
             return Some((selected_provider_model_name.clone(), Some(allowed_model)));
         }
@@ -198,13 +254,14 @@ pub fn select_provider_model_name(
     row: &StoredMinimalCandidateSelectionRow,
     api_format: &str,
 ) -> String {
-    resolve_selected_provider_model_name(row, api_format)
+    resolve_selected_provider_model_name(row, api_format, None)
         .unwrap_or_else(|| row.model_provider_model_name.clone())
 }
 
 fn resolve_selected_provider_model_name(
     row: &StoredMinimalCandidateSelectionRow,
     api_format: &str,
+    request_operation: Option<&str>,
 ) -> Option<String> {
     let Some(mappings) = row.model_provider_model_mappings.as_ref() else {
         return Some(row.model_provider_model_name.clone());
@@ -212,17 +269,20 @@ fn resolve_selected_provider_model_name(
 
     if let Some(mapping) = mappings
         .iter()
-        .filter(|mapping| mapping_scope_matches(mapping, row, api_format))
+        .filter(|mapping| mapping_scope_matches(mapping, row, api_format, request_operation))
         .min_by(|left, right| {
             left.priority
                 .cmp(&right.priority)
+                .then_with(|| {
+                    mapping_operation_scope_rank(right).cmp(&mapping_operation_scope_rank(left))
+                })
                 .then(left.name.cmp(&right.name))
         })
     {
         return Some(mapping.name.clone());
     }
 
-    row_default_provider_model_name_available(row, api_format)
+    row_default_provider_model_name_available(row, api_format, request_operation)
         .then(|| row.model_provider_model_name.clone())
 }
 
@@ -231,12 +291,12 @@ pub fn candidate_model_names(
     api_format: &str,
 ) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
-    if row_default_provider_model_name_available(row, api_format) {
+    if row_default_provider_model_name_available(row, api_format, None) {
         names.insert(row.model_provider_model_name.clone());
     }
     if let Some(mappings) = row.model_provider_model_mappings.as_ref() {
         for mapping in mappings {
-            if mapping_scope_matches(mapping, row, api_format) {
+            if mapping_scope_matches(mapping, row, api_format, None) {
                 names.insert(mapping.name.clone());
             }
         }
@@ -247,13 +307,15 @@ pub fn candidate_model_names(
 fn row_has_available_provider_model(
     row: &StoredMinimalCandidateSelectionRow,
     api_format: &str,
+    request_operation: Option<&str>,
 ) -> bool {
-    resolve_selected_provider_model_name(row, api_format).is_some()
+    resolve_selected_provider_model_name(row, api_format, request_operation).is_some()
 }
 
 fn row_default_provider_model_name_available(
     row: &StoredMinimalCandidateSelectionRow,
     api_format: &str,
+    request_operation: Option<&str>,
 ) -> bool {
     let Some(mappings) = row.model_provider_model_mappings.as_ref() else {
         return true;
@@ -264,7 +326,7 @@ fn row_default_provider_model_name_available(
             continue;
         }
         has_explicit_default_mapping = true;
-        if mapping_scope_matches(mapping, row, api_format) {
+        if mapping_scope_matches(mapping, row, api_format, request_operation) {
             return true;
         }
     }
@@ -275,21 +337,37 @@ fn mapping_scope_matches(
     mapping: &StoredProviderModelMapping,
     row: &StoredMinimalCandidateSelectionRow,
     api_format: &str,
+    request_operation: Option<&str>,
 ) -> bool {
     let api_format_matches_scope = mapping.api_formats.as_ref().is_none_or(|api_formats| {
-        api_formats
-            .iter()
-            .any(|value| api_format_matches(value, api_format))
+        api_formats.iter().any(|value| {
+            provider_model_mapping_api_format_covers(&row.provider_type, value, api_format)
+        })
     });
     if !api_format_matches_scope {
         return false;
     }
 
-    mapping.endpoint_ids.as_ref().is_none_or(|endpoint_ids| {
+    let endpoint_matches_scope = mapping.endpoint_ids.as_ref().is_none_or(|endpoint_ids| {
         endpoint_ids
             .iter()
             .any(|endpoint_id| endpoint_id == &row.endpoint_id)
+    });
+    if !endpoint_matches_scope {
+        return false;
+    }
+
+    mapping.operations.as_ref().is_none_or(|operations| {
+        request_operation.is_some_and(|request_operation| {
+            operations
+                .iter()
+                .any(|operation| operation.eq_ignore_ascii_case(request_operation))
+        })
     })
+}
+
+fn mapping_operation_scope_rank(mapping: &StoredProviderModelMapping) -> u8 {
+    u8::from(mapping.operations.is_some())
 }
 
 pub fn row_supports_required_capability(
@@ -401,16 +479,18 @@ pub fn normalize_api_format(value: &str) -> String {
 fn row_has_candidate_model_name(
     row: &StoredMinimalCandidateSelectionRow,
     api_format: &str,
+    request_operation: Option<&str>,
     model_name: &str,
 ) -> bool {
-    (row_default_provider_model_name_available(row, api_format)
+    (row_default_provider_model_name_available(row, api_format, request_operation)
         && row.model_provider_model_name == model_name)
         || row
             .model_provider_model_mappings
             .as_ref()
             .is_some_and(|mappings| {
                 mappings.iter().any(|mapping| {
-                    mapping_scope_matches(mapping, row, api_format) && mapping.name == model_name
+                    mapping_scope_matches(mapping, row, api_format, request_operation)
+                        && mapping.name == model_name
                 })
             })
 }
@@ -480,6 +560,7 @@ mod tests {
     use super::{
         matches_model_mapping, resolve_provider_model_name,
         resolve_provider_model_name_with_model_directives,
+        resolve_provider_model_name_with_model_directives_and_request_operation,
         resolve_requested_global_model_name_with_model_directives, row_supports_requested_model,
         row_supports_requested_model_with_model_directives,
     };
@@ -514,6 +595,7 @@ mod tests {
             priority: 1,
             api_formats: Some(vec!["openai:chat".to_string()]),
             endpoint_ids: None,
+            operations: None,
         }]);
 
         let resolved = resolve_provider_model_name(&row, "gpt-5", "openai:chat")
@@ -565,6 +647,138 @@ mod tests {
             )
             .as_deref(),
             Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn responses_model_mapping_scope_covers_search_in_one_direction() {
+        let mut row = sample_row("search-global", "search-default");
+        row.endpoint_api_format = "openai:search".to_string();
+        row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: "gpt-5.6-sol".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:responses".to_string()]),
+            endpoint_ids: None,
+            operations: None,
+        }]);
+
+        assert!(row_supports_requested_model(
+            &row,
+            "gpt-5.6-sol",
+            "openai:search"
+        ));
+        assert_eq!(
+            resolve_provider_model_name(&row, "gpt-5.6-sol", "openai:search")
+                .map(|resolved| resolved.0),
+            Some("gpt-5.6-sol".to_string())
+        );
+
+        row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: "search-only".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:search".to_string()]),
+            endpoint_ids: None,
+            operations: None,
+        }]);
+        assert!(!row_supports_requested_model(
+            &row,
+            "search-only",
+            "openai:responses"
+        ));
+    }
+
+    #[test]
+    fn codex_live_reuses_only_codex_responses_model_mappings() {
+        let mut row = sample_row("live-client-alias", "gpt-realtime-future");
+        row.provider_type = "codex".to_string();
+        row.endpoint_id = "endpoint-live".to_string();
+        row.endpoint_api_format = "codex:live".to_string();
+        row.key_auth_type = "oauth".to_string();
+        row.key_api_formats = Some(vec!["codex:live".to_string()]);
+        row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: "gpt-realtime-future".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:responses".to_string()]),
+            endpoint_ids: Some(vec!["endpoint-live".to_string()]),
+            operations: None,
+        }]);
+
+        assert!(row_supports_requested_model(
+            &row,
+            "live-client-alias",
+            "codex:live"
+        ));
+        assert_eq!(
+            resolve_provider_model_name(&row, "live-client-alias", "codex:live")
+                .map(|resolved| resolved.0),
+            Some("gpt-realtime-future".to_string())
+        );
+
+        let mut wrong_endpoint = row.clone();
+        wrong_endpoint.endpoint_id = "endpoint-other".to_string();
+        assert!(!row_supports_requested_model(
+            &wrong_endpoint,
+            "live-client-alias",
+            "codex:live"
+        ));
+
+        for provider_type in ["openai", "custom"] {
+            let mut non_codex = row.clone();
+            non_codex.provider_type = provider_type.to_string();
+            assert!(!row_supports_requested_model(
+                &non_codex,
+                "live-client-alias",
+                "codex:live"
+            ));
+            assert!(
+                resolve_provider_model_name(&non_codex, "live-client-alias", "codex:live")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn operation_scoped_mapping_overrides_generic_mapping_for_compaction() {
+        let mut row = sample_row("gpt-5.6-sol", "gpt-5.6-sol");
+        row.endpoint_api_format = "openai:responses".to_string();
+        row.model_provider_model_mappings = Some(vec![
+            StoredProviderModelMapping {
+                name: "gpt-5.6-sol".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:responses".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+            },
+            StoredProviderModelMapping {
+                name: "gpt-5.6-terra".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["openai:responses".to_string()]),
+                endpoint_ids: None,
+                operations: Some(vec!["compact".to_string()]),
+            },
+        ]);
+
+        assert_eq!(
+            resolve_provider_model_name_with_model_directives_and_request_operation(
+                &row,
+                "gpt-5.6-sol",
+                "openai:responses",
+                false,
+                None,
+            )
+            .map(|resolved| resolved.0),
+            Some("gpt-5.6-sol".to_string())
+        );
+        assert_eq!(
+            resolve_provider_model_name_with_model_directives_and_request_operation(
+                &row,
+                "gpt-5.6-sol",
+                "openai:responses",
+                false,
+                Some("compact"),
+            )
+            .map(|resolved| resolved.0),
+            Some("gpt-5.6-terra".to_string())
         );
     }
 
@@ -646,6 +860,7 @@ mod tests {
             priority: 1,
             api_formats: None,
             endpoint_ids: Some(vec!["endpoint-openai".to_string()]),
+            operations: None,
         }]);
 
         assert!(!row_supports_requested_model(

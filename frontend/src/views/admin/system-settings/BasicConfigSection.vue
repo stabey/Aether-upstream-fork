@@ -151,48 +151,6 @@
         </div>
       </div>
 
-      <div class="flex items-center h-full">
-        <div class="flex items-center space-x-2">
-          <Checkbox
-            id="enable-openai-image-sync-heartbeat"
-            :checked="enableOpenaiImageSyncHeartbeat"
-            @update:checked="$emit('update:enableOpenaiImageSyncHeartbeat', $event)"
-          />
-          <div>
-            <Label
-              for="enable-openai-image-sync-heartbeat"
-              class="cursor-pointer"
-            >
-              同步生图心跳
-            </Label>
-            <p class="text-xs text-muted-foreground">
-              开启后同步生图外层 HTTP 状态固定为 200，上游失败需读取响应体 error.upstream_status
-            </p>
-          </div>
-        </div>
-      </div>
-
-      <div class="flex items-center h-full">
-        <div class="flex items-center space-x-2">
-          <Checkbox
-            id="enable-standard-text-sync-heartbeat"
-            :checked="enableStandardTextSyncHeartbeat"
-            @update:checked="$emit('update:enableStandardTextSyncHeartbeat', $event)"
-          />
-          <div>
-            <Label
-              for="enable-standard-text-sync-heartbeat"
-              class="cursor-pointer"
-            >
-              标准文本非流式心跳
-            </Label>
-            <p class="text-xs text-muted-foreground">
-              开启后标准文本非流式接口外层 HTTP 状态固定为 200，上游失败需读取响应体 error.upstream_status
-            </p>
-          </div>
-        </div>
-      </div>
-
       <div class="md:col-span-2 grid grid-cols-1 md:grid-cols-2 gap-4 border-t pt-5">
         <div class="flex items-center h-full">
           <div class="flex items-center space-x-2">
@@ -518,8 +476,6 @@ defineProps<{
   registrationPrivacyPolicyVersion: string
   autoDeleteExpiredKeys: boolean
   enableFormatConversion: boolean
-  enableOpenaiImageSyncHeartbeat: boolean
-  enableStandardTextSyncHeartbeat: boolean
   loading: boolean
   hasChanges: boolean
 }>()
@@ -546,7 +502,5 @@ defineEmits<{
   'update:registrationPrivacyPolicyVersion': [value: string]
   'update:autoDeleteExpiredKeys': [value: boolean]
   'update:enableFormatConversion': [value: boolean]
-  'update:enableOpenaiImageSyncHeartbeat': [value: boolean]
-  'update:enableStandardTextSyncHeartbeat': [value: boolean]
 }>()
 </script>

@@ -6,6 +6,16 @@ license.workspace = true
 repository.workspace = true
 description = "Rust ingress gateway for Aether phase 3a transparent proxy"
 
+[features]
+default = []
+jemalloc = [
+    "dep:tikv-jemallocator",
+    "dep:tikv-jemalloc-sys",
+    "tikv-jemallocator/stats",
+    "tikv-jemalloc-sys/stats",
+]
+testkit = []
+
 [dependencies]
 aether-admin.workspace = true
 aether-ai-formats.workspace = true
@@ -14,10 +24,15 @@ aether-billing.workspace = true
 aether-cache.workspace = true
 aether-contracts.workspace = true
 aether-crypto.workspace = true
-aether-data.workspace = true
+aether-data = { workspace = true, features = ["all-drivers"] }
 aether-data-contracts.workspace = true
 aether-dispatch-core.workspace = true
+aether-gateway-frontdoor.workspace = true
+aether-gateway-control.workspace = true
+aether-gateway-execution.workspace = true
 aether-http.workspace = true
+aether-gateway-workers.workspace = true
+aether-gateway-tunnel.workspace = true
 aether-model-fetch.workspace = true
 aether-oauth.workspace = true
 aether-pool-core.workspace = true
@@ -37,6 +52,7 @@ async-trait.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 base64.workspace = true
 bcrypt.workspace = true
+brotli.workspace = true
 bytes.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
@@ -46,7 +62,11 @@ flate2.workspace = true
 futures-util.workspace = true
 hmac.workspace = true
 http.workspace = true
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "client-pool", "server-auto", "service", "tokio"] }
 ldap3 = { version = "0.11", default-features = false, features = ["sync", "tls-rustls"] }
+libc = "0.2"
 md-5 = "0.10"
 object_store.workspace = true
 parking_lot = "0.12"
@@ -56,13 +76,17 @@ rsa = "0.9.10"
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
 sha1 = "0.10"
 sha2 = { workspace = true, features = ["oid"] }
+socket2.workspace = true
 tar.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["postgres", "mysql", "sqlite", "migrate"] }
+sysinfo = "0.32"
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs", "compression-gzip", "set-header"] }
 tracing.workspace = true
@@ -74,8 +98,9 @@ wreq-util.workspace = true
 zstd.workspace = true
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-sys = { version = "0.6", optional = true }
 
 [dev-dependencies]
-aether-testkit.workspace = true
+aether-test-support.workspace = true
 tracing-subscriber.workspace = true

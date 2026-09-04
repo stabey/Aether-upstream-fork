@@ -4,17 +4,43 @@ use aether_contracts::ExecutionPlan;
 use serde_json::{json, Value};
 use tracing::debug;
 
+use aether_routing_core::RoutingExecutionPolicy;
+
 use crate::provider_transport::GatewayProviderTransportSnapshot;
 use crate::AppState;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) const RESPONSES_WEBSOCKET_CONFIG_KEY: &str = "responses_websocket";
+pub(crate) const ROUTING_EXECUTION_POLICY_REPORT_FIELD: &str = "routing_execution_policy";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalFailoverPolicy {
     pub(crate) max_retries: Option<u64>,
+    pub(crate) max_transfer_count: u64,
+    pub(crate) max_transfer_timeout_seconds: u64,
     pub(crate) stop_status_codes: BTreeSet<u16>,
     pub(crate) continue_status_codes: BTreeSet<u16>,
+    pub(crate) stop_on_transport_errors: bool,
     pub(crate) success_failover_patterns: Vec<LocalFailoverRegexRule>,
     pub(crate) error_stop_patterns: Vec<LocalFailoverRegexRule>,
     pub(crate) stop_cyber_policy_errors: bool,
+    pub(crate) retry_client_errors_by_default: bool,
+}
+
+impl Default for LocalFailoverPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: None,
+            max_transfer_count: 0,
+            max_transfer_timeout_seconds: 0,
+            stop_status_codes: BTreeSet::new(),
+            continue_status_codes: BTreeSet::new(),
+            stop_on_transport_errors: false,
+            success_failover_patterns: Vec::new(),
+            error_stop_patterns: Vec::new(),
+            stop_cyber_policy_errors: true,
+            retry_client_errors_by_default: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,16 +52,18 @@ pub(crate) struct LocalFailoverRegexRule {
 pub(crate) async fn resolve_local_failover_policy(
     state: &AppState,
     plan: &ExecutionPlan,
-    _report_context: Option<&serde_json::Value>,
+    report_context: Option<&serde_json::Value>,
 ) -> LocalFailoverPolicy {
-    let transport = match state
+    let mut policy = match state
         .read_provider_transport_snapshot(&plan.provider_id, &plan.endpoint_id, &plan.key_id)
         .await
     {
-        Ok(Some(transport)) => transport,
-        Ok(None) | Err(_) => return LocalFailoverPolicy::default(),
+        Ok(Some(transport)) => local_failover_policy_from_transport(&transport),
+        Ok(None) | Err(_) => LocalFailoverPolicy::default(),
     };
-    let policy = local_failover_policy_from_transport(&transport);
+    let cyber_continue_failover = routing_execution_policy_from_report_context(report_context)
+        .is_some_and(|policy| policy.cyber_continue_failover);
+    policy.stop_cyber_policy_errors = !cyber_continue_failover;
     debug!(
         event_name = "local_failover_policy_loaded",
         log_type = "debug",
@@ -45,18 +73,32 @@ pub(crate) async fn resolve_local_failover_policy(
         key_id = %plan.key_id,
         source = "transport_snapshot",
         max_retries = ?policy.max_retries,
+        max_transfer_count = policy.max_transfer_count,
+        max_transfer_timeout_seconds = policy.max_transfer_timeout_seconds,
         stop_status_code_count = policy.stop_status_codes.len(),
         continue_status_code_count = policy.continue_status_codes.len(),
+        stop_on_transport_errors = policy.stop_on_transport_errors,
         success_failover_pattern_count = policy.success_failover_patterns.len(),
         error_stop_pattern_count = policy.error_stop_patterns.len(),
+        cyber_continue_failover,
         "gateway loaded local failover policy from transport snapshot"
     );
     policy
 }
 
+pub(crate) fn routing_execution_policy_from_report_context(
+    report_context: Option<&Value>,
+) -> Option<RoutingExecutionPolicy> {
+    report_context
+        .and_then(Value::as_object)
+        .and_then(|object| object.get(ROUTING_EXECUTION_POLICY_REPORT_FIELD))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
 pub(crate) fn local_failover_policy_from_transport(
     transport: &GatewayProviderTransportSnapshot,
 ) -> LocalFailoverPolicy {
+    let provider_config = transport.provider.config.as_ref();
     let rules = transport
         .provider
         .config
@@ -81,10 +123,19 @@ pub(crate) fn local_failover_policy_from_transport(
 
     LocalFailoverPolicy {
         max_retries,
-        stop_cyber_policy_errors: codex_cyber_flag_passthrough_enabled(
-            &transport.provider.provider_type,
-            transport.provider.config.as_ref(),
-        ),
+        max_transfer_count: provider_config
+            .and_then(|value| value.get("max_transfer_count"))
+            .and_then(parse_u64_value)
+            .unwrap_or(0),
+        max_transfer_timeout_seconds: provider_config
+            .and_then(|value| value.get("max_transfer_timeout_seconds"))
+            .and_then(parse_u64_value)
+            .unwrap_or(0),
+        retry_client_errors_by_default:
+            crate::ai_serving::api_format_defaults_to_client_error_failover(
+                &transport.endpoint.api_format,
+            ),
+        stop_cyber_policy_errors: true,
         stop_status_codes: rules
             .map(|value| {
                 parse_status_code_set(
@@ -111,6 +162,10 @@ pub(crate) fn local_failover_policy_from_transport(
                 )
             })
             .unwrap_or_default(),
+        stop_on_transport_errors: rules
+            .and_then(|value| value.get("stop_on_transport_errors"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         success_failover_patterns: rules
             .map(|value| parse_regex_rules(value, "success_failover_patterns"))
             .unwrap_or_default(),
@@ -130,6 +185,14 @@ pub(crate) fn local_failover_policy_from_report_context(
 
     Some(LocalFailoverPolicy {
         max_retries: object.get("max_retries").and_then(parse_u64_value),
+        max_transfer_count: object
+            .get("max_transfer_count")
+            .and_then(parse_u64_value)
+            .unwrap_or(0),
+        max_transfer_timeout_seconds: object
+            .get("max_transfer_timeout_seconds")
+            .and_then(parse_u64_value)
+            .unwrap_or(0),
         stop_status_codes: object
             .get("stop_status_codes")
             .map(parse_status_code_list)
@@ -138,12 +201,20 @@ pub(crate) fn local_failover_policy_from_report_context(
             .get("continue_status_codes")
             .map(parse_status_code_list)
             .unwrap_or_default(),
+        stop_on_transport_errors: object
+            .get("stop_on_transport_errors")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         success_failover_patterns: parse_regex_rules(object, "success_failover_patterns"),
         error_stop_patterns: parse_regex_rules(object, "error_stop_patterns"),
         stop_cyber_policy_errors: object
             .get("stop_cyber_policy_errors")
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .unwrap_or(true),
+        retry_client_errors_by_default: object
+            .get("retry_client_errors_by_default")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
     })
 }
 
@@ -158,6 +229,30 @@ pub(crate) fn append_local_failover_policy_to_value(
         "local_failover_policy".to_string(),
         local_failover_policy_to_value(&local_failover_policy_from_transport(transport)),
     );
+    if transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex")
+    {
+        let codex = transport
+            .key
+            .upstream_metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("codex"));
+        object.insert(
+            "codex_quota_reset_generation".to_string(),
+            Value::from(aether_admin::provider::quota::codex_quota_account_reset_generation(codex)),
+        );
+        if let Some(generation) = aether_admin::provider::quota::codex_credential_generation(codex)
+        {
+            object.insert(
+                "codex_credential_generation".to_string(),
+                Value::String(generation.to_string()),
+            );
+        }
+    }
     Value::Object(object)
 }
 
@@ -173,11 +268,15 @@ fn parse_status_code_list(value: &Value) -> BTreeSet<u16> {
 fn local_failover_policy_to_value(policy: &LocalFailoverPolicy) -> Value {
     json!({
         "max_retries": policy.max_retries,
+        "max_transfer_count": policy.max_transfer_count,
+        "max_transfer_timeout_seconds": policy.max_transfer_timeout_seconds,
         "stop_status_codes": policy.stop_status_codes.iter().copied().collect::<Vec<_>>(),
         "continue_status_codes": policy.continue_status_codes.iter().copied().collect::<Vec<_>>(),
+        "stop_on_transport_errors": policy.stop_on_transport_errors,
         "success_failover_patterns": policy.success_failover_patterns.iter().map(local_failover_regex_rule_to_value).collect::<Vec<_>>(),
         "error_stop_patterns": policy.error_stop_patterns.iter().map(local_failover_regex_rule_to_value).collect::<Vec<_>>(),
         "stop_cyber_policy_errors": policy.stop_cyber_policy_errors,
+        "retry_client_errors_by_default": policy.retry_client_errors_by_default,
     })
 }
 
@@ -198,6 +297,64 @@ pub(crate) fn codex_cyber_flag_passthrough_enabled(
                 .and_then(Value::as_bool)
         })
         .unwrap_or(true)
+}
+
+/// Selects the protocol adapter responsible for one eligible Responses
+/// WebSocket upstream. Provider-scoped feature switches remain the source of
+/// truth; this enum only identifies provider-specific extensions around the
+/// otherwise standard Responses WebSocket protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResponsesWebSocketAdapter {
+    /// A provider that speaks the standard OpenAI Responses WebSocket protocol.
+    Standard,
+    /// Standard protocol plus Codex account and quota extensions.
+    Codex,
+}
+
+impl ResponsesWebSocketAdapter {
+    pub(crate) fn supports_provider_type(self, provider_type: &str) -> bool {
+        match self {
+            Self::Standard => {
+                !provider_type.trim().is_empty()
+                    && !provider_type.trim().eq_ignore_ascii_case("codex")
+            }
+            Self::Codex => provider_type.trim().eq_ignore_ascii_case("codex"),
+        }
+    }
+}
+
+/// Whether a provider explicitly enables the standard Responses WebSocket
+/// bridge. The setting is provider-scoped so rollout remains opt-in per
+/// verified upstream.
+pub(crate) fn responses_websocket_enabled(provider_config: Option<&Value>) -> bool {
+    provider_config
+        .and_then(|config| config.get(RESPONSES_WEBSOCKET_CONFIG_KEY))
+        .and_then(Value::as_object)
+        .and_then(|responses| responses.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Returns the enabled Responses WebSocket adapter for a provider. The shared
+/// protocol bridge remains opt-in, while this resolver isolates provider-only
+/// extensions from candidate planning and the session engine.
+pub(crate) fn responses_websocket_adapter(
+    provider_type: &str,
+    provider_config: Option<&Value>,
+) -> Option<ResponsesWebSocketAdapter> {
+    let provider_type = provider_type.trim();
+    if provider_type.is_empty() {
+        return None;
+    }
+    if !responses_websocket_enabled(provider_config) {
+        return None;
+    }
+    Some(if provider_type.eq_ignore_ascii_case("codex") {
+        ResponsesWebSocketAdapter::Codex
+    } else {
+        ResponsesWebSocketAdapter::Standard
+    })
 }
 
 fn local_failover_regex_rule_to_value(rule: &LocalFailoverRegexRule) -> Value {
@@ -271,7 +428,9 @@ mod tests {
 
     use super::{
         append_local_failover_policy_to_value, local_failover_policy_from_report_context,
-        local_failover_policy_from_transport, LocalFailoverPolicy, LocalFailoverRegexRule,
+        local_failover_policy_from_transport, responses_websocket_adapter,
+        responses_websocket_enabled, LocalFailoverPolicy, LocalFailoverRegexRule,
+        ResponsesWebSocketAdapter,
     };
     use crate::provider_transport::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -349,10 +508,13 @@ mod tests {
                 Some(5),
                 Some(4),
                 Some(json!({
+                    "max_transfer_count": 10,
+                    "max_transfer_timeout_seconds": 60,
                     "failover_rules": {
                         "max_retries": 2,
                         "continue_status_codes": [429],
                         "stop_status_codes": [400],
+                        "stop_on_transport_errors": true,
                         "success_failover_patterns": [{"pattern": "quota", "status_codes": [200]}],
                         "error_stop_patterns": [{"pattern": "validation", "status_codes": [422]}]
                     }
@@ -364,8 +526,11 @@ mod tests {
             local_failover_policy_from_report_context(Some(&report_context)),
             Some(LocalFailoverPolicy {
                 max_retries: Some(2),
+                max_transfer_count: 10,
+                max_transfer_timeout_seconds: 60,
                 stop_status_codes: [400].into_iter().collect(),
                 continue_status_codes: [429].into_iter().collect(),
+                stop_on_transport_errors: true,
                 success_failover_patterns: vec![LocalFailoverRegexRule {
                     pattern: "quota".to_string(),
                     status_codes: [200].into_iter().collect(),
@@ -374,13 +539,105 @@ mod tests {
                     pattern: "validation".to_string(),
                     status_codes: [422].into_iter().collect(),
                 }],
-                stop_cyber_policy_errors: false,
+                stop_cyber_policy_errors: true,
+                retry_client_errors_by_default: true,
             })
         );
     }
 
     #[test]
-    fn codex_cyber_policy_passthrough_defaults_on_and_can_be_disabled() {
+    fn codex_report_context_captures_quota_and_credential_generations() {
+        let mut transport = sample_transport(None, None, None);
+        transport.provider.provider_type = "codex".to_string();
+        transport.key.upstream_metadata = Some(json!({
+            "codex": {
+                "account_quota_reset_generation": 7,
+                "credential_generation": "credential-generation-7"
+            }
+        }));
+
+        let report_context = append_local_failover_policy_to_value(json!({}), &transport);
+
+        assert_eq!(report_context["codex_quota_reset_generation"], json!(7u64));
+        assert_eq!(
+            report_context["codex_credential_generation"],
+            json!("credential-generation-7")
+        );
+    }
+
+    #[test]
+    fn transport_error_failover_defaults_to_continue_and_accepts_explicit_stop() {
+        let default_policy =
+            local_failover_policy_from_transport(&sample_transport(None, None, None));
+        assert!(!default_policy.stop_on_transport_errors);
+
+        let stop_policy = local_failover_policy_from_transport(&sample_transport(
+            None,
+            None,
+            Some(json!({
+                "failover_rules": {
+                    "stop_on_transport_errors": true,
+                }
+            })),
+        ));
+        assert!(stop_policy.stop_on_transport_errors);
+
+        let invalid_policy = local_failover_policy_from_transport(&sample_transport(
+            None,
+            None,
+            Some(json!({
+                "failover_rules": {
+                    "stop_on_transport_errors": "true",
+                }
+            })),
+        ));
+        assert!(!invalid_policy.stop_on_transport_errors);
+    }
+
+    #[test]
+    fn transfer_limits_are_read_only_from_top_level_provider_config() {
+        let top_level = local_failover_policy_from_transport(&sample_transport(
+            None,
+            None,
+            Some(json!({
+                "max_transfer_count": 3,
+                "max_transfer_timeout_seconds": 45,
+            })),
+        ));
+        assert_eq!(top_level.max_transfer_count, 3);
+        assert_eq!(top_level.max_transfer_timeout_seconds, 45);
+
+        let nested = local_failover_policy_from_transport(&sample_transport(
+            None,
+            None,
+            Some(json!({
+                "failover_rules": {
+                    "max_transfer_count": 8,
+                    "max_transfer_timeout_seconds": 90,
+                }
+            })),
+        ));
+        assert_eq!(nested.max_transfer_count, 0);
+        assert_eq!(nested.max_transfer_timeout_seconds, 0);
+    }
+
+    #[test]
+    fn search_transport_disables_default_client_error_failover() {
+        let mut transport = sample_transport(None, None, None);
+        transport.endpoint.api_format = "openai:search".to_string();
+        let policy = local_failover_policy_from_transport(&transport);
+
+        assert!(!policy.retry_client_errors_by_default);
+        let report_context = append_local_failover_policy_to_value(json!({}), &transport);
+        assert_eq!(
+            local_failover_policy_from_report_context(Some(&report_context))
+                .map(|policy| policy.retry_client_errors_by_default),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn transport_policy_defaults_to_stopping_cyber_policy() {
         let mut transport = sample_transport(None, None, None);
         transport.provider.provider_type = "codex".to_string();
         assert!(local_failover_policy_from_transport(&transport).stop_cyber_policy_errors);
@@ -388,7 +645,7 @@ mod tests {
         transport.provider.config = Some(json!({
             "codex": {"pass_through_cyber_flag_interrupt": false}
         }));
-        assert!(!local_failover_policy_from_transport(&transport).stop_cyber_policy_errors);
+        assert!(local_failover_policy_from_transport(&transport).stop_cyber_policy_errors);
 
         transport.provider.config = Some(json!({
             "codex": {"passthrough_cyber_flag_interrupt": true}
@@ -396,6 +653,43 @@ mod tests {
         assert!(local_failover_policy_from_transport(&transport).stop_cyber_policy_errors);
 
         transport.provider.provider_type = "llm".to_string();
-        assert!(!local_failover_policy_from_transport(&transport).stop_cyber_policy_errors);
+        assert!(local_failover_policy_from_transport(&transport).stop_cyber_policy_errors);
+    }
+
+    #[test]
+    fn responses_websocket_requires_an_explicit_provider_switch() {
+        assert!(!responses_websocket_enabled(None));
+        assert!(!responses_websocket_enabled(Some(&json!({
+            "responses_websocket": {"enabled": false}
+        }))));
+        assert!(responses_websocket_enabled(Some(&json!({
+            "responses_websocket": {"enabled": true}
+        }))));
+
+        assert_eq!(
+            responses_websocket_adapter(
+                "custom",
+                Some(&json!({"responses_websocket": {"enabled": false}})),
+            ),
+            None
+        );
+        assert_eq!(
+            responses_websocket_adapter(
+                "custom",
+                Some(&json!({"responses_websocket": {"enabled": true}})),
+            ),
+            Some(ResponsesWebSocketAdapter::Standard)
+        );
+        assert_eq!(
+            responses_websocket_adapter(
+                "codex",
+                Some(&json!({"responses_websocket": {"enabled": true}})),
+            ),
+            Some(ResponsesWebSocketAdapter::Codex)
+        );
+        assert!(ResponsesWebSocketAdapter::Codex.supports_provider_type("CODEX"));
+        assert!(!ResponsesWebSocketAdapter::Codex.supports_provider_type("openai"));
+        assert!(ResponsesWebSocketAdapter::Standard.supports_provider_type("custom"));
+        assert!(!ResponsesWebSocketAdapter::Standard.supports_provider_type("codex"));
     }
 }

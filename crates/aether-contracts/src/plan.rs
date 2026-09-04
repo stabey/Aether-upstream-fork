@@ -7,6 +7,38 @@ pub const EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER: &str = "x-aether-execution-
 pub const EXECUTION_REQUEST_HTTP1_ONLY_HEADER: &str = "x-aether-execution-http1-only";
 pub const EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER: &str =
     "x-aether-execution-accept-invalid-certs";
+pub const EXECUTION_RESPONSE_BODY_MODE_HEADER: &str = "x-aether-execution-response-body-mode";
+pub const MAX_EXECUTION_REQUEST_TIMEOUT_SECS: u64 = 1_200;
+pub const MAX_EXECUTION_REQUEST_TIMEOUT_MS: u64 = MAX_EXECUTION_REQUEST_TIMEOUT_SECS * 1_000;
+pub const MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_SECS: u64 = 300;
+pub const MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_MS: u64 =
+    MAX_EXECUTION_STREAM_FIRST_BYTE_TIMEOUT_SECS * 1_000;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionResponseBodyMode {
+    #[default]
+    StructuredJson,
+    PreserveBytes,
+}
+
+impl ExecutionResponseBodyMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StructuredJson => "structured_json",
+            Self::PreserveBytes => "preserve_bytes",
+        }
+    }
+
+    pub fn from_header_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case(Self::PreserveBytes.as_str()) => {
+                Self::PreserveBytes
+            }
+            _ => Self::StructuredJson,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -66,6 +98,7 @@ pub const TRANSPORT_BACKEND_HYPER_RUSTLS: &str = "hyper_rustls";
 pub const TRANSPORT_BACKEND_BROWSER_WREQ: &str = "browser_wreq";
 pub const TRANSPORT_HTTP_MODE_AUTO: &str = "auto";
 pub const TRANSPORT_HTTP_MODE_HTTP1_ONLY: &str = "http1_only";
+pub const TRANSPORT_HTTP_MODE_H2C_PRIOR_KNOWLEDGE: &str = "h2c_prior_knowledge";
 pub const TRANSPORT_POOL_SCOPE_KEY: &str = "key";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -114,6 +147,7 @@ pub struct ExecutionPlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_encoding: Option<String>,
     pub body: RequestBody,
+    /// Whether the upstream API uses a streaming response protocol.
     #[serde(default)]
     pub stream: bool,
     pub client_api_format: String,
@@ -131,6 +165,22 @@ pub struct ExecutionPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_body_mode_is_fail_closed_to_structured_json() {
+        assert_eq!(
+            ExecutionResponseBodyMode::from_header_value(Some(" preserve_bytes ")),
+            ExecutionResponseBodyMode::PreserveBytes
+        );
+        assert_eq!(
+            ExecutionResponseBodyMode::from_header_value(Some("unexpected")),
+            ExecutionResponseBodyMode::StructuredJson
+        );
+        assert_eq!(
+            ExecutionResponseBodyMode::from_header_value(None),
+            ExecutionResponseBodyMode::StructuredJson
+        );
+    }
 
     #[test]
     fn serializes_plan_with_json_body() {

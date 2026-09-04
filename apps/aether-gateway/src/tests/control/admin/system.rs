@@ -1452,6 +1452,11 @@ async fn gateway_handles_admin_system_api_formats_locally_with_trusted_admin_pri
     assert!(formats.iter().any(|item| item["value"] == "jina:embedding"));
     assert!(formats.iter().any(|item| item["value"] == "jina:rerank"));
     assert!(formats.iter().any(|item| item["value"] == "gemini:video"));
+    let gemini_interactions = formats
+        .iter()
+        .find(|item| item["value"] == "gemini:interactions")
+        .expect("gemini interactions format should exist");
+    assert_eq!(gemini_interactions["default_path"], "/v1/interactions");
     let aliyun_embedding = formats
         .iter()
         .find(|item| item["value"] == "aliyun:multimodal_embedding")
@@ -1489,6 +1494,10 @@ async fn gateway_handles_admin_system_configs_locally_with_trusted_admin_princip
             json!("encrypted-turnstile-secret"),
         ),
         ("site_name".to_string(), json!("Aether Test")),
+        (
+            "external_models_proxy_node_id".to_string(),
+            json!("proxy-node-hidden"),
+        ),
     ]);
     let (upstream_url, upstream_handle) = start_server(upstream).await;
     let gateway = build_router_with_state(
@@ -1515,6 +1524,9 @@ async fn gateway_handles_admin_system_configs_locally_with_trusted_admin_princip
         .iter()
         .any(|item| item["key"] == "request_record_level"));
     assert!(!items.iter().any(|item| item["key"] == "request_log_level"));
+    assert!(!items
+        .iter()
+        .any(|item| item["key"] == "external_models_proxy_node_id"));
     let smtp_password = items
         .iter()
         .find(|item| item["key"] == "smtp_password")
@@ -1531,6 +1543,82 @@ async fn gateway_handles_admin_system_configs_locally_with_trusted_admin_princip
 
     gateway_handle.abort();
     upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_rejects_external_models_proxy_through_generic_system_config_routes() {
+    let data_state = GatewayDataState::disabled().with_system_config_values_for_tests(vec![(
+        "external_models_proxy_node_id".to_string(),
+        json!("proxy-node-owned-by-models"),
+    )]);
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data_state.clone()),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+    let config_url =
+        format!("{gateway_url}/api/admin/system/configs/external_models_proxy_node_id");
+
+    let get_response = client
+        .get(&config_url)
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("generic config get should complete");
+    assert_eq!(get_response.status(), StatusCode::BAD_REQUEST);
+    let get_payload: serde_json::Value = get_response.json().await.expect("json body should parse");
+    assert!(get_payload["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("/api/admin/models/external/config")));
+
+    let put_response = client
+        .put(&config_url)
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({ "value": null }))
+        .send()
+        .await
+        .expect("generic config put should complete");
+    assert_eq!(put_response.status(), StatusCode::BAD_REQUEST);
+    let put_payload: serde_json::Value = put_response.json().await.expect("json body should parse");
+    assert!(put_payload["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("/api/admin/models/external/config")));
+
+    let delete_response = client
+        .delete(&config_url)
+        .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .send()
+        .await
+        .expect("generic config delete should complete");
+    assert_eq!(delete_response.status(), StatusCode::BAD_REQUEST);
+    let delete_payload: serde_json::Value = delete_response
+        .json()
+        .await
+        .expect("json body should parse");
+    assert!(delete_payload["detail"]
+        .as_str()
+        .is_some_and(|detail| detail.contains("/api/admin/models/external/config")));
+
+    assert_eq!(
+        data_state
+            .find_system_config_value_strong("external_models_proxy_node_id")
+            .await
+            .expect("external models config should remain readable"),
+        Some(json!("proxy-node-owned-by-models"))
+    );
+
+    gateway_handle.abort();
 }
 
 #[tokio::test]
@@ -1860,7 +1948,7 @@ async fn gateway_validates_chat_pii_redaction_system_config_locally_with_trusted
 }
 
 #[tokio::test]
-async fn gateway_handles_admin_system_provider_priority_mode_locally_with_bearer_admin_session() {
+async fn gateway_rejects_removed_admin_system_provider_priority_mode_with_bearer_admin_session() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().route(
@@ -1874,7 +1962,7 @@ async fn gateway_handles_admin_system_provider_priority_mode_locally_with_bearer
         }),
     );
 
-    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let (_upstream_url, upstream_handle) = start_server(upstream).await;
     let state = AppState::new().expect("gateway should build");
     let access_token = issue_test_admin_access_token(&state, "device-admin-config").await;
     let gateway = build_router_with_state(state);
@@ -1890,10 +1978,7 @@ async fn gateway_handles_admin_system_provider_priority_mode_locally_with_bearer
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.expect("json body should parse");
-    assert_eq!(payload["key"], "provider_priority_mode");
-    assert_eq!(payload["value"], "provider");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

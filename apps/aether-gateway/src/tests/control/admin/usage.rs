@@ -12,8 +12,8 @@ use aether_data::repository::users::{
 use aether_data_contracts::repository::candidates::{
     RequestCandidateStatus, StoredRequestCandidate,
 };
-use aether_data_contracts::repository::usage::StoredRequestUsageAudit;
-use axum::body::{Body, Bytes};
+use aether_data_contracts::repository::usage::{StoredRequestUsageAudit, UsageBodyCaptureState};
+use axum::body::{to_bytes, Body, Bytes};
 use axum::routing::{any, get, post};
 use axum::{extract::Request, Router};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -641,7 +641,7 @@ async fn gateway_handles_admin_usage_aggregation_stats_locally_with_trusted_admi
     assert_eq!(items[0]["model"], "gpt-5");
     assert_eq!(items[0]["request_count"], 2);
     assert_eq!(items[0]["output_tokens"], 40);
-    assert_eq!(items[0]["effective_input_tokens"], 150);
+    assert_eq!(items[0]["effective_input_tokens"], 120);
     assert_eq!(items[0]["total_input_context"], 160);
     assert_eq!(items[0]["cache_creation_tokens"], 30);
     assert_eq!(items[0]["cache_creation_ephemeral_5m_tokens"], 12);
@@ -1026,7 +1026,7 @@ async fn gateway_handles_admin_usage_active_locally_with_trusted_admin_principal
     let payload: serde_json::Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["requests"].as_array().expect("array").len(), 1);
     assert_eq!(payload["requests"][0]["id"], "usage-pending");
-    assert_eq!(payload["requests"][0]["effective_input_tokens"], 5);
+    assert_eq!(payload["requests"][0]["effective_input_tokens"], 0);
     assert_eq!(payload["requests"][0]["provider"], "OpenAI");
     assert_eq!(payload["requests"][0]["api_key_name"], "fresh-primary");
     assert_eq!(payload["requests"][0]["has_fallback"], true);
@@ -1171,6 +1171,82 @@ async fn gateway_handles_admin_usage_active_ids_for_terminal_updates() {
 }
 
 #[tokio::test]
+async fn gateway_derives_admin_usage_records_and_detail_status_from_terminal_candidate() {
+    let (_records_upstream_url, records_upstream_hits, records_upstream_handle) =
+        start_usage_upstream("/api/admin/usage/records").await;
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed(vec![sample_usage_row(
+        "usage-stale-stream",
+        "req-stale-stream",
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "OpenAI",
+        "gpt-5",
+        "streaming",
+        20,
+        5,
+        0.2,
+        0.24,
+        DAY_1_UNIX_SECS,
+    )]));
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::seed(vec![
+        sample_request_candidate(
+            "cand-stale-stream-success",
+            "req-stale-stream",
+            0,
+            0,
+            RequestCandidateStatus::Success,
+        ),
+    ]));
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                GatewayDataState::with_request_candidate_and_usage_repository_for_tests(
+                    request_candidate_repository,
+                    usage_repository,
+                ),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let records_response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/records?start_date=2024-03-21&end_date=2024-03-21&tz_offset_minutes=0&limit=10&offset=0"
+    )))
+    .send()
+    .await
+    .expect("records request should succeed");
+
+    assert_eq!(records_response.status(), StatusCode::OK);
+    let records_payload: serde_json::Value = records_response
+        .json()
+        .await
+        .expect("records json should parse");
+    assert_eq!(records_payload["records"][0]["id"], "usage-stale-stream");
+    assert_eq!(records_payload["records"][0]["status"], "completed");
+
+    let detail_response = admin_request(
+        reqwest::Client::new().get(format!("{gateway_url}/api/admin/usage/usage-stale-stream")),
+    )
+    .send()
+    .await
+    .expect("detail request should succeed");
+
+    assert_eq!(detail_response.status(), StatusCode::OK);
+    let detail_payload: serde_json::Value = detail_response
+        .json()
+        .await
+        .expect("detail json should parse");
+    assert_eq!(detail_payload["id"], "usage-stale-stream");
+    assert_eq!(detail_payload["status"], "completed");
+    assert_eq!(*records_upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    records_upstream_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_handles_admin_usage_records_locally_with_trusted_admin_principal() {
     let (_upstream_url, upstream_hits, upstream_handle) =
         start_usage_upstream("/api/admin/usage/records").await;
@@ -1250,7 +1326,7 @@ async fn gateway_handles_admin_usage_records_locally_with_trusted_admin_principa
         payload["records"][0]["provider_key_name"],
         "upstream-primary"
     );
-    assert_eq!(payload["records"][0]["effective_input_tokens"], 35);
+    assert_eq!(payload["records"][0]["effective_input_tokens"], 20);
     assert_eq!(payload["records"][0]["first_byte_time_ms"], 120);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
@@ -1977,8 +2053,8 @@ async fn gateway_handles_admin_usage_detail_locally_with_trusted_admin_principal
     assert_eq!(payload["api_key"]["name"], "primary");
     assert_eq!(payload["provider"], "OpenAI");
     assert_eq!(payload["model"], "gpt-5");
-    assert_eq!(payload["effective_input_tokens"], 115);
-    assert_eq!(payload["total_tokens"], 165);
+    assert_eq!(payload["effective_input_tokens"], 100);
+    assert_eq!(payload["total_tokens"], 150);
     assert_eq!(payload["cache_creation_cost"], 0.0);
     assert_eq!(payload["cache_read_cost"], 0.0);
     assert_eq!(
@@ -2098,6 +2174,82 @@ async fn gateway_handles_admin_usage_detail_locally_with_trusted_admin_principal
 }
 
 #[tokio::test]
+async fn gateway_admin_usage_detail_preserves_live_websocket_session_metadata() {
+    let live_session = json!({
+        "schema_version": "1",
+        "transport": "websocket",
+        "mode": "direct",
+        "state": "closed",
+        "client_frames": 3,
+        "upstream_frames": 5,
+    });
+    let realtime_session = json!({
+        "schema_version": "1",
+        "transport": "websocket",
+        "usage_state": "authoritative",
+        "input_audio_tokens": 11,
+        "output_audio_tokens": 6,
+    });
+    let mut usage = sample_usage_row(
+        "usage-live-detail",
+        "req-live-detail",
+        None,
+        None,
+        None,
+        "OpenAI",
+        "gpt-live",
+        "completed",
+        0,
+        0,
+        0.0,
+        0.0,
+        DAY_1_UNIX_SECS,
+    );
+    usage.request_type = Some("live".to_string());
+    usage.api_format = Some("codex:live".to_string());
+    usage.api_family = Some("codex".to_string());
+    usage.endpoint_kind = Some("live".to_string());
+    usage.endpoint_api_format = Some("codex:live".to_string());
+    usage.provider_api_family = Some("codex".to_string());
+    usage.provider_endpoint_kind = Some("live".to_string());
+    usage.is_stream = true;
+    usage.request_metadata = Some(json!({
+        "websocket_mode": true,
+        "websocket_transport": "codex_live_direct",
+        "usage_available": false,
+        "usage_pricing_available": false,
+        "live_session": live_session,
+        "realtime_session": realtime_session,
+    }));
+
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_usage_reader_for_tests(Arc::new(
+            InMemoryUsageReadRepository::seed(vec![usage]),
+        )));
+    let response = local_admin_usage_response(
+        &state,
+        http::Method::GET,
+        "/api/admin/usage/usage-live-detail?include_bodies=false",
+        None,
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("usage detail body should be readable");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).expect("usage detail body should be JSON");
+    assert_eq!(payload["is_websocket"], true);
+    assert_eq!(payload["websocket_transport"], "codex_live_direct");
+    assert_eq!(payload["live_session"], live_session);
+    assert_eq!(payload["realtime_session"], realtime_session);
+    assert_eq!(payload["metadata"]["live_session"], live_session);
+    assert_eq!(payload["metadata"]["realtime_session"], realtime_session);
+}
+
+#[tokio::test]
 async fn gateway_handles_admin_usage_detail_with_ref_backed_bodies() {
     let (_upstream_url, upstream_hits, upstream_handle) =
         start_usage_upstream("/api/admin/usage/usage-ref-detail").await;
@@ -2206,6 +2358,84 @@ async fn gateway_handles_admin_usage_detail_with_ref_backed_bodies() {
         payload["client_response_body"]["output_text"],
         "hello from ref"
     );
+    assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_resolves_admin_usage_detail_when_inline_state_has_body_ref() {
+    let (_upstream_url, upstream_hits, upstream_handle) =
+        start_usage_upstream("/api/admin/usage/usage-inline-state-ref-detail").await;
+
+    let mut usage = sample_usage_row(
+        "usage-inline-state-ref-detail",
+        "req-inline-state-ref-detail",
+        Some("user-1"),
+        Some("key-1"),
+        Some("primary"),
+        "Gemini",
+        "gemini-3.5-flash",
+        "completed",
+        120,
+        30,
+        0.3,
+        0.36,
+        DAY_1_UNIX_SECS,
+    );
+    usage.request_body = Some(json!({
+        "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
+    }));
+    usage.provider_request_body = Some(json!({
+        "model": "gemini-3-flash-agent",
+        "request": {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+    }));
+    usage.response_body = Some(json!({
+        "chunks": [{"candidates": [{"content": {"parts": [{"text": "hello back"}]}}]}],
+    }));
+    usage.client_response_body = Some(json!({
+        "candidates": [{"content": {"parts": [{"text": "hello back"}]}}],
+    }));
+    usage.request_body_state = Some(UsageBodyCaptureState::Inline);
+    usage.provider_request_body_state = Some(UsageBodyCaptureState::Inline);
+    usage.response_body_state = Some(UsageBodyCaptureState::Inline);
+    usage.client_response_body_state = Some(UsageBodyCaptureState::Inline);
+
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::seed_with_detached_bodies(
+        vec![usage],
+    ));
+    let data_state = GatewayDataState::with_usage_reader_for_tests(usage_repository);
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data_state),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let response = admin_request(reqwest::Client::new().get(format!(
+        "{gateway_url}/api/admin/usage/usage-inline-state-ref-detail"
+    )))
+    .send()
+    .await
+    .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.expect("json body should parse");
+    assert_eq!(payload["request_body"]["contents"][0]["role"], "user");
+    assert_eq!(
+        payload["provider_request_body"]["model"],
+        "gemini-3-flash-agent"
+    );
+    assert_eq!(
+        payload["response_body"]["chunks"][0]["candidates"][0]["content"]["parts"][0]["text"],
+        "hello back"
+    );
+    assert_eq!(
+        payload["client_response_body"]["candidates"][0]["content"]["parts"][0]["text"],
+        "hello back"
+    );
+    assert!(payload["body_load_errors"].is_null());
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

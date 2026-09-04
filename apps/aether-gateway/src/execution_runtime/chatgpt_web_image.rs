@@ -12,6 +12,7 @@ use aether_contracts::{
     EXECUTION_REQUEST_ACCEPT_INVALID_CERTS_HEADER, EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
     TRANSPORT_BACKEND_BROWSER_WREQ, TRANSPORT_HTTP_MODE_AUTO, TRANSPORT_POOL_SCOPE_KEY,
 };
+use aether_data_contracts::repository::provider_catalog::ProviderCatalogKeyRuntimeMetadataUpdate;
 use aether_provider_pool::{
     build_chatgpt_web_pool_quota_request, normalize_chatgpt_web_image_quota_limit,
     ProviderPoolQuotaRequestSpec,
@@ -46,6 +47,7 @@ const CHATGPT_WEB_SEC_CH_UA: &str =
 const CHATGPT_WEB_BROWSER_PROFILE: &str = "chrome143";
 const CHATGPT_WEB_QUOTA_REFRESH_TIMEOUT_MS: u64 = 30_000;
 const CHATGPT_WEB_QUOTA_REFRESH_PROXY_TIMEOUT_MS: u64 = 60_000;
+const RUNTIME_METADATA_CAS_MAX_ATTEMPTS: usize = 16;
 const GPT_IMAGE2_TOKEN_MIN_PIXELS: u64 = 655_360;
 const GPT_IMAGE2_TOKEN_MAX_PIXELS: u64 = 8_294_400;
 const GPT_IMAGE2_TOKEN_MAX_EDGE: u64 = 3_840;
@@ -113,7 +115,16 @@ pub(crate) async fn maybe_execute_chatgpt_web_image_sync(
         let result = match execute_chatgpt_web_image(state, plan, report_context, started_at).await
         {
             Ok(result) => result,
-            Err(err) => chatgpt_web_transport_error_execution_result(plan, started_at, &err),
+            Err(ExecutionRuntimeTransportError::UpstreamHttpStatus {
+                status_code,
+                message,
+            }) => chatgpt_web_http_error_execution_result(
+                plan,
+                started_at,
+                status_code,
+                message.as_str(),
+            ),
+            Err(error) => return Err(error),
         };
         Ok(Some(result))
     })
@@ -131,7 +142,13 @@ pub(crate) async fn maybe_execute_chatgpt_web_image_stream(
     let started_at = Instant::now();
     let result = match execute_chatgpt_web_image(state, plan, report_context, started_at).await {
         Ok(result) => result,
-        Err(err) => chatgpt_web_transport_error_execution_result(plan, started_at, &err),
+        Err(ExecutionRuntimeTransportError::UpstreamHttpStatus {
+            status_code,
+            message,
+        }) => {
+            chatgpt_web_http_error_execution_result(plan, started_at, status_code, message.as_str())
+        }
+        Err(error) => return Err(error),
     };
     Ok(Some(ChatGptWebImageStream {
         frame_stream: execution_result_frame_stream(plan, &result, report_context),
@@ -1057,57 +1074,81 @@ async fn apply_chatgpt_web_image_quota_request_delta(
     if key_id.is_empty() || provider_id.is_empty() {
         return Ok(false);
     }
-    let Some(mut latest_key) = state
-        .read_provider_catalog_keys_by_ids(&[key_id.to_string()])
-        .await
-        .map_err(|err| err.into_message())?
-        .into_iter()
-        .find(|key| key.id == key_id && key.provider_id == provider_id)
-    else {
-        return Ok(false);
-    };
-
-    let mut metadata = latest_key
-        .upstream_metadata
-        .as_ref()
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("chatgpt_web"))
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-
-    let now_unix_secs = current_unix_secs();
     let request_dedup_key = chatgpt_web_image_quota_request_delta_dedup_key(plan);
-    if !apply_chatgpt_web_image_quota_request_delta_to_metadata(
-        &mut metadata,
-        latest_key.status_snapshot.as_ref(),
-        now_unix_secs,
-        request_dedup_key.as_deref(),
-    ) {
-        return Ok(false);
+    for attempt in 0..RUNTIME_METADATA_CAS_MAX_ATTEMPTS {
+        let Some(mut latest_key) = state
+            .read_provider_catalog_keys_by_ids(&[key_id.to_string()])
+            .await
+            .map_err(|err| err.into_message())?
+            .into_iter()
+            .find(|key| key.id == key_id && key.provider_id == provider_id)
+        else {
+            return Ok(false);
+        };
+        let expected_namespace_value = latest_key
+            .upstream_metadata
+            .as_ref()
+            .and_then(Value::as_object)
+            .and_then(|metadata| metadata.get("chatgpt_web"))
+            .cloned();
+        let mut metadata = expected_namespace_value
+            .as_ref()
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let now_unix_secs = current_unix_secs();
+        if !apply_chatgpt_web_image_quota_request_delta_to_metadata(
+            &mut metadata,
+            latest_key.status_snapshot.as_ref(),
+            now_unix_secs,
+            request_dedup_key.as_deref(),
+        ) {
+            return Ok(false);
+        }
+
+        let namespace_value = Value::Object(metadata);
+        let updated_upstream_metadata = merge_provider_metadata_object(
+            latest_key.upstream_metadata.as_ref(),
+            "chatgpt_web",
+            namespace_value.clone(),
+        );
+        latest_key.upstream_metadata = updated_upstream_metadata;
+        latest_key.status_snapshot = sync_provider_key_quota_status_snapshot(
+            latest_key.status_snapshot.as_ref(),
+            "chatgpt_web",
+            latest_key.upstream_metadata.as_ref(),
+            "image_request_local",
+        );
+        latest_key.status_snapshot = sync_provider_key_oauth_status_snapshot(
+            latest_key.status_snapshot.as_ref(),
+            &latest_key,
+        );
+        latest_key.updated_at_unix_secs = Some(now_unix_secs);
+
+        let persisted = state
+            .update_provider_catalog_key_runtime_metadata(
+                &ProviderCatalogKeyRuntimeMetadataUpdate {
+                    key_id: latest_key.id.clone(),
+                    namespace: "chatgpt_web".to_string(),
+                    expected_upstream_metadata_value: expected_namespace_value,
+                    upstream_metadata_value: namespace_value,
+                    status_snapshot_patch: provider_operational_status_patch(
+                        latest_key.status_snapshot.as_ref(),
+                    ),
+                    updated_at_unix_secs: latest_key.updated_at_unix_secs,
+                },
+            )
+            .await
+            .map_err(|err| err.into_message())?;
+        if persisted {
+            return Ok(true);
+        }
+        if attempt + 1 < RUNTIME_METADATA_CAS_MAX_ATTEMPTS {
+            let backoff_us = 50_u64.saturating_mul((attempt + 1) as u64).min(1_000);
+            tokio::time::sleep(Duration::from_micros(backoff_us)).await;
+        }
     }
-
-    let updated_upstream_metadata = merge_provider_metadata_object(
-        latest_key.upstream_metadata.as_ref(),
-        "chatgpt_web",
-        Value::Object(metadata),
-    );
-    latest_key.upstream_metadata = updated_upstream_metadata;
-    latest_key.status_snapshot = sync_provider_key_quota_status_snapshot(
-        latest_key.status_snapshot.as_ref(),
-        "chatgpt_web",
-        latest_key.upstream_metadata.as_ref(),
-        "image_request_local",
-    );
-    latest_key.status_snapshot =
-        sync_provider_key_oauth_status_snapshot(latest_key.status_snapshot.as_ref(), &latest_key);
-    latest_key.updated_at_unix_secs = Some(now_unix_secs);
-
-    Ok(state
-        .update_provider_catalog_key_runtime_state(&latest_key)
-        .await
-        .map_err(|err| err.into_message())?
-        .is_some())
+    Ok(false)
 }
 
 fn apply_chatgpt_web_image_quota_request_delta_to_metadata(
@@ -1427,12 +1468,10 @@ async fn refresh_chatgpt_web_image_quota_after_success(
 
     let body_json = execution_result_json(&result).map_err(|err| err.to_string())?;
     let now_unix_secs = current_unix_secs();
-    let Some(mut metadata) =
-        parse_chatgpt_web_conversation_init_response(&body_json, now_unix_secs)
+    let Some(metadata) = parse_chatgpt_web_conversation_init_response(&body_json, now_unix_secs)
     else {
         return Ok(false);
     };
-
     let Some(latest_key) = state
         .read_provider_catalog_keys_by_ids(&key_ids)
         .await
@@ -1442,9 +1481,17 @@ async fn refresh_chatgpt_web_image_quota_after_success(
     else {
         return Ok(false);
     };
+    let expected_namespace_value = latest_key
+        .upstream_metadata
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("chatgpt_web"))
+        .cloned();
+    let mut metadata = metadata.clone();
     normalize_chatgpt_web_image_quota_limit(&mut metadata, latest_key.upstream_metadata.as_ref());
 
     let mut updated_key = latest_key;
+    let namespace_value = metadata.clone();
     let updated_upstream_metadata = merge_provider_metadata_object(
         updated_key.upstream_metadata.as_ref(),
         "chatgpt_web",
@@ -1465,11 +1512,35 @@ async fn refresh_chatgpt_web_image_quota_after_success(
         sync_provider_key_oauth_status_snapshot(updated_key.status_snapshot.as_ref(), &updated_key);
     updated_key.updated_at_unix_secs = Some(now_unix_secs);
 
-    Ok(state
-        .update_provider_catalog_key_runtime_state(&updated_key)
+    let persisted = state
+        .update_provider_catalog_key_runtime_metadata(&ProviderCatalogKeyRuntimeMetadataUpdate {
+            key_id: updated_key.id.clone(),
+            namespace: "chatgpt_web".to_string(),
+            expected_upstream_metadata_value: expected_namespace_value,
+            upstream_metadata_value: namespace_value,
+            status_snapshot_patch: provider_operational_status_patch(
+                updated_key.status_snapshot.as_ref(),
+            ),
+            updated_at_unix_secs: updated_key.updated_at_unix_secs,
+        })
         .await
-        .map_err(|err| err.into_message())?
-        .is_some())
+        .map_err(|err| err.into_message())?;
+    if persisted {
+        return state
+            .update_provider_catalog_key_oauth_runtime_state(
+                &updated_key.id,
+                updated_key.oauth_invalid_at_unix_secs,
+                updated_key.oauth_invalid_reason.as_deref(),
+                None,
+                updated_key.updated_at_unix_secs,
+            )
+            .await
+            .map_err(|err| err.into_message());
+    }
+    // The conversation/init response is an authoritative snapshot.  A
+    // conflict means a newer local delta won; do not overwrite it with
+    // this stale response.  The next refresh will observe the new value.
+    Ok(false)
 }
 
 fn build_chatgpt_web_image_quota_refresh_plan(
@@ -1555,6 +1626,18 @@ fn merge_provider_metadata_object(
         .unwrap_or_default();
     merged.insert(section_key.to_string(), section_value);
     Some(Value::Object(merged))
+}
+
+fn provider_operational_status_patch(status_snapshot: Option<&Value>) -> Value {
+    let mut patch = Map::new();
+    if let Some(snapshot) = status_snapshot.and_then(Value::as_object) {
+        for field in ["quota", "oauth"] {
+            if let Some(value) = snapshot.get(field) {
+                patch.insert(field.to_string(), value.clone());
+            }
+        }
+    }
+    Value::Object(patch)
 }
 
 fn chatgpt_web_image_quota_snapshot_window(
@@ -2490,6 +2573,7 @@ fn json_execution_result(
         candidate_id: plan.candidate_id.clone(),
         status_code,
         headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        response_observation: None,
         body: Some(ResponseBody {
             json_body: Some(body),
             body_bytes_b64: None,
@@ -2499,19 +2583,20 @@ fn json_execution_result(
     }
 }
 
-fn chatgpt_web_transport_error_execution_result(
+fn chatgpt_web_http_error_execution_result(
     plan: &ExecutionPlan,
     started_at: Instant,
-    error: &ExecutionRuntimeTransportError,
+    status_code: u16,
+    message: &str,
 ) -> ExecutionResult {
     json_execution_result(
         plan,
-        503,
+        status_code,
         json!({
             "error": {
                 "type": "upstream_error",
                 "code": "chatgpt_web_image_execution_unavailable",
-                "message": error.to_string()
+                "message": message
             }
         }),
         started_at,
@@ -2531,6 +2616,7 @@ fn bytes_execution_result(
         candidate_id: plan.candidate_id.clone(),
         status_code,
         headers,
+        response_observation: None,
         body: Some(ResponseBody {
             json_body: None,
             body_bytes_b64: Some(base64::engine::general_purpose::STANDARD.encode(body)),
@@ -2553,6 +2639,7 @@ fn execution_result_frame_stream(
             payload: StreamFramePayload::Headers {
                 status_code: result.status_code,
                 headers: result.headers.clone(),
+                response_observation: result.response_observation.clone(),
             },
         },
         StreamFrame {
@@ -2730,11 +2817,14 @@ fn ensure_success(
         return Ok(());
     }
     let body = String::from_utf8_lossy(&execution_result_body_bytes_lossy(result)).to_string();
-    Err(ExecutionRuntimeTransportError::UpstreamRequest(format!(
-        "{stage} returned {}: {}",
-        result.status_code,
-        body.chars().take(320).collect::<String>()
-    )))
+    Err(ExecutionRuntimeTransportError::UpstreamHttpStatus {
+        status_code: result.status_code,
+        message: format!(
+            "{stage} returned {}: {}",
+            result.status_code,
+            body.chars().take(320).collect::<String>()
+        ),
+    })
 }
 
 fn chatgpt_web_base_url_from_plan(plan: &ExecutionPlan) -> String {
@@ -3924,10 +4014,14 @@ data: [DONE]
             Some(&json!({"chatgpt_web_image": true})),
         )
         .await
-        .expect("executor should run")
+        .expect("executor should preserve the upstream HTTP response")
         .expect("plan should be intercepted");
 
-        assert_ne!(result.status_code, 200);
+        assert_eq!(result.status_code, 500);
+        assert_eq!(
+            execution_result_json(&result).expect("error response should be json")["error"]["code"],
+            json!("chatgpt_web_image_execution_unavailable")
+        );
         let metadata = reloaded_chatgpt_web_metadata(repository.as_ref()).await;
         assert_eq!(metadata["image_quota_remaining"], json!(25.0));
         assert_eq!(metadata["image_quota_used"], json!(0.0));
@@ -3935,6 +4029,71 @@ data: [DONE]
         assert_eq!(metadata.get("image_quota_last_local_request_key"), None);
 
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn chatgpt_web_image_sync_propagates_network_failure_without_synthetic_503() {
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("local addr should resolve")
+        );
+        drop(listener);
+        let state = crate::AppState::new().expect("state should build");
+        let plan = sample_plan(
+            base_url.as_str(),
+            json!({"prompt": "draw a small test image"}),
+            false,
+        );
+
+        let error = maybe_execute_chatgpt_web_image_sync(
+            &state,
+            &plan,
+            Some(&json!({"chatgpt_web_image": true})),
+        )
+        .await
+        .expect_err("connection failure should propagate to the candidate loop");
+
+        assert!(matches!(
+            error,
+            ExecutionRuntimeTransportError::UpstreamRequest(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn chatgpt_web_image_stream_propagates_network_failure_without_synthetic_503() {
+        let listener = crate::test_support::bind_loopback_listener()
+            .await
+            .expect("listener should bind");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("local addr should resolve")
+        );
+        drop(listener);
+        let state = crate::AppState::new().expect("state should build");
+        let plan = sample_plan(
+            base_url.as_str(),
+            json!({"prompt": "draw a small test image"}),
+            true,
+        );
+
+        let error = match maybe_execute_chatgpt_web_image_stream(
+            &state,
+            &plan,
+            Some(&json!({"chatgpt_web_image": true})),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("connection failure should propagate to the candidate loop"),
+        };
+
+        assert!(matches!(
+            error,
+            ExecutionRuntimeTransportError::UpstreamRequest(_)
+        ));
     }
 
     #[tokio::test]

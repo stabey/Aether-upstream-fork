@@ -23,10 +23,111 @@ use aether_runtime_state::{
 
 use crate::data::GatewayDataState;
 
+const CONCURRENCY_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_concurrency_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(CONCURRENCY_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("concurrency test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
 fn memory_runtime_semaphore(gate: &'static str, limit: usize) -> RuntimeSemaphore {
     RuntimeState::memory(MemoryRuntimeStateConfig::default())
         .semaphore(gate, limit, RuntimeSemaphoreConfig::default())
         .expect("memory runtime semaphore should build")
+}
+
+#[test]
+fn gateway_websocket_connections_use_independent_admission() {
+    run_concurrency_test(
+        "gateway_websocket_connections_use_independent_admission",
+        gateway_websocket_connections_use_independent_admission_impl,
+    );
+}
+
+async fn gateway_websocket_connections_use_independent_admission_impl() {
+    let state = AppState::new()
+        .expect("gateway state should build")
+        .with_request_concurrency_limit(1)
+        .with_websocket_connection_limit(1);
+
+    let request_permit = state
+        .try_acquire_request_permit()
+        .await
+        .expect("request admission should succeed")
+        .expect("request gate should return a permit");
+    let websocket_permit = state
+        .try_acquire_websocket_connection_permit()
+        .await
+        .expect("WebSocket admission should be independent from request admission")
+        .expect("WebSocket connection gate should return a permit");
+
+    assert_eq!(
+        state
+            .request_concurrency_snapshot()
+            .expect("request gate should be configured")
+            .in_flight,
+        1
+    );
+    assert_eq!(
+        state
+            .websocket_connection_concurrency_snapshot()
+            .expect("WebSocket connection gate should be configured")
+            .in_flight,
+        1
+    );
+
+    let websocket_error = state
+        .try_acquire_websocket_connection_permit()
+        .await
+        .expect_err("second WebSocket connection should be rejected");
+    assert!(matches!(
+        websocket_error,
+        crate::router::RequestAdmissionError::Local(aether_runtime::ConcurrencyError::Saturated {
+            gate: "gateway_websocket_connections",
+            limit: 1,
+        })
+    ));
+
+    drop(request_permit);
+    let replacement_request_permit = state
+        .try_acquire_request_permit()
+        .await
+        .expect("request admission should remain available independently")
+        .expect("request gate should return a replacement permit");
+    assert_eq!(
+        state
+            .websocket_connection_concurrency_snapshot()
+            .expect("WebSocket connection gate should be configured")
+            .in_flight,
+        1
+    );
+
+    drop(websocket_permit);
+    let replacement_websocket_permit = state
+        .try_acquire_websocket_connection_permit()
+        .await
+        .expect("WebSocket admission should recover after release")
+        .expect("WebSocket connection gate should return a replacement permit");
+
+    drop(replacement_request_permit);
+    drop(replacement_websocket_permit);
 }
 
 fn sample_decision() -> crate::control::GatewayControlDecision {
@@ -36,12 +137,16 @@ fn sample_decision() -> crate::control::GatewayControlDecision {
         route_class: Some("ai_public".to_string()),
         route_family: Some("openai".to_string()),
         route_kind: Some("chat".to_string()),
+        client_surface: None,
+        api_operation: None,
+        gateway_credential_carrier: None,
         request_auth_channel: None,
         auth_endpoint_signature: None,
         execution_runtime_candidate: true,
         auth_context: None,
         admin_principal: None,
         local_auth_rejection: None,
+        model_directive_policy: Default::default(),
     }
 }
 
@@ -80,8 +185,15 @@ fn build_local_openai_gateway_state(
         )
 }
 
-#[tokio::test]
-async fn gateway_rejects_second_in_flight_stream_request_with_distributed_overload() {
+#[test]
+fn gateway_rejects_second_in_flight_stream_request_with_distributed_overload() {
+    run_concurrency_test(
+        "gateway_rejects_second_in_flight_stream_request_with_distributed_overload",
+        gateway_rejects_second_in_flight_stream_request_with_distributed_overload_impl,
+    );
+}
+
+async fn gateway_rejects_second_in_flight_stream_request_with_distributed_overload_impl() {
     let execution_runtime_hits = Arc::new(AtomicUsize::new(0));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -175,8 +287,15 @@ async fn gateway_rejects_second_in_flight_stream_request_with_distributed_overlo
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_second_in_flight_stream_request_with_local_overload() {
+#[test]
+fn gateway_rejects_second_in_flight_stream_request_with_local_overload() {
+    run_concurrency_test(
+        "gateway_rejects_second_in_flight_stream_request_with_local_overload",
+        gateway_rejects_second_in_flight_stream_request_with_local_overload_impl,
+    );
+}
+
+async fn gateway_rejects_second_in_flight_stream_request_with_local_overload_impl() {
     let execution_runtime_hits = Arc::new(AtomicUsize::new(0));
     let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
     let execution_runtime = Router::new().route(
@@ -262,17 +381,29 @@ async fn gateway_rejects_second_in_flight_stream_request_with_local_overload() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_exposes_request_concurrency_metrics() {
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway state should build")
-            .with_request_concurrency_limit(3)
-            .with_distributed_request_concurrency_gate(memory_runtime_semaphore(
-                "gateway_requests_distributed",
-                5,
-            )),
+#[test]
+fn gateway_exposes_request_concurrency_metrics() {
+    run_concurrency_test(
+        "gateway_exposes_request_concurrency_metrics",
+        gateway_exposes_request_concurrency_metrics_impl,
     );
+}
+
+async fn gateway_exposes_request_concurrency_metrics_impl() {
+    let state = AppState::new()
+        .expect("gateway state should build")
+        .with_request_concurrency_limit(3)
+        .with_websocket_connection_limit(7)
+        .with_distributed_request_concurrency_gate(memory_runtime_semaphore(
+            "gateway_requests_distributed",
+            5,
+        ))
+        .with_distributed_websocket_connection_gate(memory_runtime_semaphore(
+            "gateway_websocket_connections_distributed",
+            9,
+        ));
+    assert!(state.prewarm_metric_snapshot().await);
+    let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let response = reqwest::Client::new()
@@ -295,15 +426,88 @@ async fn gateway_exposes_request_concurrency_metrics() {
     assert!(body.contains("concurrency_available_permits{gate=\"gateway_requests\"} 3"));
     assert!(body.contains("concurrency_in_flight{gate=\"gateway_requests_distributed\"} 0"));
     assert!(body.contains("concurrency_available_permits{gate=\"gateway_requests_distributed\"} 5"));
+    assert!(body.contains("concurrency_in_flight{gate=\"gateway_websocket_connections\"} 0"));
+    assert!(
+        body.contains("concurrency_available_permits{gate=\"gateway_websocket_connections\"} 7")
+    );
+    assert!(body
+        .contains("concurrency_in_flight{gate=\"gateway_websocket_connections_distributed\"} 0"));
+    assert!(body.contains(
+        "concurrency_available_permits{gate=\"gateway_websocket_connections_distributed\"} 9"
+    ));
     assert!(body.contains("tunnel_proxy_connections 0"));
     assert!(body.contains("tunnel_nodes 0"));
     assert!(body.contains("tunnel_active_streams 0"));
+    assert!(body.contains("gateway_process_cpu_usage_basis_points "));
+    assert!(body.contains("gateway_process_memory_bytes "));
+    assert!(body.contains("gateway_process_threads "));
+    assert!(body.contains("gateway_process_open_fds "));
+    assert!(body.contains("gateway_process_fd_limit "));
+    assert!(body.contains("gateway_process_socket_fds "));
+    assert!(body.contains("gateway_allocator_observability_available "));
+    assert!(body.contains("gateway_allocator_allocated_bytes "));
+    assert!(body.contains("gateway_allocator_active_bytes "));
+    assert!(body.contains("gateway_allocator_resident_bytes "));
+    assert!(body.contains("gateway_allocator_active_to_allocated_basis_points "));
+    assert!(body.contains("gateway_network_observability_available "));
+    assert!(body.contains("gateway_network_received_bytes_total "));
+    assert!(body.contains("gateway_tcp_state_observability_available "));
+    assert!(body.contains("gateway_host_tcp_established_connections "));
+    assert!(body.contains("gateway_process_tcp_established_connections "));
+    assert!(body.contains("postgres_observability_available{driver=\"postgres\"} 0"));
+    assert!(body.contains("postgres_observability_unavailable{driver=\"postgres\"} 0"));
+    assert!(body.contains("postgres_lock_waiting_connections{driver=\"postgres\"} 0"));
+    assert!(body.contains("postgres_oldest_active_query_age_ms{driver=\"postgres\"} 0"));
+    assert!(body.contains("postgres_oldest_transaction_age_ms{driver=\"postgres\"} 0"));
+    assert!(body.contains("redis_runtime_enabled{backend=\"redis\"} 0"));
+    assert!(body.contains("redis_runtime_health_unavailable{backend=\"redis\"} 0"));
+    assert!(body.contains("redis_runtime_connected_clients{backend=\"redis\"} 0"));
+    assert!(body.contains("redis_runtime_used_memory_bytes{backend=\"redis\"} 0"));
+    assert!(body.contains("usage_runtime_queue_worker_read_batches_total 0"));
+    assert!(body.contains("usage_runtime_queue_worker_read_entries_total 0"));
+    assert!(body.contains("usage_runtime_queue_worker_reclaimed_entries_total 0"));
+    assert!(body.contains("usage_runtime_queue_worker_acked_entries_total 0"));
+    assert!(body.contains("usage_runtime_queue_worker_dead_lettered_entries_total 0"));
+    assert!(body.contains("usage_runtime_queue_worker_process_failures_total 0"));
+    assert!(body.contains("usage_runtime_queue_worker_read_failures_total 0"));
+    assert!(body.contains("usage_runtime_queue_worker_reclaim_failures_total 0"));
+    assert!(body.contains("usage_queue_health_unavailable 0"));
+    assert!(
+        body.contains("usage_queue_enabled{stream=\"usage:events\",group=\"usage_consumers\"} 0")
+    );
+    assert!(body
+        .contains("usage_queue_configured{stream=\"usage:events\",group=\"usage_consumers\"} 0"));
+    assert!(body.contains("usage_queue_dlq_length{stream=\"usage:events:dlq\"} 0"));
+    assert!(body.contains("usage_counter_health_unavailable 0"));
+    assert!(body.contains("usage_counter_outbox_pending_rows 0"));
+    assert!(body.contains("usage_counter_outbox_oldest_pending_age_seconds 0"));
+    assert!(body.contains("usage_counter_outbox_flush_batches_total 0"));
+    assert!(body.contains("usage_counter_outbox_flush_rows_claimed_total 0"));
+    assert!(body.contains("usage_counter_outbox_flush_failed_batches_total 0"));
+    assert!(body.contains("usage_counter_outbox_cleanup_rows_total 0"));
+    assert!(body.contains("usage_counter_outbox_cleanup_failed_batches_total 0"));
+    assert!(body.contains("gateway_background_tasks_active 0"));
+    assert!(body.contains("gateway_background_tasks_supervised_total 0"));
+    assert!(body.contains("gateway_background_tasks_unexpected_exits_total 0"));
+    assert!(body.contains("gateway_background_tasks_panicked_total 0"));
+    assert!(body.contains("gateway_background_tasks_aborted_total 0"));
+    assert!(body.contains("gateway_tokio_runtime_observability_available 1"));
+    assert!(body.contains("gateway_tokio_runtime_workers "));
+    assert!(body.contains("gateway_tokio_runtime_alive_tasks "));
+    assert!(body.contains("gateway_tokio_runtime_global_queue_depth "));
 
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_exposes_fallback_metrics() {
+#[test]
+fn gateway_exposes_fallback_metrics() {
+    run_concurrency_test(
+        "gateway_exposes_fallback_metrics",
+        gateway_exposes_fallback_metrics_impl,
+    );
+}
+
+async fn gateway_exposes_fallback_metrics_impl() {
     let state = AppState::new().expect("gateway state should build");
     let decision = sample_decision();
     state.record_fallback_metric(
@@ -327,6 +531,7 @@ async fn gateway_exposes_fallback_metrics() {
         Some(EXECUTION_PATH_LOCAL_EXECUTION_RUNTIME_MISS),
         GatewayFallbackReason::LocalExecutionPathRequired,
     );
+    assert!(state.prewarm_metric_snapshot().await);
     let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 

@@ -1,3 +1,4 @@
+use aether_routing_core::RoutingExecutionPolicy;
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -92,8 +93,15 @@ pub(crate) async fn build_local_openai_chat_sync_attempt_source<'a>(
 
 #[async_trait]
 impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalOpenAiChatSyncAttemptSource<'_> {
+    fn routing_execution_policy(&self) -> Option<RoutingExecutionPolicy> {
+        self.input
+            .routing_policy
+            .as_ref()
+            .map(|policy| policy.execution_policy)
+    }
+
     async fn next_execution_attempt(&mut self) -> Result<Option<AiSyncAttempt>, GatewayError> {
-        while let Some(attempt) = self.candidates.next_attempt().await {
+        while let Some(attempt) = self.candidates.next_attempt().await? {
             match self.build_sync_attempt(attempt).await? {
                 Some(attempt) => return Ok(Some(attempt)),
                 None => continue,
@@ -116,6 +124,21 @@ impl LocalExecutionAttemptSource<AiSyncAttempt> for LocalOpenAiChatSyncAttemptSo
         }
         Ok(drained)
     }
+
+    async fn skip_credential(&mut self, key_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_credential(key_id);
+        Ok(())
+    }
+
+    async fn skip_endpoint(&mut self, endpoint_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_endpoint(endpoint_id);
+        Ok(())
+    }
+
+    async fn skip_provider(&mut self, provider_id: &str) -> Result<(), GatewayError> {
+        self.candidates.skip_provider(provider_id);
+        Ok(())
+    }
 }
 
 impl LocalOpenAiChatSyncAttemptSource<'_> {
@@ -134,6 +157,7 @@ impl LocalOpenAiChatSyncAttemptSource<'_> {
             self.trace_id,
             &self.body_json,
             &self.input,
+            None,
             attempt,
             OPENAI_CHAT_SYNC_PLAN_KIND,
             "openai_chat_sync_success",

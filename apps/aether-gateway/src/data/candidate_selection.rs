@@ -1,7 +1,7 @@
 use aether_data::DataLayerError;
 use aether_data_contracts::repository::candidate_selection::{
-    StoredMinimalCandidateSelectionRow, StoredPoolKeyCandidateRowsQuery,
-    StoredRequestedModelCandidateRowsQuery,
+    StoredApiFormatCandidateRowsQuery, StoredMinimalCandidateSelectionRow,
+    StoredPoolKeyCandidateRowsQuery, StoredRequestedModelCandidateRowsQuery,
 };
 use aether_scheduler_core::{
     auth_constraints_allow_api_format, collect_global_model_names_for_required_capability,
@@ -38,6 +38,19 @@ pub(crate) trait MinimalCandidateSelectionRowSource {
         &self,
         api_format: &str,
     ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError>;
+
+    async fn read_minimal_candidate_selection_rows_for_api_format_page(
+        &self,
+        query: &StoredApiFormatCandidateRowsQuery,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
+        Ok(self
+            .read_minimal_candidate_selection_rows_for_api_format(&query.api_format)
+            .await?
+            .into_iter()
+            .skip(query.offset as usize)
+            .take(query.limit as usize)
+            .collect())
+    }
 
     async fn read_pool_key_candidate_rows_for_group(
         &self,
@@ -231,6 +244,30 @@ pub(crate) async fn read_requested_model_rows_fast_path_page(
     })
 }
 
+pub(crate) async fn read_api_format_rows_fallback_page(
+    state: &(impl MinimalCandidateSelectionRowSource + Sync),
+    api_format: &str,
+    offset: u32,
+    limit: u32,
+) -> Result<RequestedModelCandidateRowsPage, DataLayerError> {
+    let limit = limit.max(1);
+    let rows = state
+        .read_minimal_candidate_selection_rows_for_api_format_page(
+            &StoredApiFormatCandidateRowsQuery {
+                api_format: api_format.to_string(),
+                offset,
+                limit,
+            },
+        )
+        .await?;
+    let scanned_rows = rows.len() as u32;
+    Ok(RequestedModelCandidateRowsPage {
+        rows,
+        scanned_rows,
+        end_of_requested_name: scanned_rows < limit,
+    })
+}
+
 pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabilities(
     state: &(impl MinimalCandidateSelectionRowSource + Sync),
     api_format: &str,
@@ -239,6 +276,29 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
     auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
     required_capabilities: Option<&serde_json::Value>,
     enable_model_directives: bool,
+) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, DataLayerError> {
+    enumerate_minimal_candidate_selection_with_required_capabilities_for_request_operation(
+        state,
+        api_format,
+        requested_model_name,
+        require_streaming,
+        auth_snapshot,
+        required_capabilities,
+        enable_model_directives,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabilities_for_request_operation(
+    state: &(impl MinimalCandidateSelectionRowSource + Sync),
+    api_format: &str,
+    requested_model_name: &str,
+    require_streaming: bool,
+    auth_snapshot: Option<&GatewayAuthApiKeySnapshot>,
+    required_capabilities: Option<&serde_json::Value>,
+    enable_model_directives: bool,
+    request_operation: Option<&str>,
 ) -> Result<Vec<SchedulerMinimalCandidateSelectionCandidate>, DataLayerError> {
     let normalized_api_format = normalize_api_format(api_format);
     if normalized_api_format.is_empty() {
@@ -267,6 +327,7 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
         EnumerateMinimalCandidateSelectionInput {
             rows,
             normalized_api_format: &normalized_api_format,
+            request_operation,
             requested_model_name,
             resolved_global_model_name: resolved_global_model_name.as_str(),
             require_streaming,

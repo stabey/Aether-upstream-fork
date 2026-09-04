@@ -53,7 +53,9 @@ pub(super) async fn resolve_local_gemini_files_decision_input(
         state,
         auth_context,
         None,
+        decision.auth_endpoint_signature.as_deref(),
         Some(&explicit_required_capabilities),
+        &decision.model_directive_policy,
     )
     .await
     {
@@ -106,6 +108,9 @@ pub(super) async fn materialize_local_gemini_files_candidate_attempts(
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
             current_unix_secs(),
+            crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                input.routing_policy.as_ref(),
+            ),
         )
         .await?;
     let outcome = materialize_local_execution_candidates_with_serving(
@@ -179,6 +184,9 @@ pub(super) async fn build_local_gemini_files_candidate_attempt_source<'a>(
             Some(&input.auth_snapshot),
             input.client_session_affinity.as_ref(),
             current_unix_secs(),
+            crate::ai_serving::planner::candidate_ranking::scheduler_ordering_config_for_routing_policy(
+                input.routing_policy.as_ref(),
+            ),
         )
         .await?;
     Ok(build_local_execution_candidate_attempt_source_with_serving(

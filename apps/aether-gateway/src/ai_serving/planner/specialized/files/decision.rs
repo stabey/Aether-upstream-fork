@@ -7,14 +7,14 @@ use crate::ai_serving::planner::report_context::{
 };
 use crate::ai_serving::planner::spec_metadata::local_gemini_files_spec_metadata;
 use crate::ai_serving::planner::{
-    build_ai_execution_decision_response, resolve_transport_request_gzip_policy,
+    build_ai_execution_decision_response, resolve_transport_request_encoding_policy,
     AiExecutionDecisionResponseParts,
 };
 use crate::ai_serving::transport::{
     resolve_transport_execution_timeouts, resolve_transport_profile,
 };
 use crate::ai_serving::{ai_local_execution_contract_for_formats, PlannerAppState};
-use crate::{AiExecutionDecision, AppState, GatewayError};
+use crate::{append_local_failover_policy_to_value, AiExecutionDecision, AppState, GatewayError};
 
 use super::request::resolve_local_gemini_files_candidate_payload_parts;
 use super::support::{
@@ -107,13 +107,16 @@ pub(super) async fn maybe_build_local_gemini_files_decision_payload_for_candidat
         original_request_body_json: Some(body_json),
         original_request_body_base64: resolved.provider_request_body_base64.as_deref(),
         client_session_affinity: input.client_session_affinity.as_ref(),
+        routing_policy: input.routing_policy.as_ref(),
         scheduler_affinity_epoch: eligible.orchestration.scheduler_affinity_epoch,
+        sticky_key_attempts: eligible.orchestration.sticky_key_attempts,
         client_requested_stream: spec_metadata.require_streaming,
         upstream_is_stream: spec_metadata.require_streaming,
         has_envelope: false,
         needs_conversion: false,
         extra_fields,
     });
+    let report_context = append_local_failover_policy_to_value(report_context, &transport);
     let super::request::LocalGeminiFilesCandidatePayloadParts {
         transport: _,
         auth_header,
@@ -124,7 +127,7 @@ pub(super) async fn maybe_build_local_gemini_files_decision_payload_for_candidat
         upstream_url,
         file_name: _,
     } = resolved;
-    let request_gzip = resolve_transport_request_gzip_policy(&transport);
+    let request_encoding = resolve_transport_request_encoding_policy(&transport);
 
     let mut decision = build_ai_execution_decision_response(AiExecutionDecisionResponseParts {
         decision_is_stream: spec_metadata.require_streaming,
@@ -134,6 +137,7 @@ pub(super) async fn maybe_build_local_gemini_files_decision_payload_for_candidat
         request_id: trace_id.to_string(),
         candidate_id: candidate_id.clone(),
         provider_name: transport.provider.name.clone(),
+        provider_type: transport.provider.provider_type.clone(),
         provider_id: candidate.provider_id.clone(),
         endpoint_id: candidate.endpoint_id.clone(),
         key_id: candidate.key_id.clone(),
@@ -156,8 +160,8 @@ pub(super) async fn maybe_build_local_gemini_files_decision_payload_for_candidat
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
-        content_encoding: None,
-        request_gzip,
+        content_encoding: request_encoding.content_encoding,
+        request_gzip: request_encoding.request_gzip,
         proxy,
         transport_profile,
         timeouts: resolve_transport_execution_timeouts(&transport),
@@ -166,6 +170,10 @@ pub(super) async fn maybe_build_local_gemini_files_decision_payload_for_candidat
         report_context: Some(report_context),
         auth_context: input.auth_context.clone(),
     });
-    apply_provider_request_routing_policy_to_decision(input, &mut decision)?;
+    apply_provider_request_routing_policy_to_decision(
+        input,
+        &mut decision,
+        Some(transport.as_ref()),
+    )?;
     Ok(Some(decision))
 }

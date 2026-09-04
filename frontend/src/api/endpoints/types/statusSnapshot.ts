@@ -31,6 +31,11 @@ export interface QuotaWindowSnapshot {
   scope?: 'account' | 'workspace' | 'model' | string
   unit?: 'percent' | 'count' | 'usd' | 'tokens' | string
   model?: string | null
+  quota_group?: string | null
+  quota_group_label?: string | null
+  bucket_id?: string | null
+  window?: string | null
+  description?: string | null
   used_ratio?: number | null
   remaining_ratio?: number | null
   used_value?: number | null
@@ -39,6 +44,7 @@ export interface QuotaWindowSnapshot {
   reset_at?: number | null
   reset_seconds?: number | null
   window_minutes?: number | null
+  usage_reset_at?: number | null
   is_exhausted?: boolean | null
   usage?: QuotaWindowUsageSnapshot | null
 }
@@ -52,6 +58,24 @@ export interface QuotaCreditsSnapshot {
   unlimited?: boolean | null
   trace_id?: string | null
   updated_at?: number | null
+}
+
+export interface QuotaResetCreditSnapshot {
+  id?: string | null
+  display_key?: string | null
+  status?: string | null
+  granted_at?: number | null
+  expires_at?: number | null
+  remaining_seconds?: number | null
+}
+
+export interface QuotaResetCreditsSnapshot {
+  available_count?: number | null
+  updated_at?: number | null
+  detail_source?: string | null
+  detail_status?: string | null
+  detail_error?: string | null
+  credits?: QuotaResetCreditSnapshot[] | null
 }
 
 export interface QuotaStatusSnapshot {
@@ -71,6 +95,7 @@ export interface QuotaStatusSnapshot {
   plan_type?: string | null
   pool_tier?: string | null
   credits?: QuotaCreditsSnapshot | null
+  reset_credits?: QuotaResetCreditsSnapshot | null
   allowed_models_count?: number | null
   rate_limit?: Record<string, unknown> | null
   windows?: QuotaWindowSnapshot[] | null

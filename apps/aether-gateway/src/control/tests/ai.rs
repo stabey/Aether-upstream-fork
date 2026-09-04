@@ -1,9 +1,11 @@
+use aether_ai_formats::{ApiOperation, ClientSurface};
 use http::Uri;
 
+use super::super::auth::GatewayCredentialCarrier;
 use super::{classify_control_route, headers};
 
 #[test]
-fn classifies_claude_count_tokens_as_non_execution_runtime_public_route() {
+fn classifies_claude_count_tokens_as_execution_runtime_operation() {
     let headers = headers(&[("x-api-key", "sk-test")]);
     let uri: Uri = "/v1/messages/count_tokens"
         .parse()
@@ -17,7 +19,11 @@ fn classifies_claude_count_tokens_as_non_execution_runtime_public_route() {
         decision.auth_endpoint_signature.as_deref(),
         Some("claude:messages")
     );
-    assert!(!decision.is_execution_runtime_candidate());
+    assert!(decision.is_execution_runtime_candidate());
+    assert_eq!(
+        decision.api_operation,
+        Some(ApiOperation::ClaudeCountTokens)
+    );
 }
 
 #[test]
@@ -57,6 +63,28 @@ fn classifies_openai_rerank_as_rerank_not_chat() {
 }
 
 #[test]
+fn classifies_openai_search_as_its_own_sync_endpoint() {
+    let headers = headers(&[("authorization", "Bearer sk-test")]);
+    let uri: Uri = "/v1/alpha/search".parse().expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_family.as_deref(), Some("openai"));
+    assert_eq!(decision.route_kind.as_deref(), Some("search"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("openai:search")
+    );
+    assert!(decision.is_execution_runtime_candidate());
+    assert!(classify_control_route(&http::Method::GET, &uri, &headers).is_none());
+
+    let upstream_uri: Uri = "/backend-api/codex/alpha/search"
+        .parse()
+        .expect("uri should parse");
+    assert!(classify_control_route(&http::Method::POST, &upstream_uri, &headers).is_none());
+}
+
+#[test]
 fn classifies_openai_chat_and_responses_separately_from_embedding() {
     let headers = headers(&[("authorization", "Bearer sk-test")]);
     let chat_uri: Uri = "/v1/chat/completions".parse().expect("uri should parse");
@@ -78,6 +106,32 @@ fn classifies_openai_chat_and_responses_separately_from_embedding() {
         Some("openai:responses")
     );
     assert_ne!(responses.route_kind.as_deref(), Some("embedding"));
+}
+
+#[test]
+fn classifies_openai_realtime_only_for_websocket_upgrades() {
+    let websocket_headers = headers(&[
+        ("authorization", "Bearer sk-test"),
+        ("connection", "keep-alive, Upgrade"),
+        ("upgrade", "websocket"),
+    ]);
+    let uri: Uri = "/v1/realtime?model=gpt-realtime"
+        .parse()
+        .expect("uri should parse");
+
+    let decision = classify_control_route(&http::Method::GET, &uri, &websocket_headers)
+        .expect("Realtime WebSocket route should classify");
+    assert_eq!(decision.route_family.as_deref(), Some("openai"));
+    assert_eq!(decision.route_kind.as_deref(), Some("realtime"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("openai:realtime")
+    );
+    assert!(decision.is_execution_runtime_candidate());
+
+    let plain_headers = headers(&[("authorization", "Bearer sk-test")]);
+    assert!(classify_control_route(&http::Method::GET, &uri, &plain_headers).is_none());
+    assert!(classify_control_route(&http::Method::POST, &uri, &websocket_headers).is_none());
 }
 
 #[test]
@@ -119,7 +173,7 @@ fn classifies_models_list_as_claude_when_headers_match() {
 }
 
 #[test]
-fn classifies_claude_messages_cli_when_bearer_without_api_key() {
+fn bearer_auth_does_not_imply_claude_code_client_surface() {
     let headers = headers(&[("authorization", "Bearer token-123")]);
     let uri: Uri = "/v1/messages".parse().expect("uri should parse");
     let decision =
@@ -127,6 +181,10 @@ fn classifies_claude_messages_cli_when_bearer_without_api_key() {
 
     assert_eq!(decision.route_family.as_deref(), Some("claude"));
     assert_eq!(decision.route_kind.as_deref(), Some("messages"));
+    assert_eq!(
+        decision.client_surface,
+        Some(ClientSurface::GenericCompatible)
+    );
     assert_eq!(
         decision.request_auth_channel.as_deref(),
         Some("bearer_like")
@@ -139,7 +197,7 @@ fn classifies_claude_messages_cli_when_bearer_without_api_key() {
 }
 
 #[test]
-fn classifies_claude_messages_cli_when_bearer_is_present_even_with_api_key() {
+fn claude_api_key_carrier_keeps_precedence_over_bearer() {
     let headers = headers(&[
         ("authorization", "Bearer token-123"),
         ("x-api-key", "sk-client"),
@@ -150,15 +208,73 @@ fn classifies_claude_messages_cli_when_bearer_is_present_even_with_api_key() {
 
     assert_eq!(decision.route_family.as_deref(), Some("claude"));
     assert_eq!(decision.route_kind.as_deref(), Some("messages"));
+    assert_eq!(decision.request_auth_channel.as_deref(), Some("api_key"));
     assert_eq!(
-        decision.request_auth_channel.as_deref(),
-        Some("bearer_like")
+        decision.gateway_credential_carrier,
+        Some(GatewayCredentialCarrier::XApiKey)
     );
     assert_eq!(
         decision.auth_endpoint_signature.as_deref(),
         Some("claude:messages")
     );
     assert!(decision.is_execution_runtime_candidate());
+}
+
+#[test]
+fn detects_claude_code_independently_from_bearer_auth() {
+    let headers = headers(&[
+        ("authorization", "Bearer token-123"),
+        ("user-agent", "Claude-Code/2.1.0"),
+    ]);
+    let uri: Uri = "/v1/messages".parse().expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.client_surface, Some(ClientSurface::ClaudeCode));
+    assert_eq!(
+        decision.gateway_credential_carrier,
+        Some(GatewayCredentialCarrier::AuthorizationBearer)
+    );
+    assert_eq!(
+        decision.api_operation,
+        Some(ApiOperation::ClaudeMessagesCreate)
+    );
+}
+
+#[test]
+fn detects_current_claude_cli_user_agent() {
+    let headers = headers(&[
+        ("x-api-key", "sk-client"),
+        ("user-agent", "claude-cli/2.1.161 (external, cli)"),
+    ]);
+    let uri: Uri = "/v1/messages".parse().expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.client_surface, Some(ClientSurface::ClaudeCode));
+    assert_eq!(decision.request_auth_channel.as_deref(), Some("api_key"));
+    assert_eq!(
+        decision.gateway_credential_carrier,
+        Some(GatewayCredentialCarrier::XApiKey)
+    );
+}
+
+#[test]
+fn detects_claude_code_from_explicit_x_app_signal() {
+    let headers = headers(&[
+        ("x-api-key", "sk-client"),
+        ("user-agent", "rewritten-by-proxy"),
+        ("x-app", "cli"),
+    ]);
+    let uri: Uri = "/v1/messages".parse().expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.client_surface, Some(ClientSurface::ClaudeCode));
+    assert_eq!(
+        decision.api_operation,
+        Some(ApiOperation::ClaudeMessagesCreate)
+    );
 }
 
 #[test]
@@ -275,6 +391,23 @@ fn classifies_gemini_batch_embed_contents_as_embedding_route() {
 }
 
 #[test]
+fn classifies_gemini_interactions_as_interactions_route() {
+    let headers = headers(&[("x-goog-api-key", "gemini-key")]);
+    let uri: Uri = "/v1/interactions".parse().expect("uri should parse");
+    let decision =
+        classify_control_route(&http::Method::POST, &uri, &headers).expect("route should classify");
+
+    assert_eq!(decision.route_family.as_deref(), Some("gemini"));
+    assert_eq!(decision.route_kind.as_deref(), Some("interactions"));
+    assert_eq!(decision.request_auth_channel.as_deref(), Some("api_key"));
+    assert_eq!(
+        decision.auth_endpoint_signature.as_deref(),
+        Some("gemini:interactions")
+    );
+    assert!(decision.is_execution_runtime_candidate());
+}
+
+#[test]
 fn classifies_gemini_predict_long_running_as_video_route() {
     let headers = headers(&[]);
     let uri: Uri = "/v1beta/models/veo-3:predictLongRunning"
@@ -302,6 +435,10 @@ fn classifies_antigravity_v1internal_control_plane_routes() {
     for (path, route_kind) in [
         ("/v1internal:loadCodeAssist", "load_code_assist"),
         ("/v1internal:fetchAvailableModels", "fetch_available_models"),
+        (
+            "/v1internal:retrieveUserQuotaSummary",
+            "retrieve_user_quota_summary",
+        ),
         ("/v1internal:fetchUserInfo", "fetch_user_info"),
         ("/v1internal:fetchAdminControls", "fetch_admin_controls"),
         ("/v1internal:setUserSettings", "set_user_settings"),
@@ -310,6 +447,7 @@ fn classifies_antigravity_v1internal_control_plane_routes() {
             "/v1internal:recordCodeAssistMetrics",
             "record_code_assist_metrics",
         ),
+        ("/v1internal:writeTrajectoryAcls", "write_trajectory_acls"),
     ] {
         let uri: Uri = path.parse().expect("uri should parse");
         let decision = classify_control_route(&http::Method::POST, &uri, &headers)

@@ -1,11 +1,19 @@
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use axum::{body::Body, extract::Request};
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use hyper::body::Incoming;
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as HyperServerBuilder,
+    service::TowerToHyperService,
+};
+use tower::{Service as _, ServiceExt as _};
 use tracing::{debug, info, warn};
 
 use aether_crypto::warm_python_fernet_secret;
@@ -15,7 +23,8 @@ use aether_data::lifecycle::export::{
 };
 use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig, DEFAULT_SQLITE_DATABASE_URL};
 use aether_gateway::{
-    attach_static_frontend, build_router_with_state, set_gateway_frontdoor_app_port, AppState,
+    attach_static_frontend, build_router_with_state,
+    prewarm_direct_h2c_sender_cache_from_env_for_startup, set_gateway_frontdoor_app_port, AppState,
     FrontdoorCorsConfig, FrontdoorUserRpmConfig, GatewayDataConfig, UsageRuntimeConfig,
     VideoTaskTruthSourceMode,
 };
@@ -68,6 +77,29 @@ enum DatabaseDriverArg {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum DatabaseModeArg {
+    Auto,
+    VerifyOnly,
+}
+
+fn resolve_database_mode(
+    configured: Option<DatabaseModeArg>,
+    legacy_auto_prepare: Option<bool>,
+) -> DatabaseModeArg {
+    if let Some(configured) = configured {
+        return configured;
+    }
+    if let Some(legacy_auto_prepare) = legacy_auto_prepare {
+        return if legacy_auto_prepare {
+            DatabaseModeArg::Auto
+        } else {
+            DatabaseModeArg::VerifyOnly
+        };
+    }
+    DatabaseModeArg::Auto
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum ExportDomainArg {
     Users,
     ApiKeys,
@@ -76,10 +108,17 @@ enum ExportDomainArg {
     Endpoints,
     Models,
     GlobalModels,
+    AuthModules,
+    OAuthProviders,
+    UserOAuthLinks,
+    UserGroups,
+    UserGroupMembers,
+    ProxyNodes,
     SystemConfigs,
     Wallets,
     Usage,
     Billing,
+    Auxiliary,
 }
 
 impl From<ExportDomainArg> for ExportDomain {
@@ -92,10 +131,17 @@ impl From<ExportDomainArg> for ExportDomain {
             ExportDomainArg::Endpoints => ExportDomain::Endpoints,
             ExportDomainArg::Models => ExportDomain::Models,
             ExportDomainArg::GlobalModels => ExportDomain::GlobalModels,
+            ExportDomainArg::AuthModules => ExportDomain::AuthModules,
+            ExportDomainArg::OAuthProviders => ExportDomain::OAuthProviders,
+            ExportDomainArg::UserOAuthLinks => ExportDomain::UserOAuthLinks,
+            ExportDomainArg::UserGroups => ExportDomain::UserGroups,
+            ExportDomainArg::UserGroupMembers => ExportDomain::UserGroupMembers,
+            ExportDomainArg::ProxyNodes => ExportDomain::ProxyNodes,
             ExportDomainArg::SystemConfigs => ExportDomain::SystemConfigs,
             ExportDomainArg::Wallets => ExportDomain::Wallets,
             ExportDomainArg::Usage => ExportDomain::Usage,
             ExportDomainArg::Billing => ExportDomain::Billing,
+            ExportDomainArg::Auxiliary => ExportDomain::Auxiliary,
         }
     }
 }
@@ -128,6 +174,10 @@ impl NodeRoleArg {
 
     const fn spawns_background_tasks(self) -> bool {
         matches!(self, Self::All | Self::Background)
+    }
+
+    const fn isolates_background_database(self) -> bool {
+        matches!(self, Self::All)
     }
 }
 
@@ -223,7 +273,40 @@ impl From<GatewayLogRotationArg> for LogRotation {
 }
 
 const GATEWAY_TOKIO_WORKER_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
-
+const DEFAULT_SQL_POOL_ACQUIRE_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_SQL_POOL_IDLE_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_SQL_POOL_MAX_LIFETIME_MS: u64 = 30 * 60_000;
+const DEFAULT_SQL_POOL_STATEMENT_CACHE_CAPACITY: usize = 100;
+const DEFAULT_SQLITE_POOL_MAX_CONNECTIONS: u32 = 1;
+// Per-process default for server SQL backends. Keep this below common
+// database server max_connections defaults; operators can override with
+// AETHER_GATEWAY_DATA_POSTGRES_{MIN,MAX}_CONNECTIONS after sizing the DB.
+const AUTO_SERVER_SQL_POOL_CONNECTIONS_PER_CPU: u32 = 4;
+const AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_FLOOR: u32 = 4;
+const AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_CAP: u32 = 16;
+const AUTO_SERVER_SQL_POOL_MAX_CONNECTIONS_FLOOR: u32 = 32;
+const AUTO_SERVER_SQL_POOL_MAX_CONNECTIONS_CAP: u32 = 100;
+const DEFAULT_USAGE_QUEUE_WORKERS_CAP: usize = 8;
+const AUTO_USAGE_QUEUE_WORKERS_MIN: usize = 2;
+const AUTO_USAGE_QUEUE_WORKERS_REQUESTS_PER_WORKER: usize = 128;
+const AUTO_USAGE_QUEUE_WORKERS_DB_SHARE_ALL: usize = 4;
+const AUTO_USAGE_QUEUE_WORKERS_DB_SHARE_BACKGROUND: usize = 2;
+const AUTO_USAGE_WORKER_RECORD_DB_SHARE_ALL: usize = 8;
+const AUTO_USAGE_WORKER_RECORD_DB_SHARE_BACKGROUND: usize = 4;
+const MAX_USAGE_QUEUE_WORKERS: usize = 64;
+const DEFAULT_GATEWAY_LISTEN_BACKLOG: i32 = 65_535;
+const MIN_GATEWAY_LISTEN_BACKLOG: i32 = 128;
+const MAX_GATEWAY_LISTEN_BACKLOG: i32 = 65_535;
+const DEFAULT_GATEWAY_LISTENER_SHARDS: usize = 0;
+const MAX_GATEWAY_LISTENER_SHARDS: usize = 64;
+const DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 16_384;
+const MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 200;
+const MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS: u32 = 1_000_000;
+const AUTO_GATEWAY_REQUESTS_PER_CPU: usize = 1_024;
+const MIN_AUTO_GATEWAY_REQUEST_CONCURRENCY: usize = 512;
+const MAX_AUTO_GATEWAY_REQUEST_CONCURRENCY: usize = 65_536;
+const AUTO_GATEWAY_REQUEST_FD_DIVISOR: usize = 2;
+const AUTO_GATEWAY_REQUEST_FD_RESERVE: usize = 256;
 fn env_var_trimmed(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -231,72 +314,318 @@ fn env_var_trimmed(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn available_parallelism_u32() -> u32 {
+    u32::try_from(available_parallelism_usize())
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+fn available_parallelism_usize() -> usize {
+    std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_FLOOR as usize)
+        .max(1)
+}
+
+#[cfg(test)]
+fn automatic_gateway_request_concurrency_for_parallelism(parallelism: usize) -> usize {
+    automatic_gateway_request_concurrency_for_capacity(parallelism, None)
+}
+
+fn automatic_gateway_request_concurrency_for_capacity(
+    parallelism: usize,
+    fd_soft_limit: Option<usize>,
+) -> usize {
+    let cpu_limit = parallelism
+        .max(1)
+        .saturating_mul(AUTO_GATEWAY_REQUESTS_PER_CPU)
+        .clamp(
+            MIN_AUTO_GATEWAY_REQUEST_CONCURRENCY,
+            MAX_AUTO_GATEWAY_REQUEST_CONCURRENCY,
+        );
+    let fd_limit = fd_soft_limit
+        .map(|limit| {
+            limit
+                .saturating_sub(AUTO_GATEWAY_REQUEST_FD_RESERVE)
+                .checked_div(AUTO_GATEWAY_REQUEST_FD_DIVISOR)
+                .unwrap_or(1)
+                .max(1)
+        })
+        .unwrap_or(MAX_AUTO_GATEWAY_REQUEST_CONCURRENCY);
+    cpu_limit.min(fd_limit).max(1)
+}
+
+fn automatic_gateway_request_concurrency() -> usize {
+    automatic_gateway_request_concurrency_for_capacity(
+        available_parallelism_usize(),
+        soft_fd_limit(),
+    )
+}
+
+fn soft_fd_limit() -> Option<usize> {
+    #[cfg(unix)]
+    {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+        if result == 0 {
+            return usize::try_from(limit.rlim_cur).ok();
+        }
+    }
+    None
+}
+
+fn usage_queue_request_concurrency_hint(
+    max_in_flight_requests: Option<usize>,
+    distributed_request_limit: Option<usize>,
+) -> Option<usize> {
+    match (
+        max_in_flight_requests.filter(|limit| *limit > 0),
+        distributed_request_limit.filter(|limit| *limit > 0),
+    ) {
+        (Some(local), Some(distributed)) => Some(local.min(distributed)),
+        (Some(local), None) => Some(local),
+        (None, Some(distributed)) => Some(distributed),
+        (None, None) => None,
+    }
+}
+
+fn usage_queue_workers_for_request_concurrency(request_concurrency: usize) -> usize {
+    let workers = request_concurrency
+        .saturating_add(AUTO_USAGE_QUEUE_WORKERS_REQUESTS_PER_WORKER - 1)
+        / AUTO_USAGE_QUEUE_WORKERS_REQUESTS_PER_WORKER;
+    workers.clamp(AUTO_USAGE_QUEUE_WORKERS_MIN, MAX_USAGE_QUEUE_WORKERS)
+}
+
+fn usage_database_config_for_role<'a>(
+    node_role: NodeRoleArg,
+    database: Option<&'a SqlDatabaseConfig>,
+    isolated_background_database: Option<&'a SqlDatabaseConfig>,
+) -> Option<&'a SqlDatabaseConfig> {
+    if node_role.isolates_background_database() {
+        isolated_background_database.or(database)
+    } else {
+        database
+    }
+}
+
+fn usage_queue_worker_database_cap(
+    node_role: NodeRoleArg,
+    database: Option<&SqlDatabaseConfig>,
+    database_is_isolated: bool,
+) -> usize {
+    let Some(database) = database else {
+        return MAX_USAGE_QUEUE_WORKERS;
+    };
+    if database.driver == DatabaseDriver::Sqlite {
+        return 1;
+    }
+
+    let max_connections = database.pool.max_connections.max(1) as usize;
+    // An isolated pool is already a dedicated background budget. Applying the shared-pool
+    // divisor a second time would underutilize that pool.
+    if database_is_isolated {
+        return max_connections
+            .saturating_sub(1)
+            .max(1)
+            .clamp(1, MAX_USAGE_QUEUE_WORKERS);
+    }
+    let divisor = if matches!(node_role, NodeRoleArg::Background) {
+        AUTO_USAGE_QUEUE_WORKERS_DB_SHARE_BACKGROUND
+    } else {
+        AUTO_USAGE_QUEUE_WORKERS_DB_SHARE_ALL
+    };
+    max_connections
+        .saturating_add(divisor - 1)
+        .checked_div(divisor)
+        .unwrap_or(1)
+        .clamp(1, MAX_USAGE_QUEUE_WORKERS)
+}
+
+fn usage_worker_record_concurrency_database_cap(
+    node_role: NodeRoleArg,
+    database: Option<&SqlDatabaseConfig>,
+    database_is_isolated: bool,
+) -> Option<usize> {
+    let database = database?;
+    if database.driver == DatabaseDriver::Sqlite {
+        return Some(1);
+    }
+
+    let max_connections = database.pool.max_connections.max(1) as usize;
+    // The isolated background pool has already been carved out of the foreground pool. Keep one
+    // connection available for maintenance/health work and use the rest for usage persistence.
+    if database_is_isolated {
+        return Some(
+            max_connections
+                .saturating_sub(1)
+                .max(1)
+                .clamp(1, MAX_USAGE_QUEUE_WORKERS),
+        );
+    }
+    let divisor = if matches!(node_role, NodeRoleArg::Background) {
+        AUTO_USAGE_WORKER_RECORD_DB_SHARE_BACKGROUND
+    } else {
+        AUTO_USAGE_WORKER_RECORD_DB_SHARE_ALL
+    };
+    Some(
+        max_connections
+            .checked_div(divisor.max(1))
+            .unwrap_or(1)
+            .clamp(1, MAX_USAGE_QUEUE_WORKERS),
+    )
+}
+
+fn automatic_usage_queue_workers_for_parallelism(
+    parallelism: usize,
+    node_role: NodeRoleArg,
+    max_in_flight_requests: Option<usize>,
+    distributed_request_limit: Option<usize>,
+    database: Option<&SqlDatabaseConfig>,
+    database_is_isolated: bool,
+) -> usize {
+    let cpu_default = parallelism.max(1).clamp(
+        AUTO_USAGE_QUEUE_WORKERS_MIN,
+        DEFAULT_USAGE_QUEUE_WORKERS_CAP,
+    );
+    let requested =
+        usage_queue_request_concurrency_hint(max_in_flight_requests, distributed_request_limit)
+            .map(usage_queue_workers_for_request_concurrency)
+            .unwrap_or(cpu_default);
+    requested
+        .min(usage_queue_worker_database_cap(
+            node_role,
+            database,
+            database_is_isolated,
+        ))
+        .clamp(1, MAX_USAGE_QUEUE_WORKERS)
+}
+
+fn automatic_usage_queue_workers(
+    node_role: NodeRoleArg,
+    max_in_flight_requests: Option<usize>,
+    distributed_request_limit: Option<usize>,
+    database: Option<&SqlDatabaseConfig>,
+    database_is_isolated: bool,
+) -> usize {
+    automatic_usage_queue_workers_for_parallelism(
+        available_parallelism_usize(),
+        node_role,
+        max_in_flight_requests,
+        distributed_request_limit,
+        database,
+        database_is_isolated,
+    )
+}
+
+fn automatic_sql_pool_config(driver: DatabaseDriver) -> SqlPoolConfig {
+    automatic_sql_pool_config_for_parallelism(driver, available_parallelism_u32())
+}
+
+fn automatic_sql_pool_config_for_parallelism(
+    driver: DatabaseDriver,
+    parallelism: u32,
+) -> SqlPoolConfig {
+    let (min_connections, max_connections) = match driver {
+        DatabaseDriver::Sqlite => (1, DEFAULT_SQLITE_POOL_MAX_CONNECTIONS),
+        DatabaseDriver::Mysql | DatabaseDriver::Postgres => {
+            let cpu_count = parallelism.max(1);
+            let max_connections = cpu_count
+                .saturating_mul(AUTO_SERVER_SQL_POOL_CONNECTIONS_PER_CPU)
+                .clamp(
+                    AUTO_SERVER_SQL_POOL_MAX_CONNECTIONS_FLOOR,
+                    AUTO_SERVER_SQL_POOL_MAX_CONNECTIONS_CAP,
+                );
+            let min_connections = cpu_count
+                .clamp(
+                    AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_FLOOR,
+                    AUTO_SERVER_SQL_POOL_MIN_CONNECTIONS_CAP,
+                )
+                .min(max_connections);
+            (min_connections, max_connections)
+        }
+    };
+
+    SqlPoolConfig {
+        min_connections,
+        max_connections,
+        acquire_timeout_ms: DEFAULT_SQL_POOL_ACQUIRE_TIMEOUT_MS,
+        idle_timeout_ms: DEFAULT_SQL_POOL_IDLE_TIMEOUT_MS,
+        max_lifetime_ms: DEFAULT_SQL_POOL_MAX_LIFETIME_MS,
+        statement_cache_capacity: DEFAULT_SQL_POOL_STATEMENT_CACHE_CAPACITY,
+        require_ssl: false,
+    }
+}
+
 #[derive(ClapArgs, Debug, Clone)]
 struct GatewayDataArgs {
-    #[arg(long, env = "AETHER_DATABASE_DRIVER")]
+    #[arg(long, env = "AETHER_DATABASE_DRIVER", global = true)]
     database_driver: Option<DatabaseDriverArg>,
 
-    #[arg(long, env = "AETHER_DATABASE_URL")]
+    #[arg(long, env = "AETHER_DATABASE_URL", global = true)]
     database_url: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_URL")]
+    #[arg(long, env = "AETHER_GATEWAY_DATA_POSTGRES_URL", global = true)]
     postgres_url: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_ENCRYPTION_KEY")]
+    #[arg(long, env = "AETHER_GATEWAY_DATA_ENCRYPTION_KEY", global = true)]
     encryption_key: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_REDIS_URL")]
+    #[arg(long, env = "AETHER_GATEWAY_DATA_REDIS_URL", global = true)]
     redis_url: Option<String>,
 
-    #[arg(long, env = "AETHER_GATEWAY_DATA_REDIS_KEY_PREFIX")]
+    #[arg(long, env = "AETHER_GATEWAY_DATA_REDIS_KEY_PREFIX", global = true)]
     redis_key_prefix: Option<String>,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_MIN_CONNECTIONS",
-        default_value_t = 4
+        global = true
     )]
-    postgres_min_connections: u32,
+    postgres_min_connections: Option<u32>,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_MAX_CONNECTIONS",
-        default_value_t = 20
+        global = true
     )]
-    postgres_max_connections: u32,
+    postgres_max_connections: Option<u32>,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_ACQUIRE_TIMEOUT_MS",
-        default_value_t = 10_000
+        global = true
     )]
-    postgres_acquire_timeout_ms: u64,
+    postgres_acquire_timeout_ms: Option<u64>,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_IDLE_TIMEOUT_MS",
-        default_value_t = 30_000
+        global = true
     )]
-    postgres_idle_timeout_ms: u64,
+    postgres_idle_timeout_ms: Option<u64>,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_MAX_LIFETIME_MS",
-        default_value_t = 1_800_000
+        global = true
     )]
-    postgres_max_lifetime_ms: u64,
+    postgres_max_lifetime_ms: Option<u64>,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_STATEMENT_CACHE_CAPACITY",
-        default_value_t = 100
+        global = true
     )]
-    postgres_statement_cache_capacity: usize,
+    postgres_statement_cache_capacity: Option<usize>,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_DATA_POSTGRES_REQUIRE_SSL",
-        default_value_t = false
+        default_value_t = false,
+        global = true
     )]
     postgres_require_ssl: bool,
 }
@@ -319,14 +648,23 @@ impl GatewayDataArgs {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+        let legacy_postgres_url = self
+            .postgres_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let generic_database_url = std::env::var("DATABASE_URL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
-        match (self.effective_database_driver(), configured_url) {
-            (Some(DatabaseDriver::Sqlite), None) => Some(DEFAULT_SQLITE_DATABASE_URL.to_string()),
-            (_, Some(url)) => Some(url),
-            (None, None) => self.effective_postgres_url(),
-            (Some(DatabaseDriver::Postgres), None) => self.effective_postgres_url(),
-            (Some(DatabaseDriver::Mysql), None) => None,
-        }
+        resolve_database_url(
+            self.effective_database_driver(),
+            configured_url,
+            legacy_postgres_url,
+            generic_database_url,
+        )
     }
 
     fn effective_sql_database_config(&self) -> Option<SqlDatabaseConfig> {
@@ -339,30 +677,47 @@ impl GatewayDataArgs {
         Some(SqlDatabaseConfig {
             driver,
             url,
-            pool: SqlPoolConfig {
-                min_connections: self.postgres_min_connections,
-                max_connections: self.postgres_max_connections,
-                acquire_timeout_ms: self.postgres_acquire_timeout_ms,
-                idle_timeout_ms: self.postgres_idle_timeout_ms,
-                max_lifetime_ms: self.postgres_max_lifetime_ms,
-                statement_cache_capacity: self.postgres_statement_cache_capacity,
-                require_ssl: driver != DatabaseDriver::Sqlite && self.postgres_require_ssl,
-            },
+            pool: self.effective_sql_pool_config(driver),
         })
     }
 
-    fn effective_postgres_url(&self) -> Option<String> {
-        self.postgres_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .or_else(|| {
-                std::env::var("DATABASE_URL")
-                    .ok()
-                    .map(|value| value.trim().to_string())
-                    .filter(|value| !value.is_empty())
-            })
+    fn effective_sql_pool_config(&self, driver: DatabaseDriver) -> SqlPoolConfig {
+        let auto = automatic_sql_pool_config(driver);
+        let mut min_connections = self
+            .postgres_min_connections
+            .unwrap_or(auto.min_connections);
+        let mut max_connections = self
+            .postgres_max_connections
+            .unwrap_or(auto.max_connections)
+            .max(1);
+
+        match (self.postgres_min_connections, self.postgres_max_connections) {
+            (None, Some(_)) if min_connections > max_connections => {
+                min_connections = max_connections;
+            }
+            (Some(_), None) if max_connections < min_connections => {
+                max_connections = min_connections.max(1);
+            }
+            _ => {}
+        }
+
+        SqlPoolConfig {
+            min_connections,
+            max_connections,
+            acquire_timeout_ms: self
+                .postgres_acquire_timeout_ms
+                .unwrap_or(auto.acquire_timeout_ms),
+            idle_timeout_ms: self
+                .postgres_idle_timeout_ms
+                .unwrap_or(auto.idle_timeout_ms),
+            max_lifetime_ms: self
+                .postgres_max_lifetime_ms
+                .unwrap_or(auto.max_lifetime_ms),
+            statement_cache_capacity: self
+                .postgres_statement_cache_capacity
+                .unwrap_or(auto.statement_cache_capacity),
+            require_ssl: driver != DatabaseDriver::Sqlite && self.postgres_require_ssl,
+        }
     }
 
     fn effective_redis_url(&self) -> Option<String> {
@@ -427,8 +782,81 @@ impl GatewayDataArgs {
     }
 }
 
+fn resolve_database_url(
+    driver: Option<DatabaseDriver>,
+    configured_url: Option<String>,
+    legacy_postgres_url: Option<String>,
+    generic_database_url: Option<String>,
+) -> Option<String> {
+    if configured_url.is_some() {
+        return configured_url;
+    }
+
+    match driver {
+        Some(DatabaseDriver::Sqlite) => {
+            generic_database_url.or_else(|| Some(DEFAULT_SQLITE_DATABASE_URL.to_string()))
+        }
+        Some(DatabaseDriver::Mysql) => generic_database_url,
+        Some(DatabaseDriver::Postgres) | None => legacy_postgres_url.or(generic_database_url),
+    }
+}
+
 #[derive(ClapArgs, Debug, Clone)]
 struct GatewayUsageArgs {
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_TERMINAL_EVENTS",
+        default_value_t = true
+    )]
+    queue_terminal_events: bool,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_LIFECYCLE_EVENTS",
+        default_value_t = true
+    )]
+    queue_lifecycle_events: bool,
+
+    #[arg(long, env = "AETHER_GATEWAY_USAGE_QUEUE_WORKERS", value_name = "COUNT")]
+    queue_workers: Option<usize>,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_WORKER_AUTOSCALE_ENABLED",
+        default_value_t = true
+    )]
+    queue_worker_autoscale_enabled: bool,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_WORKER_MAX_COUNT",
+        value_name = "COUNT",
+        default_value = "32"
+    )]
+    queue_worker_max_count: Option<usize>,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_WORKER_RECORD_CONCURRENCY_LIMIT",
+        value_name = "COUNT",
+        default_value = "32"
+    )]
+    worker_record_concurrency_limit: Option<usize>,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_WORKER_SCALE_INTERVAL_MS",
+        default_value_t = 1_000
+    )]
+    queue_worker_scale_interval_ms: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_QUEUE_WORKER_IDLE_SCALE_DOWN_TICKS",
+        default_value_t = 30
+    )]
+    queue_worker_idle_scale_down_ticks: u64,
+
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_STREAM_KEY",
@@ -453,14 +881,14 @@ struct GatewayUsageArgs {
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_STREAM_MAXLEN",
-        default_value_t = 2_000
+        default_value_t = 200_000
     )]
     queue_stream_maxlen: usize,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_BATCH_SIZE",
-        default_value_t = 200
+        default_value_t = 128
     )]
     queue_batch_size: usize,
 
@@ -474,14 +902,14 @@ struct GatewayUsageArgs {
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_RECLAIM_IDLE_MS",
-        default_value_t = 30_000
+        default_value_t = 60_000
     )]
     queue_reclaim_idle_ms: u64,
 
     #[arg(
         long,
         env = "AETHER_GATEWAY_USAGE_QUEUE_RECLAIM_COUNT",
-        default_value_t = 200
+        default_value_t = 128
     )]
     queue_reclaim_count: usize,
 
@@ -491,13 +919,181 @@ struct GatewayUsageArgs {
         default_value_t = 5_000
     )]
     queue_reclaim_interval_ms: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_TERMINAL_SUBMISSION_MAX_IN_FLIGHT",
+        default_value_t = 1_024
+    )]
+    terminal_submission_max_in_flight: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_TERMINAL_ENQUEUE_MAX_IN_FLIGHT",
+        default_value_t = 1_024
+    )]
+    terminal_enqueue_max_in_flight: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_LIFECYCLE_ENQUEUE_MAX_IN_FLIGHT",
+        default_value_t = 512
+    )]
+    lifecycle_enqueue_max_in_flight: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_LIFECYCLE_ENQUEUE_DELAY_MS",
+        default_value_t = 1_000
+    )]
+    lifecycle_enqueue_delay_ms: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_RETRY_DEFERRED_LIFECYCLE_EVENTS",
+        default_value_t = true
+    )]
+    retry_deferred_lifecycle_events: bool,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_ENQUEUE_RETRY_BUFFER_CAPACITY",
+        default_value_t = 131_072
+    )]
+    enqueue_retry_buffer_capacity: usize,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_ENQUEUE_RETRY_WORKERS",
+        default_value_t = 8
+    )]
+    enqueue_retry_workers: usize,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_ENQUEUE_RETRY_INITIAL_BACKOFF_MS",
+        default_value_t = 3_000
+    )]
+    enqueue_retry_initial_backoff_ms: u64,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_USAGE_ENQUEUE_RETRY_MAX_BACKOFF_MS",
+        default_value_t = 10_000
+    )]
+    enqueue_retry_max_backoff_ms: u64,
 }
 
 impl GatewayUsageArgs {
-    fn to_config(&self) -> UsageRuntimeConfig {
+    fn effective_queue_workers(
+        &self,
+        node_role: NodeRoleArg,
+        max_in_flight_requests: Option<usize>,
+        distributed_request_limit: Option<usize>,
+        database: Option<&SqlDatabaseConfig>,
+        database_is_isolated: bool,
+    ) -> usize {
+        if let Some(queue_workers) = self.queue_workers {
+            return queue_workers.clamp(1, MAX_USAGE_QUEUE_WORKERS);
+        }
+        if !self.queue_terminal_events && !self.queue_lifecycle_events {
+            return 1;
+        }
+        automatic_usage_queue_workers(
+            node_role,
+            max_in_flight_requests,
+            distributed_request_limit,
+            database,
+            database_is_isolated,
+        )
+    }
+
+    fn effective_queue_worker_max_count(
+        &self,
+        node_role: NodeRoleArg,
+        database: Option<&SqlDatabaseConfig>,
+        worker_count: usize,
+        database_is_isolated: bool,
+    ) -> usize {
+        if !self.queue_worker_autoscale_enabled {
+            return worker_count.clamp(1, MAX_USAGE_QUEUE_WORKERS);
+        }
+        self.queue_worker_max_count
+            .unwrap_or_else(|| {
+                usage_queue_worker_database_cap(node_role, database, database_is_isolated)
+            })
+            .max(1)
+            .min(usage_queue_worker_database_cap(
+                node_role,
+                database,
+                database_is_isolated,
+            ))
+            .clamp(worker_count.max(1), MAX_USAGE_QUEUE_WORKERS)
+    }
+
+    fn runtime_state_blocking_stream_lanes(
+        &self,
+        node_role: NodeRoleArg,
+        database: Option<&SqlDatabaseConfig>,
+        worker_max_count: usize,
+    ) -> Option<usize> {
+        if !node_role.spawns_background_tasks()
+            || (!self.queue_terminal_events && !self.queue_lifecycle_events)
+            || database.is_none()
+        {
+            return None;
+        }
+        Some(worker_max_count.clamp(1, MAX_USAGE_QUEUE_WORKERS))
+    }
+
+    fn effective_worker_record_concurrency_limit(
+        &self,
+        node_role: NodeRoleArg,
+        database: Option<&SqlDatabaseConfig>,
+        database_is_isolated: bool,
+    ) -> Option<usize> {
+        if let Some(limit) = self.worker_record_concurrency_limit {
+            if limit == 0 {
+                return None;
+            }
+            return Some(
+                limit
+                    .min(MAX_USAGE_QUEUE_WORKERS)
+                    .min(
+                        usage_worker_record_concurrency_database_cap(
+                            node_role,
+                            database,
+                            database_is_isolated,
+                        )
+                        .unwrap_or(MAX_USAGE_QUEUE_WORKERS),
+                    )
+                    .max(1),
+            );
+        }
+        if !node_role.spawns_background_tasks()
+            || (!self.queue_terminal_events && !self.queue_lifecycle_events)
+        {
+            return None;
+        }
+        usage_worker_record_concurrency_database_cap(node_role, database, database_is_isolated)
+    }
+
+    fn to_config(
+        &self,
+        worker_count: usize,
+        worker_max_count: usize,
+        worker_record_concurrency_limit: Option<usize>,
+    ) -> UsageRuntimeConfig {
         UsageRuntimeConfig {
             enabled: true,
-            queue_terminal_events: true,
+            queue_terminal_events: self.queue_terminal_events,
+            queue_lifecycle_events: self.queue_lifecycle_events,
+            worker_count: worker_count.clamp(1, MAX_USAGE_QUEUE_WORKERS),
+            worker_autoscale_enabled: self.queue_worker_autoscale_enabled,
+            worker_max_count: worker_max_count.clamp(worker_count.max(1), MAX_USAGE_QUEUE_WORKERS),
+            worker_record_concurrency_limit,
+            worker_scale_interval_ms: self.queue_worker_scale_interval_ms.max(1),
+            worker_idle_scale_down_ticks: self.queue_worker_idle_scale_down_ticks.max(1),
             stream_key: self.queue_stream_key.trim().to_string(),
             consumer_group: self.queue_group.trim().to_string(),
             dlq_stream_key: self.queue_dlq_stream_key.trim().to_string(),
@@ -507,6 +1103,17 @@ impl GatewayUsageArgs {
             reclaim_idle_ms: self.queue_reclaim_idle_ms.max(1),
             reclaim_count: self.queue_reclaim_count.max(1),
             reclaim_interval_ms: self.queue_reclaim_interval_ms.max(1),
+            terminal_submission_max_in_flight: self.terminal_submission_max_in_flight.max(1),
+            terminal_enqueue_max_in_flight: self.terminal_enqueue_max_in_flight.max(1),
+            lifecycle_enqueue_max_in_flight: self.lifecycle_enqueue_max_in_flight.max(1),
+            lifecycle_enqueue_delay_ms: self.lifecycle_enqueue_delay_ms,
+            retry_deferred_lifecycle_events: self.retry_deferred_lifecycle_events,
+            enqueue_retry_buffer_capacity: self.enqueue_retry_buffer_capacity.max(1),
+            enqueue_retry_workers: self.enqueue_retry_workers.clamp(1, 64),
+            enqueue_retry_initial_backoff_ms: self.enqueue_retry_initial_backoff_ms.max(1),
+            enqueue_retry_max_backoff_ms: self
+                .enqueue_retry_max_backoff_ms
+                .max(self.enqueue_retry_initial_backoff_ms.max(1)),
         }
     }
 }
@@ -585,13 +1192,26 @@ enum DataCommand {
     Import(DataImportArgs),
     /// Copy persistent SQL data directly between two databases without a JSONL file.
     Copy(DataCopyArgs),
+    /// Inspect or prepare the configured database.
+    Db(DatabaseCommandArgs),
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+struct DatabaseCommandArgs {
+    #[command(subcommand)]
+    command: DatabaseCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum DatabaseCommand {
+    /// Show whether schema migrations and data backfills are current.
+    Status,
+    /// Apply pending schema migrations and data backfills.
+    Prepare,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
 struct DataExportArgs {
-    #[command(flatten)]
-    data: GatewayDataArgs,
-
     #[arg(long)]
     output: PathBuf,
 
@@ -601,9 +1221,6 @@ struct DataExportArgs {
 
 #[derive(ClapArgs, Debug, Clone)]
 struct DataImportArgs {
-    #[command(flatten)]
-    data: GatewayDataArgs,
-
     #[arg(long)]
     input: PathBuf,
 }
@@ -675,6 +1292,28 @@ struct Args {
     #[arg(long, env = "APP_PORT", default_value_t = 8084)]
     app_port: u16,
 
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_LISTEN_BACKLOG",
+        default_value_t = DEFAULT_GATEWAY_LISTEN_BACKLOG
+    )]
+    listen_backlog: i32,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_LISTENER_SHARDS",
+        default_value_t = DEFAULT_GATEWAY_LISTENER_SHARDS
+    )]
+    /// Number of SO_REUSEPORT listener shards. 0 selects a high-concurrency default.
+    listener_shards: usize,
+
+    #[arg(
+        long,
+        env = "AETHER_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS",
+        default_value_t = DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS
+    )]
+    http2_max_concurrent_streams: u32,
+
     /// 容器内健康检查入口：根据当前 bind 端口探测本地 /health。
     #[arg(long, hide = true, default_value_t = false)]
     healthcheck: bool,
@@ -703,18 +1342,25 @@ struct Args {
     )]
     node_role: NodeRoleArg,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, hide = true, default_value_t = false)]
     migrate: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, hide = true, default_value_t = false)]
     apply_backfills: bool,
 
+    /// Database startup policy. Defaults to auto when neither this nor the legacy setting is set.
+    #[arg(long, env = "AETHER_GATEWAY_DATABASE_MODE", value_enum)]
+    database_mode: Option<DatabaseModeArg>,
+
+    /// Legacy compatibility switch. Prefer --database-mode.
     #[arg(
         long,
         env = "AETHER_GATEWAY_AUTO_PREPARE_DATABASE",
-        default_value_t = false
+        hide = true,
+        num_args = 0..=1,
+        default_missing_value = "true"
     )]
-    auto_prepare_database: bool,
+    auto_prepare_database: Option<bool>,
 
     /// Path to frontend static files directory (SPA). When set, the gateway
     /// serves the frontend directly without nginx.
@@ -749,8 +1395,20 @@ struct Args {
     #[arg(long, env = "AETHER_GATEWAY_MAX_IN_FLIGHT_REQUESTS")]
     max_in_flight_requests: Option<usize>,
 
+    /// Maximum number of long-lived public WebSocket connections. When unset,
+    /// this follows `max_in_flight_requests` while remaining an independent
+    /// gate. Set `AETHER_GATEWAY_MAX_WEBSOCKET_CONNECTIONS` to override it.
+    #[arg(long, env = "AETHER_GATEWAY_MAX_WEBSOCKET_CONNECTIONS")]
+    max_websocket_connections: Option<usize>,
+
     #[arg(long, env = "AETHER_GATEWAY_DISTRIBUTED_REQUEST_LIMIT")]
     distributed_request_limit: Option<usize>,
+
+    /// Optional distributed limit for long-lived WebSocket connections. When
+    /// omitted, the distributed request limit is reused; set it to 0 to keep
+    /// WebSocket admission local-only.
+    #[arg(long, env = "AETHER_GATEWAY_DISTRIBUTED_WEBSOCKET_CONNECTION_LIMIT")]
+    distributed_websocket_connection_limit: Option<usize>,
 
     #[arg(long, env = "AETHER_GATEWAY_DISTRIBUTED_REQUEST_REDIS_URL")]
     distributed_request_redis_url: Option<String>,
@@ -788,6 +1446,13 @@ struct Args {
     #[arg(long, env = "AETHER_RUNTIME_REDIS_KEY_PREFIX")]
     runtime_redis_key_prefix: Option<String>,
 
+    #[arg(
+        long,
+        env = "AETHER_RUNTIME_COMMAND_TIMEOUT_MS",
+        default_value_t = 2_000
+    )]
+    runtime_command_timeout_ms: u64,
+
     #[command(flatten)]
     data: GatewayDataArgs,
 
@@ -805,6 +1470,10 @@ struct Args {
 }
 
 impl Args {
+    fn effective_database_mode(&self) -> DatabaseModeArg {
+        resolve_database_mode(self.database_mode, self.auto_prepare_database)
+    }
+
     fn effective_runtime_backend(
         &self,
         database: Option<&SqlDatabaseConfig>,
@@ -857,6 +1526,7 @@ impl Args {
         &self,
         runtime_backend: RuntimeBackendArg,
         data_redis_url: Option<&str>,
+        blocking_stream_lanes: Option<usize>,
     ) -> RuntimeStateConfig {
         let redis = self
             .effective_runtime_redis_url(data_redis_url)
@@ -867,20 +1537,14 @@ impl Args {
         RuntimeStateConfig {
             backend: runtime_backend.to_runtime_state_backend(),
             redis,
+            command_timeout_ms: Some(self.runtime_command_timeout_ms.max(1)),
+            blocking_stream_lanes,
             ..RuntimeStateConfig::default()
         }
     }
 
     fn runtime_config(&self) -> Result<ServiceRuntimeConfig, std::io::Error> {
-        let default_log_filter = if self.command.is_some()
-            || self.migrate
-            || self.apply_backfills
-            || self.auto_prepare_database
-        {
-            "aether_gateway=info,aether_data=info"
-        } else {
-            "aether_gateway=info"
-        };
+        let default_log_filter = "aether_gateway=info,aether_data=info";
         let config = self
             .logging
             .apply_to_runtime_config(ServiceRuntimeConfig::new(
@@ -914,6 +1578,142 @@ fn gateway_bind_addr(app_port: u16) -> Result<std::net::SocketAddr, std::io::Err
         [0, 0, 0, 0],
         validate_app_port(app_port)?,
     )))
+}
+
+fn gateway_listen_backlog(backlog: i32) -> i32 {
+    backlog.clamp(MIN_GATEWAY_LISTEN_BACKLOG, MAX_GATEWAY_LISTEN_BACKLOG)
+}
+
+fn gateway_auto_listener_shards() -> usize {
+    #[cfg(unix)]
+    {
+        std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().saturating_mul(2))
+            .unwrap_or(16)
+            .clamp(8, 16)
+            .min(MAX_GATEWAY_LISTENER_SHARDS)
+    }
+
+    #[cfg(not(unix))]
+    {
+        1
+    }
+}
+
+fn gateway_listener_shards(shards: usize) -> usize {
+    if shards == 0 {
+        return gateway_auto_listener_shards();
+    }
+    shards.clamp(1, MAX_GATEWAY_LISTENER_SHARDS)
+}
+
+fn gateway_http2_max_concurrent_streams(streams: u32) -> u32 {
+    streams.clamp(
+        MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
+        MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
+    )
+}
+
+fn gateway_listener(
+    bind_addr: std::net::SocketAddr,
+    backlog: i32,
+    reuse_port: bool,
+) -> Result<tokio::net::TcpListener, std::io::Error> {
+    let domain = match bind_addr {
+        std::net::SocketAddr::V4(_) => socket2::Domain::IPV4,
+        std::net::SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    if reuse_port {
+        set_gateway_listener_reuse_port(&socket)?;
+    }
+    socket.set_nonblocking(true)?;
+    socket.set_tcp_nodelay(true)?;
+    socket.bind(&bind_addr.into())?;
+    socket.listen(gateway_listen_backlog(backlog))?;
+    tokio::net::TcpListener::from_std(socket.into())
+}
+
+#[cfg(unix)]
+fn set_gateway_listener_reuse_port(socket: &socket2::Socket) -> Result<(), std::io::Error> {
+    socket.set_reuse_port(true)
+}
+
+#[cfg(not(unix))]
+fn set_gateway_listener_reuse_port(_socket: &socket2::Socket) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "AETHER_GATEWAY_LISTENER_SHARDS > 1 requires SO_REUSEPORT support",
+    ))
+}
+
+fn gateway_listeners(
+    bind_addr: std::net::SocketAddr,
+    backlog: i32,
+    shards: usize,
+) -> Result<Vec<tokio::net::TcpListener>, std::io::Error> {
+    let shards = gateway_listener_shards(shards);
+    let mut listeners = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        listeners.push(gateway_listener(bind_addr, backlog, shards > 1)?);
+    }
+    Ok(listeners)
+}
+
+async fn serve_gateway_router(
+    listeners: Vec<tokio::net::TcpListener>,
+    router: axum::Router,
+    http2_max_concurrent_streams: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let http2_max_concurrent_streams =
+        gateway_http2_max_concurrent_streams(http2_max_concurrent_streams);
+    let mut servers = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let router = router.clone();
+        servers.spawn(async move {
+            serve_gateway_listener(listener, router, http2_max_concurrent_streams).await
+        });
+    }
+    if let Some(result) = servers.join_next().await {
+        servers.abort_all();
+        let serve_result = result
+            .map_err(|err| std::io::Error::other(format!("gateway listener task failed: {err}")))?;
+        serve_result?;
+    }
+    Ok(())
+}
+
+async fn serve_gateway_listener(
+    listener: tokio::net::TcpListener,
+    router: axum::Router,
+    http2_max_concurrent_streams: u32,
+) -> Result<(), std::io::Error> {
+    let mut make_service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    loop {
+        let (io, remote_addr) = listener.accept().await?;
+        let tower_service = make_service
+            .call(remote_addr)
+            .await
+            .unwrap_or_else(|err| match err {})
+            .map_request(|req: Request<Incoming>| req.map(Body::new));
+        let hyper_service = TowerToHyperService::new(tower_service);
+        let io = TokioIo::new(io);
+
+        tokio::spawn(async move {
+            let mut builder = HyperServerBuilder::new(TokioExecutor::new());
+            builder.http2().enable_connect_protocol();
+            builder
+                .http2()
+                .max_concurrent_streams(http2_max_concurrent_streams);
+            if let Err(err) = builder
+                .serve_connection_with_upgrades(io, hyper_service)
+                .await
+            {
+                tracing::trace!(error = ?err, "gateway connection closed with error");
+            }
+        });
+    }
 }
 
 fn resolve_local_http_base_url(app_port: u16) -> Result<String, std::io::Error> {
@@ -1009,7 +1809,7 @@ fn validate_deployment_topology(
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "AETHER_GATEWAY_VIDEO_TASK_STORE_PATH must be unset when AETHER_GATEWAY_DEPLOYMENT_TOPOLOGY=multi-node; use shared Postgres-backed state instead",
+            "AETHER_GATEWAY_VIDEO_TASK_STORE_PATH must be unset when AETHER_GATEWAY_DEPLOYMENT_TOPOLOGY=multi-node; use shared SQL-backed state instead",
         ));
     }
 
@@ -1047,7 +1847,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     if let Some(command) = args.command.as_ref() {
         init_service_runtime(args.runtime_config()?)?;
-        return run_data_command(command).await;
+        return run_data_command(command, &args.data).await;
     }
     if args.migrate {
         init_service_runtime(args.runtime_config()?)?;
@@ -1065,7 +1865,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     init_service_runtime(args.runtime_config()?)?;
     let sql_database_config = args.data.effective_sql_database_config();
-    let data_postgres_url = args.data.effective_postgres_url();
     let data_redis_url = args.data.effective_redis_url();
     let runtime_backend =
         args.effective_runtime_backend(sql_database_config.as_ref(), data_redis_url.as_deref());
@@ -1076,14 +1875,81 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_redis_url.as_deref(),
         runtime_backend,
     )?;
+    let data_config = args.data.to_config();
+    let isolate_background_database = args.node_role.isolates_background_database();
+    let background_database_config = if isolate_background_database {
+        data_config.background_database_config()
+    } else {
+        None
+    };
+    let usage_database_is_isolated =
+        isolate_background_database && background_database_config.is_some();
+    let usage_database_config = usage_database_config_for_role(
+        args.node_role,
+        data_config.database(),
+        background_database_config.as_ref(),
+    );
+    let request_concurrency_limit = args
+        .max_in_flight_requests
+        .filter(|limit| *limit > 0)
+        .unwrap_or_else(automatic_gateway_request_concurrency);
+    let websocket_connection_limit = args
+        .max_websocket_connections
+        .filter(|limit| *limit > 0)
+        .unwrap_or(request_concurrency_limit);
+    let distributed_websocket_connection_limit = match args.distributed_websocket_connection_limit {
+        Some(limit) if limit > 0 => Some(limit),
+        Some(_) => None,
+        None => args.distributed_request_limit.filter(|limit| *limit > 0),
+    };
+    let usage_queue_request_concurrency_hint = usage_queue_request_concurrency_hint(
+        Some(request_concurrency_limit),
+        args.distributed_request_limit,
+    );
+    let usage_queue_request_concurrency_hint_source =
+        if args.max_in_flight_requests.is_some() || args.distributed_request_limit.is_some() {
+            "explicit"
+        } else {
+            "auto"
+        };
+    let usage_queue_workers = args.usage.effective_queue_workers(
+        args.node_role,
+        Some(request_concurrency_limit),
+        args.distributed_request_limit,
+        usage_database_config,
+        usage_database_is_isolated,
+    );
+    let usage_queue_worker_max_count = args.usage.effective_queue_worker_max_count(
+        args.node_role,
+        usage_database_config,
+        usage_queue_workers,
+        usage_database_is_isolated,
+    );
+    let usage_worker_record_concurrency_limit =
+        args.usage.effective_worker_record_concurrency_limit(
+            args.node_role,
+            usage_database_config,
+            usage_database_is_isolated,
+        );
+    let usage_config = args.usage.to_config(
+        usage_queue_workers,
+        usage_queue_worker_max_count,
+        usage_worker_record_concurrency_limit,
+    );
+    let usage_blocking_stream_lanes = args.usage.runtime_state_blocking_stream_lanes(
+        args.node_role,
+        usage_database_config,
+        usage_config.worker_max_count,
+    );
     let runtime_state = Arc::new(
-        RuntimeState::from_config(
-            args.runtime_state_config(runtime_backend, data_redis_url.as_deref()),
-        )
+        RuntimeState::from_config(args.runtime_state_config(
+            runtime_backend,
+            data_redis_url.as_deref(),
+            usage_blocking_stream_lanes,
+        ))
         .await
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?,
     );
-    let data_config = args.data.to_config();
     let rate_limit_config = if matches!(args.deployment_topology, DeploymentTopologyArg::MultiNode)
     {
         args.rate_limit.config().with_local_fallback(false)
@@ -1104,6 +1970,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         deployment_topology = args.deployment_topology.as_str(),
         node_role = args.node_role.as_str(),
         runtime_backend = runtime_backend.as_str(),
+        usage_queue_workers = usage_config.worker_count,
+        usage_queue_worker_autoscale_enabled = usage_config.worker_autoscale_enabled,
+        usage_queue_worker_max_count = usage_config.worker_max_count,
+        usage_worker_record_concurrency_limit = usage_config
+            .worker_record_concurrency_limit
+            .unwrap_or_default(),
+        usage_queue_request_concurrency_hint =
+            usage_queue_request_concurrency_hint.unwrap_or_default(),
+        usage_queue_request_concurrency_hint_source,
         frontdoor_mode = "compatibility_frontdoor",
         log_format = ?args.logging.log_format,
         log_destination = args.logging.log_destination.as_str(),
@@ -1127,8 +2002,35 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         video_task_poller_interval_ms = args.video_task_poller_interval_ms,
         video_task_poller_batch_size = args.video_task_poller_batch_size,
         video_task_store_path = args.video_task_store_path.as_deref().unwrap_or("-"),
-        max_in_flight_requests = args.max_in_flight_requests.unwrap_or_default(),
+        usage_queue_workers = usage_config.worker_count,
+        usage_queue_workers_source = if args.usage.queue_workers.is_some() {
+            "explicit"
+        } else {
+            "auto"
+        },
+        usage_queue_worker_autoscale_enabled = usage_config.worker_autoscale_enabled,
+        usage_queue_worker_max_count = usage_config.worker_max_count,
+        usage_worker_record_concurrency_limit = usage_config
+            .worker_record_concurrency_limit
+            .unwrap_or_default(),
+        usage_queue_request_concurrency_hint =
+            usage_queue_request_concurrency_hint.unwrap_or_default(),
+        usage_queue_request_concurrency_hint_source,
+        max_in_flight_requests = request_concurrency_limit,
+        max_in_flight_requests_source = if args.max_in_flight_requests.is_some() {
+            "explicit"
+        } else {
+            "auto"
+        },
         distributed_request_limit = args.distributed_request_limit.unwrap_or_default(),
+        max_websocket_connections = websocket_connection_limit,
+        max_websocket_connections_source = if args.max_websocket_connections.is_some() {
+            "explicit"
+        } else {
+            "request_concurrency_fallback"
+        },
+        distributed_websocket_connection_limit =
+            distributed_websocket_connection_limit.unwrap_or_default(),
         distributed_request_redis_configured = args
             .distributed_request_redis_url
             .as_deref()
@@ -1139,7 +2041,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .as_ref()
             .map(|database| database.driver.as_str())
             .unwrap_or("-"),
-        data_postgres_configured = data_postgres_url.is_some(),
+        data_database_pool_min_connections = sql_database_config
+            .as_ref()
+            .map(|database| database.pool.min_connections)
+            .unwrap_or_default(),
+        data_database_pool_max_connections = sql_database_config
+            .as_ref()
+            .map(|database| database.pool.max_connections)
+            .unwrap_or_default(),
+        data_postgres_configured = sql_database_config
+            .as_ref()
+            .is_some_and(|database| database.driver == DatabaseDriver::Postgres),
         runtime_redis_configured = matches!(runtime_backend, RuntimeBackendArg::Redis),
         data_redis_url_supplied = data_redis_url.is_some(),
         data_has_encryption_key = data_config.encryption_key().is_some(),
@@ -1149,8 +2061,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut state = AppState::new()?
         .with_runtime_state(runtime_state)
-        .with_data_config(data_config)?
-        .with_usage_runtime_config(args.usage.to_config())?
+        .with_data_config_and_background_isolation(data_config, isolate_background_database)?
+        .with_usage_runtime_config(usage_config)?
         .with_video_task_truth_source_mode(args.video_task_truth_source_mode.into());
     if let Some(cors_config) = args.frontdoor.cors_config() {
         state = state.with_frontdoor_cors_config(cors_config);
@@ -1173,9 +2085,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         state = state.with_video_task_store_path(path)?;
     }
-    if let Some(limit) = args.max_in_flight_requests.filter(|limit| *limit > 0) {
-        state = state.with_request_concurrency_limit(limit);
-    }
+    state = state
+        .with_request_concurrency_limit(request_concurrency_limit)
+        .with_websocket_connection_limit(websocket_connection_limit);
     if let Some(limit) = args.distributed_request_limit.filter(|limit| *limit > 0) {
         let distributed_gate = state
             .runtime_state()
@@ -1193,12 +2105,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             })?;
         state = state.with_distributed_request_concurrency_gate(distributed_gate);
     }
+    if let Some(limit) = distributed_websocket_connection_limit {
+        let distributed_gate = state
+            .runtime_state()
+            .semaphore(
+                "gateway_websocket_connections_distributed",
+                limit,
+                RuntimeSemaphoreConfig {
+                    lease_ttl_ms: args.distributed_request_lease_ttl_ms.max(1),
+                    renew_interval_ms: args.distributed_request_renew_interval_ms.max(1),
+                    command_timeout_ms: Some(args.distributed_request_command_timeout_ms.max(1)),
+                },
+            )
+            .map_err(|err| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+            })?;
+        state = state.with_distributed_websocket_connection_gate(distributed_gate);
+    }
     if matches!(args.deployment_topology, DeploymentTopologyArg::MultiNode)
         && !state.has_usage_data_writer()
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "usage persistence requires a configured Postgres data backend; set AETHER_GATEWAY_DATA_POSTGRES_URL before starting aether-gateway",
+            "usage persistence requires a configured shared SQL data backend; set AETHER_DATABASE_DRIVER and AETHER_DATABASE_URL before starting aether-gateway",
         )
         .into());
     }
@@ -1218,7 +2147,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         execution_runtime_configured = state.execution_runtime_configured(),
         "aether-gateway data layer configured"
     );
-    prepare_database_startup_requirements(&state, args.auto_prepare_database).await?;
+    prepare_database_startup_requirements(&state, args.effective_database_mode()).await?;
+    state.warm_database_pools().await?;
     let reset_stale_proxy_nodes = state.reset_stale_proxy_node_tunnel_statuses().await?;
     if reset_stale_proxy_nodes > 0 {
         info!(
@@ -1227,6 +2157,58 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     state.bootstrap_admin_from_env().await?;
+    match state.ensure_system_default_routing_group().await {
+        Ok(Some(group)) => {
+            info!(
+                group_id = %group.id,
+                group_name = %group.name,
+                "created system default routing group from routing strategy defaults"
+            );
+        }
+        Ok(None) => {}
+        Err(err) => return Err(err.into()),
+    }
+    match state.prewarm_chat_pii_redaction_runtime_config().await {
+        Ok(enabled) => {
+            info!(
+                chat_pii_redaction_enabled = enabled,
+                "prewarmed chat pii redaction runtime config"
+            );
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to prewarm chat pii redaction runtime config"
+            );
+        }
+    }
+    match prewarm_direct_h2c_sender_cache_from_env_for_startup().await {
+        Ok(Some(report)) => {
+            if report.failed_targets > 0 {
+                warn!(
+                    requested_urls = report.requested_urls,
+                    unique_targets = report.unique_targets,
+                    warmed_targets = report.warmed_targets,
+                    failed_targets = report.failed_targets,
+                    ready_required = report.ready_required,
+                    first_error = ?report.first_error,
+                    "direct h2c sender cache prewarm completed with failures"
+                );
+            } else {
+                info!(
+                    requested_urls = report.requested_urls,
+                    unique_targets = report.unique_targets,
+                    warmed_targets = report.warmed_targets,
+                    ready_required = report.ready_required,
+                    "direct h2c sender cache prewarmed"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(std::io::Error::other(err).into());
+        }
+    }
 
     let background_tasks = if args.node_role.spawns_background_tasks() {
         Some(state.spawn_background_tasks())
@@ -1237,7 +2219,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         None
     };
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    if state.prewarm_metric_snapshot().await {
+        info!("gateway metric snapshot prewarmed");
+    } else {
+        warn!(
+            "gateway metric snapshot prewarm did not complete; continuing with fail-open metrics"
+        );
+    }
+    let listen_backlog = gateway_listen_backlog(args.listen_backlog);
+    let listener_shards = gateway_listener_shards(args.listener_shards);
+    let listeners = gateway_listeners(bind_addr, listen_backlog, listener_shards)?;
     let public_base_url = resolve_local_http_base_url(app_port)?;
     let frontdoor_health_url = format!("{public_base_url}/_gateway/health");
     let api_router = build_router_with_state(state);
@@ -1257,29 +2248,91 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_type = "ops",
         bind = %bind_addr,
         app_port,
+        listen_backlog,
+        listener_shards,
+        http2_max_concurrent_streams = gateway_http2_max_concurrent_streams(args.http2_max_concurrent_streams),
         public_url = %public_base_url,
         healthcheck_url = %frontdoor_health_url,
         legacy_route_policy = "fail_closed",
         "aether-gateway ready"
     );
 
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await?;
+    serve_gateway_router(listeners, router, args.http2_max_concurrent_streams).await?;
     if let Some(background_tasks) = background_tasks {
         background_tasks.shutdown().await;
     }
     Ok(())
 }
 
-async fn run_data_command(command: &DataCommand) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_data_command(
+    command: &DataCommand,
+    data: &GatewayDataArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
     match command {
-        DataCommand::Export(args) => run_data_export(args).await,
-        DataCommand::Import(args) => run_data_import(args).await,
+        DataCommand::Export(args) => run_data_export(args, data).await,
+        DataCommand::Import(args) => run_data_import(args, data).await,
         DataCommand::Copy(args) => run_data_copy(args).await,
+        DataCommand::Db(args) => run_database_command(args, data).await,
     }
+}
+
+async fn run_database_command(
+    args: &DatabaseCommandArgs,
+    data: &GatewayDataArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match args.command {
+        DatabaseCommand::Status => run_database_status(data).await,
+        DatabaseCommand::Prepare => run_database_prepare(data).await,
+    }
+}
+
+fn database_maintenance_state(
+    data: &GatewayDataArgs,
+) -> Result<(DatabaseDriver, AppState), Box<dyn std::error::Error>> {
+    let database = required_sql_database_config(data)?;
+    let driver = database.driver;
+    let state = AppState::new()?.with_data_config(data.to_config())?;
+    Ok((driver, state))
+}
+
+async fn run_database_status(data: &GatewayDataArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let (driver, state) = database_maintenance_state(data)?;
+    let pending_migrations = state
+        .pending_database_migrations()
+        .await?
+        .unwrap_or_default();
+
+    if let Some(next) = pending_migrations.first() {
+        println!("database {driver}: preparation required");
+        println!("pending migrations: {}", pending_migrations.len());
+        println!("next migration: {} ({})", next.version, next.description);
+        println!("pending backfills: not checked until migrations are current");
+        println!("run `aether-gateway db prepare`");
+        return Ok(());
+    }
+
+    let pending_backfills = state
+        .pending_database_backfills()
+        .await?
+        .unwrap_or_default();
+    if let Some(next) = pending_backfills.first() {
+        println!("database {driver}: preparation required");
+        println!("pending migrations: 0");
+        println!("pending backfills: {}", pending_backfills.len());
+        println!("next backfill: {} ({})", next.version, next.description);
+        println!("run `aether-gateway db prepare`");
+        return Ok(());
+    }
+
+    println!("database {driver}: ready (schema and backfills are current)");
+    Ok(())
+}
+
+async fn run_database_prepare(data: &GatewayDataArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let (driver, state) = database_maintenance_state(data)?;
+    prepare_database_startup_requirements(&state, DatabaseModeArg::Auto).await?;
+    println!("database {driver}: ready (schema and backfills are current)");
+    Ok(())
 }
 
 fn required_sql_database_config(
@@ -1308,8 +2361,11 @@ fn current_unix_secs() -> Result<u64, std::time::SystemTimeError> {
         .as_secs())
 }
 
-async fn run_data_export(args: &DataExportArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let database = required_sql_database_config(&args.data)?;
+async fn run_data_export(
+    args: &DataExportArgs,
+    data: &GatewayDataArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database = required_sql_database_config(data)?;
     let driver = database.driver;
     let domains = requested_export_domains(args);
     let created_at_unix_secs = current_unix_secs()?;
@@ -1331,8 +2387,11 @@ async fn run_data_export(args: &DataExportArgs) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-async fn run_data_import(args: &DataImportArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let database = required_sql_database_config(&args.data)?;
+async fn run_data_import(
+    args: &DataImportArgs,
+    data: &GatewayDataArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let database = required_sql_database_config(data)?;
     let driver = database.driver;
     let input = tokio::fs::read_to_string(&args.input).await?;
     let imported = import_database_jsonl(database, &input).await?;
@@ -1492,17 +2551,15 @@ async fn run_explicit_backfills(args: &Args) -> Result<(), Box<dyn std::error::E
 
 async fn prepare_database_startup_requirements(
     state: &AppState,
-    auto_prepare_database: bool,
+    database_mode: DatabaseModeArg,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !auto_prepare_database {
+    if matches!(database_mode, DatabaseModeArg::VerifyOnly) {
         ensure_database_schema_is_current(state).await?;
         ensure_database_backfills_are_current(state).await?;
         return Ok(());
     }
 
-    info!(
-        "auto database preparation enabled; applying pending migrations and backfills before serving traffic"
-    );
+    info!("database preparation enabled; applying pending migrations and backfills");
 
     let Some(pending_migrations) = state.prepare_database_for_startup().await? else {
         return Ok(());
@@ -1516,10 +2573,10 @@ async fn prepare_database_startup_requirements(
             next_version = next.version,
             next_description = %next.description,
             pending_versions = %format_pending_migrations(&pending_migrations),
-            "running database migrations during service startup..."
+            "running database migrations during database preparation..."
         );
         if state.run_database_migrations().await? {
-            info!("database migrations complete during service startup");
+            info!("database migrations complete");
         }
     }
 
@@ -1538,10 +2595,10 @@ async fn prepare_database_startup_requirements(
         next_version = next.version,
         next_description = %next.description,
         pending_versions = %format_pending_backfills(&pending_backfills),
-        "running database backfills during service startup..."
+        "running database backfills during database preparation..."
     );
     if state.run_database_backfills().await? {
-        info!("database backfills complete during service startup");
+        info!("database backfills complete");
     }
 
     Ok(())
@@ -1586,7 +2643,7 @@ async fn ensure_database_backfills_are_current(
 async fn ensure_database_schema_is_current(
     state: &AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(pending) = state.prepare_database_for_startup().await? else {
+    let Some(pending) = state.pending_database_migrations().await? else {
         return Ok(());
     };
     if pending.is_empty() {
@@ -1605,10 +2662,8 @@ fn pending_schema_error(
     next_description: &str,
 ) -> std::io::Error {
     std::io::Error::other(format!(
-        "database schema is behind by {} migration(s); next pending migration is {} ({})\nrun `aether-gateway --migrate` before starting the service",
-        pending_count,
-        next_version,
-        next_description
+        "database schema is behind by {} migration(s); next pending migration is {} ({})\nrun `aether-gateway db prepare` before starting the service",
+        pending_count, next_version, next_description
     ))
 }
 
@@ -1618,44 +2673,57 @@ fn pending_backfills_error(
     next_description: &str,
 ) -> std::io::Error {
     std::io::Error::other(format!(
-        "database backfills are behind by {} backfill(s); next pending backfill is {} ({})\nrun `aether-gateway --apply-backfills` before starting the service",
-        pending_count,
-        next_version,
-        next_description
+        "database backfills are behind by {} backfill(s); next pending backfill is {} ({})\nrun `aether-gateway db prepare` before starting the service",
+        pending_count, next_version, next_description
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
+        automatic_gateway_request_concurrency_for_capacity,
+        automatic_gateway_request_concurrency_for_parallelism, automatic_sql_pool_config,
+        automatic_sql_pool_config_for_parallelism, automatic_usage_queue_workers_for_parallelism,
         ensure_database_backfills_are_current, ensure_database_schema_is_current,
-        pending_backfills_error, pending_schema_error, resolve_healthcheck_url, Args,
-        DatabaseDriverArg, DeploymentTopologyArg, GatewayDataArgs, GatewayFrontdoorArgs,
-        GatewayLogDestinationArg, GatewayLogFormatArg, GatewayLogRotationArg, GatewayLoggingArgs,
-        GatewayRateLimitArgs, GatewayUsageArgs, NodeRoleArg, RuntimeBackendArg,
-        VideoTaskTruthSourceArg,
+        pending_backfills_error, pending_schema_error, resolve_database_mode,
+        resolve_healthcheck_url, usage_database_config_for_role, Args, DataCommand,
+        DatabaseCommand, DatabaseDriverArg, DatabaseModeArg, DeploymentTopologyArg,
+        GatewayDataArgs, GatewayFrontdoorArgs, GatewayLogDestinationArg, GatewayLogFormatArg,
+        GatewayLogRotationArg, GatewayLoggingArgs, GatewayRateLimitArgs, GatewayUsageArgs,
+        NodeRoleArg, RuntimeBackendArg, VideoTaskTruthSourceArg,
+        DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, DEFAULT_GATEWAY_LISTENER_SHARDS,
+        DEFAULT_GATEWAY_LISTEN_BACKLOG, MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
+        MAX_GATEWAY_LISTENER_SHARDS, MAX_GATEWAY_LISTEN_BACKLOG,
+        MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS, MIN_GATEWAY_LISTEN_BACKLOG,
     };
     use aether_data::{DatabaseDriver, SqlDatabaseConfig, SqlPoolConfig};
     use aether_gateway::AppState;
+    use clap::Parser;
 
     fn test_args() -> Args {
         Args {
             command: None,
             app_port: 8084,
+            listen_backlog: DEFAULT_GATEWAY_LISTEN_BACKLOG,
+            listener_shards: DEFAULT_GATEWAY_LISTENER_SHARDS,
+            http2_max_concurrent_streams: DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS,
             healthcheck: false,
             healthcheck_timeout_ms: 3_000,
             deployment_topology: DeploymentTopologyArg::SingleNode,
             node_role: NodeRoleArg::All,
             migrate: false,
             apply_backfills: false,
-            auto_prepare_database: false,
+            database_mode: None,
+            auto_prepare_database: None,
             static_dir: None,
             video_task_truth_source_mode: VideoTaskTruthSourceArg::PythonSyncReport,
             video_task_poller_interval_ms: 5_000,
             video_task_poller_batch_size: 32,
             video_task_store_path: None,
             max_in_flight_requests: None,
+            max_websocket_connections: None,
             distributed_request_limit: None,
+            distributed_websocket_connection_limit: None,
             distributed_request_redis_url: None,
             distributed_request_redis_key_prefix: None,
             distributed_request_lease_ttl_ms: 30_000,
@@ -1664,6 +2732,7 @@ mod tests {
             runtime_backend: None,
             runtime_redis_url: None,
             runtime_redis_key_prefix: None,
+            runtime_command_timeout_ms: 1_000,
             data: GatewayDataArgs {
                 database_driver: None,
                 database_url: None,
@@ -1671,24 +2740,41 @@ mod tests {
                 encryption_key: None,
                 redis_url: None,
                 redis_key_prefix: None,
-                postgres_min_connections: 4,
-                postgres_max_connections: 20,
-                postgres_acquire_timeout_ms: 10_000,
-                postgres_idle_timeout_ms: 30_000,
-                postgres_max_lifetime_ms: 1_800_000,
-                postgres_statement_cache_capacity: 100,
+                postgres_min_connections: None,
+                postgres_max_connections: None,
+                postgres_acquire_timeout_ms: None,
+                postgres_idle_timeout_ms: None,
+                postgres_max_lifetime_ms: None,
+                postgres_statement_cache_capacity: None,
                 postgres_require_ssl: false,
             },
             usage: GatewayUsageArgs {
+                queue_terminal_events: true,
+                queue_lifecycle_events: true,
+                queue_workers: Some(4),
+                queue_worker_autoscale_enabled: true,
+                queue_worker_max_count: Some(32),
+                worker_record_concurrency_limit: Some(32),
+                queue_worker_scale_interval_ms: 1_000,
+                queue_worker_idle_scale_down_ticks: 30,
                 queue_stream_key: "usage:events".to_string(),
                 queue_group: "usage_consumers".to_string(),
                 queue_dlq_stream_key: "usage:events:dlq".to_string(),
-                queue_stream_maxlen: 2_000,
-                queue_batch_size: 200,
+                queue_stream_maxlen: 200_000,
+                queue_batch_size: 128,
                 queue_block_ms: 500,
-                queue_reclaim_idle_ms: 30_000,
-                queue_reclaim_count: 200,
+                queue_reclaim_idle_ms: 60_000,
+                queue_reclaim_count: 128,
                 queue_reclaim_interval_ms: 5_000,
+                terminal_submission_max_in_flight: 1_024,
+                terminal_enqueue_max_in_flight: 1_024,
+                lifecycle_enqueue_max_in_flight: 512,
+                lifecycle_enqueue_delay_ms: 1_000,
+                retry_deferred_lifecycle_events: true,
+                enqueue_retry_buffer_capacity: 131_072,
+                enqueue_retry_workers: 8,
+                enqueue_retry_initial_backoff_ms: 3_000,
+                enqueue_retry_max_backoff_ms: 10_000,
             },
             frontdoor: GatewayFrontdoorArgs {
                 environment: "development".to_string(),
@@ -1711,6 +2797,38 @@ mod tests {
         }
     }
 
+    fn test_database(driver: DatabaseDriver, max_connections: u32) -> SqlDatabaseConfig {
+        let url = match driver {
+            DatabaseDriver::Sqlite => "sqlite://./data/aether.db",
+            DatabaseDriver::Mysql => "mysql://root:root@localhost/aether",
+            DatabaseDriver::Postgres => "postgres://postgres:postgres@localhost/aether",
+        };
+        let max_connections = max_connections.max(1);
+        SqlDatabaseConfig::new(
+            driver,
+            url,
+            SqlPoolConfig {
+                min_connections: 1,
+                max_connections,
+                ..SqlPoolConfig::default()
+            },
+        )
+        .expect("test database config should build")
+    }
+
+    fn temporary_sqlite_args(label: &str) -> (Args, std::path::PathBuf) {
+        let mut args = test_args();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be available")
+            .as_nanos();
+        let database_path =
+            std::env::temp_dir().join(format!("aether-{label}-{}-{nonce}.db", std::process::id()));
+        args.data.database_driver = Some(DatabaseDriverArg::Sqlite);
+        args.data.database_url = Some(format!("sqlite://{}", database_path.display()));
+        (args, database_path)
+    }
+
     #[test]
     fn resolves_healthcheck_url_from_app_port() {
         assert_eq!(
@@ -1726,6 +2844,91 @@ mod tests {
     }
 
     #[test]
+    fn clamps_gateway_listen_backlog() {
+        assert_eq!(
+            super::gateway_listen_backlog(MIN_GATEWAY_LISTEN_BACKLOG - 1),
+            MIN_GATEWAY_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            super::gateway_listen_backlog(DEFAULT_GATEWAY_LISTEN_BACKLOG),
+            DEFAULT_GATEWAY_LISTEN_BACKLOG
+        );
+        assert_eq!(
+            super::gateway_listen_backlog(MAX_GATEWAY_LISTEN_BACKLOG + 1),
+            MAX_GATEWAY_LISTEN_BACKLOG
+        );
+    }
+
+    #[test]
+    fn clamps_gateway_listener_shards() {
+        let auto_shards = super::gateway_listener_shards(0);
+        assert!((1..=MAX_GATEWAY_LISTENER_SHARDS).contains(&auto_shards));
+        assert_eq!(super::gateway_listener_shards(1), 1);
+        assert_eq!(
+            super::gateway_listener_shards(DEFAULT_GATEWAY_LISTENER_SHARDS),
+            auto_shards
+        );
+        assert_eq!(
+            super::gateway_listener_shards(MAX_GATEWAY_LISTENER_SHARDS + 1),
+            MAX_GATEWAY_LISTENER_SHARDS
+        );
+    }
+
+    #[test]
+    fn clamps_gateway_http2_max_concurrent_streams() {
+        assert_eq!(
+            super::gateway_http2_max_concurrent_streams(
+                MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS - 1
+            ),
+            MIN_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS
+        );
+        assert_eq!(
+            super::gateway_http2_max_concurrent_streams(
+                DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS
+            ),
+            DEFAULT_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS
+        );
+        assert_eq!(
+            super::gateway_http2_max_concurrent_streams(
+                MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS + 1
+            ),
+            MAX_GATEWAY_HTTP2_MAX_CONCURRENT_STREAMS
+        );
+    }
+
+    #[test]
+    fn auto_gateway_request_concurrency_scales_and_clamps() {
+        assert_eq!(
+            automatic_gateway_request_concurrency_for_parallelism(1),
+            1_024
+        );
+        assert_eq!(
+            automatic_gateway_request_concurrency_for_parallelism(4),
+            4_096
+        );
+        assert_eq!(
+            automatic_gateway_request_concurrency_for_parallelism(64),
+            65_536
+        );
+    }
+
+    #[test]
+    fn auto_gateway_request_concurrency_respects_fd_budget() {
+        assert_eq!(
+            automatic_gateway_request_concurrency_for_capacity(64, Some(16_384)),
+            8_064
+        );
+        assert_eq!(
+            automatic_gateway_request_concurrency_for_capacity(64, Some(1_024)),
+            384
+        );
+        assert_eq!(
+            automatic_gateway_request_concurrency_for_capacity(64, None),
+            65_536
+        );
+    }
+
+    #[test]
     fn explicit_migrate_runtime_config_enables_data_logs() {
         let mut args = test_args();
         args.migrate = true;
@@ -1737,11 +2940,14 @@ mod tests {
     }
 
     #[test]
-    fn normal_runtime_config_keeps_gateway_only_logs() {
+    fn normal_runtime_config_includes_database_lifecycle_logs() {
         let config = test_args()
             .runtime_config()
             .expect("runtime config should build");
-        assert_eq!(config.default_log_filter, "aether_gateway=info");
+        assert_eq!(
+            config.default_log_filter,
+            "aether_gateway=info,aether_data=info"
+        );
     }
 
     #[test]
@@ -1758,12 +2964,543 @@ mod tests {
     #[test]
     fn auto_prepare_database_runtime_config_enables_data_logs() {
         let mut args = test_args();
-        args.auto_prepare_database = true;
+        args.auto_prepare_database = Some(true);
         let config = args.runtime_config().expect("runtime config should build");
         assert_eq!(
             config.default_log_filter,
             "aether_gateway=info,aether_data=info"
         );
+    }
+
+    #[test]
+    fn database_mode_defaults_to_auto_and_preserves_legacy_false() {
+        assert_eq!(resolve_database_mode(None, None), DatabaseModeArg::Auto);
+        assert_eq!(
+            resolve_database_mode(None, Some(false)),
+            DatabaseModeArg::VerifyOnly
+        );
+        assert_eq!(
+            resolve_database_mode(Some(DatabaseModeArg::Auto), Some(false)),
+            DatabaseModeArg::Auto
+        );
+    }
+
+    #[test]
+    fn parses_database_commands_and_verify_only_mode() {
+        let status = Args::try_parse_from(["aether-gateway", "db", "status"])
+            .expect("db status should parse");
+        assert!(matches!(
+            status.command,
+            Some(DataCommand::Db(args))
+                if matches!(args.command, DatabaseCommand::Status)
+        ));
+
+        let verify_only =
+            Args::try_parse_from(["aether-gateway", "--database-mode", "verify-only"])
+                .expect("verify-only mode should parse");
+        assert_eq!(
+            verify_only.effective_database_mode(),
+            DatabaseModeArg::VerifyOnly
+        );
+
+        let legacy_false =
+            Args::try_parse_from(["aether-gateway", "--auto-prepare-database=false"])
+                .expect("legacy false setting should parse");
+        assert_eq!(
+            legacy_false.effective_database_mode(),
+            DatabaseModeArg::VerifyOnly
+        );
+
+        let prepare = Args::try_parse_from(["aether-gateway", "db", "prepare"])
+            .expect("db prepare should parse");
+        assert!(matches!(
+            prepare.command,
+            Some(DataCommand::Db(args))
+                if matches!(args.command, DatabaseCommand::Prepare)
+        ));
+    }
+
+    #[test]
+    fn database_arguments_are_global_for_database_commands() {
+        let before = Args::try_parse_from([
+            "aether-gateway",
+            "--database-driver",
+            "sqlite",
+            "--database-url",
+            "sqlite:///tmp/before.db",
+            "db",
+            "status",
+        ])
+        .expect("database arguments before db should parse");
+        assert_eq!(
+            before.data.database_url.as_deref(),
+            Some("sqlite:///tmp/before.db")
+        );
+
+        let after = Args::try_parse_from([
+            "aether-gateway",
+            "db",
+            "prepare",
+            "--database-driver",
+            "sqlite",
+            "--database-url",
+            "sqlite:///tmp/after.db",
+        ])
+        .expect("database arguments after db prepare should parse");
+        assert_eq!(
+            after.data.database_url.as_deref(),
+            Some("sqlite:///tmp/after.db")
+        );
+    }
+
+    #[test]
+    fn gateway_data_pool_auto_sizes_sqlite_to_single_connection() {
+        let mut args = test_args();
+        args.data.database_driver = Some(DatabaseDriverArg::Sqlite);
+        args.data.database_url = Some("sqlite://./data/aether.db".to_string());
+
+        let database = args
+            .data
+            .effective_sql_database_config()
+            .expect("sqlite database config should build");
+
+        assert_eq!(database.driver, DatabaseDriver::Sqlite);
+        assert_eq!(database.pool.min_connections, 1);
+        assert_eq!(database.pool.max_connections, 1);
+    }
+
+    #[test]
+    fn explicit_mysql_driver_accepts_generic_database_url() {
+        let url = super::resolve_database_url(
+            Some(DatabaseDriver::Mysql),
+            None,
+            Some("postgres://legacy/aether".to_string()),
+            Some("mysql://root:root@localhost/aether".to_string()),
+        );
+
+        assert_eq!(url.as_deref(), Some("mysql://root:root@localhost/aether"));
+    }
+
+    #[test]
+    fn explicit_sqlite_driver_accepts_generic_database_url() {
+        let url = super::resolve_database_url(
+            Some(DatabaseDriver::Sqlite),
+            None,
+            Some("postgres://legacy/aether".to_string()),
+            Some("sqlite:///opt/aether/data/aether.db".to_string()),
+        );
+
+        assert_eq!(url.as_deref(), Some("sqlite:///opt/aether/data/aether.db"));
+    }
+
+    #[test]
+    fn postgres_legacy_url_keeps_precedence_over_generic_database_url() {
+        let url = super::resolve_database_url(
+            Some(DatabaseDriver::Postgres),
+            None,
+            Some("postgres://legacy/aether".to_string()),
+            Some("postgres://generic/aether".to_string()),
+        );
+
+        assert_eq!(url.as_deref(), Some("postgres://legacy/aether"));
+    }
+
+    #[test]
+    fn gateway_data_pool_auto_sizes_server_databases_from_runtime_cpu() {
+        let mut args = test_args();
+        args.data.database_driver = Some(DatabaseDriverArg::Postgres);
+        args.data.database_url = Some("postgres://postgres:postgres@localhost/aether".to_string());
+
+        let database = args
+            .data
+            .effective_sql_database_config()
+            .expect("postgres database config should build");
+        let auto = automatic_sql_pool_config(DatabaseDriver::Postgres);
+
+        assert_eq!(database.driver, DatabaseDriver::Postgres);
+        assert_eq!(database.pool.min_connections, auto.min_connections);
+        assert_eq!(database.pool.max_connections, auto.max_connections);
+    }
+
+    #[test]
+    fn gateway_data_pool_cpu_sizing_examples() {
+        let two_cpu = automatic_sql_pool_config_for_parallelism(DatabaseDriver::Postgres, 2);
+        assert_eq!(two_cpu.min_connections, 4);
+        assert_eq!(two_cpu.max_connections, 32);
+
+        let four_cpu = automatic_sql_pool_config_for_parallelism(DatabaseDriver::Postgres, 4);
+        assert_eq!(four_cpu.min_connections, 4);
+        assert_eq!(four_cpu.max_connections, 32);
+
+        let eight_cpu = automatic_sql_pool_config_for_parallelism(DatabaseDriver::Postgres, 8);
+        assert_eq!(eight_cpu.min_connections, 8);
+        assert_eq!(eight_cpu.max_connections, 32);
+
+        let sixteen_cpu = automatic_sql_pool_config_for_parallelism(DatabaseDriver::Postgres, 16);
+        assert_eq!(sixteen_cpu.min_connections, 16);
+        assert_eq!(sixteen_cpu.max_connections, 64);
+
+        let many_cpu = automatic_sql_pool_config_for_parallelism(DatabaseDriver::Postgres, 32);
+        assert_eq!(many_cpu.min_connections, 16);
+        assert_eq!(many_cpu.max_connections, 100);
+    }
+
+    #[test]
+    fn gateway_database_pool_isolation_and_usage_capacity_follow_role() {
+        assert!(NodeRoleArg::All.isolates_background_database());
+        assert!(!NodeRoleArg::Frontdoor.isolates_background_database());
+        assert!(!NodeRoleArg::Background.isolates_background_database());
+
+        let database = test_database(DatabaseDriver::Postgres, 20);
+        let isolated_background = test_database(DatabaseDriver::Postgres, 4);
+        assert_eq!(
+            usage_database_config_for_role(
+                NodeRoleArg::All,
+                Some(&database),
+                Some(&isolated_background),
+            )
+            .expect("all-role usage database")
+            .pool
+            .max_connections,
+            4
+        );
+        for role in [NodeRoleArg::Frontdoor, NodeRoleArg::Background] {
+            assert_eq!(
+                usage_database_config_for_role(role, Some(&database), Some(&isolated_background),)
+                    .expect("single-pool role usage database")
+                    .pool
+                    .max_connections,
+                20
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_manual_override_wins_and_is_capped() {
+        let mut args = test_args();
+        args.usage.queue_workers = Some(72);
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers = args.usage.effective_queue_workers(
+            NodeRoleArg::All,
+            Some(10_000),
+            None,
+            Some(&database),
+            false,
+        );
+
+        assert_eq!(workers, 64);
+        assert_eq!(args.usage.to_config(workers, 64, Some(8)).worker_count, 64);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_uses_cpu_default_without_concurrency_hint() {
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            4,
+            NodeRoleArg::All,
+            None,
+            None,
+            Some(&database),
+            false,
+        );
+
+        assert_eq!(workers, 4);
+    }
+
+    #[test]
+    fn gateway_usage_queue_worker_autoscale_max_uses_database_cap() {
+        let mut args = test_args();
+        args.usage.queue_workers = None;
+        let database = test_database(DatabaseDriver::Postgres, 40);
+
+        let workers = args.usage.effective_queue_workers(
+            args.node_role,
+            Some(1_024),
+            None,
+            Some(&database),
+            false,
+        );
+        let max_workers = args.usage.effective_queue_worker_max_count(
+            args.node_role,
+            Some(&database),
+            workers,
+            false,
+        );
+
+        assert_eq!(workers, 8);
+        assert_eq!(max_workers, 10);
+    }
+
+    #[test]
+    fn gateway_usage_queue_worker_autoscale_max_respects_explicit_override() {
+        let mut args = test_args();
+        args.usage.queue_workers = None;
+        args.usage.queue_worker_max_count = Some(32);
+        let database = test_database(DatabaseDriver::Postgres, 200);
+
+        let workers = args.usage.effective_queue_workers(
+            args.node_role,
+            Some(1_024),
+            None,
+            Some(&database),
+            false,
+        );
+        let max_workers = args.usage.effective_queue_worker_max_count(
+            args.node_role,
+            Some(&database),
+            workers,
+            false,
+        );
+
+        assert_eq!(workers, 8);
+        assert_eq!(max_workers, 32);
+    }
+
+    #[test]
+    fn gateway_usage_worker_record_concurrency_defaults_to_pool_reserve_share() {
+        let args = test_args();
+        let database = test_database(DatabaseDriver::Postgres, 64);
+
+        assert_eq!(
+            args.usage.effective_worker_record_concurrency_limit(
+                NodeRoleArg::All,
+                Some(&database),
+                false,
+            ),
+            Some(8)
+        );
+        assert_eq!(
+            args.usage.effective_worker_record_concurrency_limit(
+                NodeRoleArg::Background,
+                Some(&database),
+                false,
+            ),
+            Some(16)
+        );
+    }
+
+    #[test]
+    fn gateway_usage_isolated_database_uses_dedicated_capacity_once() {
+        let mut args = test_args();
+        args.usage.queue_workers = None;
+        let database = test_database(DatabaseDriver::Postgres, 64);
+        let isolated_background = test_database(DatabaseDriver::Postgres, 8);
+        let usage_database = usage_database_config_for_role(
+            NodeRoleArg::All,
+            Some(&database),
+            Some(&isolated_background),
+        )
+        .expect("isolated usage database");
+
+        let workers = args.usage.effective_queue_workers(
+            NodeRoleArg::All,
+            Some(5_000),
+            None,
+            Some(usage_database),
+            true,
+        );
+        let max_workers = args.usage.effective_queue_worker_max_count(
+            NodeRoleArg::All,
+            Some(usage_database),
+            workers,
+            true,
+        );
+
+        assert_eq!(usage_database.pool.max_connections, 8);
+        assert_eq!(workers, 7);
+        assert_eq!(max_workers, 7);
+        assert_eq!(
+            args.usage.effective_worker_record_concurrency_limit(
+                NodeRoleArg::All,
+                Some(usage_database),
+                true,
+            ),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn gateway_usage_worker_record_concurrency_can_be_explicitly_disabled() {
+        let mut args = test_args();
+        args.usage.worker_record_concurrency_limit = Some(0);
+        let database = test_database(DatabaseDriver::Postgres, 64);
+
+        assert_eq!(
+            args.usage.effective_worker_record_concurrency_limit(
+                NodeRoleArg::All,
+                Some(&database),
+                false,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn gateway_usage_queue_blocking_stream_lanes_only_expand_when_worker_can_spawn() {
+        let database = test_database(DatabaseDriver::Postgres, 100);
+        let args = test_args();
+
+        assert_eq!(
+            args.usage
+                .runtime_state_blocking_stream_lanes(NodeRoleArg::All, Some(&database), 10,),
+            Some(10)
+        );
+        assert_eq!(
+            args.usage.runtime_state_blocking_stream_lanes(
+                NodeRoleArg::Frontdoor,
+                Some(&database),
+                10,
+            ),
+            None
+        );
+        assert_eq!(
+            args.usage
+                .runtime_state_blocking_stream_lanes(NodeRoleArg::All, None, 10),
+            None
+        );
+
+        let mut disabled_queue_args = args;
+        disabled_queue_args.usage.queue_terminal_events = false;
+        disabled_queue_args.usage.queue_lifecycle_events = false;
+        assert_eq!(
+            disabled_queue_args
+                .usage
+                .runtime_state_blocking_stream_lanes(NodeRoleArg::All, Some(&database), 10,),
+            None
+        );
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_scales_from_request_concurrency() {
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            8,
+            NodeRoleArg::All,
+            Some(1_536),
+            None,
+            Some(&database),
+            false,
+        );
+
+        assert_eq!(workers, 12);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_respects_effective_request_limit() {
+        let database = test_database(DatabaseDriver::Postgres, 100);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            8,
+            NodeRoleArg::All,
+            Some(2_048),
+            Some(256),
+            Some(&database),
+            false,
+        );
+
+        assert_eq!(workers, 2);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_is_capped_by_database_pool() {
+        let database = test_database(DatabaseDriver::Postgres, 20);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            16,
+            NodeRoleArg::All,
+            Some(5_000),
+            None,
+            Some(&database),
+            false,
+        );
+
+        assert_eq!(workers, 5);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_gives_background_nodes_more_pool_budget() {
+        let database = test_database(DatabaseDriver::Postgres, 20);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            16,
+            NodeRoleArg::Background,
+            Some(5_000),
+            None,
+            Some(&database),
+            false,
+        );
+
+        assert_eq!(workers, 10);
+    }
+
+    #[test]
+    fn gateway_usage_queue_workers_auto_uses_single_worker_for_sqlite() {
+        let database = test_database(DatabaseDriver::Sqlite, 1);
+
+        let workers = automatic_usage_queue_workers_for_parallelism(
+            16,
+            NodeRoleArg::All,
+            Some(5_000),
+            None,
+            Some(&database),
+            false,
+        );
+
+        assert_eq!(workers, 1);
+    }
+
+    #[test]
+    fn gateway_data_pool_explicit_values_override_auto_sizing() {
+        let mut args = test_args();
+        args.data.database_driver = Some(DatabaseDriverArg::Sqlite);
+        args.data.database_url = Some("sqlite://./data/aether.db".to_string());
+        args.data.postgres_min_connections = Some(2);
+        args.data.postgres_max_connections = Some(8);
+        args.data.postgres_acquire_timeout_ms = Some(2_000);
+
+        let database = args
+            .data
+            .effective_sql_database_config()
+            .expect("sqlite database config should build");
+
+        assert_eq!(database.pool.min_connections, 2);
+        assert_eq!(database.pool.max_connections, 8);
+        assert_eq!(database.pool.acquire_timeout_ms, 2_000);
+    }
+
+    #[test]
+    fn gateway_data_pool_partial_max_override_clamps_auto_minimum() {
+        let mut args = test_args();
+        args.data.database_driver = Some(DatabaseDriverArg::Postgres);
+        args.data.database_url = Some("postgres://postgres:postgres@localhost/aether".to_string());
+        args.data.postgres_max_connections = Some(2);
+
+        let database = args
+            .data
+            .effective_sql_database_config()
+            .expect("postgres database config should build");
+
+        assert_eq!(database.pool.min_connections, 2);
+        assert_eq!(database.pool.max_connections, 2);
+    }
+
+    #[test]
+    fn gateway_data_pool_partial_min_override_raises_auto_maximum() {
+        let mut args = test_args();
+        args.data.database_driver = Some(DatabaseDriverArg::Postgres);
+        args.data.database_url = Some("postgres://postgres:postgres@localhost/aether".to_string());
+        args.data.postgres_min_connections = Some(128);
+
+        let database = args
+            .data
+            .effective_sql_database_config()
+            .expect("postgres database config should build");
+
+        assert_eq!(database.pool.min_connections, 128);
+        assert_eq!(database.pool.max_connections, 128);
     }
 
     #[test]
@@ -1810,8 +3547,10 @@ mod tests {
         let config = args.runtime_state_config(
             RuntimeBackendArg::Redis,
             args.data.effective_redis_url().as_deref(),
+            Some(7),
         );
 
+        assert_eq!(config.blocking_stream_lanes, Some(7));
         assert_eq!(
             config
                 .redis
@@ -1898,6 +3637,23 @@ mod tests {
     }
 
     #[test]
+    fn multi_node_accepts_mysql_database_backend() {
+        let mut args = test_args();
+        args.deployment_topology = DeploymentTopologyArg::MultiNode;
+        args.node_role = NodeRoleArg::Frontdoor;
+        args.video_task_store_path = None;
+        let database = test_database(DatabaseDriver::Mysql, 8);
+
+        super::validate_deployment_topology(
+            &args,
+            Some(&database),
+            Some("redis://127.0.0.1/0"),
+            RuntimeBackendArg::Redis,
+        )
+        .expect("multi-node mysql with shared redis should be accepted");
+    }
+
+    #[test]
     fn multi_node_rejects_memory_runtime_backend() {
         let mut args = test_args();
         args.deployment_topology = DeploymentTopologyArg::MultiNode;
@@ -1967,17 +3723,17 @@ mod tests {
     }
 
     #[test]
-    fn pending_schema_error_mentions_explicit_migrate_command() {
+    fn pending_schema_error_mentions_database_prepare_command() {
         let error = pending_schema_error(2, 20260413020000, "squash usage schema split");
         let message = error.to_string();
         assert!(message.contains("database schema is behind by 2 migration(s)"));
         assert!(message.contains("20260413020000"));
         assert!(message.contains("squash usage schema split"));
-        assert!(message.contains("aether-gateway --migrate"));
+        assert!(message.contains("aether-gateway db prepare"));
     }
 
     #[test]
-    fn pending_backfills_error_mentions_explicit_apply_backfills_command() {
+    fn pending_backfills_error_mentions_database_prepare_command() {
         let message = pending_backfills_error(
             1,
             20260422110000,
@@ -1987,7 +3743,7 @@ mod tests {
         assert!(message.contains("database backfills are behind by 1 backfill(s)"));
         assert!(message.contains("20260422110000"));
         assert!(message.contains("backfill stats aggregate read path support"));
-        assert!(message.contains("aether-gateway --apply-backfills"));
+        assert!(message.contains("aether-gateway db prepare"));
         assert!(message.contains("before starting the service"));
     }
 
@@ -2010,9 +3766,77 @@ mod tests {
     #[tokio::test]
     async fn auto_prepare_database_is_noop_without_database_pool() {
         let state = AppState::new().expect("state should build");
-        super::prepare_database_startup_requirements(&state, true)
+        super::prepare_database_startup_requirements(&state, DatabaseModeArg::Auto)
             .await
             .expect("disabled data backend should not block startup");
+    }
+
+    #[tokio::test]
+    async fn verify_only_does_not_prepare_fresh_sqlite_database() {
+        let (args, database_path) = temporary_sqlite_args("verify-only");
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_config(args.data.to_config())
+            .expect("sqlite state should build");
+        let pending_before = state
+            .pending_database_migrations()
+            .await
+            .expect("pending migrations should load")
+            .expect("sqlite should expose migration state");
+        assert!(!pending_before.is_empty());
+
+        let error =
+            super::prepare_database_startup_requirements(&state, DatabaseModeArg::VerifyOnly)
+                .await
+                .expect_err("verify-only should reject a fresh database");
+        assert!(error.to_string().contains("aether-gateway db prepare"));
+
+        let pending_after = state
+            .pending_database_migrations()
+            .await
+            .expect("pending migrations should reload")
+            .expect("sqlite should expose migration state");
+        assert_eq!(pending_after, pending_before);
+        drop(state);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_prepares_fresh_sqlite_database() {
+        let (args, database_path) = temporary_sqlite_args("auto-prepare");
+        let state = AppState::new()
+            .expect("state should build")
+            .with_data_config(args.data.to_config())
+            .expect("sqlite state should build");
+
+        super::prepare_database_startup_requirements(&state, DatabaseModeArg::Auto)
+            .await
+            .expect("auto mode should prepare a fresh database");
+        assert!(state
+            .pending_database_migrations()
+            .await
+            .expect("pending migrations should load")
+            .expect("sqlite should expose migration state")
+            .is_empty());
+        assert!(state
+            .pending_database_backfills()
+            .await
+            .expect("pending backfills should load")
+            .expect("sqlite should expose backfill state")
+            .is_empty());
+        drop(state);
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    #[tokio::test]
+    async fn database_prepare_requires_database_url() {
+        let data = test_args().data;
+        let error = super::run_database_prepare(&data)
+            .await
+            .expect_err("missing database URL should fail");
+        assert!(error
+            .to_string()
+            .contains("AETHER_DATABASE_DRIVER/AETHER_DATABASE_URL"));
     }
 
     #[tokio::test]

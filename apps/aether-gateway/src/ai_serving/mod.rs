@@ -1,8 +1,10 @@
 mod adaptation;
 pub(crate) mod api;
+pub(crate) mod codex_context;
 mod finalize;
 mod planner;
 mod pure;
+mod response_history;
 pub(crate) mod transport;
 
 use axum::body::Body;
@@ -13,13 +15,16 @@ use crate::{usage::GatewaySyncReportRequest, AppState, GatewayError};
 pub(crate) use self::adaptation::{
     maybe_build_provider_private_stream_normalizer, ProviderPrivateStreamNormalizer,
 };
-pub(crate) use self::api::gemini_generate_content_response_has_visible_output;
+pub(crate) use self::api::{
+    gemini_generate_content_response_has_visible_output, CODEX_RESPONSES_LITE_HEADER,
+};
 pub(crate) use self::finalize::common::LocalCoreSyncFinalizeOutcome;
 pub(crate) use self::finalize::internal::{
     maybe_bridge_standard_sync_json_to_stream, maybe_build_stream_response_rewriter,
     maybe_build_sync_finalize_outcome, maybe_compile_sync_finalize_response,
     SyncToStreamBridgeOutcome,
 };
+pub(crate) use self::planner::openai_responses_reasoning_replay_policy;
 pub(crate) use self::planner::{
     apply_local_runtime_candidate_terminal_reason, build_gemini_stream_plan_from_decision,
     build_gemini_sync_plan_from_decision, build_local_gemini_files_stream_attempt_source_for_kind,
@@ -48,18 +53,27 @@ pub(crate) use self::planner::{
     build_standard_family_stream_plan_and_reports, build_standard_family_sync_attempt_source,
     build_standard_family_sync_plan_and_reports, build_standard_stream_plan_from_decision,
     build_standard_sync_plan_from_decision, candidate_auth_channel_skip_reason,
-    extract_pool_sticky_session_token, maybe_build_stream_decision_payload,
+    codex_model_capabilities_for_transport, extract_pool_sticky_session_token,
+    maybe_build_pinned_stream_local_same_format_provider_decision_payload,
+    maybe_build_responses_websocket_decision, maybe_build_stream_decision_payload,
     maybe_build_stream_plan_payload, maybe_build_sync_decision_payload,
     maybe_build_sync_plan_payload, planner_is_matching_stream_request, provider_key_pool_score_id,
     provider_key_pool_score_scope, read_candidate_transport_snapshot,
-    record_local_runtime_candidate_skip_reason,
+    record_local_runtime_candidate_skip_reason, resolve_provider_chat_pii_redaction,
+    resolve_tunnel_scheduler_affinity_context, resolve_upstream_is_stream_for_provider,
     set_local_openai_chat_execution_exhausted_diagnostic,
-    set_local_openai_image_execution_exhausted_diagnostic, CandidateFailureDiagnostic,
-    CandidateFailureDiagnosticKind, EligibleLocalExecutionCandidate, GatewayAuthApiKeySnapshot,
-    GatewayProviderTransportSnapshot, LocalExecutionAttemptSource, LocalExecutionCandidateKind,
-    LocalResolvedOAuthRequestAuth, PlannerAppState, SkippedLocalExecutionCandidate,
+    set_local_openai_image_execution_exhausted_diagnostic, validate_final_openai_provider_request,
+    CandidateFailureDiagnostic, CandidateFailureDiagnosticKind, EligibleLocalExecutionCandidate,
+    GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalExecutionAttemptSource,
+    LocalExecutionCandidateKind, LocalResolvedOAuthRequestAuth, PlannerAppState,
+    ResponsesWebSocketBodyNormalization, ResponsesWebSocketDecision,
+    ResponsesWebSocketPinnedCandidate, SkippedLocalExecutionCandidate,
 };
 pub(crate) use self::pure::*;
+pub(crate) use self::response_history::{
+    hydrate_openai_response_history, persist_converted_response_history,
+    persist_response_history_record,
+};
 pub(crate) use self::transport::{
     append_transport_diagnostics_to_value, build_request_trace_proxy_value,
     candidate_common_transport_skip_reason, candidate_transport_pair_skip_reason,
@@ -68,7 +82,7 @@ pub(crate) use self::transport::{
     request_pair_allowed_for_transport, request_pair_direct_auth,
     request_pair_transport_unsupported_reason, CandidateTransportPolicyFacts,
 };
-pub(crate) use crate::control::GatewayControlDecision;
+pub(crate) use crate::control::{GatewayControlDecision, GatewayCredentialCarrier};
 pub(crate) use crate::execution_runtime::{ConversionMode, ExecutionStrategy};
 pub(crate) use crate::headers::RequestOrigin;
 pub(crate) use aether_ai_serving::{
@@ -86,6 +100,7 @@ pub(crate) fn build_provider_transport_request_url(
     upstream_is_stream: bool,
     request_query: Option<&str>,
     kiro_api_region: Option<&str>,
+    api_operation: Option<ApiOperation>,
 ) -> Option<String> {
     self::transport::build_transport_request_url(
         transport,
@@ -95,6 +110,7 @@ pub(crate) fn build_provider_transport_request_url(
             upstream_is_stream,
             request_query,
             kiro_api_region,
+            api_operation,
         },
     )
 }
@@ -106,6 +122,7 @@ pub(crate) fn build_provider_transport_request_url_for_request_body(
     upstream_is_stream: bool,
     request_query: Option<&str>,
     kiro_api_region: Option<&str>,
+    api_operation: Option<ApiOperation>,
     provider_request_body: Option<&serde_json::Value>,
 ) -> Option<String> {
     self::transport::build_transport_request_url_for_request_body(
@@ -116,6 +133,7 @@ pub(crate) fn build_provider_transport_request_url_for_request_body(
             upstream_is_stream,
             request_query,
             kiro_api_region,
+            api_operation,
         },
         provider_request_body,
     )

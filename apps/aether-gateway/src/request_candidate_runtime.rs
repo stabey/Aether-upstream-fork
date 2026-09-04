@@ -14,12 +14,73 @@ use aether_scheduler_core::{
 use aether_usage_runtime::build_locally_actionable_report_context_from_request_candidate;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::OnceLock;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::clock::current_unix_ms;
 use crate::log_ids::short_request_id;
 use crate::GatewayError;
+
+const REQUEST_CANDIDATE_PERSISTENCE_ENV: &str = "AETHER_GATEWAY_REQUEST_CANDIDATE_PERSISTENCE";
+const REQUEST_CANDIDATE_SEED_WRITE_TIMEOUT_ENV: &str =
+    "AETHER_GATEWAY_REQUEST_CANDIDATE_SEED_WRITE_TIMEOUT_MS";
+const DEFAULT_REQUEST_CANDIDATE_SEED_WRITE_TIMEOUT_MS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestCandidatePersistenceMode {
+    Full,
+    Terminal,
+    None,
+}
+
+fn request_candidate_persistence_mode() -> RequestCandidatePersistenceMode {
+    static MODE: OnceLock<RequestCandidatePersistenceMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var(REQUEST_CANDIDATE_PERSISTENCE_ENV)
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("terminal") | Some("final") | Some("final_only") | Some("final-only") => {
+                RequestCandidatePersistenceMode::Terminal
+            }
+            Some("none") | Some("off") | Some("disabled") | Some("false") | Some("0") => {
+                RequestCandidatePersistenceMode::None
+            }
+            _ => RequestCandidatePersistenceMode::Full,
+        }
+    })
+}
+
+fn request_candidate_status_is_terminal(status: RequestCandidateStatus) -> bool {
+    matches!(
+        status,
+        RequestCandidateStatus::Success
+            | RequestCandidateStatus::Failed
+            | RequestCandidateStatus::Cancelled
+    )
+}
+
+fn should_persist_request_candidate_status(status: RequestCandidateStatus) -> bool {
+    match request_candidate_persistence_mode() {
+        RequestCandidatePersistenceMode::Full => true,
+        RequestCandidatePersistenceMode::Terminal => request_candidate_status_is_terminal(status),
+        RequestCandidatePersistenceMode::None => false,
+    }
+}
+
+fn request_candidate_seed_write_timeout() -> Duration {
+    static TIMEOUT: OnceLock<Duration> = OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        let millis = std::env::var(REQUEST_CANDIDATE_SEED_WRITE_TIMEOUT_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_REQUEST_CANDIDATE_SEED_WRITE_TIMEOUT_MS);
+        Duration::from_millis(millis)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct LocalRequestCandidateStatusSnapshot {
@@ -43,13 +104,29 @@ pub(crate) trait RequestCandidateRuntimeReader {
 }
 
 #[async_trait]
-pub(crate) trait RequestCandidateRuntimeWriter {
+pub(crate) trait RequestCandidateRuntimeWriter: Sync {
     fn has_request_candidate_data_writer(&self) -> bool;
 
     async fn upsert_request_candidate(
         &self,
         candidate: UpsertRequestCandidateRecord,
     ) -> Result<Option<StoredRequestCandidate>, GatewayError>;
+
+    async fn enqueue_request_candidate_status(
+        &self,
+        candidate: UpsertRequestCandidateRecord,
+    ) -> Result<Option<()>, GatewayError> {
+        self.upsert_request_candidate(candidate)
+            .await
+            .map(|stored| stored.map(|_| ()))
+    }
+
+    fn try_enqueue_request_candidate_status(
+        &self,
+        candidate: UpsertRequestCandidateRecord,
+    ) -> Result<(), UpsertRequestCandidateRecord> {
+        Err(candidate)
+    }
 }
 
 #[async_trait]
@@ -72,7 +149,7 @@ pub(crate) async fn resolve_request_candidate_required_capabilities(
     api_key_id: &str,
     requested_model: Option<&str>,
     explicit_required_capabilities: Option<&Value>,
-    enable_model_directives: bool,
+    model_directive_base_model: Option<&str>,
 ) -> Option<Value> {
     let mut merged = serde_json::Map::new();
 
@@ -85,7 +162,7 @@ pub(crate) async fn resolve_request_candidate_required_capabilities(
             select_requested_model_capabilities(
                 settings.as_ref(),
                 requested_model,
-                enable_model_directives,
+                model_directive_base_model,
             ),
         ),
         Err(error) => {
@@ -138,7 +215,7 @@ fn merge_capability_object(target: &mut serde_json::Map<String, Value>, source: 
 fn select_requested_model_capabilities<'a>(
     settings: Option<&'a Value>,
     requested_model: Option<&str>,
-    enable_model_directives: bool,
+    model_directive_base_model: Option<&str>,
 ) -> Option<&'a Value> {
     let requested_model = requested_model
         .map(str::trim)
@@ -146,10 +223,9 @@ fn select_requested_model_capabilities<'a>(
     let settings = settings?.as_object()?;
 
     find_model_capabilities(settings, requested_model).or_else(|| {
-        enable_model_directives
-            .then(|| crate::ai_serving::model_directive_base_model(requested_model))
-            .flatten()
-            .as_deref()
+        model_directive_base_model
+            .map(str::trim)
+            .filter(|base_model| !base_model.is_empty() && *base_model != requested_model)
             .and_then(|base_model| find_model_capabilities(settings, base_model))
     })
 }
@@ -216,7 +292,7 @@ pub(crate) fn snapshot_local_request_candidate_status(
     })
 }
 
-async fn persist_local_request_candidate_status_record(
+pub(crate) async fn persist_local_request_candidate_status_record(
     state: &(impl RequestCandidateRuntimeWriter + ?Sized),
     record: UpsertRequestCandidateRecord,
 ) {
@@ -226,13 +302,28 @@ async fn persist_local_request_candidate_status_record(
     let retry_index = record.retry_index;
     let status = record.status;
 
-    match state.upsert_request_candidate(record).await {
-        Ok(Some(stored)) => {
+    if !should_persist_request_candidate_status(status) {
+        debug!(
+            event_name = "request_candidate_status_persistence_skipped",
+            log_type = "event",
+            request_id = %request_id,
+            candidate_id = %candidate_id,
+            candidate_index,
+            retry_index,
+            status = request_candidate_status_label(status),
+            source = "local_status",
+            "gateway skipped request candidate status update due to persistence mode"
+        );
+        return;
+    }
+
+    match state.enqueue_request_candidate_status(record).await {
+        Ok(Some(())) => {
             debug!(
                 event_name = "request_candidate_status_persisted",
                 log_type = "event",
                 request_id = %request_id,
-                candidate_id = %stored.id,
+                candidate_id = %candidate_id,
                 candidate_index,
                 retry_index,
                 status = request_candidate_status_label(status),
@@ -272,7 +363,7 @@ pub(crate) async fn record_local_request_candidate_status(
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) {
-    let Some(record) =
+    let Some(mut record) =
         build_local_request_candidate_status_record(LocalRequestCandidateStatusRecordInput {
             plan,
             report_context,
@@ -281,6 +372,8 @@ pub(crate) async fn record_local_request_candidate_status(
     else {
         return;
     };
+    record.skip_reason =
+        local_request_candidate_skip_reason(record.status, record.error_type.as_deref());
     persist_local_request_candidate_status_record(state, record).await;
 }
 
@@ -325,11 +418,10 @@ pub(crate) async fn record_local_request_candidate_extra_data(
     persist_local_request_candidate_status_record(state, record).await;
 }
 
-pub(crate) async fn record_local_request_candidate_status_snapshot(
-    state: &(impl RequestCandidateRuntimeWriter + ?Sized),
+fn build_local_request_candidate_status_snapshot_record(
     snapshot: &LocalRequestCandidateStatusSnapshot,
     status_update: SchedulerRequestCandidateStatusUpdate,
-) {
+) -> UpsertRequestCandidateRecord {
     let SchedulerRequestCandidateStatusUpdate {
         status,
         status_code,
@@ -339,7 +431,8 @@ pub(crate) async fn record_local_request_candidate_status_snapshot(
         started_at_unix_ms,
         finished_at_unix_ms,
     } = status_update;
-    let record = UpsertRequestCandidateRecord {
+    let skip_reason = local_request_candidate_skip_reason(status, error_type.as_deref());
+    UpsertRequestCandidateRecord {
         id: snapshot.candidate_id.clone(),
         request_id: snapshot.request_id.clone(),
         user_id: snapshot.user_id.clone(),
@@ -352,7 +445,7 @@ pub(crate) async fn record_local_request_candidate_status_snapshot(
         endpoint_id: Some(snapshot.endpoint_id.clone()),
         key_id: Some(snapshot.key_id.clone()),
         status,
-        skip_reason: None,
+        skip_reason,
         is_cached: None,
         status_code,
         error_type,
@@ -364,7 +457,38 @@ pub(crate) async fn record_local_request_candidate_status_snapshot(
         created_at_unix_ms: None,
         started_at_unix_ms,
         finished_at_unix_ms,
-    };
+    }
+}
+
+fn local_request_candidate_skip_reason(
+    status: RequestCandidateStatus,
+    error_type: Option<&str>,
+) -> Option<String> {
+    (status == RequestCandidateStatus::Skipped)
+        .then_some(error_type)
+        .flatten()
+        .filter(|reason| *reason == "provider_key_concurrency_limit_reached")
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn try_enqueue_local_request_candidate_status_snapshot(
+    state: &(impl RequestCandidateRuntimeWriter + ?Sized),
+    snapshot: &LocalRequestCandidateStatusSnapshot,
+    status_update: SchedulerRequestCandidateStatusUpdate,
+) -> Result<(), UpsertRequestCandidateRecord> {
+    let record = build_local_request_candidate_status_snapshot_record(snapshot, status_update);
+    if !should_persist_request_candidate_status(record.status) {
+        return Ok(());
+    }
+    state.try_enqueue_request_candidate_status(record)
+}
+
+pub(crate) async fn record_local_request_candidate_status_snapshot(
+    state: &(impl RequestCandidateRuntimeWriter + ?Sized),
+    snapshot: &LocalRequestCandidateStatusSnapshot,
+    status_update: SchedulerRequestCandidateStatusUpdate,
+) {
+    let record = build_local_request_candidate_status_snapshot_record(snapshot, status_update);
     persist_local_request_candidate_status_record(state, record).await;
 }
 
@@ -373,6 +497,12 @@ pub(crate) async fn record_report_request_candidate_status(
     report_context: Option<&Value>,
     status_update: SchedulerRequestCandidateStatusUpdate,
 ) {
+    if matches!(
+        request_candidate_persistence_mode(),
+        RequestCandidatePersistenceMode::None
+    ) {
+        return;
+    }
     let Some(slot) = resolve_report_request_candidate_slot(state, report_context).await else {
         return;
     };
@@ -389,13 +519,28 @@ pub(crate) async fn record_report_request_candidate_status(
     let candidate_id = record.id.clone();
     let status = record.status;
 
-    match state.upsert_request_candidate(record).await {
-        Ok(Some(stored)) => {
+    if !should_persist_request_candidate_status(status) {
+        debug!(
+            event_name = "request_candidate_report_status_persistence_skipped",
+            log_type = "event",
+            request_id = %request_id_for_log,
+            candidate_id = %candidate_id,
+            candidate_index,
+            retry_index,
+            status = request_candidate_status_label(status),
+            source = "report_status",
+            "gateway skipped report-driven request candidate status update due to persistence mode"
+        );
+        return;
+    }
+
+    match state.enqueue_request_candidate_status(record).await {
+        Ok(Some(())) => {
             debug!(
                 event_name = "request_candidate_report_status_persisted",
                 log_type = "event",
                 request_id = %request_id_for_log,
-                candidate_id = %stored.id,
+                candidate_id = %candidate_id,
                 candidate_index,
                 retry_index,
                 status = request_candidate_status_label(status),
@@ -471,8 +616,35 @@ pub(crate) async fn ensure_execution_request_candidate_slot(
     let generated_candidate_id = seed.upsert_record.id.clone();
     let request_id = short_request_id(plan.request_id.as_str());
 
-    let candidate_id = match state.upsert_request_candidate(seed.upsert_record).await {
-        Ok(Some(stored)) => {
+    if !should_persist_request_candidate_status(seed.upsert_record.status) {
+        plan.candidate_id = Some(generated_candidate_id.clone());
+        *report_context = Some(finalize_execution_request_candidate_report_context(
+            seed.report_context,
+            &generated_candidate_id,
+        ));
+        debug!(
+            event_name = "request_candidate_slot_seed_persistence_skipped",
+            log_type = "event",
+            request_id = %request_id,
+            candidate_id = %generated_candidate_id,
+            provider_id = %plan.provider_id,
+            endpoint_id = %plan.endpoint_id,
+            key_id = %plan.key_id,
+            source = "seed",
+            "gateway skipped request candidate seed due to persistence mode"
+        );
+        return;
+    }
+
+    let seed_upsert_record = seed.upsert_record;
+    let generated_candidate_id = generated_candidate_id.clone();
+    let candidate_id = match tokio::time::timeout(
+        request_candidate_seed_write_timeout(),
+        state.upsert_request_candidate(seed_upsert_record),
+    )
+    .await
+    {
+        Ok(Ok(Some(stored))) => {
             info!(
                 event_name = "request_candidate_slot_seeded",
                 log_type = "event",
@@ -486,7 +658,7 @@ pub(crate) async fn ensure_execution_request_candidate_slot(
             );
             stored.id
         }
-        Ok(None) => {
+        Ok(Ok(None)) => {
             warn!(
                 event_name = "request_candidate_writer_unavailable",
                 log_type = "event",
@@ -500,7 +672,7 @@ pub(crate) async fn ensure_execution_request_candidate_slot(
             );
             generated_candidate_id
         }
-        Err(err) => {
+        Ok(Err(err)) => {
             warn!(
                 event_name = "request_candidate_slot_seed_failed",
                 log_type = "event",
@@ -508,7 +680,23 @@ pub(crate) async fn ensure_execution_request_candidate_slot(
                 error = ?err,
                 "gateway failed to seed execution request candidate slot"
             );
-            return;
+            generated_candidate_id
+        }
+        Err(_) => {
+            let timeout_ms = request_candidate_seed_write_timeout().as_millis() as u64;
+            warn!(
+                event_name = "request_candidate_slot_seed_timed_out",
+                log_type = "event",
+                request_id = %request_id,
+                candidate_id = %generated_candidate_id,
+                provider_id = %plan.provider_id,
+                endpoint_id = %plan.endpoint_id,
+                key_id = %plan.key_id,
+                source = "seed",
+                timeout_ms,
+                "gateway skipped blocking request candidate seed after timeout"
+            );
+            generated_candidate_id
         }
     };
 
@@ -533,6 +721,9 @@ pub(crate) async fn persist_available_local_candidate(
     created_at_unix_ms: u64,
     error_context: &'static str,
 ) -> String {
+    if !should_persist_request_candidate_status(RequestCandidateStatus::Available) {
+        return candidate_id.to_string();
+    }
     match state
         .upsert_request_candidate(UpsertRequestCandidateRecord {
             id: candidate_id.to_string(),
@@ -624,6 +815,9 @@ pub(crate) async fn persist_skipped_local_candidate(
     finished_at_unix_ms: u64,
     error_context: &'static str,
 ) {
+    if !should_persist_request_candidate_status(RequestCandidateStatus::Skipped) {
+        return;
+    }
     match state
         .upsert_request_candidate(UpsertRequestCandidateRecord {
             id: candidate_id.to_string(),
@@ -725,6 +919,25 @@ async fn resolve_report_request_candidate_slot(
     report_context: Option<&Value>,
 ) -> Option<SchedulerResolvedReportRequestCandidateSlot> {
     let metadata = parse_request_candidate_report_context(report_context)?;
+    if metadata
+        .request_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+        && metadata
+            .candidate_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    {
+        return resolve_report_request_candidate_slot_from_candidates(
+            &[],
+            metadata,
+            current_unix_ms(),
+            Uuid::new_v4().to_string(),
+        );
+    }
+
     let request_id = metadata.request_id.clone()?;
     let existing_candidates = state
         .read_request_candidates_by_request_id(request_id.as_str())
@@ -742,7 +955,7 @@ async fn resolve_report_request_candidate_slot(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use aether_contracts::{ExecutionPlan, RequestBody};
     use aether_data::repository::auth::{
@@ -752,6 +965,7 @@ mod tests {
     use aether_data::repository::usage::InMemoryUsageReadRepository;
     use aether_data_contracts::repository::candidates::{
         RequestCandidateReadRepository, RequestCandidateStatus, StoredRequestCandidate,
+        UpsertRequestCandidateRecord,
     };
     use aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate;
     use serde_json::json;
@@ -759,6 +973,8 @@ mod tests {
     use super::{
         ensure_execution_request_candidate_slot, persist_available_local_candidate,
         record_report_request_candidate_status, resolve_request_candidate_required_capabilities,
+        select_requested_model_capabilities, snapshot_local_request_candidate_status,
+        try_enqueue_local_request_candidate_status_snapshot, RequestCandidateRuntimeWriter,
         SchedulerRequestCandidateStatusUpdate,
     };
     use crate::data::GatewayDataState;
@@ -790,6 +1006,36 @@ mod tests {
             )
     }
 
+    #[derive(Default)]
+    struct SynchronousStatusWriter {
+        records: Mutex<Vec<UpsertRequestCandidateRecord>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RequestCandidateRuntimeWriter for SynchronousStatusWriter {
+        fn has_request_candidate_data_writer(&self) -> bool {
+            true
+        }
+
+        async fn upsert_request_candidate(
+            &self,
+            _candidate: UpsertRequestCandidateRecord,
+        ) -> Result<Option<StoredRequestCandidate>, crate::GatewayError> {
+            panic!("synchronous status fast path must not call the async writer")
+        }
+
+        fn try_enqueue_request_candidate_status(
+            &self,
+            candidate: UpsertRequestCandidateRecord,
+        ) -> Result<(), UpsertRequestCandidateRecord> {
+            self.records
+                .lock()
+                .expect("synchronous status records lock")
+                .push(candidate);
+            Ok(())
+        }
+    }
+
     fn sample_plan() -> ExecutionPlan {
         ExecutionPlan {
             request_id: "req-request-candidate-seed-123".to_string(),
@@ -814,6 +1060,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn streaming_snapshot_uses_synchronous_status_enqueue_fast_path() {
+        let mut plan = sample_plan();
+        plan.candidate_id = Some("candidate-streaming-fast-path".to_string());
+        let snapshot = snapshot_local_request_candidate_status(&plan, None)
+            .expect("candidate snapshot should build");
+        let writer = SynchronousStatusWriter::default();
+
+        try_enqueue_local_request_candidate_status_snapshot(
+            &writer,
+            &snapshot,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Streaming,
+                status_code: Some(200),
+                error_type: None,
+                error_message: None,
+                latency_ms: None,
+                started_at_unix_ms: Some(123),
+                finished_at_unix_ms: None,
+            },
+        )
+        .expect("streaming status should use the synchronous enqueue path");
+
+        let records = writer
+            .records
+            .lock()
+            .expect("synchronous status records lock");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, RequestCandidateStatus::Streaming);
+        assert_eq!(records[0].status_code, Some(200));
+    }
+
+    #[test]
+    fn saturated_provider_key_snapshot_persists_capacity_skip_reason() {
+        let mut plan = sample_plan();
+        plan.candidate_id = Some("candidate-provider-key-saturated".to_string());
+        let snapshot = snapshot_local_request_candidate_status(&plan, None)
+            .expect("candidate snapshot should build");
+        let writer = SynchronousStatusWriter::default();
+
+        try_enqueue_local_request_candidate_status_snapshot(
+            &writer,
+            &snapshot,
+            SchedulerRequestCandidateStatusUpdate {
+                status: RequestCandidateStatus::Skipped,
+                status_code: Some(429),
+                error_type: Some("provider_key_concurrency_limit_reached".to_string()),
+                error_message: Some("provider key concurrency limit reached: 1".to_string()),
+                latency_ms: Some(0),
+                started_at_unix_ms: Some(123),
+                finished_at_unix_ms: Some(123),
+            },
+        )
+        .expect("saturated status should use the synchronous enqueue path");
+
+        let records = writer
+            .records
+            .lock()
+            .expect("synchronous status records lock");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].skip_reason.as_deref(),
+            Some("provider_key_concurrency_limit_reached")
+        );
+    }
+
     fn sample_minimal_candidate() -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
             provider_id: "provider-1".to_string(),
@@ -832,6 +1144,7 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-5".to_string(),
             selected_provider_model_name: "gpt-5".to_string(),
+            supports_streaming: true,
             mapping_matched_model: None,
         }
     }
@@ -1065,7 +1378,7 @@ mod tests {
             "api-key-1",
             Some("gpt-5"),
             Some(&explicit_required_capabilities),
-            false,
+            None,
         )
         .await
         .expect("required capabilities should resolve");
@@ -1073,6 +1386,48 @@ mod tests {
         assert_eq!(required_capabilities["cache_1h"], json!(false));
         assert_eq!(required_capabilities["context_1m"], json!(true));
         assert_eq!(required_capabilities["gemini_files"], json!(true));
+    }
+
+    #[test]
+    fn requested_model_capabilities_use_the_policy_resolved_base_model() {
+        let base_only = json!({
+            "deployment-alias": {
+                "context_1m": true
+            }
+        });
+        assert_eq!(
+            select_requested_model_capabilities(
+                Some(&base_only),
+                Some("deployment-alias-VendorFuture"),
+                Some("deployment-alias"),
+            ),
+            Some(&base_only["deployment-alias"])
+        );
+        assert_eq!(
+            select_requested_model_capabilities(
+                Some(&base_only),
+                Some("deployment-alias-VendorFuture"),
+                None,
+            ),
+            None
+        );
+
+        let exact_and_base = json!({
+            "deployment-alias-VendorFuture": {
+                "cache_1h": true
+            },
+            "deployment-alias": {
+                "context_1m": true
+            }
+        });
+        assert_eq!(
+            select_requested_model_capabilities(
+                Some(&exact_and_base),
+                Some("deployment-alias-VendorFuture"),
+                Some("deployment-alias"),
+            ),
+            Some(&exact_and_base["deployment-alias-VendorFuture"])
+        );
     }
 
     #[tokio::test]

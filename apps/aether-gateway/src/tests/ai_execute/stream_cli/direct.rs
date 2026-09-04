@@ -1,7 +1,8 @@
 use super::{
-    any, build_router_with_state, build_state_with_execution_runtime_override, json, start_server,
-    strip_sse_keepalive_comments, to_bytes, Arc, Body, Bytes, HeaderName, HeaderValue, Infallible,
-    Json, Mutex, Request, Response, Router, StatusCode, UsageRuntimeConfig, TRACE_ID_HEADER,
+    any, build_router_with_state, build_state_with_execution_runtime_override, json,
+    run_stream_cli_test, start_server, strip_sse_keepalive_comments, to_bytes, Arc, Body, Bytes,
+    HeaderName, HeaderValue, Infallible, Json, Mutex, Request, Response, Router, StatusCode,
+    UsageRuntimeConfig, TRACE_ID_HEADER,
 };
 use aether_crypto::{encrypt_python_fernet_plaintext, DEVELOPMENT_ENCRYPTION_KEY};
 use aether_data::repository::auth::{
@@ -23,17 +24,39 @@ use aether_data_contracts::repository::provider_catalog::{
 use aether_data_contracts::repository::usage::UsageReadRepository;
 use sha2::{Digest, Sha256};
 
-#[tokio::test]
-async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_refresh() {
+#[test]
+fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_refresh() {
+    run_stream_cli_test(
+        "gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_refresh",
+        gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_refresh_impl,
+    );
+}
+
+async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_refresh_impl() {
     #[derive(Debug, Clone)]
     struct SeenExecutionRuntimeStreamRequest {
         trace_id: String,
         url: String,
         model: String,
+        content_encoding: String,
         stream: bool,
         accept: String,
         authorization: String,
+        chatgpt_account_id: String,
+        fedramp: String,
         x_client_request_id: String,
+        session_id: String,
+        thread_id: String,
+        prompt_cache_key: String,
+        responses_lite: String,
+        has_top_level_tools: bool,
+        has_top_level_instructions: bool,
+        has_additional_tools: bool,
+        parallel_tool_calls: bool,
+        reasoning_effort: String,
+        reasoning_context: String,
+        has_compaction_trigger: bool,
+        has_context_management: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -66,7 +89,7 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
             false,
             Some(serde_json::json!(["openai", "codex"])),
             Some(serde_json::json!(["openai:responses"])),
-            Some(serde_json::json!(["gpt-5.4"])),
+            Some(serde_json::json!(["gpt-5.6-sol"])),
             api_key_id.to_string(),
             Some("default".to_string()),
             true,
@@ -77,7 +100,7 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
             Some(4_102_444_800_i64),
             Some(serde_json::json!(["openai", "codex"])),
             Some(serde_json::json!(["openai:responses"])),
-            Some(serde_json::json!(["gpt-5.4"])),
+            Some(serde_json::json!(["gpt-5.6-sol"])),
         )
         .expect("auth snapshot should build")
     }
@@ -105,15 +128,16 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
             key_global_priority_by_format: Some(serde_json::json!({"openai:responses": 1})),
             model_id: "model-codex-cli-stream-local-1".to_string(),
             global_model_id: "global-model-codex-cli-stream-local-1".to_string(),
-            global_model_name: "gpt-5.4".to_string(),
+            global_model_name: "gpt-5.6-sol".to_string(),
             global_model_mappings: None,
             global_model_supports_streaming: Some(true),
-            model_provider_model_name: "gpt-5.4".to_string(),
+            model_provider_model_name: "gpt-5.6-sol".to_string(),
             model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
-                name: "gpt-5.4".to_string(),
+                name: "gpt-5.6-sol".to_string(),
                 priority: 1,
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
+                operations: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -168,7 +192,7 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
     fn sample_provider_catalog_key() -> StoredProviderCatalogKey {
         let encrypted_auth_config = encrypt_python_fernet_plaintext(
             DEVELOPMENT_ENCRYPTION_KEY,
-            r#"{"provider_type":"codex","refresh_token":"rt-codex-stream-local-123"}"#,
+            r#"{"provider_type":"codex","refresh_token":"rt-codex-stream-local-123","account_id":"acc-codex-stream-local-123","is_fedramp":true}"#,
         )
         .expect("auth config should encrypt");
         StoredProviderCatalogKey::new(
@@ -359,6 +383,11 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
                             .and_then(|value| value.as_str())
                             .unwrap_or_default()
                             .to_string(),
+                        content_encoding: payload
+                            .get("content_encoding")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         stream: payload
                             .get("stream")
                             .and_then(|value| value.as_bool())
@@ -375,22 +404,127 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
                             .and_then(|value| value.as_str())
                             .unwrap_or_default()
                             .to_string(),
+                        chatgpt_account_id: payload
+                            .get("headers")
+                            .and_then(|value| value.get("chatgpt-account-id"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        fedramp: payload
+                            .get("headers")
+                            .and_then(|value| value.get("x-openai-fedramp"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
                         x_client_request_id: payload
                             .get("headers")
                             .and_then(|value| value.get("x-client-request-id"))
                             .and_then(|value| value.as_str())
                             .unwrap_or_default()
                             .to_string(),
+                        session_id: payload
+                            .get("headers")
+                            .and_then(|value| value.get("session-id"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        thread_id: payload
+                            .get("headers")
+                            .and_then(|value| value.get("thread-id"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        prompt_cache_key: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("prompt_cache_key"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        responses_lite: payload
+                            .get("headers")
+                            .and_then(|value| {
+                                value.get("x-openai-internal-codex-responses-lite")
+                            })
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        has_top_level_tools: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .is_some_and(|body| body.get("tools").is_some()),
+                        has_top_level_instructions: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .is_some_and(|body| body.get("instructions").is_some()),
+                        has_additional_tools: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("input"))
+                            .and_then(|value| value.as_array())
+                            .and_then(|input| input.first())
+                            .and_then(|item| item.get("type"))
+                            .and_then(|value| value.as_str())
+                            == Some("additional_tools"),
+                        parallel_tool_calls: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("parallel_tool_calls"))
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(true),
+                        reasoning_effort: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("reasoning"))
+                            .and_then(|value| value.get("effort"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        reasoning_context: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("reasoning"))
+                            .and_then(|value| value.get("context"))
+                            .and_then(|value| value.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        has_compaction_trigger: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .and_then(|value| value.get("input"))
+                            .and_then(|value| value.as_array())
+                            .is_some_and(|input| {
+                                input.iter().any(|item| {
+                                    item.get("type").and_then(|value| value.as_str())
+                                        == Some("compaction_trigger")
+                                })
+                            }),
+                        has_context_management: payload
+                            .get("body")
+                            .and_then(|value| value.get("json_body"))
+                            .is_some_and(|body| body.get("context_management").is_some()),
                     });
-                let frames = concat!(
-                    "{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"text/event-stream\"}}}\n",
-                    "{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: response.completed\\ndata: {\\\"type\\\":\\\"response.completed\\\",\\\"response\\\":{\\\"id\\\":\\\"resp_codex_cli_stream_local_123\\\",\\\"object\\\":\\\"response\\\",\\\"model\\\":\\\"gpt-5.4\\\",\\\"status\\\":\\\"completed\\\",\\\"usage\\\":{\\\"input_tokens\\\":1,\\\"output_tokens\\\":2,\\\"total_tokens\\\":3}}}\\n\\n\"}}\n",
-                    "{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":41}}}\n",
-                    "{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n"
-                );
+                let frames = async_stream::stream! {
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"headers\",\"payload\":{\"kind\":\"headers\",\"status_code\":200,\"headers\":{\"content-type\":\"application/octet-stream\"}}}\n",
+                    ));
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: response.output_item.done\\ndata: {\\\"type\\\":\\\"response.output_item.done\\\",\\\"item\\\":{\\\"type\\\":\\\"compaction\\\",\\\"encrypted_content\\\":\\\"ENCRYPTED_CONTEXT_COMPACTION_SUMMARY\\\"}}\\n\\n\"}}\n",
+                    ));
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"data\",\"payload\":{\"kind\":\"data\",\"text\":\"event: response.completed\\ndata: {\\\"type\\\":\\\"response.completed\\\",\\\"response\\\":{\\\"id\\\":\\\"resp_codex_cli_stream_local_123\\\",\\\"object\\\":\\\"response\\\",\\\"model\\\":\\\"gpt-5.6-sol\\\",\\\"status\\\":\\\"completed\\\",\\\"usage\\\":{\\\"input_tokens\\\":1,\\\"output_tokens\\\":2,\\\"total_tokens\\\":3}}}\\n\\n\"}}\n",
+                    ));
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"telemetry\",\"payload\":{\"kind\":\"telemetry\",\"telemetry\":{\"elapsed_ms\":41}}}\n",
+                    ));
+                    yield Ok::<Bytes, Infallible>(Bytes::from_static(
+                        b"{\"type\":\"eof\",\"payload\":{\"kind\":\"eof\"}}\n",
+                    ));
+                };
                 let mut response = Response::builder()
                     .status(StatusCode::OK)
-                    .body(Body::from(frames))
+                    .body(Body::from_stream(frames))
                     .expect("response should build");
                 response.headers_mut().insert(
                     http::header::CONTENT_TYPE,
@@ -451,28 +585,75 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
         enabled: true,
         ..UsageRuntimeConfig::default()
     });
-    let gateway = build_router_with_state(gateway_state);
+    let gateway = build_router_with_state(gateway_state)
+        .layer(tower_http::compression::CompressionLayer::new());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let response = reqwest::Client::new()
+    let mut response = reqwest::Client::new()
         .post(format!("{gateway_url}/v1/responses"))
         .header(http::header::CONTENT_TYPE, "application/json")
+        .header(http::header::ACCEPT_ENCODING, "gzip")
         .header(
             http::header::AUTHORIZATION,
             format!("Bearer {client_api_key}"),
         )
+        .header("session-id", "session-codex-stream-local-123")
+        .header("thread-id", "thread-codex-stream-local-123")
+        .header(
+            "x-client-request-id",
+            "thread-codex-stream-local-123",
+        )
         .header(TRACE_ID_HEADER, "trace-codex-cli-stream-local-123")
-        .body("{\"model\":\"gpt-5.4\",\"input\":\"hello\",\"stream\":true}")
+        .body(
+            r#"{"model":"gpt-5.6-sol","instructions":"Use the configured tools.","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"compact"}]},{"type":"compaction_trigger"}],"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],"context_management":[{"type":"compaction","compact_threshold":128000}],"parallel_tool_calls":true,"prompt_cache_key":"thread-codex-stream-local-123","client_metadata":{"session_id":"session-codex-stream-local-123","thread_id":"thread-codex-stream-local-123"},"stream":true}"#,
+        )
         .send()
         .await
         .expect("request should succeed");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    assert!(
+        response
+            .headers()
+            .get(http::header::CONTENT_ENCODING)
+            .is_none(),
+        "SSE responses must not be gzip-buffered"
+    );
+    let first_event = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        super::super::next_non_keepalive_chunk(&mut response),
+    )
+    .await
+    .expect("first upstream SSE event should reach the client before completion");
+    assert!(
+        first_event.starts_with(b"event: response.output_item.done\n"),
+        "unexpected first event: {}",
+        String::from_utf8_lossy(&first_event)
+    );
     let response_body =
         strip_sse_keepalive_comments(&response.text().await.expect("body should read"));
+    let response_body = format!("{}{}", String::from_utf8_lossy(&first_event), response_body);
+    assert!(response_body.contains("event: response.output_item.done\n"));
+    assert!(response_body.contains("\"type\":\"compaction\""));
+    assert!(response_body.contains("ENCRYPTED_CONTEXT_COMPACTION_SUMMARY"));
     let data_line = response_body
         .lines()
-        .find_map(|line| line.strip_prefix("data: "))
+        .filter_map(|line| line.strip_prefix("data: "))
+        .find(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|event| event.get("type").cloned())
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .as_deref()
+                == Some("response.completed")
+        })
         .expect("completed event data should exist");
     let completed_event: serde_json::Value =
         serde_json::from_str(data_line).expect("completed event should parse");
@@ -487,7 +668,7 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
             "response": {
                 "id": "resp_codex_cli_stream_local_123",
                 "object": "response",
-                "model": "gpt-5.4",
+                "model": "gpt-5.6-sol",
                 "status": "completed",
                 "usage": {
                     "input_tokens": 1,
@@ -534,7 +715,8 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
         seen_execution_runtime_request.url,
         "https://chatgpt.com/backend-api/codex/responses"
     );
-    assert_eq!(seen_execution_runtime_request.model, "gpt-5.4");
+    assert_eq!(seen_execution_runtime_request.model, "gpt-5.6-sol");
+    assert_eq!(seen_execution_runtime_request.content_encoding, "zstd");
     assert!(seen_execution_runtime_request.stream);
     assert_eq!(seen_execution_runtime_request.accept, "text/event-stream");
     assert_eq!(
@@ -542,9 +724,35 @@ async fn gateway_executes_codex_cli_stream_via_local_decision_gate_after_oauth_r
         "Bearer refreshed-codex-stream-access-token"
     );
     assert_eq!(
-        seen_execution_runtime_request.x_client_request_id,
-        "trace-codex-cli-stream-local-123"
+        seen_execution_runtime_request.chatgpt_account_id,
+        "acc-codex-stream-local-123"
     );
+    assert_eq!(seen_execution_runtime_request.fedramp, "true");
+    assert_eq!(
+        seen_execution_runtime_request.x_client_request_id,
+        "thread-codex-stream-local-123"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.session_id,
+        "session-codex-stream-local-123"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.thread_id,
+        "thread-codex-stream-local-123"
+    );
+    assert_eq!(
+        seen_execution_runtime_request.thread_id,
+        seen_execution_runtime_request.prompt_cache_key
+    );
+    assert!(seen_execution_runtime_request.responses_lite.is_empty());
+    assert!(seen_execution_runtime_request.has_top_level_tools);
+    assert!(seen_execution_runtime_request.has_top_level_instructions);
+    assert!(!seen_execution_runtime_request.has_additional_tools);
+    assert!(seen_execution_runtime_request.parallel_tool_calls);
+    assert_eq!(seen_execution_runtime_request.reasoning_effort, "low");
+    assert!(seen_execution_runtime_request.reasoning_context.is_empty());
+    assert!(seen_execution_runtime_request.has_compaction_trigger);
+    assert!(seen_execution_runtime_request.has_context_management);
 
     let stored_candidates = request_candidate_repository
         .list_by_request_id("trace-codex-cli-stream-local-123")

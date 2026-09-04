@@ -32,14 +32,18 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    logging:
+      driver: local
+      options:
+        max-size: "100m"
+        max-file: "3"
+        compress: "true"
     restart: unless-stopped
 
   redis:
     image: redis:7-alpine
     container_name: aether-redis
-    command: redis-server --appendonly yes --appendfsync everysec --save 60 1000 --requirepass ${REDIS_PASSWORD} --maxclients ${REDIS_MAXCLIENTS:-10000}
-    volumes:
-      - redis_data:/data
+    command: redis-server --dir /tmp --appendonly no --save "" --requirepass ${REDIS_PASSWORD} --maxclients ${REDIS_MAXCLIENTS:-10000}
     ports:
       - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
@@ -107,4 +111,3 @@ services:
 volumes:
   postgres_data:
   mysql_data:
-  redis_data:

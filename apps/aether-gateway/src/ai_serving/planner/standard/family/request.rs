@@ -4,6 +4,10 @@ use std::sync::Arc;
 use aether_contracts::ResolvedTransportProfile;
 use serde_json::Value;
 
+use crate::ai_serving::planner::antigravity::{
+    build_antigravity_v1internal_provider_request, AntigravityV1InternalRequestError,
+    AntigravityV1InternalRequestInput, ANTIGRAVITY_V1INTERNAL_ENVELOPE_NAME,
+};
 use crate::ai_serving::planner::candidate_preparation::{
     prepare_header_authenticated_candidate, prepare_header_authenticated_candidate_from_auth,
     OauthPreparationContext,
@@ -21,10 +25,12 @@ use crate::ai_serving::planner::redaction::{
 };
 use crate::ai_serving::planner::spec_metadata::local_standard_spec_metadata;
 use crate::ai_serving::planner::standard::{
-    apply_codex_openai_responses_special_headers, apply_deepseek_tool_call_thinking_compat,
-    is_deepseek_provider, request_body_build_failure_extra_data,
-    request_conversion_failure_extra_data,
+    apply_codex_openai_special_headers, apply_deepseek_tool_call_thinking_compat,
+    codex_model_capabilities_for_transport, is_deepseek_provider,
+    openai_provider_request_contract_failure_extra_data, openai_responses_reasoning_replay_policy,
+    request_body_build_failure_extra_data, request_conversion_failure_extra_data,
 };
+use crate::ai_serving::transport::antigravity::is_antigravity_provider_transport;
 use crate::ai_serving::transport::kiro::{
     build_kiro_provider_headers, build_kiro_provider_request_body,
     is_kiro_claude_messages_transport, KiroProviderHeadersInput, KiroRequestAuth,
@@ -44,7 +50,9 @@ use crate::ai_serving::transport::{
 };
 use crate::ai_serving::{
     build_openai_image_request_body_from_gemini_image_request, gemini_request_is_image_generation,
+    project_codex_openai_image_api_request_body, project_openai_image_api_request_body,
     CandidateFailureDiagnostic, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
+    OpenAiImageOperation,
 };
 use crate::{AppState, GatewayError};
 
@@ -313,7 +321,13 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     {
         return Ok(
             resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
-                state, parts, trace_id, body_json, input, attempt,
+                state,
+                parts,
+                trace_id,
+                body_json,
+                input,
+                attempt,
+                spec_metadata.require_streaming,
             )
             .await,
         );
@@ -355,6 +369,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             body_json,
             &input.auth_context,
             spec_metadata.api_format,
+            crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds,
             &attempt.candidate_id,
         )
         .await?;
@@ -555,25 +570,53 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
     );
     let force_body_stream_field =
         endpoint_config_forces_body_stream_field(transport.endpoint.config.as_ref());
-    let enable_model_directives =
-        crate::system_features::reasoning_model_directive_enabled_for_api_format_and_model(
-            state,
-            provider_api_format,
-            Some(&input.requested_model),
-        )
-        .await;
+    let model_directive_resolution = input
+        .model_directive_policy
+        .resolve_reasoning(provider_api_format, Some(&input.requested_model));
+    let model_directive_mapping = match model_directive_resolution
+        .mapping_patch_for_mapped_model(&prepared_candidate.mapped_model)
+    {
+        Ok(mapping) => mapping,
+        Err(skip_reason) => {
+            mark_skipped_local_standard_candidate(
+                state,
+                input,
+                trace_id,
+                candidate,
+                attempt.candidate_index,
+                &attempt.candidate_id,
+                skip_reason,
+            )
+            .await;
+            return Ok(None);
+        }
+    };
+    crate::ai_serving::hydrate_openai_response_history(
+        state.runtime_state(),
+        body_json,
+        spec_metadata.api_format,
+        provider_api_format,
+        input.auth_context.api_key_id.as_str(),
+    )
+    .await?;
+    let reasoning_replay_policy = openai_responses_reasoning_replay_policy(
+        transport.provider.provider_type.as_str(),
+        transport.endpoint.base_url.as_str(),
+        prepared_candidate.mapped_model.as_str(),
+    );
     let redaction = resolve_provider_chat_pii_redaction(
         state,
         parts,
         body_json,
         &input.auth_context,
         spec_metadata.api_format,
+        reasoning_replay_policy,
         &attempt.candidate_id,
     )
     .await?;
     let body_json = redaction.body_json.as_ref();
     let mut provider_request_body =
-        match crate::ai_serving::planner::standard::build_standard_request_body_with_model_directives_and_request_headers(
+        match crate::ai_serving::planner::standard::build_standard_request_body_with_model_directives_and_request_headers_and_reasoning_replay_policy(
             body_json,
             spec_metadata.api_format,
             &prepared_candidate.mapped_model,
@@ -588,7 +631,8 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             },
             Some(input.auth_context.api_key_id.as_str()),
             Some(effective_headers),
-            enable_model_directives,
+            false,
+            reasoning_replay_policy,
         ) {
             Some(body) => body,
             None => {
@@ -655,18 +699,8 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         provider_api_format,
         Some(body_json),
     );
-    if let Some(mapping) =
-        crate::system_features::reasoning_model_directive_mapping_for_api_format_and_model(
-            state,
-            provider_api_format,
-            Some(&input.requested_model),
-        )
-        .await
-    {
-        crate::ai_serving::apply_model_directive_mapping_patch(
-            &mut provider_request_body,
-            &mapping,
-        );
+    if let Some(mapping) = model_directive_mapping.as_ref() {
+        crate::ai_serving::apply_model_directive_mapping_patch(&mut provider_request_body, mapping);
         // Directive mapping is a deep-merge patch and may overwrite/add `stream`;
         // re-enforce stream-field policy afterward.
         enforce_provider_body_stream_policy(
@@ -712,6 +746,62 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         );
     }
 
+    let normalized_provider_api_format =
+        crate::ai_serving::normalize_api_format_alias(provider_api_format);
+    if matches!(
+        normalized_provider_api_format.as_str(),
+        "openai:chat" | "openai:responses" | "openai:responses:compact"
+    ) {
+        let source_model = body_json
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or(input.requested_model.as_str());
+        let codex_model_capabilities = codex_model_capabilities_for_transport(
+            transport,
+            provider_api_format,
+            prepared_candidate.mapped_model.as_str(),
+            source_model,
+        );
+        if let Err(violation) =
+            crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
+                &mut provider_request_body,
+                crate::ai_serving::OpenAiProviderRequestFinalization {
+                    source_api_format: spec_metadata.api_format,
+                    provider_api_format,
+                    provider_type: transport.provider.provider_type.as_str(),
+                    provider_model: prepared_candidate.mapped_model.as_str(),
+                    source_model,
+                    body_rules: transport.endpoint.body_rules.as_ref(),
+                    upstream_is_stream,
+                    require_body_stream_field: request_requires_body_stream_field(
+                        body_json,
+                        force_body_stream_field,
+                    ),
+                },
+                codex_model_capabilities.as_ref(),
+                reasoning_replay_policy,
+            )
+        {
+            mark_skipped_local_standard_candidate_with_extra_data(
+                state,
+                input,
+                trace_id,
+                candidate,
+                attempt.candidate_index,
+                &attempt.candidate_id,
+                "provider_request_body_build_failed",
+                Some(openai_provider_request_contract_failure_extra_data(
+                    &violation,
+                    spec_metadata.api_format,
+                    provider_api_format,
+                    "standard_family_request_finalization",
+                )),
+            )
+            .await;
+            return Ok(None);
+        }
+    }
+
     if let Some(kiro_auth) = kiro_auth.as_ref() {
         return Ok(build_kiro_cross_format_payload_parts(
             state,
@@ -752,8 +842,29 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         .await);
     }
 
-    let normalized_provider_api_format =
-        crate::ai_serving::normalize_api_format_alias(provider_api_format);
+    if normalized_provider_api_format == "gemini:generate_content"
+        && is_antigravity_provider_transport(transport)
+    {
+        return Ok(build_antigravity_cross_format_payload_parts(
+            state,
+            parts,
+            trace_id,
+            body_json,
+            input,
+            attempt,
+            transport,
+            spec_metadata.api_format,
+            provider_api_format,
+            prepared_candidate.mapped_model,
+            prepared_candidate.auth_header,
+            prepared_candidate.auth_value,
+            provider_request_body,
+            upstream_is_stream,
+            redaction.redacted,
+        )
+        .await);
+    }
+
     if normalized_provider_api_format == "gemini:generate_content"
         && is_gemini_cli_provider_transport(transport)
     {
@@ -838,7 +949,7 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
         return Ok(None);
     };
     let mut provider_request_headers = resolved_headers.headers;
-    apply_codex_openai_responses_special_headers(
+    apply_codex_openai_special_headers(
         &mut provider_request_headers,
         &provider_request_body,
         effective_headers,
@@ -878,6 +989,145 @@ fn apply_transport_request_body_semantics(
         transport,
         provider_api_format,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_antigravity_cross_format_payload_parts(
+    state: &AppState,
+    parts: &http::request::Parts,
+    trace_id: &str,
+    original_body_json: &serde_json::Value,
+    input: &LocalStandardDecisionInput,
+    attempt: &LocalStandardCandidateAttempt,
+    transport: &Arc<GatewayProviderTransportSnapshot>,
+    client_api_format: &str,
+    provider_api_format: &str,
+    mapped_model: String,
+    auth_header: String,
+    auth_value: String,
+    gemini_request_body: Value,
+    upstream_is_stream: bool,
+    request_redacted: bool,
+) -> Option<LocalStandardCandidatePayloadParts> {
+    let candidate = &attempt.eligible.candidate;
+    let effective_headers = input.effective_headers(&parts.headers);
+    let resolved =
+        match build_antigravity_v1internal_provider_request(AntigravityV1InternalRequestInput {
+            state,
+            parts,
+            transport,
+            trace_id,
+            mapped_model: &mapped_model,
+            provider_api_format,
+            auth_header: &auth_header,
+            auth_value: &auth_value,
+            request_headers: effective_headers,
+            original_request_body: original_body_json,
+            gemini_request_body: &gemini_request_body,
+            upstream_is_stream,
+            same_format: false,
+        })
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(AntigravityV1InternalRequestError::TransportUnsupported) => {
+                mark_skipped_local_standard_candidate(
+                    state,
+                    input,
+                    trace_id,
+                    candidate,
+                    attempt.candidate_index,
+                    &attempt.candidate_id,
+                    "transport_unsupported",
+                )
+                .await;
+                return None;
+            }
+            Err(AntigravityV1InternalRequestError::EnvelopeUnsupported) => {
+                mark_skipped_local_standard_candidate_with_extra_data(
+                    state,
+                    input,
+                    trace_id,
+                    candidate,
+                    attempt.candidate_index,
+                    &attempt.candidate_id,
+                    "provider_request_body_build_failed",
+                    request_body_build_failure_extra_data(
+                        original_body_json,
+                        client_api_format,
+                        provider_api_format,
+                    ),
+                )
+                .await;
+                return None;
+            }
+            Err(AntigravityV1InternalRequestError::UpstreamUrlUnavailable) => {
+                mark_skipped_local_standard_candidate_with_failure_diagnostic(
+                    state,
+                    input,
+                    trace_id,
+                    candidate,
+                    attempt.candidate_index,
+                    &attempt.candidate_id,
+                    "upstream_url_missing",
+                    CandidateFailureDiagnostic::upstream_url_missing(
+                        client_api_format,
+                        provider_api_format,
+                        "standard_family_antigravity_url",
+                    ),
+                )
+                .await;
+                return None;
+            }
+            Err(AntigravityV1InternalRequestError::HeaderRulesApplyFailed) => {
+                mark_skipped_local_standard_candidate_with_failure_diagnostic(
+                    state,
+                    input,
+                    trace_id,
+                    candidate,
+                    attempt.candidate_index,
+                    &attempt.candidate_id,
+                    "transport_header_rules_apply_failed",
+                    CandidateFailureDiagnostic::header_rules_apply_failed(
+                        client_api_format,
+                        provider_api_format,
+                        "standard_family_antigravity_headers",
+                    ),
+                )
+                .await;
+                return None;
+            }
+        };
+
+    let mut provider_request_headers = resolved.headers.headers;
+    apply_codex_openai_special_headers(
+        &mut provider_request_headers,
+        &resolved.body,
+        effective_headers,
+        resolved.transport.provider.provider_type.as_str(),
+        provider_api_format,
+        Some(trace_id),
+        resolved.transport.key.decrypted_auth_config.as_deref(),
+    );
+    request_identity_response_encoding_when_redacted(
+        &mut provider_request_headers,
+        request_redacted,
+    );
+
+    Some(LocalStandardCandidatePayloadParts {
+        auth_header: resolved.headers.auth_header,
+        auth_value: resolved.headers.auth_value,
+        mapped_model,
+        provider_api_format: provider_api_format.to_string(),
+        provider_request_body: resolved.body,
+        provider_request_headers,
+        upstream_url: resolved.upstream_url,
+        upstream_is_stream,
+        envelope_name: Some(ANTIGRAVITY_V1INTERNAL_ENVELOPE_NAME),
+        transport: resolved.transport,
+        transport_profile: None,
+        request_redacted,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -988,7 +1238,7 @@ async fn build_gemini_cli_cross_format_payload_parts(
         };
 
     let mut provider_request_headers = resolved.headers.headers;
-    apply_codex_openai_responses_special_headers(
+    apply_codex_openai_special_headers(
         &mut provider_request_headers,
         &resolved.body,
         effective_headers,
@@ -1146,6 +1396,7 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
     body_json: &serde_json::Value,
     input: &LocalStandardDecisionInput,
     attempt: &LocalStandardCandidateAttempt,
+    client_requires_streaming: bool,
 ) -> Option<LocalStandardCandidatePayloadParts> {
     let client_api_format = "gemini:generate_content";
     let provider_api_format = "openai:image";
@@ -1221,9 +1472,42 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         return None;
     };
 
-    let upstream_is_stream = true;
-    let upstream_url =
-        build_openai_image_upstream_url(transport, Some("/v1/images/generations"), None);
+    let upstream_is_stream = resolve_upstream_is_stream_for_provider(
+        transport.endpoint.config.as_ref(),
+        transport.provider.provider_type.as_str(),
+        provider_api_format,
+        client_requires_streaming && candidate.supports_streaming,
+        false,
+    );
+    let is_codex = transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("codex");
+    let mut provider_request_body = converted.body_json;
+    if upstream_is_stream {
+        provider_request_body
+            .as_object_mut()?
+            .insert("stream".to_string(), Value::Bool(true));
+    }
+    provider_request_body = if is_codex {
+        project_codex_openai_image_api_request_body(&provider_request_body, converted.operation)?
+    } else {
+        project_openai_image_api_request_body(
+            &provider_request_body,
+            &prepared_candidate.mapped_model,
+            converted.operation,
+            crate::image_capabilities::openai_image_provider_max_generation_count_for_model(
+                transport.provider.provider_type.as_str(),
+                Some(prepared_candidate.mapped_model.as_str()),
+            ),
+        )?
+    };
+    let request_path = match converted.operation {
+        OpenAiImageOperation::Generate => "/v1/images/generations",
+        OpenAiImageOperation::Edit => "/v1/images/edits",
+    };
+    let upstream_url = build_openai_image_upstream_url(transport, Some(request_path), None);
     let effective_headers = input.effective_headers(&parts.headers);
     let Some(mut provider_request_headers) =
         build_openai_image_headers(ProviderOpenAiImageHeadersInput {
@@ -1231,9 +1515,15 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
             headers: effective_headers,
             auth_header: &prepared_candidate.auth_header,
             auth_value: &prepared_candidate.auth_value,
-            accept: "text/event-stream",
+            accept: if is_codex {
+                None
+            } else if upstream_is_stream {
+                Some("text/event-stream")
+            } else {
+                Some("application/json")
+            },
             header_rules: transport.endpoint.header_rules.as_ref(),
-            provider_request_body: &converted.body_json,
+            provider_request_body: &provider_request_body,
             original_request_body: body_json,
         })
     else {
@@ -1254,9 +1544,9 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         .await;
         return None;
     };
-    apply_codex_openai_responses_special_headers(
+    apply_codex_openai_special_headers(
         &mut provider_request_headers,
-        &converted.body_json,
+        &provider_request_body,
         effective_headers,
         transport.provider.provider_type.as_str(),
         provider_api_format,
@@ -1269,7 +1559,7 @@ async fn resolve_local_gemini_image_to_openai_image_candidate_payload_parts(
         auth_value: prepared_candidate.auth_value,
         mapped_model: converted.mapped_model,
         provider_api_format: provider_api_format.to_string(),
-        provider_request_body: converted.body_json,
+        provider_request_body,
         provider_request_headers,
         upstream_url,
         upstream_is_stream,

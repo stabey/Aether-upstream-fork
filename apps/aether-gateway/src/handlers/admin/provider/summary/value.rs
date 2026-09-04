@@ -1,6 +1,10 @@
+use crate::handlers::admin::provider::shared::support::{
+    provider_transfer_limit_from_config, PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY,
+    PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
+};
 use crate::handlers::admin::shared::unix_secs_to_rfc3339;
 use crate::handlers::public::{request_candidate_event_unix_ms, request_candidate_status_label};
-use crate::orchestration::codex_cyber_flag_passthrough_enabled;
+use crate::orchestration::{codex_cyber_flag_passthrough_enabled, responses_websocket_adapter};
 use crate::provider_key_auth::provider_key_effective_api_formats;
 use aether_data_contracts::repository::candidates::{
     RequestCandidateStatus, StoredRequestCandidate,
@@ -126,6 +130,12 @@ pub(crate) fn build_admin_provider_summary_value(
     let config = provider_config
         .as_ref()
         .and_then(serde_json::Value::as_object);
+    let max_transfer_count =
+        provider_transfer_limit_from_config(config, PROVIDER_MAX_TRANSFER_COUNT_CONFIG_KEY);
+    let max_transfer_timeout_seconds = provider_transfer_limit_from_config(
+        config,
+        PROVIDER_MAX_TRANSFER_TIMEOUT_SECONDS_CONFIG_KEY,
+    );
     let provider_ops_config = config.and_then(|cfg| cfg.get("provider_ops"));
     let ops_configured = provider_ops_config.is_some_and(json_truthy);
     let ops_architecture_id = provider_ops_config
@@ -184,6 +194,8 @@ pub(crate) fn build_admin_provider_summary_value(
         "quota_last_reset_at": quota_last_reset_at,
         "quota_expires_at": quota_expires_at,
         "max_retries": provider.max_retries,
+        "max_transfer_count": max_transfer_count,
+        "max_transfer_timeout_seconds": max_transfer_timeout_seconds,
         "proxy": provider.proxy.clone(),
         "stream_first_byte_timeout": provider.stream_first_byte_timeout_secs,
         "request_timeout": provider.request_timeout_secs,
@@ -206,6 +218,11 @@ pub(crate) fn build_admin_provider_summary_value(
         "ops_architecture_id": ops_architecture_id,
         "kiro_simulated_cache_enabled": kiro_simulated_cache_enabled,
         "codex_cyber_flag_passthrough_enabled": codex_cyber_flag_passthrough_enabled(&provider.provider_type, provider.config.as_ref()),
+        "codex_fingerprint_convergence_enabled": crate::provider_transport::codex_fingerprint_convergence_enabled(
+            &provider.provider_type,
+            provider.config.as_ref(),
+        ),
+        "responses_websocket_enabled": responses_websocket_adapter(&provider.provider_type, provider.config.as_ref()).is_some(),
         "ops_quota_alert_enabled": ops_quota_alert_enabled,
         "created_at": endpoint_timestamp_or_now(provider.created_at_unix_ms, now_unix_secs),
         "updated_at": endpoint_timestamp_or_now(provider.updated_at_unix_secs, now_unix_secs),

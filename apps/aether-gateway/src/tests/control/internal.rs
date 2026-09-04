@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use aether_contracts::tunnel::RequestMeta;
 use aether_data::repository::proxy_nodes::ProxyNodeReadRepository;
 use axum::body::Body;
 use axum::routing::{any, post};
@@ -10,11 +11,44 @@ use futures_util::stream;
 use http::header::HeaderValue;
 use http::StatusCode;
 use serde_json::json;
+use std::collections::HashMap;
+use std::time::Duration;
 
 use super::{
     build_router_with_state, sample_proxy_node, start_server, AppState, GatewayDataState,
     InMemoryProxyNodeRepository, TRACE_ID_HEADER,
 };
+
+fn relay_request_meta(
+    stream: bool,
+    request_timeout_ms: Option<u64>,
+    stream_first_byte_timeout_ms: Option<u64>,
+) -> RequestMeta {
+    RequestMeta {
+        provider_id: Some("provider-1".to_string()),
+        endpoint_id: Some("endpoint-1".to_string()),
+        key_id: Some("key-1".to_string()),
+        method: "POST".to_string(),
+        url: "https://example.com/responses".to_string(),
+        headers: HashMap::new(),
+        stream,
+        request_timeout_ms,
+        stream_first_byte_timeout_ms,
+        timeout: 60,
+        follow_redirects: None,
+        http1_only: false,
+        transport_profile: None,
+    }
+}
+
+fn relay_envelope(meta: &RequestMeta, body: &[u8]) -> Vec<u8> {
+    let encoded_meta = serde_json::to_vec(meta).expect("metadata should encode");
+    let mut envelope = Vec::with_capacity(4 + encoded_meta.len() + body.len());
+    envelope.extend_from_slice(&(encoded_meta.len() as u32).to_be_bytes());
+    envelope.extend_from_slice(&encoded_meta);
+    envelope.extend_from_slice(body);
+    envelope
+}
 
 #[tokio::test]
 async fn gateway_handles_internal_tunnel_heartbeat_locally_with_loopback() {
@@ -292,10 +326,13 @@ async fn gateway_forwards_tunnel_relay_to_attachment_owner() {
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let envelope = relay_envelope(&relay_request_meta(false, None, None), b"relay-envelope");
+
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/api/internal/tunnel/relay/node-123"))
         .header(TRACE_ID_HEADER, "trace-owner-forward")
-        .body("relay-envelope")
+        .header(http::header::CONTENT_TYPE, "application/octet-stream")
+        .body(envelope.clone())
         .send()
         .await
         .expect("request should succeed");
@@ -309,10 +346,75 @@ async fn gateway_forwards_tunnel_relay_to_attachment_owner() {
         Some("trace-owner-forward")
     );
     assert_eq!(
-        response.text().await.expect("body should read"),
-        "relay-envelope"
+        response.bytes().await.expect("body should read"),
+        Bytes::from(envelope)
     );
     assert_eq!(*owner_hits.lock().expect("mutex should lock"), 1);
+
+    gateway_handle.abort();
+    owner_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_owner_relay_uses_non_stream_timeout_from_envelope() {
+    let owner = Router::new().route(
+        "/api/internal/tunnel/relay/node-123",
+        post(|body: Body| async move {
+            let body = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .expect("body should read");
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            (StatusCode::OK, Body::from(body))
+        }),
+    );
+
+    let (owner_url, owner_handle) = start_server(owner).await;
+    let data_state = GatewayDataState::disabled().with_system_config_values_for_tests(vec![(
+        "tunnel.attachments.node-123".to_string(),
+        json!({
+            "gateway_instance_id": "gateway-b",
+            "relay_base_url": owner_url,
+            "conn_count": 1,
+            "observed_at_unix_secs": 4_102_444_800u64,
+        }),
+    )]);
+    let mut state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state)
+        .with_tunnel_identity_for_tests("gateway-a", Some("http://gateway-a.internal"));
+    let short_timeout_client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(10))
+        .build()
+        .expect("test client should build");
+    state.client = short_timeout_client.clone();
+    state.owner_forward_client = short_timeout_client;
+    let gateway = build_router_with_state(state);
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let meta = relay_request_meta(false, Some(100), None);
+    let envelope = relay_envelope(&meta, b"relay-body");
+    let encoded_meta = serde_json::to_vec(&meta).expect("metadata should encode");
+    let split_at = 4 + encoded_meta.len() / 2;
+    let request_body = reqwest::Body::wrap_stream(stream::iter(vec![
+        Ok::<Bytes, io::Error>(Bytes::copy_from_slice(&envelope[..split_at])),
+        Ok::<Bytes, io::Error>(Bytes::copy_from_slice(&envelope[split_at..])),
+    ]));
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .expect("request client should build")
+        .post(format!("{gateway_url}/api/internal/tunnel/relay/node-123"))
+        .body(request_body)
+        .send()
+        .await
+        .expect("request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.bytes().await.expect("response body should read"),
+        Bytes::from(envelope)
+    );
 
     gateway_handle.abort();
     owner_handle.abort();
@@ -331,35 +433,46 @@ async fn gateway_streams_tunnel_relay_body_to_attachment_owner() {
                 let body = axum::body::to_bytes(body, usize::MAX)
                     .await
                     .expect("body should read");
-                assert_eq!(body, Bytes::from_static(b"relay-stream-envelope"));
-                (StatusCode::OK, Body::from("stream-ok"))
+                let response_body = Body::from_stream(async_stream::stream! {
+                    yield Ok::<_, io::Error>(Bytes::from_static(b"stream-"));
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    yield Ok::<_, io::Error>(Bytes::from_static(b"ok"));
+                });
+                (StatusCode::OK, response_body)
             }
         }),
     );
 
     let (owner_url, owner_handle) = start_server(owner).await;
-    let data_state = GatewayDataState::disabled().with_system_config_values_for_tests(vec![(
-        "tunnel.attachments.node-123".to_string(),
-        json!({
-            "gateway_instance_id": "gateway-b",
-            "relay_base_url": owner_url,
-            "conn_count": 1,
-            "observed_at_unix_secs": 4_102_444_800u64,
-        }),
-    )]);
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(data_state)
-            .with_tunnel_identity_for_tests("gateway-a", Some("http://gateway-a.internal")),
-    );
+    let data_state = GatewayDataState::disabled().with_system_config_values_for_tests(vec![
+        (
+            "tunnel.attachments.node-123".to_string(),
+            json!({
+                "gateway_instance_id": "gateway-b",
+                "relay_base_url": owner_url,
+                "conn_count": 1,
+                "observed_at_unix_secs": 4_102_444_800u64,
+            }),
+        ),
+        ("max_request_body_size".to_string(), json!(8)),
+    ]);
+    let mut state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state)
+        .with_tunnel_identity_for_tests("gateway-a", Some("http://gateway-a.internal"));
+    state.client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(10))
+        .build()
+        .expect("short shared client should build");
+    let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
-    let request_body = reqwest::Body::wrap_stream(stream::iter(vec![
-        Ok::<Bytes, io::Error>(Bytes::from_static(b"relay-")),
-        Ok::<Bytes, io::Error>(Bytes::from_static(b"stream-")),
-        Ok::<Bytes, io::Error>(Bytes::from_static(b"envelope")),
-    ]));
+    let meta = relay_request_meta(true, Some(900_000), Some(100));
+    let envelope = relay_envelope(&meta, b"relay-stream-envelope");
+    let expected_envelope = Bytes::copy_from_slice(&envelope);
+    let request_body = reqwest::Body::wrap_stream(stream::iter(vec![Ok::<Bytes, io::Error>(
+        expected_envelope.clone(),
+    )]));
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/api/internal/tunnel/relay/node-123"))
         .body(request_body)
@@ -369,8 +482,8 @@ async fn gateway_streams_tunnel_relay_body_to_attachment_owner() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.text().await.expect("body should read"),
-        "stream-ok"
+        response.bytes().await.expect("body should read"),
+        Bytes::from_static(b"stream-ok")
     );
     assert_eq!(*owner_hits.lock().expect("mutex should lock"), 1);
 
@@ -429,16 +542,21 @@ async fn gateway_does_not_forward_tunnel_relay_twice() {
 }
 
 #[tokio::test]
-async fn gateway_rejects_owner_relay_body_above_configured_limit() {
-    let owner_hits = Arc::new(Mutex::new(0usize));
-    let owner_hits_clone = Arc::clone(&owner_hits);
+async fn gateway_forwards_owner_relay_body_above_recording_limit() {
+    const RECORDING_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+
+    let captured_body = Arc::new(Mutex::new(None::<Bytes>));
+    let captured_body_clone = Arc::clone(&captured_body);
     let owner = Router::new().route(
         "/api/internal/tunnel/relay/node-123",
-        post(move |_request: Request| {
-            let owner_hits_inner = Arc::clone(&owner_hits_clone);
+        post(move |body: Body| {
+            let captured_body_inner = Arc::clone(&captured_body_clone);
             async move {
-                *owner_hits_inner.lock().expect("mutex should lock") += 1;
-                (StatusCode::OK, Body::from("unexpected owner hit"))
+                let body = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .expect("owner body should read");
+                *captured_body_inner.lock().expect("mutex should lock") = Some(body);
+                StatusCode::OK
             }
         }),
     );
@@ -454,7 +572,10 @@ async fn gateway_rejects_owner_relay_body_above_configured_limit() {
                 "observed_at_unix_secs": 4_102_444_800u64,
             }),
         ),
-        ("max_request_body_size".to_string(), json!(8)),
+        (
+            "max_request_body_size".to_string(),
+            json!(RECORDING_LIMIT_BYTES),
+        ),
     ]);
     let gateway = build_router_with_state(
         AppState::new()
@@ -464,15 +585,24 @@ async fn gateway_rejects_owner_relay_body_above_configured_limit() {
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let request_payload = vec![b'x'; RECORDING_LIMIT_BYTES + 1];
+    let envelope = relay_envelope(
+        &relay_request_meta(false, Some(60_000), None),
+        &request_payload,
+    );
+    assert!(envelope.len() > RECORDING_LIMIT_BYTES);
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/api/internal/tunnel/relay/node-123"))
-        .body("relay-envelope")
+        .body(envelope.clone())
         .send()
         .await
         .expect("request should succeed");
 
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(*owner_hits.lock().expect("mutex should lock"), 0);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        captured_body.lock().expect("mutex should lock").as_ref(),
+        Some(&Bytes::from(envelope))
+    );
 
     gateway_handle.abort();
     owner_handle.abort();

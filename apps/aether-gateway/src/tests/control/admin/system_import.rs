@@ -14,12 +14,17 @@ use aether_data::repository::global_models::InMemoryGlobalModelReadRepository;
 use aether_data::repository::oauth_providers::{
     InMemoryOAuthProviderRepository, OAuthProviderReadRepository, StoredOAuthProviderConfig,
 };
+use aether_data::repository::pool_scores::InMemoryPoolMemberScoreRepository;
 use aether_data::repository::provider_catalog::InMemoryProviderCatalogReadRepository;
 use aether_data::repository::users::{StoredUserAuthRecord, UserReadRepository};
 use aether_data::repository::wallet::{StoredWalletSnapshot, WalletLookupKey};
 use aether_data_contracts::repository::global_models::{
     AdminGlobalModelListQuery, AdminProviderModelListQuery, GlobalModelReadRepository,
     StoredPublicGlobalModel,
+};
+use aether_data_contracts::repository::pool_scores::{
+    GetPoolMemberScoresByIdsQuery, PoolMemberHardState, PoolMemberIdentity, PoolMemberProbeStatus,
+    PoolScoreReadRepository,
 };
 use aether_data_contracts::repository::provider_catalog::ProviderCatalogReadRepository;
 use axum::body::{Body, Bytes};
@@ -32,6 +37,9 @@ use serde_json::{json, Value};
 use super::super::helpers::{hash_api_key, sample_endpoint, sample_key, sample_provider};
 use super::super::{
     build_router_with_state, build_state_with_execution_runtime_override, start_server, AppState,
+};
+use crate::ai_serving::{
+    build_provider_key_pool_score_upsert, provider_key_pool_score_id, provider_key_pool_score_scope,
 };
 use crate::constants::{
     GATEWAY_HEADER, TRUSTED_ADMIN_SESSION_ID_HEADER, TRUSTED_ADMIN_USER_ID_HEADER,
@@ -227,6 +235,7 @@ fn sample_oauth_system_import_payload(access_token: &str, refresh_token: &str) -
                     refresh_token
                 ),
                 "api_formats": ["openai:responses"],
+                "rpm_limit": null,
                 "is_active": true
             }],
             "models": []
@@ -264,8 +273,39 @@ fn sample_import_admin_user(user_id: &str) -> StoredUserAuthRecord {
     .expect("admin user should build")
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_system_config_locally_and_persists_data() {
+const ADMIN_SYSTEM_IMPORT_TEST_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+fn run_admin_system_import_test<F, Fut>(test_name: &'static str, make_future: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let handle = std::thread::Builder::new()
+        .name(test_name.to_string())
+        .stack_size(ADMIN_SYSTEM_IMPORT_TEST_STACK_BYTES)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(make_future());
+        })
+        .expect("admin system import test thread should spawn");
+
+    if let Err(payload) = handle.join() {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[test]
+fn gateway_imports_admin_system_config_locally_and_persists_data() {
+    run_admin_system_import_test(
+        "gateway_imports_admin_system_config_locally_and_persists_data",
+        gateway_imports_admin_system_config_locally_and_persists_data_impl,
+    );
+}
+
+async fn gateway_imports_admin_system_config_locally_and_persists_data_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -310,13 +350,22 @@ async fn gateway_imports_admin_system_config_locally_and_persists_data() {
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
     let client = reqwest::Client::new();
+    let mut import_payload = sample_system_import_payload();
+    import_payload["system_configs"]
+        .as_array_mut()
+        .expect("system configs should be an array")
+        .push(json!({
+            "key": "external_models_proxy_node_id",
+            "value": null,
+            "description": "External models proxy"
+        }));
     let response = client
         .post(format!("{gateway_url}/api/admin/system/config/import"))
         .header(GATEWAY_HEADER, "rust-phase3b")
         .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
-        .json(&sample_system_import_payload())
+        .json(&import_payload)
         .send()
         .await
         .expect("request should succeed");
@@ -332,7 +381,7 @@ async fn gateway_imports_admin_system_config_locally_and_persists_data() {
     assert_eq!(payload["stats"]["models"]["created"], json!(1));
     assert_eq!(payload["stats"]["ldap"]["created"], json!(1));
     assert_eq!(payload["stats"]["oauth"]["created"], json!(1));
-    assert_eq!(payload["stats"]["system_configs"]["created"], json!(2));
+    assert_eq!(payload["stats"]["system_configs"]["created"], json!(3));
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     let global_models = global_model_repository
@@ -491,16 +540,31 @@ async fn gateway_imports_admin_system_config_locally_and_persists_data() {
         .iter()
         .find(|entry| entry["key"] == "smtp_password")
         .expect("smtp_password should exist");
+    let exported_external_models_proxy = exported_system_configs
+        .iter()
+        .find(|entry| entry["key"] == "external_models_proxy_node_id")
+        .expect("external models proxy should exist");
     assert_eq!(exported_site_name["value"], "Imported Aether");
     assert_eq!(exported_smtp_password["value"], "smtp-secret");
+    assert_eq!(
+        exported_external_models_proxy["value"],
+        serde_json::Value::Null
+    );
 
     gateway_handle.abort();
     upstream_handle.abort();
     let _ = upstream_url;
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_system_config_openai_image_aliases() {
+#[test]
+fn gateway_imports_admin_system_config_openai_image_aliases() {
+    run_admin_system_import_test(
+        "gateway_imports_admin_system_config_openai_image_aliases",
+        gateway_imports_admin_system_config_openai_image_aliases_impl,
+    );
+}
+
+async fn gateway_imports_admin_system_config_openai_image_aliases_impl() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         Vec::new(),
         Vec::new(),
@@ -566,8 +630,15 @@ async fn gateway_imports_admin_system_config_openai_image_aliases() {
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_returns_503_for_admin_system_config_import_when_local_data_is_unavailable() {
+#[test]
+fn gateway_returns_503_for_admin_system_config_import_when_local_data_is_unavailable() {
+    run_admin_system_import_test(
+        "gateway_returns_503_for_admin_system_config_import_when_local_data_is_unavailable",
+        gateway_returns_503_for_admin_system_config_import_when_local_data_is_unavailable_impl,
+    );
+}
+
+async fn gateway_returns_503_for_admin_system_config_import_when_local_data_is_unavailable_impl() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -603,8 +674,15 @@ async fn gateway_returns_503_for_admin_system_config_import_when_local_data_is_u
     let _ = upstream_url;
 }
 
-#[tokio::test]
-async fn gateway_imports_legacy_admin_system_config_versions_and_model_test_succeeds() {
+#[test]
+fn gateway_imports_legacy_admin_system_config_versions_and_model_test_succeeds() {
+    run_admin_system_import_test(
+        "gateway_imports_legacy_admin_system_config_versions_and_model_test_succeeds",
+        gateway_imports_legacy_admin_system_config_versions_and_model_test_succeeds_impl,
+    );
+}
+
+async fn gateway_imports_legacy_admin_system_config_versions_and_model_test_succeeds_impl() {
     for (
         fixture_name,
         expected_provider_name,
@@ -828,8 +906,15 @@ async fn assert_legacy_admin_system_config_import_model_test_succeeds(
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_unknown_admin_system_config_import_versions() {
+#[test]
+fn gateway_rejects_unknown_admin_system_config_import_versions() {
+    run_admin_system_import_test(
+        "gateway_rejects_unknown_admin_system_config_import_versions",
+        gateway_rejects_unknown_admin_system_config_import_versions_impl,
+    );
+}
+
+async fn gateway_rejects_unknown_admin_system_config_import_versions_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -867,8 +952,15 @@ async fn gateway_rejects_unknown_admin_system_config_import_versions() {
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_system_users_locally_and_persists_data() {
+#[test]
+fn gateway_imports_admin_system_users_locally_and_persists_data() {
+    run_admin_system_import_test(
+        "gateway_imports_admin_system_users_locally_and_persists_data",
+        gateway_imports_admin_system_users_locally_and_persists_data_impl,
+    );
+}
+
+async fn gateway_imports_admin_system_users_locally_and_persists_data_impl() {
     let user_wallet_updated_at = "2024-05-06T07:08:09Z";
     let standalone_wallet_updated_at = "2024-06-07T08:09:10Z";
     let upstream_hits = Arc::new(Mutex::new(0usize));
@@ -1142,8 +1234,15 @@ async fn gateway_imports_admin_system_users_locally_and_persists_data() {
     let _ = upstream_url;
 }
 
-#[tokio::test]
-async fn gateway_overwrites_existing_admin_system_user_key_usage_totals() {
+#[test]
+fn gateway_overwrites_existing_admin_system_user_key_usage_totals() {
+    run_admin_system_import_test(
+        "gateway_overwrites_existing_admin_system_user_key_usage_totals",
+        gateway_overwrites_existing_admin_system_user_key_usage_totals_impl,
+    );
+}
+
+async fn gateway_overwrites_existing_admin_system_user_key_usage_totals_impl() {
     let user_key_hash = hash_api_key("sk-existing-user-key");
     let standalone_key_hash = hash_api_key("sk-existing-standalone-key");
     let existing_user = StoredUserAuthRecord::new(
@@ -1347,8 +1446,15 @@ async fn gateway_overwrites_existing_admin_system_user_key_usage_totals() {
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_system_config_fixture_v22() {
+#[test]
+fn gateway_imports_admin_system_config_fixture_v22() {
+    run_admin_system_import_test(
+        "gateway_imports_admin_system_config_fixture_v22",
+        gateway_imports_admin_system_config_fixture_v22_impl,
+    );
+}
+
+async fn gateway_imports_admin_system_config_fixture_v22_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -1374,8 +1480,15 @@ async fn gateway_imports_admin_system_config_fixture_v22() {
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_system_config_fixtures_from_legacy_exports() {
+#[test]
+fn gateway_imports_admin_system_config_fixtures_from_legacy_exports() {
+    run_admin_system_import_test(
+        "gateway_imports_admin_system_config_fixtures_from_legacy_exports",
+        gateway_imports_admin_system_config_fixtures_from_legacy_exports_impl,
+    );
+}
+
+async fn gateway_imports_admin_system_config_fixtures_from_legacy_exports_impl() {
     for fixture in ["v20", "v21"] {
         let gateway = build_router_with_state(
             AppState::new()
@@ -1409,8 +1522,15 @@ async fn gateway_imports_admin_system_config_fixtures_from_legacy_exports() {
     }
 }
 
-#[tokio::test]
-async fn gateway_imports_python_cli_alias_export_and_model_test_smoke() {
+#[test]
+fn gateway_imports_python_cli_alias_export_and_model_test_smoke() {
+    run_admin_system_import_test(
+        "gateway_imports_python_cli_alias_export_and_model_test_smoke",
+        gateway_imports_python_cli_alias_export_and_model_test_smoke_impl,
+    );
+}
+
+async fn gateway_imports_python_cli_alias_export_and_model_test_smoke_impl() {
     let seen_plan = Arc::new(Mutex::new(None::<ExecutionPlan>));
     let seen_plan_clone = Arc::clone(&seen_plan);
     let execution_runtime = Router::new().route(
@@ -1561,8 +1681,15 @@ async fn gateway_imports_python_cli_alias_export_and_model_test_smoke() {
     execution_runtime_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_rejects_legacy_user_import_string_bool_field() {
+#[test]
+fn gateway_rejects_legacy_user_import_string_bool_field() {
+    run_admin_system_import_test(
+        "gateway_rejects_legacy_user_import_string_bool_field",
+        gateway_rejects_legacy_user_import_string_bool_field_impl,
+    );
+}
+
+async fn gateway_rejects_legacy_user_import_string_bool_field_impl() {
     let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::default());
     let state = AppState::new()
         .expect("gateway should build")
@@ -1600,8 +1727,15 @@ async fn gateway_rejects_legacy_user_import_string_bool_field() {
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_reports_field_path_for_invalid_admin_system_config_import_shape() {
+#[test]
+fn gateway_reports_field_path_for_invalid_admin_system_config_import_shape() {
+    run_admin_system_import_test(
+        "gateway_reports_field_path_for_invalid_admin_system_config_import_shape",
+        gateway_reports_field_path_for_invalid_admin_system_config_import_shape_impl,
+    );
+}
+
+async fn gateway_reports_field_path_for_invalid_admin_system_config_import_shape_impl() {
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
@@ -1641,8 +1775,153 @@ async fn gateway_reports_field_path_for_invalid_admin_system_config_import_shape
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_admin_system_config_with_numeric_string_prices() {
+#[test]
+fn gateway_rejects_invalid_anthropic_profiles_during_admin_system_config_import() {
+    run_admin_system_import_test(
+        "gateway_rejects_invalid_anthropic_profiles_during_admin_system_config_import",
+        gateway_rejects_invalid_anthropic_profiles_during_admin_system_config_import_impl,
+    );
+}
+
+async fn gateway_rejects_invalid_anthropic_profiles_during_admin_system_config_import_impl() {
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(build_empty_admin_system_data_state()),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    for config_scope in ["provider", "endpoint"] {
+        let mut payload = sample_system_import_payload();
+        let invalid_config = json!({
+            "anthropic": {"compatibility_profile": "claude_cod_typo"}
+        });
+        if config_scope == "provider" {
+            payload["providers"][0]["config"] = invalid_config;
+        } else {
+            payload["providers"][0]["endpoints"][0]["config"] = invalid_config;
+        }
+
+        let response = client
+            .post(format!("{gateway_url}/api/admin/system/config/import"))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&payload)
+            .send()
+            .await
+            .expect("invalid Anthropic profile import should complete locally");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.expect("json body should parse");
+        assert_eq!(
+            body["detail"], "无效的 Anthropic compatibility profile",
+            "unexpected {config_scope} validation response: {body}"
+        );
+    }
+
+    gateway_handle.abort();
+}
+
+#[test]
+fn gateway_does_not_restore_retired_vertex_claude_endpoint_from_system_import() {
+    run_admin_system_import_test(
+        "gateway_does_not_restore_retired_vertex_claude_endpoint_from_system_import",
+        gateway_does_not_restore_retired_vertex_claude_endpoint_from_system_import_impl,
+    );
+}
+
+async fn gateway_does_not_restore_retired_vertex_claude_endpoint_from_system_import_impl() {
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
+    let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(Vec::<
+        StoredPublicGlobalModel,
+    >::new()));
+    let data_state = build_admin_system_data_state_with_repositories(
+        Arc::clone(&provider_catalog_repository),
+        Arc::clone(&global_model_repository),
+    );
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(data_state),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+
+    let mut payload = sample_system_import_payload();
+    payload["providers"][0]["name"] = json!("legacy-vertex-backup");
+    payload["providers"][0]["provider_type"] = json!("vertex_ai");
+    payload["providers"][0]["endpoints"] = json!([
+        {
+            "api_format": "gemini:generate_content",
+            "base_url": "https://aiplatform.googleapis.com",
+            "max_retries": 2,
+            "is_active": true
+        },
+        {
+            "api_format": "claude:messages",
+            "base_url": "https://aiplatform.googleapis.com",
+            "max_retries": 2,
+            "is_active": true
+        }
+    ]);
+    payload["providers"][0]["api_keys"] = json!([]);
+    payload["providers"][0]["models"] = json!([]);
+
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&payload)
+        .send()
+        .await
+        .expect("legacy Vertex import should complete");
+
+    let status = response.status();
+    let response_body: Value = response.json().await.expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={response_body}");
+    assert_eq!(response_body["stats"]["endpoints"]["created"], json!(1));
+    assert_eq!(response_body["stats"]["endpoints"]["skipped"], json!(1));
+    assert!(response_body["stats"]["errors"]
+        .as_array()
+        .is_some_and(|errors| errors.iter().any(|error| {
+            error
+                .as_str()
+                .is_some_and(|error| error.contains("claude:messages"))
+        })));
+
+    let providers = provider_catalog_repository
+        .list_providers(false)
+        .await
+        .expect("providers should load");
+    assert_eq!(providers.len(), 1);
+    let endpoints = provider_catalog_repository
+        .list_endpoints_by_provider_ids(std::slice::from_ref(&providers[0].id))
+        .await
+        .expect("endpoints should load");
+    assert_eq!(endpoints.len(), 1, "unexpected endpoints: {endpoints:?}");
+    assert_eq!(endpoints[0].api_format, "gemini:generate_content");
+    assert!(endpoints[0].is_active);
+
+    gateway_handle.abort();
+}
+
+#[test]
+fn gateway_imports_admin_system_config_with_numeric_string_prices() {
+    run_admin_system_import_test(
+        "gateway_imports_admin_system_config_with_numeric_string_prices",
+        gateway_imports_admin_system_config_with_numeric_string_prices_impl,
+    );
+}
+
+async fn gateway_imports_admin_system_config_with_numeric_string_prices_impl() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         Vec::new(),
         Vec::new(),
@@ -1714,8 +1993,15 @@ async fn gateway_imports_admin_system_config_with_numeric_string_prices() {
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_imports_oauth_provider_key_credentials_from_admin_system_config() {
+#[test]
+fn gateway_imports_oauth_provider_key_credentials_from_admin_system_config() {
+    run_admin_system_import_test(
+        "gateway_imports_oauth_provider_key_credentials_from_admin_system_config",
+        gateway_imports_oauth_provider_key_credentials_from_admin_system_config_impl,
+    );
+}
+
+async fn gateway_imports_oauth_provider_key_credentials_from_admin_system_config_impl() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         Vec::new(),
         Vec::new(),
@@ -1804,8 +2090,15 @@ async fn gateway_imports_oauth_provider_key_credentials_from_admin_system_config
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import() {
+#[test]
+fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import() {
+    run_admin_system_import_test(
+        "gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import",
+        gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import_impl,
+    );
+}
+
+async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import_impl() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         Vec::new(),
         Vec::new(),
@@ -1831,11 +2124,10 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
     .with_system_config_values_for_tests(Vec::<(String, Value)>::new())
     .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
 
-    let gateway = build_router_with_state(
-        AppState::new()
-            .expect("gateway should build")
-            .with_data_state_for_tests(data_state),
-    );
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(data_state);
+    let gateway = build_router_with_state(state.clone());
     let (gateway_url, gateway_handle) = start_server(gateway).await;
     let client = reqwest::Client::new();
 
@@ -1895,11 +2187,77 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
         serde_json::from_str(&auth_config).expect("oauth auth config json should parse");
     assert_eq!(auth_config["refresh_token"], "oauth-refresh-token-new");
 
+    assert!(state
+        .update_provider_catalog_key_oauth_runtime_state(
+            &keys[0].id,
+            Some(1_700_000_001),
+            Some("[REFRESH_FAILED] imported token remains invalid"),
+            None,
+            Some(1_700_000_001),
+        )
+        .await
+        .expect("invalid marker should be seeded"));
+    let mut metadata_only_payload = sample_oauth_system_import_payload("unused", "unused");
+    let key_payload = metadata_only_payload["providers"][0]["api_keys"][0]
+        .as_object_mut()
+        .expect("OAuth key payload should be an object");
+    key_payload.remove("api_key");
+    key_payload.remove("auth_config");
+    key_payload.insert("internal_priority".to_string(), json!(71));
+
+    let response = client
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&metadata_only_payload)
+        .send()
+        .await
+        .expect("metadata-only import should succeed");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let keys = provider_catalog_repository
+        .list_keys_by_provider_ids(std::slice::from_ref(&providers[0].id))
+        .await
+        .expect("keys should reload");
+    assert_eq!(keys[0].internal_priority, 71);
+    assert_eq!(keys[0].oauth_invalid_at_unix_secs, Some(1_700_000_001));
+    assert_eq!(
+        keys[0].oauth_invalid_reason.as_deref(),
+        Some("[REFRESH_FAILED] imported token remains invalid")
+    );
+
+    let response = client
+        .post(format!("{gateway_url}/api/admin/system/config/import"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&sample_oauth_system_import_payload(
+            "oauth-access-token-new",
+            "oauth-refresh-token-new",
+        ))
+        .send()
+        .await
+        .expect("same valid credentials should be accepted as recovery input");
+    assert_eq!(response.status(), StatusCode::OK);
+    let keys = provider_catalog_repository
+        .list_keys_by_provider_ids(std::slice::from_ref(&providers[0].id))
+        .await
+        .expect("keys should reload after credential recovery");
+    assert_eq!(keys[0].oauth_invalid_at_unix_secs, None);
+    assert_eq!(keys[0].oauth_invalid_reason, None);
+
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import_without_refresh(
+#[test]
+fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import_without_refresh() {
+    run_admin_system_import_test("gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import_without_refresh", gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import_without_refresh_impl);
+}
+
+async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_import_without_refresh_impl(
 ) {
     let seen_refresh = Arc::new(Mutex::new(false));
     let seen_refresh_clone = Arc::clone(&seen_refresh);
@@ -1925,6 +2283,7 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
 
     let mut provider = sample_provider("provider-codex-existing", "oauth-import-provider", 10);
     provider.provider_type = "codex".to_string();
+    provider.config = Some(json!({"pool_advanced": {}}));
     let endpoint = sample_endpoint(
         "endpoint-codex-existing",
         "provider-codex-existing",
@@ -1940,9 +2299,17 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
     existing_key.name = "oauth-primary".to_string();
     existing_key.auth_type = "oauth".to_string();
     existing_key.expires_at_unix_secs = Some(1);
+    existing_key.learned_rpm_limit = Some(31);
     existing_key.oauth_invalid_at_unix_secs = Some(1_700_000_000);
     existing_key.oauth_invalid_reason =
         Some("[REFRESH_FAILED] refresh_token 无效、已过期或已撤销，请重新登录授权".to_string());
+    existing_key.error_count = Some(7);
+    existing_key.health_by_format = Some(json!({
+        "openai:responses": {"consecutive_failures": 3}
+    }));
+    existing_key.circuit_breaker_by_format = Some(json!({
+        "openai:responses": {"state": "open"}
+    }));
     existing_key.encrypted_auth_config = Some(
         encrypt_python_fernet_plaintext(
             DEVELOPMENT_ENCRYPTION_KEY,
@@ -1950,12 +2317,42 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
         )
         .expect("auth config should encrypt"),
     );
+    existing_key.upstream_metadata = Some(json!({
+        "codex": {
+            "credential_generation": "generation-before-import",
+            "primary_used_percent": 90.0,
+        },
+        "unrelated": {"preserved": true},
+    }));
+    existing_key.status_snapshot = Some(json!({
+        "oauth": {"status": "invalid"},
+        "quota": {"used_ratio": 0.9},
+    }));
 
+    let score_identity =
+        PoolMemberIdentity::provider_api_key("provider-codex-existing", "key-codex-existing");
+    let score_scope = provider_key_pool_score_scope();
+    let mut invalid_score = build_provider_key_pool_score_upsert(
+        &existing_key,
+        "codex",
+        None,
+        1_700_000_000,
+        aether_pool_core::PoolMemberScoreRules::default(),
+    )
+    .into_stored();
+    invalid_score.last_failure_at = Some(1_700_000_000);
+    invalid_score.failure_count = 9;
+    invalid_score.last_probe_failure_at = Some(1_700_000_000);
+    invalid_score.probe_failure_count = 4;
+    invalid_score.probe_status = PoolMemberProbeStatus::Failed;
+    assert_eq!(invalid_score.hard_state, PoolMemberHardState::AuthInvalid);
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         vec![provider],
         vec![endpoint],
         vec![existing_key],
     ));
+    let pool_score_repository =
+        Arc::new(InMemoryPoolMemberScoreRepository::seed(vec![invalid_score]));
     let global_model_repository = Arc::new(InMemoryGlobalModelReadRepository::seed(Vec::<
         StoredPublicGlobalModel,
     >::new()));
@@ -1981,6 +2378,7 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
     .with_global_model_repository_for_tests(Arc::clone(&global_model_repository))
     .attach_auth_module_repository_for_tests(Arc::clone(&auth_module_repository))
     .attach_oauth_provider_repository_for_tests(Arc::clone(&oauth_provider_repository))
+    .with_pool_score_repository_for_tests(Arc::clone(&pool_score_repository))
     .with_system_config_values_for_tests(Vec::<(String, Value)>::new())
     .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
 
@@ -1992,16 +2390,16 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let mut import_payload =
+        sample_oauth_system_import_payload("oauth-access-token-new", "oauth-refresh-token-new");
+    import_payload["providers"][0]["config"] = json!({"pool_advanced": {}});
     let response = reqwest::Client::new()
         .post(format!("{gateway_url}/api/admin/system/config/import"))
         .header(GATEWAY_HEADER, "rust-phase3b")
         .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
-        .json(&sample_oauth_system_import_payload(
-            "oauth-access-token-new",
-            "oauth-refresh-token-new",
-        ))
+        .json(&import_payload)
         .send()
         .await
         .expect("request should succeed");
@@ -2026,6 +2424,35 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
     assert_eq!(key.oauth_invalid_at_unix_secs, None);
     assert_eq!(key.oauth_invalid_reason, None);
     assert_eq!(key.expires_at_unix_secs, None);
+    assert_eq!(key.learned_rpm_limit, None);
+    assert_eq!(key.error_count, Some(0));
+    assert_eq!(key.health_by_format, Some(json!({})));
+    assert_eq!(key.circuit_breaker_by_format, Some(json!({})));
+    let codex = key
+        .upstream_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("codex"))
+        .and_then(Value::as_object)
+        .expect("Codex metadata should exist");
+    assert_eq!(codex.len(), 1);
+    assert_ne!(
+        codex
+            .get(aether_admin::provider::quota::CODEX_CREDENTIAL_GENERATION_KEY)
+            .and_then(Value::as_str),
+        Some("generation-before-import")
+    );
+    assert_eq!(
+        key.upstream_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.pointer("/unrelated/preserved")),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        key.status_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get("quota")),
+        Some(&Value::Null)
+    );
     assert_eq!(
         decrypt_python_fernet_ciphertext(
             DEVELOPMENT_ENCRYPTION_KEY,
@@ -2054,16 +2481,42 @@ async fn gateway_overwrites_oauth_provider_key_credentials_from_admin_system_imp
     assert!(auth_config.get("token_type").is_none());
     assert!(auth_config.get("expires_at").is_none());
 
+    let scores = pool_score_repository
+        .get_pool_member_scores_by_ids(&GetPoolMemberScoresByIdsQuery {
+            ids: vec![provider_key_pool_score_id(&score_identity, &score_scope)],
+        })
+        .await
+        .expect("pool score should load");
+    assert_eq!(scores.len(), 1);
+    assert!(
+        scores[0].hard_state.schedulable(),
+        "OAuth credential import should reset the pool score: {:?}",
+        scores[0]
+    );
+    assert_eq!(scores[0].last_failure_at, None);
+    assert_eq!(scores[0].failure_count, 0);
+    assert_eq!(scores[0].last_probe_failure_at, None);
+    assert_eq!(scores[0].probe_failure_count, 0);
+    assert_eq!(scores[0].probe_status, PoolMemberProbeStatus::Never);
+
     gateway_handle.abort();
     refresh_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_skips_proxy_nodes_during_admin_system_config_import() {
+#[test]
+fn gateway_skips_proxy_nodes_during_admin_system_config_import() {
+    run_admin_system_import_test(
+        "gateway_skips_proxy_nodes_during_admin_system_config_import",
+        gateway_skips_proxy_nodes_during_admin_system_config_import_impl,
+    );
+}
+
+async fn gateway_skips_proxy_nodes_during_admin_system_config_import_impl() {
+    let data_state = build_empty_admin_system_data_state();
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
-            .with_data_state_for_tests(build_empty_admin_system_data_state()),
+            .with_data_state_for_tests(data_state.clone()),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -2083,6 +2536,11 @@ async fn gateway_skips_proxy_nodes_during_admin_system_config_import() {
                 "name": "Legacy Node",
                 "ip": "127.0.0.1",
                 "port": 8080
+            }],
+            "system_configs": [{
+                "key": "external_models_proxy_node_id",
+                "value": "legacy-node-1",
+                "description": "External models proxy"
             }]
         }))
         .send()
@@ -2092,6 +2550,7 @@ async fn gateway_skips_proxy_nodes_during_admin_system_config_import() {
     assert_eq!(response.status(), StatusCode::OK);
     let payload: Value = response.json().await.expect("json body should parse");
     assert_eq!(payload["stats"]["proxy_nodes"]["skipped"], json!(1));
+    assert_eq!(payload["stats"]["system_configs"]["created"], json!(1));
     assert!(payload["stats"]["errors"]
         .as_array()
         .expect("errors should be an array")
@@ -2099,12 +2558,33 @@ async fn gateway_skips_proxy_nodes_during_admin_system_config_import() {
         .any(|item| item
             .as_str()
             .is_some_and(|value| value.contains("暂不支持导入代理节点"))));
+    assert!(payload["stats"]["errors"]
+        .as_array()
+        .expect("errors should be an array")
+        .iter()
+        .any(|item| item
+            .as_str()
+            .is_some_and(|value| value.contains("已切换为直连"))));
+    assert_eq!(
+        data_state
+            .find_system_config_value("external_models_proxy_node_id")
+            .await
+            .expect("external models proxy config lookup should succeed"),
+        Some(Value::Null)
+    );
 
     gateway_handle.abort();
 }
 
-#[tokio::test]
-async fn gateway_preserves_manual_proxy_configs_while_skipping_proxy_nodes_during_import() {
+#[test]
+fn gateway_preserves_manual_proxy_configs_while_skipping_proxy_nodes_during_import() {
+    run_admin_system_import_test(
+        "gateway_preserves_manual_proxy_configs_while_skipping_proxy_nodes_during_import",
+        gateway_preserves_manual_proxy_configs_while_skipping_proxy_nodes_during_import_impl,
+    );
+}
+
+async fn gateway_preserves_manual_proxy_configs_while_skipping_proxy_nodes_during_import_impl() {
     let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
         Vec::new(),
         Vec::new(),

@@ -3,7 +3,7 @@
     <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4">
       <!-- 左侧：标题 -->
       <h3 class="text-sm sm:text-base font-semibold text-foreground shrink-0">
-        提供商管理
+        {{ legacyT('提供商管理') }}
       </h3>
 
       <!-- 右侧：操作区 -->
@@ -15,7 +15,7 @@
             id="provider-search"
             :model-value="searchQuery"
             type="text"
-            placeholder="搜索提供商..."
+            :placeholder="legacyT('搜索提供商...')"
             class="w-32 sm:w-44 pl-8 pr-3 h-8 text-sm bg-muted/30 border-border/50 focus:border-primary/50 transition-colors"
             @update:model-value="$emit('update:searchQuery', $event)"
           />
@@ -28,7 +28,7 @@
             @update:model-value="$emit('update:filterStatus', $event)"
           >
             <SelectTrigger class="w-20 sm:w-28 h-8 text-xs border-border/60">
-              <SelectValue placeholder="全部状态" />
+              <SelectValue :placeholder="legacyT('全部状态')" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem
@@ -36,7 +36,7 @@
                 :key="status.value"
                 :value="status.value"
               >
-                {{ status.label }}
+                {{ legacyT(status.label) }}
               </SelectItem>
             </SelectContent>
           </Select>
@@ -49,7 +49,7 @@
             @update:model-value="$emit('update:filterApiFormat', $event)"
           >
             <SelectTrigger class="w-20 sm:w-28 h-8 text-xs border-border/60">
-              <SelectValue placeholder="全部格式" />
+              <SelectValue :placeholder="legacyT('全部格式')" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem
@@ -57,7 +57,7 @@
                 :key="fmt.value"
                 :value="fmt.value"
               >
-                {{ fmt.label }}
+                {{ legacyT(fmt.label) }}
               </SelectItem>
             </SelectContent>
           </Select>
@@ -70,7 +70,7 @@
             @update:model-value="$emit('update:filterModel', $event)"
           >
             <SelectTrigger class="w-20 sm:w-36 h-8 text-xs border-border/60">
-              <SelectValue placeholder="全部模型" />
+              <SelectValue :placeholder="legacyT('全部模型')" />
             </SelectTrigger>
             <SelectContent>
               <SelectItem
@@ -78,7 +78,7 @@
                 :key="model.value"
                 :value="model.value"
               >
-                {{ model.label }}
+                {{ legacyT(model.label) }}
               </SelectItem>
             </SelectContent>
           </Select>
@@ -90,24 +90,11 @@
           variant="ghost"
           size="icon"
           class="h-8 w-8"
-          title="重置筛选"
+          :title="legacyT('重置筛选')"
           @click="$emit('resetFilters')"
         >
           <FilterX class="w-3.5 h-3.5" />
         </Button>
-
-        <div class="hidden sm:block h-4 w-px bg-border" />
-
-        <!-- 调度策略 -->
-        <button
-          class="group inline-flex items-center gap-1.5 px-2.5 h-8 rounded-md border border-border/50 bg-muted/20 hover:bg-muted/40 hover:border-primary/40 transition-all duration-200 text-xs"
-          title="点击调整调度策略"
-          @click="$emit('openPriorityDialog')"
-        >
-          <span class="text-muted-foreground/80 hidden sm:inline">调度:</span>
-          <span class="font-medium text-foreground/90">{{ priorityModeLabel }}</span>
-          <ChevronDown class="w-3 h-3 text-muted-foreground/70 group-hover:text-foreground transition-colors" />
-        </button>
 
         <div class="hidden sm:block h-4 w-px bg-border" />
 
@@ -116,7 +103,7 @@
           variant="ghost"
           size="icon"
           class="h-8 w-8"
-          title="批量处理提供商"
+          :title="legacyT('批量处理提供商')"
           :disabled="loading"
           @click="$emit('batchProcess')"
         >
@@ -126,7 +113,7 @@
           variant="ghost"
           size="icon"
           class="h-8 w-8"
-          title="新增提供商"
+          :title="legacyT('新增提供商')"
           @click="$emit('addProvider')"
         >
           <Plus class="w-3.5 h-3.5" />
@@ -141,7 +128,7 @@
 </template>
 
 <script setup lang="ts">
-import { Search, Plus, ChevronDown, FilterX, Users } from 'lucide-vue-next'
+import { Search, Plus, FilterX, Users } from 'lucide-vue-next'
 import Button from '@/components/ui/button.vue'
 import Input from '@/components/ui/input.vue'
 import Select from '@/components/ui/select.vue'
@@ -151,6 +138,7 @@ import SelectContent from '@/components/ui/select-content.vue'
 import SelectItem from '@/components/ui/select-item.vue'
 import RefreshButton from '@/components/ui/refresh-button.vue'
 import type { FilterOption } from '@/features/providers/composables/useProviderFilters'
+import { useI18n } from '@/i18n'
 
 defineProps<{
   searchQuery: string
@@ -161,7 +149,6 @@ defineProps<{
   apiFormatFilters: FilterOption[]
   modelFilters: FilterOption[]
   hasActiveFilters: boolean
-  priorityModeLabel: string
   loading: boolean
 }>()
 
@@ -171,9 +158,10 @@ defineEmits<{
   'update:filterApiFormat': [value: string]
   'update:filterModel': [value: string]
   'resetFilters': []
-  'openPriorityDialog': []
   'batchProcess': []
   'addProvider': []
   'refresh': []
 }>()
+
+const { legacyT } = useI18n()
 </script>
