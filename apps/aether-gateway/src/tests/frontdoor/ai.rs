@@ -5,6 +5,7 @@ use super::{
     InMemoryVideoTaskRepository, StoredAuthApiKeySnapshot, UpsertVideoTask, VideoTaskLookupKey,
     VideoTaskReadRepository, VideoTaskStatus, VideoTaskWriteRepository, DEVELOPMENT_ENCRYPTION_KEY,
 };
+use crate::data::GatewayDataState;
 use crate::image_capabilities::openai_image_gateway_max_generation_count;
 use crate::tests::{
     any, build_router_with_state, build_state_with_execution_runtime_override, json, start_server,
@@ -234,6 +235,12 @@ fn codex_catalog_key(
     key_id: &str,
     allowed_models: &[&str],
 ) -> StoredProviderCatalogKey {
+    let bootstrap = AppState::new()
+        .expect("bootstrap state should build")
+        .with_data_state_for_tests(
+            crate::data::GatewayDataState::disabled()
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
     let mut key = StoredProviderCatalogKey::new(
         key_id.to_string(),
         provider_id.to_string(),
@@ -245,7 +252,8 @@ fn codex_catalog_key(
     .expect("Codex key should build")
     .with_transport_fields(
         Some(json!(["openai:responses"])),
-        encrypt_python_fernet_plaintext(DEVELOPMENT_ENCRYPTION_KEY, "oauth-upstream-secret")
+        bootstrap
+            .seal_provider_catalog_key_api_key(provider_id, key_id, "oauth-upstream-secret")
             .expect("Codex test token should encrypt"),
         None,
         None,
@@ -409,6 +417,84 @@ fn sample_gemini_video_task(
             }
         })),
     }
+}
+
+fn gemini_video_catalog_repository() -> Arc<InMemoryProviderCatalogReadRepository> {
+    const PROVIDER_ID: &str = "provider-gemini-video-local-1";
+    const ENDPOINT_ID: &str = "endpoint-gemini-video-local-1";
+    const KEY_ID: &str = "key-gemini-video-local-1";
+    let bootstrap = AppState::new()
+        .expect("bootstrap state should build")
+        .with_data_state_for_tests(
+            crate::data::GatewayDataState::disabled()
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    let provider = StoredProviderCatalogProvider::new(
+        PROVIDER_ID.to_string(),
+        "gemini-video".to_string(),
+        Some("https://generativelanguage.googleapis.com".to_string()),
+        "gemini".to_string(),
+    )
+    .expect("Gemini video provider should build")
+    .with_transport_fields(
+        true,
+        false,
+        false,
+        None,
+        Some(2),
+        None,
+        Some(20.0),
+        None,
+        None,
+    );
+    let endpoint = StoredProviderCatalogEndpoint::new(
+        ENDPOINT_ID.to_string(),
+        PROVIDER_ID.to_string(),
+        "gemini:video".to_string(),
+        Some("gemini".to_string()),
+        Some("video".to_string()),
+        true,
+    )
+    .expect("Gemini video endpoint should build")
+    .with_transport_fields(
+        "https://generativelanguage.googleapis.com".to_string(),
+        None,
+        None,
+        Some(2),
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("Gemini video endpoint transport should build");
+    let key = StoredProviderCatalogKey::new(
+        KEY_ID.to_string(),
+        PROVIDER_ID.to_string(),
+        "prod".to_string(),
+        "api_key".to_string(),
+        None,
+        true,
+    )
+    .expect("Gemini video key should build")
+    .with_transport_fields(
+        Some(json!(["gemini:video"])),
+        bootstrap
+            .seal_provider_catalog_key_api_key(PROVIDER_ID, KEY_ID, "sk-upstream-gemini-video")
+            .expect("Gemini video api key should encrypt"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("Gemini video key transport should build");
+    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ))
 }
 
 struct PendingMinimalCandidateSelectionReadRepository;
@@ -657,13 +743,19 @@ fn gateway_versioned_models_fail_closed_when_cached_auth_becomes_unusable_or_mis
 }
 
 async fn run_versioned_models_auth_race_scenario() {
+    let mut auth_race_snapshot = codex_models_snapshot(
+        "key-codex-models-auth-race",
+        "user-codex-models-auth-race",
+        &["future-alias"],
+    );
+    // This scenario exercises API-key cache invalidation, not provider
+    // allowlist resolution. Keep the catalog dependency absent so the warm
+    // request remains on the local models route while the key is usable.
+    auth_race_snapshot.user_allowed_providers = None;
+    auth_race_snapshot.api_key_allowed_providers = None;
     let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
         Some(hash_api_key("sk-codex-models-auth-race")),
-        codex_models_snapshot(
-            "key-codex-models-auth-race",
-            "user-codex-models-auth-race",
-            &["future-alias"],
-        ),
+        auth_race_snapshot,
     )]));
     let candidate_repository = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(
         Vec::new(),
@@ -1708,14 +1800,22 @@ async fn receive_realtime_message(socket: &mut wreq::ws::WebSocket) -> WreqWsMes
 }
 
 #[test]
-fn gateway_creates_bound_codex_live_oauth_calls_with_opaque_session_fields() {
+fn gateway_creates_bound_codex_live_oauth_calls_with_legacy_responses_mapping() {
     super::run_frontdoor_async_test(
         "codex-live-oauth-frontdoor",
-        run_codex_live_oauth_frontdoor_scenario(),
+        run_codex_live_oauth_frontdoor_scenario(CodexLiveWebRtcTestDialect::LegacyLive),
     );
 }
 
-async fn run_codex_live_oauth_frontdoor_scenario() {
+#[test]
+fn gateway_creates_bound_codex_realtime_oauth_calls_with_legacy_responses_mapping() {
+    super::run_frontdoor_async_test(
+        "codex-realtime-oauth-frontdoor",
+        run_codex_live_oauth_frontdoor_scenario(CodexLiveWebRtcTestDialect::Realtime),
+    );
+}
+
+async fn run_codex_live_oauth_frontdoor_scenario(dialect: CodexLiveWebRtcTestDialect) {
     const PROVIDER_ID: &str = "provider-codex-live";
     const ENDPOINT_ID: &str = "endpoint-provider-codex-live";
     const UPSTREAM_KEY_ID: &str = "key-provider-codex-live";
@@ -1724,6 +1824,15 @@ async fn run_codex_live_oauth_frontdoor_scenario() {
     const CALL_ID: &str = "rtc_frontdoor_live";
 
     let mut row = sample_codex_live_candidate_row(PROVIDER_ID, CLIENT_MODEL, PROVIDER_MODEL);
+    // Existing Codex associations predate the dedicated Live format. The
+    // provider-aware compatibility rule must carry their Responses-scoped
+    // source mapping through the complete scheduler, not only the repository
+    // fast path.
+    if let Some(mappings) = row.model_provider_model_mappings.as_mut() {
+        for mapping in mappings {
+            mapping.api_formats = Some(vec!["openai:responses".to_string()]);
+        }
+    }
     row.key_allowed_models = Some(vec![PROVIDER_MODEL.to_string()]);
     let candidate_repository =
         Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
@@ -1755,6 +1864,8 @@ async fn run_codex_live_oauth_frontdoor_scenario() {
         vec![endpoint],
         vec![upstream_key],
     ));
+    let request_candidate_repository = Arc::new(InMemoryRequestCandidateRepository::default());
+    let usage_repository = Arc::new(InMemoryUsageReadRepository::default());
 
     let captured_plan = Arc::new(Mutex::new(None::<aether_contracts::ExecutionPlan>));
     let captured_plan_for_runtime = Arc::clone(&captured_plan);
@@ -1804,13 +1915,19 @@ async fn run_codex_live_oauth_frontdoor_scenario() {
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
     let state = build_state_with_execution_runtime_override(execution_runtime_url)
         .with_data_state_for_tests(
-            crate::data::GatewayDataState::with_minimal_candidate_selection_and_auth_for_tests(
-                candidate_repository,
+            crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_request_candidates_and_usage_for_tests(
                 auth_repository,
-            )
-            .attach_provider_catalog_repository_for_tests(provider_catalog_repository)
-            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
-        );
+                candidate_repository,
+                provider_catalog_repository,
+                request_candidate_repository,
+                Arc::clone(&usage_repository),
+                DEVELOPMENT_ENCRYPTION_KEY,
+            ),
+        )
+        .with_usage_runtime_for_tests(crate::usage::UsageRuntimeConfig {
+            enabled: true,
+            ..crate::usage::UsageRuntimeConfig::default()
+        });
     let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -1829,7 +1946,10 @@ async fn run_codex_live_oauth_frontdoor_scenario() {
         session
     );
     let response = reqwest::Client::new()
-        .post(format!("{gateway_url}/v1/live"))
+        .post(format!(
+            "{gateway_url}{}",
+            dialect.call_create_request_target()
+        ))
         .header("authorization", "Bearer sk-codex-live")
         .header(
             "content-type",
@@ -1842,7 +1962,7 @@ async fn run_codex_live_oauth_frontdoor_scenario() {
         .await
         .expect("Codex Live call creation should complete");
     assert_eq!(response.status(), StatusCode::CREATED);
-    let downstream_location = format!("/v1/live/{CALL_ID}");
+    let downstream_location = dialect.call_location(CALL_ID);
     assert_eq!(
         response
             .headers()
@@ -1896,7 +2016,7 @@ async fn run_codex_live_oauth_frontdoor_scenario() {
     assert_eq!(provider_body["session"]["instructions"], "Keep this opaque");
     assert_eq!(
         plan.headers.get("openai-alpha").map(String::as_str),
-        Some("quicksilver=v2")
+        Some(dialect.alpha_header())
     );
     assert_eq!(
         plan.headers.get("originator").map(String::as_str),
@@ -1918,6 +2038,49 @@ async fn run_codex_live_oauth_frontdoor_scenario() {
     assert_eq!(plan.headers.get("thread-id"), Some(converged_session));
     uuid::Uuid::parse_str(converged_session).expect("converged session ID must be a UUID");
 
+    let call_create_usage = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(usage) = usage_repository
+                .find_by_request_id(plan.request_id.as_str())
+                .await
+                .expect("Live call-create usage read should succeed")
+            {
+                break usage;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Live call-create usage should be persisted before timeout");
+    assert_eq!(call_create_usage.status, "completed");
+    assert_eq!(call_create_usage.billing_status, "void");
+    assert_eq!(call_create_usage.status_code, Some(201));
+    assert_eq!(call_create_usage.request_type.as_deref(), Some("live"));
+    assert_eq!(call_create_usage.api_format.as_deref(), Some("codex:live"));
+    assert_eq!(call_create_usage.model, CLIENT_MODEL);
+    assert!(!call_create_usage.is_stream);
+    assert!(!call_create_usage.is_websocket());
+    assert_eq!(call_create_usage.websocket_transport(), None);
+    assert!(!call_create_usage.usage_available());
+    assert!(!call_create_usage.usage_pricing_available());
+    assert_eq!(call_create_usage.total_tokens, 0);
+    assert_eq!(call_create_usage.total_cost_usd, 0.0);
+    assert_eq!(call_create_usage.actual_total_cost_usd, 0.0);
+    assert!(call_create_usage.request_headers.is_none());
+    assert!(call_create_usage.request_body.is_none());
+    assert!(call_create_usage.provider_request_headers.is_none());
+    assert!(call_create_usage.provider_request_body.is_none());
+    let serialized_call_create_usage =
+        serde_json::to_string(&call_create_usage).expect("Live call-create usage should serialize");
+    for sentinel in [
+        offer_sdp,
+        "Keep this opaque",
+        "sk-codex-live",
+        "oauth-upstream-secret",
+    ] {
+        assert!(!serialized_call_create_usage.contains(sentinel));
+    }
+
     gateway_handle.abort();
     execution_runtime_handle.abort();
 }
@@ -1927,20 +2090,78 @@ struct ObservedCodexLiveWebSocket {
     request_target: String,
     authorization: Option<String>,
     alpha: Option<String>,
+    originator: Option<String>,
     session_id: Option<String>,
     initial_event: serde_json::Value,
     event_after_turn_done: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CodexLiveDirectTestDialect {
+    LegacyLive,
+    RealtimeV1,
+    RealtimeV2,
+}
+
+impl CodexLiveDirectTestDialect {
+    fn public_path(self) -> &'static str {
+        match self {
+            Self::LegacyLive => "/v1/live",
+            Self::RealtimeV1 | Self::RealtimeV2 => "/v1/realtime",
+        }
+    }
+
+    fn query_prefix(self) -> &'static str {
+        match self {
+            Self::RealtimeV1 => "intent=quicksilver&",
+            Self::LegacyLive | Self::RealtimeV2 => "",
+        }
+    }
+
+    fn expected_upstream_target(self, provider_model: &str) -> String {
+        match self {
+            Self::LegacyLive => format!("/v1/live?model={provider_model}"),
+            Self::RealtimeV1 => {
+                format!("/v1/realtime?intent=quicksilver&model={provider_model}")
+            }
+            Self::RealtimeV2 => format!("/v1/realtime?model={provider_model}"),
+        }
+    }
+
+    fn expected_alpha(self) -> Option<&'static str> {
+        match self {
+            Self::LegacyLive => Some("quicksilver=v2"),
+            Self::RealtimeV1 => Some("quicksilver=v1"),
+            Self::RealtimeV2 => None,
+        }
+    }
 }
 
 #[test]
 fn gateway_relays_codex_live_api_key_websocket_opaquely() {
     super::run_frontdoor_async_test(
         "codex-live-api-key-websocket-frontdoor",
-        run_codex_live_api_key_websocket_frontdoor_scenario(),
+        run_codex_live_api_key_websocket_frontdoor_scenario(CodexLiveDirectTestDialect::LegacyLive),
     );
 }
 
-async fn run_codex_live_api_key_websocket_frontdoor_scenario() {
+#[test]
+fn gateway_relays_codex_realtime_v2_api_key_websocket_opaquely() {
+    super::run_frontdoor_async_test(
+        "codex-realtime-v2-api-key-websocket-frontdoor",
+        run_codex_live_api_key_websocket_frontdoor_scenario(CodexLiveDirectTestDialect::RealtimeV2),
+    );
+}
+
+#[test]
+fn gateway_relays_codex_realtime_v1_api_key_websocket_opaquely() {
+    super::run_frontdoor_async_test(
+        "codex-realtime-v1-api-key-websocket-frontdoor",
+        run_codex_live_api_key_websocket_frontdoor_scenario(CodexLiveDirectTestDialect::RealtimeV1),
+    );
+}
+
+async fn run_codex_live_api_key_websocket_frontdoor_scenario(dialect: CodexLiveDirectTestDialect) {
     const PROVIDER_ID: &str = "provider-codex-live-api-key";
     const ENDPOINT_ID: &str = "endpoint-provider-codex-live-api-key";
     const UPSTREAM_KEY_ID: &str = "key-provider-codex-live-api-key";
@@ -1951,6 +2172,7 @@ async fn run_codex_live_api_key_websocket_frontdoor_scenario() {
     let upstream_state = Arc::new(Mutex::new(Some(observed_tx)));
     let upstream = Router::new()
         .route("/v1/live", get(mock_codex_live_websocket))
+        .route("/v1/realtime", get(mock_codex_live_websocket))
         .with_state(upstream_state);
     let (upstream_url, upstream_handle) = start_server(upstream).await;
 
@@ -2014,10 +2236,18 @@ async fn run_codex_live_api_key_websocket_frontdoor_scenario() {
         http::HeaderName::from_static("openai-alpha"),
         http::HeaderValue::from_static("client-value-must-be-replaced"),
     );
+    if matches!(dialect, CodexLiveDirectTestDialect::RealtimeV2) {
+        handshake_headers.insert(
+            http::HeaderName::from_static("originator"),
+            http::HeaderValue::from_static("codex_work_desktop"),
+        );
+    }
     let invalid_model_response = wreq::Client::new()
         .websocket(format!(
-            "{}/v1/live?model={CLIENT_MODEL}&model=second-model",
-            gateway_url.replacen("http://", "ws://", 1)
+            "{}{}?{}model={CLIENT_MODEL}&model=second-model",
+            gateway_url.replacen("http://", "ws://", 1),
+            dialect.public_path(),
+            dialect.query_prefix(),
         ))
         .headers(handshake_headers.clone())
         .send()
@@ -2026,8 +2256,10 @@ async fn run_codex_live_api_key_websocket_frontdoor_scenario() {
     assert_eq!(invalid_model_response.status(), StatusCode::BAD_REQUEST);
 
     let websocket_url = format!(
-        "{}/v1/live?foo=bar&model={CLIENT_MODEL}&trace=1",
-        gateway_url.replacen("http://", "ws://", 1)
+        "{}{}?{}foo=bar&model={CLIENT_MODEL}&trace=1",
+        gateway_url.replacen("http://", "ws://", 1),
+        dialect.public_path(),
+        dialect.query_prefix(),
     );
     let response = wreq::Client::new()
         .websocket(websocket_url)
@@ -2091,13 +2323,17 @@ async fn run_codex_live_api_key_websocket_frontdoor_scenario() {
         .expect("mock upstream observation channel should remain open");
     assert_eq!(
         observed.request_target,
-        format!("/v1/live?model={PROVIDER_MODEL}")
+        dialect.expected_upstream_target(PROVIDER_MODEL)
     );
     assert_eq!(
         observed.authorization.as_deref(),
         Some("Bearer oauth-upstream-secret")
     );
-    assert_eq!(observed.alpha.as_deref(), Some("quicksilver=v2"));
+    assert_eq!(observed.alpha.as_deref(), dialect.expected_alpha());
+    assert_eq!(
+        observed.originator.as_deref(),
+        matches!(dialect, CodexLiveDirectTestDialect::RealtimeV2).then_some("codex_work_desktop")
+    );
     assert_eq!(observed.session_id.as_deref(), Some("stable-live-session"));
     let mut expected_initial_event = initial_event;
     expected_initial_event["session"]["model"] = json!(PROVIDER_MODEL);
@@ -2119,15 +2355,63 @@ struct ObservedCodexLiveSideband {
     session_update: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CodexLiveWebRtcTestDialect {
+    LegacyLive,
+    Realtime,
+}
+
+impl CodexLiveWebRtcTestDialect {
+    fn call_create_path(self) -> &'static str {
+        match self {
+            Self::LegacyLive => "/v1/live",
+            Self::Realtime => "/v1/realtime/calls",
+        }
+    }
+
+    fn call_location(self, call_id: &str) -> String {
+        format!("{}/{call_id}", self.call_create_path())
+    }
+
+    fn call_create_request_target(self) -> &'static str {
+        match self {
+            Self::LegacyLive => "/v1/live",
+            Self::Realtime => "/v1/realtime/calls?intent=quicksilver&architecture=avas",
+        }
+    }
+
+    fn alpha_header(self) -> &'static str {
+        match self {
+            Self::LegacyLive => "quicksilver=v2",
+            Self::Realtime => "quicksilver=v1",
+        }
+    }
+
+    fn sideband_path(self, call_id: &str) -> String {
+        match self {
+            Self::LegacyLive => format!("/v1/live/{call_id}"),
+            Self::Realtime => format!("/v1/realtime?intent=quicksilver&call_id={call_id}"),
+        }
+    }
+}
+
 #[test]
 fn gateway_creates_and_relays_bound_codex_live_api_key_sideband() {
     super::run_frontdoor_async_test(
         "codex-live-api-key-sideband-frontdoor",
-        run_codex_live_api_key_sideband_frontdoor_scenario(),
+        run_codex_live_api_key_sideband_frontdoor_scenario(CodexLiveWebRtcTestDialect::LegacyLive),
     );
 }
 
-async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
+#[test]
+fn gateway_creates_and_relays_bound_codex_live_api_key_realtime_calls_sideband() {
+    super::run_frontdoor_async_test(
+        "codex-live-api-key-realtime-calls-sideband-frontdoor",
+        run_codex_live_api_key_sideband_frontdoor_scenario(CodexLiveWebRtcTestDialect::Realtime),
+    );
+}
+
+async fn run_codex_live_api_key_sideband_frontdoor_scenario(dialect: CodexLiveWebRtcTestDialect) {
     const PROVIDER_ID: &str = "provider-codex-live-sideband";
     const ENDPOINT_ID: &str = "endpoint-provider-codex-live-sideband";
     const UPSTREAM_KEY_ID: &str = "key-provider-codex-live-sideband";
@@ -2142,12 +2426,13 @@ async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
             "/v1/live/{call_id}",
             get(mock_codex_live_sideband_websocket),
         )
+        .route("/v1/realtime", get(mock_codex_live_sideband_websocket))
         .with_state(upstream_state);
     let (upstream_url, upstream_handle) = start_server(upstream).await;
 
     let captured_plan = Arc::new(Mutex::new(None::<aether_contracts::ExecutionPlan>));
     let captured_plan_for_runtime = Arc::clone(&captured_plan);
-    let upstream_location = format!("{upstream_url}/v1/live/{CALL_ID}");
+    let upstream_location = format!("{upstream_url}{}", dialect.call_location(CALL_ID));
     let execution_runtime = Router::new().route(
         "/v1/execute/sync",
         any(move |request: Request| {
@@ -2237,9 +2522,11 @@ async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
     let gateway = build_router_with_state(state);
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
+    let sideband_path = dialect.sideband_path(CALL_ID);
     let sideband_url = format!(
-        "{}/v1/live/{CALL_ID}",
-        gateway_url.replacen("http://", "ws://", 1)
+        "{}{}",
+        gateway_url.replacen("http://", "ws://", 1),
+        sideband_path
     );
     let mut sideband_headers = HeaderMap::new();
     sideband_headers.insert(
@@ -2273,7 +2560,10 @@ async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
         session
     );
     let response = reqwest::Client::new()
-        .post(format!("{gateway_url}/v1/live"))
+        .post(format!(
+            "{gateway_url}{}",
+            dialect.call_create_request_target()
+        ))
         .header("authorization", "Bearer sk-codex-live-sideband")
         .header(
             "content-type",
@@ -2291,7 +2581,7 @@ async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
             .headers()
             .get(http::header::LOCATION)
             .and_then(|value| value.to_str().ok()),
-        Some(format!("/v1/live/{CALL_ID}").as_str())
+        Some(dialect.call_location(CALL_ID).as_str())
     );
     assert_eq!(
         response
@@ -2315,8 +2605,17 @@ async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
         .clone()
         .expect("Live API-key call should reach execution runtime");
     let plan_url = url::Url::parse(plan.url.as_str()).expect("Live API-key URL should parse");
-    assert_eq!(plan_url.path(), "/v1/live");
-    assert!(plan_url.query().is_none());
+    assert_eq!(plan_url.path(), dialect.call_create_path());
+    match dialect {
+        CodexLiveWebRtcTestDialect::LegacyLive => assert!(plan_url.query().is_none()),
+        CodexLiveWebRtcTestDialect::Realtime => assert_eq!(
+            plan_url.query_pairs().collect::<HashMap<_, _>>(),
+            HashMap::from([
+                ("intent".into(), "quicksilver".into()),
+                ("architecture".into(), "avas".into()),
+            ])
+        ),
+    }
     assert_eq!(plan.method, "POST");
     assert!(!plan.stream);
     assert!(plan
@@ -2344,7 +2643,7 @@ async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
     );
     assert_eq!(
         plan.headers.get("openai-alpha").map(String::as_str),
-        Some("quicksilver=v2")
+        Some(dialect.alpha_header())
     );
     assert_eq!(
         plan.headers.get("x-session-id").map(String::as_str),
@@ -2380,8 +2679,9 @@ async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
     );
     let conflicting_response = wreq::Client::new()
         .websocket(format!(
-            "{}/v1/live/{CALL_ID}",
-            gateway_url.replacen("http://", "ws://", 1)
+            "{}{}",
+            gateway_url.replacen("http://", "ws://", 1),
+            dialect.sideband_path(CALL_ID)
         ))
         .headers(sideband_headers)
         .send()
@@ -2414,12 +2714,12 @@ async fn run_codex_live_api_key_sideband_frontdoor_scenario() {
         .await
         .expect("mock sideband should observe the opaque command before timeout")
         .expect("mock sideband observation channel should remain open");
-    assert_eq!(observed.request_target, format!("/v1/live/{CALL_ID}"));
+    assert_eq!(observed.request_target, sideband_path);
     assert_eq!(
         observed.authorization.as_deref(),
         Some("Bearer oauth-upstream-secret")
     );
-    assert_eq!(observed.alpha.as_deref(), Some("quicksilver=v2"));
+    assert_eq!(observed.alpha.as_deref(), Some(dialect.alpha_header()));
     assert_eq!(
         observed.session_id.as_deref(),
         Some("stable-live-sideband-session")
@@ -2501,6 +2801,10 @@ async fn mock_codex_live_websocket(
         .get("openai-alpha")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let originator = headers
+        .get("originator")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let session_id = headers
         .get("x-session-id")
         .and_then(|value| value.to_str().ok())
@@ -2535,6 +2839,7 @@ async fn mock_codex_live_websocket(
             request_target,
             authorization,
             alpha,
+            originator,
             session_id,
             initial_event,
             event_after_turn_done,
@@ -3264,7 +3569,10 @@ async fn gateway_does_not_locally_reject_image_model_name_on_chat_completions() 
     let gateway = build_router_with_state(
         AppState::new()
             .expect("gateway should build")
-            .with_auth_api_key_data_reader_for_tests(auth_repository),
+            .with_data_state_for_tests(
+                GatewayDataState::with_auth_api_key_reader_for_tests(auth_repository)
+                    .with_system_default_routing_group_for_tests(),
+            ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;
 
@@ -3492,6 +3800,231 @@ async fn gateway_handles_gemini_operation_detail_without_hitting_fallback_probe(
 }
 
 #[tokio::test]
+async fn gateway_hides_gemini_operation_detail_and_cancel_from_non_owner() {
+    let fallback_probe_hits = Arc::new(Mutex::new(0usize));
+    let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
+    let fallback_probe = Router::new().route(
+        "/{*path}",
+        any(move |_request: Request| {
+            let fallback_probe_hits_inner = Arc::clone(&fallback_probe_hits_clone);
+            async move {
+                *fallback_probe_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Json(json!({"proxied": true}))).into_response()
+            }
+        }),
+    );
+
+    let execution_runtime_hits = Arc::new(Mutex::new(0usize));
+    let execution_runtime_hits_clone = Arc::clone(&execution_runtime_hits);
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |_request: Request| {
+            let execution_runtime_hits_inner = Arc::clone(&execution_runtime_hits_clone);
+            async move {
+                *execution_runtime_hits_inner
+                    .lock()
+                    .expect("mutex should lock") += 1;
+                Json(json!({
+                    "request_id": "unexpected-cross-user-cancel",
+                    "status_code": 200,
+                    "headers": {},
+                    "body": { "json_body": {} }
+                }))
+            }
+        }),
+    );
+
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![(
+        Some(hash_api_key("sk-gemini-operation-non-owner")),
+        unrestricted_models_snapshot(
+            "key-gemini-operation-non-owner",
+            "user-gemini-operation-non-owner",
+        ),
+    )]));
+    let repository = Arc::new(InMemoryVideoTaskRepository::default());
+    repository
+        .upsert(sample_gemini_video_task(
+            "task-gemini-operation-owner",
+            "opshort-owner-only",
+            "user-gemini-operation-owner",
+            "key-gemini-operation-owner",
+            "operations/ext-owner-only",
+            VideoTaskStatus::Submitted,
+        ))
+        .await
+        .expect("upsert should succeed");
+
+    let (_fallback_probe_url, fallback_probe_handle) = start_server(fallback_probe).await;
+    let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let gateway = build_router_with_state(
+        build_state_with_execution_runtime_override(execution_runtime_url)
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_auth_and_video_task_repository_for_tests(
+                    auth_repository,
+                    Arc::clone(&repository),
+                ),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::new();
+
+    let detail_response = client
+        .get(format!(
+            "{gateway_url}/v1beta/operations/opshort-owner-only?key=sk-gemini-operation-non-owner"
+        ))
+        .send()
+        .await
+        .expect("cross-user detail request should complete");
+    assert_eq!(detail_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        detail_response
+            .json::<serde_json::Value>()
+            .await
+            .expect("json body should parse"),
+        json!({ "detail": "Video task not found" })
+    );
+
+    let cancel_response = client
+        .post(format!(
+            "{gateway_url}/v1beta/operations/opshort-owner-only:cancel"
+        ))
+        .header("x-goog-api-key", "sk-gemini-operation-non-owner")
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body("{}")
+        .send()
+        .await
+        .expect("cross-user cancel request should complete");
+    assert_eq!(cancel_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        cancel_response
+            .json::<serde_json::Value>()
+            .await
+            .expect("json body should parse"),
+        json!({ "detail": "Video task not found" })
+    );
+
+    let stored = repository
+        .find(VideoTaskLookupKey::Id("task-gemini-operation-owner"))
+        .await
+        .expect("task lookup should succeed")
+        .expect("task should exist");
+    assert_eq!(stored.status, VideoTaskStatus::Submitted);
+    assert_eq!(
+        *execution_runtime_hits.lock().expect("mutex should lock"),
+        0
+    );
+    assert_eq!(*fallback_probe_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    execution_runtime_handle.abort();
+    fallback_probe_handle.abort();
+}
+
+#[tokio::test]
+async fn gateway_hides_gemini_video_file_from_non_owner_and_allows_owner_rotated_key() {
+    let fallback_probe_hits = Arc::new(Mutex::new(0usize));
+    let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
+    let fallback_probe = Router::new().route(
+        "/{*path}",
+        any(move |_request: Request| {
+            let fallback_probe_hits_inner = Arc::clone(&fallback_probe_hits_clone);
+            async move {
+                *fallback_probe_hits_inner.lock().expect("mutex should lock") += 1;
+                (StatusCode::OK, Json(json!({"proxied": true}))).into_response()
+            }
+        }),
+    );
+
+    let auth_repository = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![
+        (
+            Some(hash_api_key("sk-gemini-video-file-foreign")),
+            unrestricted_models_snapshot(
+                "key-gemini-video-file-foreign",
+                "user-gemini-video-file-foreign",
+            ),
+        ),
+        (
+            Some(hash_api_key("sk-gemini-video-file-owner")),
+            unrestricted_models_snapshot(
+                "key-gemini-video-file-owner-rotated",
+                "user-gemini-video-file-owner",
+            ),
+        ),
+    ]));
+    let repository = Arc::new(InMemoryVideoTaskRepository::default());
+    let mut task = sample_gemini_video_task(
+        "task-gemini-video-file-owner",
+        "opshort-file-owner",
+        "user-gemini-video-file-owner",
+        "key-gemini-video-file-original",
+        "operations/ext-file-owner",
+        VideoTaskStatus::Completed,
+    );
+    task.provider_api_format = None;
+    task.video_url = Some("https://8.8.8.8/video-owner.mp4".to_string());
+    repository
+        .upsert(task)
+        .await
+        .expect("upsert should succeed");
+
+    let (_unused_fallback_probe_url, fallback_probe_handle) = start_server(fallback_probe).await;
+    let gateway = build_router_with_state(
+        AppState::new()
+            .expect("gateway should build")
+            .with_data_state_for_tests(
+                crate::data::GatewayDataState::with_auth_and_video_task_repository_for_tests(
+                    auth_repository,
+                    repository,
+                ),
+            ),
+    );
+    let (gateway_url, gateway_handle) = start_server(gateway).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client should build");
+
+    let foreign_response = client
+        .get(format!(
+            "{gateway_url}/v1beta/files/aev_opshort-file-owner:download?alt=media&key=sk-gemini-video-file-foreign"
+        ))
+        .send()
+        .await
+        .expect("foreign request should complete");
+    assert_eq!(foreign_response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        foreign_response
+            .json::<serde_json::Value>()
+            .await
+            .expect("json body should parse"),
+        json!({"detail": "File not found"})
+    );
+    assert_eq!(*fallback_probe_hits.lock().expect("mutex should lock"), 0);
+
+    let owner_response = client
+        .get(format!(
+            "{gateway_url}/v1beta/files/aev_opshort-file-owner:download?alt=media&key=sk-gemini-video-file-owner"
+        ))
+        .send()
+        .await
+        .expect("owner request should complete");
+    assert_ne!(owner_response.status(), StatusCode::NOT_FOUND);
+    assert_ne!(owner_response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(owner_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        owner_response
+            .json::<serde_json::Value>()
+            .await
+            .expect("json body should parse"),
+        json!({"detail": "Service temporarily unavailable"})
+    );
+    assert_eq!(*fallback_probe_hits.lock().expect("mutex should lock"), 0);
+
+    gateway_handle.abort();
+    fallback_probe_handle.abort();
+}
+
+#[tokio::test]
 async fn gateway_lists_gemini_operations_without_hitting_fallback_probe() {
     let fallback_probe_hits = Arc::new(Mutex::new(0usize));
     let fallback_probe_hits_clone = Arc::clone(&fallback_probe_hits);
@@ -3693,13 +4226,16 @@ async fn gateway_cancels_gemini_operation_without_hitting_fallback_probe() {
 
     let (fallback_probe_url, fallback_probe_handle) = start_server(fallback_probe).await;
     let (execution_runtime_url, execution_runtime_handle) = start_server(execution_runtime).await;
+    let provider_catalog_repository = gemini_video_catalog_repository();
     let gateway = build_router_with_state(
         build_state_with_execution_runtime_override(execution_runtime_url)
             .with_data_state_for_tests(
-                crate::data::GatewayDataState::with_auth_and_video_task_repository_for_tests(
-                    auth_repository,
+                crate::data::GatewayDataState::with_video_task_repository_and_provider_transport_for_tests(
                     Arc::clone(&repository),
-                ),
+                    provider_catalog_repository,
+                    DEVELOPMENT_ENCRYPTION_KEY,
+                )
+                .with_auth_api_key_reader(auth_repository),
             ),
     );
     let (gateway_url, gateway_handle) = start_server(gateway).await;

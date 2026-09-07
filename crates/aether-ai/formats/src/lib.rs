@@ -12,6 +12,7 @@ pub use formats::context::{
     ConversionFieldRecord, ConversionFieldStatus, ConversionReport, Converted, FormatContext,
     FormatError,
 };
+pub use formats::gemini::generate_content::request::ensure_server_side_tool_invocations_for_mixed_tools;
 pub use formats::id::{
     api_format_alias_matches, api_format_defaults_to_client_error_failover,
     api_format_defaults_to_non_stream, api_format_permission_covers,
@@ -56,6 +57,7 @@ pub use formats::openai::responses::request::{
     validate_openai_responses_request_contract, OpenAiResponsesRequestContractViolation,
 };
 pub use formats::openai::responses::{
+    normalize_openai_responses_message_item_ids, openai_responses_message_item_id,
     openai_responses_request_operation, openai_responses_synthetic_reasoning_item_id,
     strip_incompatible_openai_responses_reasoning_items,
     strip_incompatible_openai_responses_reasoning_items_with_policy,

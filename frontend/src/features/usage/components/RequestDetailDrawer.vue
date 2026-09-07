@@ -728,7 +728,7 @@
                           :detail="detail"
                           :view-mode="viewMode"
                           :data-source="dataSource"
-                          :current-header-data="currentHeaderData"
+                          :current-header-data="currentHeaderData ?? null"
                           :current-expand-depth="currentExpandDepth"
                           :has-provider-headers="hasProviderHeaders"
                           :header-stats="headerStats"
@@ -782,7 +782,7 @@
                           :detail="detail"
                           :view-mode="viewMode"
                           :data-source="dataSource"
-                          :current-header-data="currentResponseHeaderData"
+                          :current-header-data="currentResponseHeaderData ?? null"
                           :current-expand-depth="currentExpandDepth"
                           :has-provider-headers="hasProviderResponseHeaders"
                           :header-stats="responseHeaderStats"
@@ -873,6 +873,7 @@
 </template>
 
 <script setup lang="ts">
+import { getI18nLocale } from '@/i18n'
 import { ref, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import Button from '@/components/ui/button.vue'
 import { useEscapeKey } from '@/composables/useEscapeKey'
@@ -1411,7 +1412,7 @@ const TIMELINE_MOUNT_DELAY_MS = 120
 let loadDetailRequestId = 0
 let bodyLoadRequestId = 0
 let loadDetailInFlight = false
-let timelineMountTimer: ReturnType<typeof setTimeout> | null = null
+let timelineMountTimer: number | null = null
 
 const fullRequestId = computed(() => detail.value?.request_id || detail.value?.id || '-')
 const displayRequestId = computed(() => formatShortRequestId(fullRequestId.value))
@@ -1989,7 +1990,7 @@ const effectiveCacheCreationCost = computed(() => {
     getNestedNumber(billingCostBreakdown.value, 'cache_creation_uncategorized_cost'),
     getNestedNumber(billingCostBreakdown.value, 'cache_creation_ephemeral_5m_cost'),
     getNestedNumber(billingCostBreakdown.value, 'cache_creation_ephemeral_1h_cost'),
-  ].reduce((sum, value) => sum + (value ?? 0), 0)
+  ].reduce<number>((sum, value) => sum + (value ?? 0), 0)
   if (snapshotCost > 0) return snapshotCost
   return toNumber(detail.value?.cache_creation_cost) ?? 0
 })
@@ -2848,7 +2849,7 @@ onBeforeUnmount(() => {
 function formatDateTime(dateStr: string | null | undefined): string {
   if (!dateStr) return 'N/A'
   const date = new Date(dateStr)
-  return date.toLocaleString('zh-CN', {
+  return date.toLocaleString(getI18nLocale(), {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',
