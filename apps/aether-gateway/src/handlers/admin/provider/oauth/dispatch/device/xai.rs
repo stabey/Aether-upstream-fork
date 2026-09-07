@@ -190,7 +190,7 @@ pub(super) async fn handle_admin_provider_oauth_xai_device_poll(
                 request_proxy,
                 session_id,
                 session,
-                result,
+                *result,
             )
             .await
         }

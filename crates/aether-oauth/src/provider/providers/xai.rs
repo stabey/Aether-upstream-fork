@@ -34,7 +34,7 @@ const DEFAULT_DEVICE_POLL_INTERVAL_SECS: u64 = 5;
 pub enum XaiDevicePollOutcome {
     Pending,
     SlowDown,
-    Authorized(ProviderOAuthTokenSet),
+    Authorized(Box<ProviderOAuthTokenSet>),
 }
 
 #[derive(Clone)]
@@ -172,7 +172,7 @@ impl XaiProviderOAuthAdapter {
         let raw_payload = token_set.token_set.raw_payload.clone();
         mark_oauth_auth_config(&mut token_set.auth_config);
         enrich_xai_identity(&mut token_set.auth_config, raw_payload.as_ref());
-        Ok(XaiDevicePollOutcome::Authorized(token_set))
+        Ok(XaiDevicePollOutcome::Authorized(Box::new(token_set)))
     }
 
     async fn import_raw_api_key(
