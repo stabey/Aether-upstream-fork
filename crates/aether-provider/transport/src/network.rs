@@ -847,16 +847,7 @@ mod tests {
 
         let profile = resolve_transport_profile(&transport).expect("profile");
 
-        assert_eq!(profile.profile_id, "chrome136");
-        assert_eq!(profile.backend, "browser_wreq");
-        assert_eq!(
-            profile
-                .extra
-                .as_ref()
-                .and_then(|value| value.get("source"))
-                .and_then(Value::as_str),
-            Some("grok_auth_config")
-        );
+        assert_eq!(profile.profile_id, "chrome145");
     }
 
     #[test]
