@@ -197,7 +197,8 @@ pub use windsurf::{
     WINDSURF_ENVELOPE_NAME,
 };
 pub use xai::{
-    insert_cli_identity_headers_if_needed, is_xai_provider_transport,
-    resolved_xai_upstream_base_url, should_attach_cli_identity_headers, XAI_API_BASE_URL,
-    XAI_CHAT_PROXY_BASE_URL, XAI_PROVIDER_TYPE,
+    extract_xai_user_id_from_auth_config, extract_xai_user_id_from_value,
+    insert_cli_identity_headers, insert_cli_identity_headers_if_needed, is_xai_provider_transport,
+    resolved_xai_upstream_base_url, should_attach_cli_identity_headers, xai_auth_uses_api,
+    XAI_API_BASE_URL, XAI_CHAT_PROXY_BASE_URL, XAI_PROVIDER_TYPE,
 };

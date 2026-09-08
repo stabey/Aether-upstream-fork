@@ -1700,6 +1700,7 @@ const showAccountQuotaColumn = computed(() => {
     || selectedProviderType.value === 'antigravity'
     || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'chatgpt_web'
+    || selectedProviderType.value === 'xai'
 })
 
 const desktopColumnWidths = computed(() => {
@@ -2149,6 +2150,7 @@ const quotaRefreshSupported = computed(() => {
     || selectedProviderType.value === 'antigravity'
     || selectedProviderType.value === 'grok'
     || selectedProviderType.value === 'chatgpt_web'
+    || selectedProviderType.value === 'xai'
 })
 
 function canResetCycleStats(_key: PoolKeyDetail): boolean {
@@ -3758,7 +3760,7 @@ function buildQuotaProgressItemsFromSnapshot(key: PoolKeyDetail): QuotaProgressI
       .filter((item): item is QuotaProgressItem => item != null)
   }
 
-  if (providerType === 'kiro') {
+  if (providerType === 'kiro' || providerType === 'xai') {
     const quotaResetAtSeconds = getQuotaSnapshotResetAtSeconds(quota)
     const quotaResetSeconds = getQuotaSnapshotResetSeconds(quota)
     const window = getQuotaSnapshotWindow(quota, 'usage')

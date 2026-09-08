@@ -105,17 +105,61 @@ pub fn insert_cli_identity_headers_if_needed(
     }
 }
 
-fn xai_using_api(transport: &GatewayProviderTransportSnapshot) -> bool {
-    if let Some(value) = auth_config_using_api(transport.key.decrypted_auth_config.as_deref()) {
+pub fn xai_auth_uses_api(auth_type: &str, decrypted_auth_config: Option<&str>) -> bool {
+    if let Some(value) = auth_config_using_api(decrypted_auth_config) {
         return value;
     }
-    let auth_type = transport.key.auth_type.trim().to_ascii_lowercase();
-    if auth_type == "oauth"
-        || auth_config_has_refresh_token(transport.key.decrypted_auth_config.as_deref())
-    {
+    let auth_type = auth_type.trim().to_ascii_lowercase();
+    if auth_type == "oauth" || auth_config_has_refresh_token(decrypted_auth_config) {
         return false;
     }
     matches!(auth_type.as_str(), "api_key" | "bearer" | "apikey")
+}
+
+pub fn extract_xai_user_id_from_auth_config(raw_auth_config: Option<&str>) -> Option<String> {
+    let value = parse_auth_config(raw_auth_config)?;
+    extract_xai_user_id_from_value(&value)
+}
+
+pub fn extract_xai_user_id_from_value(value: &Value) -> Option<String> {
+    const PATHS: &[&[&str]] = &[
+        &["userId"],
+        &["user_id"],
+        &["id"],
+        &["sub"],
+        &["user", "userId"],
+        &["user", "id"],
+        &["user", "user_id"],
+        &["user", "sub"],
+    ];
+    PATHS.iter().find_map(|path| {
+        let mut current = value;
+        for key in *path {
+            current = current.get(*key)?;
+        }
+        coerce_xai_id(current)
+    })
+}
+
+fn xai_using_api(transport: &GatewayProviderTransportSnapshot) -> bool {
+    xai_auth_uses_api(
+        transport.key.auth_type.as_str(),
+        transport.key.decrypted_auth_config.as_deref(),
+    )
+}
+
+fn coerce_xai_id(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Number(number) => {
+            let rendered = number.to_string();
+            (!rendered.is_empty()).then_some(rendered)
+        }
+        _ => None,
+    }
 }
 
 fn auth_config_using_api(raw_auth_config: Option<&str>) -> Option<bool> {
@@ -322,5 +366,30 @@ mod tests {
             headers.get("x-grok-client-identifier").map(String::as_str),
             Some(XAI_CLIENT_IDENTIFIER_VALUE)
         );
+    }
+
+    #[test]
+    fn extracts_user_id_from_user_payload_and_auth_config_sub() {
+        use super::{
+            extract_xai_user_id_from_auth_config, extract_xai_user_id_from_value, xai_auth_uses_api,
+        };
+        use serde_json::json;
+
+        assert_eq!(
+            extract_xai_user_id_from_value(&json!({"userId": "user-42"})).as_deref(),
+            Some("user-42")
+        );
+        assert_eq!(
+            extract_xai_user_id_from_auth_config(Some(r#"{"sub":"subject-1"}"#)).as_deref(),
+            Some("subject-1")
+        );
+        assert!(!xai_auth_uses_api(
+            "oauth",
+            Some(r#"{"refresh_token":"rt","using_api":false}"#)
+        ));
+        assert!(xai_auth_uses_api(
+            "bearer",
+            Some(r#"{"api_key":"xai-key","using_api":true}"#)
+        ));
     }
 }
