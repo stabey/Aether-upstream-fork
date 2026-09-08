@@ -29,6 +29,13 @@ pub fn is_xai_provider_transport(transport: &GatewayProviderTransportSnapshot) -
         .eq_ignore_ascii_case(XAI_PROVIDER_TYPE)
 }
 
+pub fn xai_uses_official_api(api_format: &str) -> bool {
+    matches!(
+        normalize_api_format_alias(api_format).as_str(),
+        "openai:responses:compact" | "openai:image" | "openai:video"
+    )
+}
+
 pub fn resolved_xai_upstream_base_url(
     transport: &GatewayProviderTransportSnapshot,
     api_format: &str,
@@ -37,8 +44,7 @@ pub fn resolved_xai_upstream_base_url(
         return None;
     }
     let stored = transport.endpoint.base_url.trim();
-    let compact = normalize_api_format_alias(api_format) == "openai:responses:compact";
-    if compact {
+    if xai_uses_official_api(api_format) {
         if stored.is_empty()
             || is_cli_chat_proxy_base_url(stored)
             || is_official_api_base_url(stored)
@@ -59,6 +65,14 @@ pub fn resolved_xai_upstream_base_url(
     Some(trim_base_url(stored))
 }
 
+pub fn resolved_xai_request_base_url(
+    transport: &GatewayProviderTransportSnapshot,
+    api_format: &str,
+) -> String {
+    resolved_xai_upstream_base_url(transport, api_format)
+        .unwrap_or_else(|| trim_base_url(&transport.endpoint.base_url))
+}
+
 pub fn should_attach_cli_identity_headers(
     transport: &GatewayProviderTransportSnapshot,
     api_format: &str,
@@ -66,7 +80,7 @@ pub fn should_attach_cli_identity_headers(
     if !is_xai_provider_transport(transport) {
         return false;
     }
-    if normalize_api_format_alias(api_format) == "openai:responses:compact" {
+    if xai_uses_official_api(api_format) {
         return false;
     }
     resolved_xai_upstream_base_url(transport, api_format)
@@ -327,6 +341,22 @@ mod tests {
             &api_key,
             "openai:responses"
         ));
+    }
+
+    #[test]
+    fn image_and_video_oauth_stay_on_official_api() {
+        let oauth = sample_transport(
+            "oauth",
+            Some(r#"{"refresh_token":"rt","using_api":false}"#),
+            XAI_CHAT_PROXY_BASE_URL,
+        );
+        for api_format in ["openai:image", "openai:video"] {
+            assert_eq!(
+                resolved_xai_upstream_base_url(&oauth, api_format).as_deref(),
+                Some(XAI_API_BASE_URL)
+            );
+            assert!(!should_attach_cli_identity_headers(&oauth, api_format));
+        }
     }
 
     #[test]

@@ -84,6 +84,11 @@ fn is_dedicated_openai_image_provider(transport: &GatewayProviderTransportSnapsh
             .trim()
             .eq_ignore_ascii_case("codex")
         || is_grok_provider_transport(transport)
+        || transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("xai")
 }
 
 pub fn resolve_openai_image_auth(
@@ -92,7 +97,10 @@ pub fn resolve_openai_image_auth(
     if is_grok_provider_transport(transport) {
         return resolve_grok_session_auth(transport);
     }
-    resolve_local_openai_bearer_auth(transport)
+    resolve_local_openai_bearer_auth(transport).or_else(|| {
+        crate::generic_oauth::resolve_local_generic_oauth_transport_authorization(transport)
+            .map(|value| ("authorization".to_string(), value))
+    })
 }
 
 pub fn build_openai_image_upstream_url(
@@ -100,7 +108,11 @@ pub fn build_openai_image_upstream_url(
     request_path: Option<&str>,
     request_query: Option<&str>,
 ) -> String {
-    build_openai_image_url(&transport.endpoint.base_url, request_path, request_query)
+    build_openai_image_url(
+        &crate::xai::resolved_xai_request_base_url(transport, "openai:image"),
+        request_path,
+        request_query,
+    )
 }
 
 pub fn build_openai_image_headers(
@@ -277,6 +289,29 @@ mod tests {
         assert_eq!(
             openai_image_transport_unsupported_reason(&transport, "openai:image"),
             None
+        );
+    }
+
+    #[test]
+    fn xai_oauth_image_uses_official_api() {
+        let mut transport = sample_transport();
+        transport.provider.provider_type = "xai".to_string();
+        transport.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
+        transport.key.auth_type = "oauth".to_string();
+        transport.key.decrypted_auth_config =
+            Some(r#"{"refresh_token":"rt","using_api":false}"#.to_string());
+
+        assert_eq!(
+            openai_image_transport_unsupported_reason(&transport, "openai:image"),
+            None
+        );
+        assert_eq!(
+            build_openai_image_upstream_url(&transport, Some("/v1/images/generations"), None),
+            "https://api.x.ai/v1/images/generations"
+        );
+        assert_eq!(
+            build_openai_image_upstream_url(&transport, Some("/v1/images/edits"), None),
+            "https://api.x.ai/v1/images/edits"
         );
     }
 

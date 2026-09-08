@@ -7,6 +7,7 @@ pub mod request;
 pub mod response;
 pub mod spec;
 pub mod stream;
+pub mod xai;
 
 const TOOL_ERROR_PREFIX: &str = "[tool error]";
 const AETHER_REASONING_ITEM_ID_PREFIX: &str = "rs_aether_";

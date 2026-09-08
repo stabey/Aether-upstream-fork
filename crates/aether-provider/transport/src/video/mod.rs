@@ -92,7 +92,7 @@ pub fn resolve_local_video_task_transport(
             if !supports_local_standard_transport(transport, api_format) {
                 return None;
             }
-            resolve_local_openai_bearer_auth(transport)?
+            resolve_openai_compatible_video_auth(transport)?
         }
         "gemini:video" => {
             if !supports_local_gemini_transport(transport, api_format) {
@@ -105,7 +105,7 @@ pub fn resolve_local_video_task_transport(
 
     Some(LocalVideoTaskTransport::from_bridge_input(
         LocalVideoTaskTransportBridgeInput {
-            upstream_base_url: transport.endpoint.base_url.clone(),
+            upstream_base_url: crate::xai::resolved_xai_request_base_url(transport, api_format),
             provider_name: Some(transport.provider.name.clone()),
             provider_id: transport.provider.id.clone(),
             endpoint_id: transport.endpoint.id.clone(),
@@ -141,7 +141,7 @@ pub fn resolve_video_create_auth(
     family: ProviderVideoCreateFamily,
 ) -> Option<(String, String)> {
     match family {
-        ProviderVideoCreateFamily::OpenAi => resolve_local_openai_bearer_auth(transport),
+        ProviderVideoCreateFamily::OpenAi => resolve_openai_compatible_video_auth(transport),
         ProviderVideoCreateFamily::Gemini => resolve_local_gemini_auth(transport),
     }
 }
@@ -173,6 +173,15 @@ pub fn build_video_create_request_body(
     Some(provider_request_body)
 }
 
+fn resolve_openai_compatible_video_auth(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Option<(String, String)> {
+    resolve_local_openai_bearer_auth(transport).or_else(|| {
+        crate::generic_oauth::resolve_local_generic_oauth_transport_authorization(transport)
+            .map(|value| ("authorization".to_string(), value))
+    })
+}
+
 pub fn build_video_create_upstream_url(
     transport: &GatewayProviderTransportSnapshot,
     request_path: &str,
@@ -193,7 +202,13 @@ pub fn build_video_create_upstream_url(
             ProviderVideoCreateFamily::Gemini => &["key"][..],
         };
         return build_passthrough_path_url(
-            &transport.endpoint.base_url,
+            &crate::xai::resolved_xai_request_base_url(
+                transport,
+                match family {
+                    ProviderVideoCreateFamily::OpenAi => "openai:video",
+                    ProviderVideoCreateFamily::Gemini => "gemini:video",
+                },
+            ),
             path,
             request_query,
             blocked_keys,
@@ -202,7 +217,7 @@ pub fn build_video_create_upstream_url(
 
     match family {
         ProviderVideoCreateFamily::OpenAi => build_passthrough_path_url(
-            &transport.endpoint.base_url,
+            &crate::xai::resolved_xai_request_base_url(transport, "openai:video"),
             openai_video_api_root_request_path(request_path),
             request_query,
             &[],
@@ -487,6 +502,25 @@ mod tests {
         .expect("url should build");
 
         assert_eq!(url, "https://api.openai.example/v1/videos?trace=1");
+    }
+
+    #[test]
+    fn xai_oauth_video_uses_official_api() {
+        let mut transport = sample_transport("openai:video", "oauth");
+        transport.provider.provider_type = "xai".to_string();
+        transport.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
+        transport.key.decrypted_auth_config =
+            Some(r#"{"refresh_token":"rt","using_api":false}"#.to_string());
+        let url = build_video_create_upstream_url(
+            &transport,
+            "/v1/videos/generations",
+            None,
+            "grok-imagine-video",
+            ProviderVideoCreateFamily::OpenAi,
+        )
+        .expect("url should build");
+
+        assert_eq!(url, "https://api.x.ai/v1/videos/generations");
     }
 
     #[test]

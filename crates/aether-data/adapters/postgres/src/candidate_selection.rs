@@ -105,7 +105,7 @@ INNER JOIN LATERAL (
       OR (
         LOWER(BTRIM(p.provider_type)) = 'xai'
         AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
-        AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:chat')
+        AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
       )
       OR (
         LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -196,7 +196,7 @@ WHERE p.is_active = TRUE
     OR (
       LOWER(BTRIM(p.provider_type)) = 'xai'
       AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
-      AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:chat')
+      AND LOWER($3) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -380,7 +380,7 @@ INNER JOIN LATERAL (
       OR (
         LOWER(BTRIM(p.provider_type)) = 'xai'
         AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
-        AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:chat')
+        AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
       )
       OR (
         LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -472,7 +472,7 @@ WHERE p.is_active = TRUE
     OR (
       LOWER(BTRIM(p.provider_type)) = 'xai'
       AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
-      AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:chat')
+      AND LOWER($4) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
     )
     OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -664,7 +664,7 @@ WHERE p.is_active = TRUE
       OR (
         LOWER(BTRIM(p.provider_type)) = 'xai'
         AND LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')
-        AND LOWER($6) IN ('openai:responses', 'openai:responses:compact', 'openai:chat')
+        AND LOWER($6) IN ('openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video')
       )
     OR (
       LOWER(BTRIM(p.provider_type)) IN ('gemini_cli', 'antigravity')
@@ -1758,7 +1758,9 @@ mod tests {
         ] {
             assert!(sql.contains("LOWER(BTRIM(p.provider_type)) = 'xai'"));
             assert!(sql.contains("LOWER(BTRIM(pak.auth_type)) IN ('oauth', 'bearer', 'api_key')"));
-            assert!(sql.contains("'openai:responses', 'openai:responses:compact', 'openai:chat'"));
+            assert!(sql.contains(
+                "'openai:responses', 'openai:responses:compact', 'openai:image', 'openai:video'"
+            ));
             assert!(sql.contains("'xai'"));
         }
     }

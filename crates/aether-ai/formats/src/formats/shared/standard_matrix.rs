@@ -17,6 +17,7 @@ use crate::formats::openai::responses::codex::{
     apply_codex_openai_responses_chat_body_edits, apply_codex_openai_responses_special_body_edits,
     apply_openai_responses_compact_special_body_edits,
 };
+use crate::formats::openai::responses::xai::apply_xai_upstream_payload_edits_with_client;
 use crate::formats::shared::standard_normalize::{
     build_local_openai_chat_request_body_with_model_directives,
     is_claude_messages_shaped_body_on_openai_chat_endpoint,
@@ -199,6 +200,13 @@ pub fn build_standard_request_body_with_model_directives_and_request_headers_and
     apply_openai_responses_compact_special_body_edits(
         &mut provider_request_body,
         provider_api_format,
+    );
+    apply_xai_upstream_payload_edits_with_client(
+        &mut provider_request_body,
+        provider_type,
+        provider_api_format,
+        Some(client_api_format),
+        Some(body_json),
     );
     crate::formats::openai::responses::strip_incompatible_openai_responses_reasoning_items_with_policy(
         &mut provider_request_body,
@@ -2076,5 +2084,127 @@ mod tests {
             true
         );
         assert_eq!(gemini["toolConfig"]["functionCallingConfig"]["mode"], "ANY");
+    }
+
+    #[test]
+    fn xai_standard_conversion_strips_unsupported_responses_fields() {
+        let request = json!({
+            "model": "source-model",
+            "messages": [{"role": "user", "content": "Hello xAI"}],
+            "max_tokens": 128,
+            "stop": ["END"],
+            "stream_options": {"include_usage": true},
+            "web_search_options": {"search_context_size": "high"}
+        });
+        let converted = build_standard_request_body(
+            &request,
+            "openai:chat",
+            "grok-4.6",
+            "xai",
+            "openai:responses",
+            "/v1/chat/completions",
+            true,
+            None,
+            None,
+        )
+        .expect("chat should convert onto xAI Responses");
+
+        assert_eq!(converted["model"], "grok-4.6");
+        assert!(converted.get("stop").is_none());
+        assert!(converted.get("stream_options").is_none());
+        assert!(converted.get("previous_response_id").is_none());
+        assert!(converted.get("input").is_some() || converted.get("messages").is_none());
+        assert_eq!(converted["max_output_tokens"], 128);
+        assert_eq!(converted["tools"][0]["type"], "web_search");
+    }
+
+    #[test]
+    fn xai_standard_conversion_covers_claude_and_gemini_clients() {
+        let claude = json!({
+            "model": "claude-sonnet",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Hello xAI"}],
+            "tools": [
+                {"type": "web_search_20250305", "name": "web_search"},
+                {
+                    "name": "lookup",
+                    "description": "Look something up",
+                    "input_schema": {"type": "object", "properties": {}}
+                }
+            ],
+            "tool_choice": {"type": "tool", "name": "web_search"}
+        });
+        let converted = build_standard_request_body(
+            &claude,
+            "claude:messages",
+            "grok-4.6",
+            "xai",
+            "openai:responses",
+            "/v1/messages",
+            true,
+            None,
+            None,
+        )
+        .expect("claude should convert onto xAI Responses");
+        assert_eq!(converted["model"], "grok-4.6");
+        assert!(converted.get("context_management").is_none());
+        assert!(converted
+            .get("include")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .all(|item| item != "reasoning.encrypted_content"));
+        assert!(converted["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|tool| tool["type"] == "web_search"));
+        assert_eq!(converted["tool_choice"]["type"], "allowed_tools");
+        assert!(converted.get("input").is_some());
+
+        let gemini = json!({
+            "model": "gemini-2.5-pro",
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": "Hello xAI"}]
+            }],
+            "tools": [{"googleSearch": {}}]
+        });
+        let converted = build_standard_request_body(
+            &gemini,
+            "gemini:generate_content",
+            "grok-4.6",
+            "xai",
+            "openai:responses",
+            "/v1beta/models/gemini-2.5-pro:generateContent",
+            false,
+            None,
+            None,
+        )
+        .expect("gemini should convert onto xAI Responses");
+        assert_eq!(converted["model"], "grok-4.6");
+        assert_eq!(converted["tools"][0]["type"], "web_search");
+        assert!(converted.get("input").is_some());
+
+        let same_format = json!({
+            "model": "grok-4.6",
+            "input": "hello",
+            "previous_response_id": "resp_123",
+            "stop": ["END"]
+        });
+        let converted = build_standard_request_body(
+            &same_format,
+            "openai:responses",
+            "grok-4.6",
+            "xai",
+            "openai:responses",
+            "/v1/responses",
+            true,
+            None,
+            None,
+        )
+        .expect("same-format xAI Responses should sanitize in place");
+        assert!(converted.get("previous_response_id").is_none());
+        assert!(converted.get("stop").is_none());
     }
 }
