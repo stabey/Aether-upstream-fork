@@ -466,6 +466,8 @@ export interface XaiUpstreamMetadata {
   updated_at?: number
   subscription_title?: string
   usage_percentage?: number
+  remaining_percentage?: number
+  usage_label?: string
   usage_limit?: number
   current_usage?: number
   remaining?: number

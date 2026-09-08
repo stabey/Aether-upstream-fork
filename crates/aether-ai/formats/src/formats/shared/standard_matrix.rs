@@ -2094,6 +2094,7 @@ mod tests {
             "max_tokens": 128,
             "stop": ["END"],
             "stream_options": {"include_usage": true},
+            "metadata": {"user_id": "claude-session"},
             "web_search_options": {"search_context_size": "high"}
         });
         let converted = build_standard_request_body(
@@ -2113,6 +2114,7 @@ mod tests {
         assert!(converted.get("stop").is_none());
         assert!(converted.get("stream_options").is_none());
         assert!(converted.get("previous_response_id").is_none());
+        assert!(converted.get("metadata").is_none());
         assert!(converted.get("input").is_some() || converted.get("messages").is_none());
         assert_eq!(converted["max_output_tokens"], 128);
         assert_eq!(converted["tools"][0]["type"], "web_search");
@@ -2124,6 +2126,9 @@ mod tests {
             "model": "claude-sonnet",
             "max_tokens": 64,
             "messages": [{"role": "user", "content": "Hello xAI"}],
+            "metadata": {
+                "user_id": "{\"device_id\":\"dev-1\",\"account_uuid\":\"acct-1\",\"session_id\":\"sess-1\"}"
+            },
             "tools": [
                 {"type": "web_search_20250305", "name": "web_search"},
                 {
@@ -2147,6 +2152,7 @@ mod tests {
         )
         .expect("claude should convert onto xAI Responses");
         assert_eq!(converted["model"], "grok-4.6");
+        assert!(converted.get("metadata").is_none());
         assert!(converted.get("context_management").is_none());
         assert!(converted
             .get("include")
@@ -2190,7 +2196,8 @@ mod tests {
             "model": "grok-4.6",
             "input": "hello",
             "previous_response_id": "resp_123",
-            "stop": ["END"]
+            "stop": ["END"],
+            "metadata": {"user_id": "claude-session"}
         });
         let converted = build_standard_request_body(
             &same_format,
@@ -2206,5 +2213,6 @@ mod tests {
         .expect("same-format xAI Responses should sanitize in place");
         assert!(converted.get("previous_response_id").is_none());
         assert!(converted.get("stop").is_none());
+        assert!(converted.get("metadata").is_none());
     }
 }

@@ -526,19 +526,25 @@
                       />
                       <div class="space-y-2">
                         <ProviderQuotaProgressRow
-                          v-if="getXaiQuotaDisplay(key)?.usage_percentage !== undefined"
+                          v-if="getXaiQuotaDisplay(key)?.usage_percentage !== undefined || getXaiQuotaDisplay(key)?.remaining_percentage !== undefined"
                           :label="legacyT(getXaiUsageLabel(key))"
-                          :used-percent="getXaiQuotaDisplay(key)?.usage_percentage || 0"
-                          :meter-class="getQuotaRemainingClass(getXaiQuotaDisplay(key)?.usage_percentage || 0)"
-                          :bar-class="getQuotaRemainingBarColor(getXaiQuotaDisplay(key)?.usage_percentage || 0)"
+                          :used-percent="getXaiUsedPercent(key)"
+                          :remaining-percent="getXaiRemainingPercent(key)"
+                          :meter-class="getQuotaRemainingClass(getXaiUsedPercent(key))"
+                          :bar-class="getQuotaRemainingBarColor(getXaiUsedPercent(key))"
+                          :reset-text="getXaiQuotaDisplay(key)?.next_reset_at
+                            ? `${formatKiroResetTime(getXaiQuotaDisplay(key)?.next_reset_at)}${legacyT('重置')}`
+                            : null"
                         >
-                          <template #footer>
+                          <template
+                            v-if="getXaiQuotaDisplay(key)?.usage_limit != null"
+                            #footer
+                          >
                             <div class="flex items-center justify-between text-[9px] text-muted-foreground/70 mt-0.5">
-                              <span v-if="getXaiQuotaDisplay(key)?.usage_limit != null">
+                              <span>
                                 {{ formatKiroUsage(getXaiQuotaDisplay(key)?.current_usage) }} /
                                 {{ formatKiroUsage(getXaiQuotaDisplay(key)?.usage_limit) }}
                               </span>
-                              <span v-else>{{ formatKiroUsage(getXaiQuotaDisplay(key)?.usage_percentage) }}%</span>
                               <span v-if="getXaiQuotaDisplay(key)?.next_reset_at">
                                 {{ formatKiroResetTime(getXaiQuotaDisplay(key)?.next_reset_at) }}{{ legacyT('重置') }}
                               </span>
@@ -2248,7 +2254,11 @@ function getXaiQuotaDisplay(key: EndpointAPIKey): XaiUpstreamMetadata | null {
     ?? null
   if (usageWindow) {
     const usedPercent = getQuotaWindowUsedPercent(usageWindow)
+    const remainingPercent = getQuotaWindowRemainingPercent(usageWindow)
     if (usedPercent !== undefined) display.usage_percentage = usedPercent
+    if (remainingPercent !== undefined) display.remaining_percentage = remainingPercent
+    const usageLabel = String(usageWindow.label || '').trim()
+    if (usageLabel) display.usage_label = usageLabel
     if (typeof usageWindow.used_value === 'number') display.current_usage = usageWindow.used_value
     if (typeof usageWindow.limit_value === 'number') display.usage_limit = usageWindow.limit_value
     if (typeof usageWindow.remaining_value === 'number') display.remaining = usageWindow.remaining_value
@@ -2277,12 +2287,34 @@ function getXaiQuotaDisplay(key: EndpointAPIKey): XaiUpstreamMetadata | null {
 
 function hasXaiQuotaDisplayData(key: EndpointAPIKey): boolean {
   const xai = getXaiQuotaDisplay(key)
-  return !!xai && (xai.usage_percentage !== undefined || xai.prepaid_balance !== undefined || xai.on_demand_cap !== undefined)
+  return !!xai && (
+    xai.usage_percentage !== undefined
+    || xai.remaining_percentage !== undefined
+    || xai.prepaid_balance !== undefined
+    || xai.on_demand_cap !== undefined
+  )
 }
 
 function getXaiUsageLabel(key: EndpointAPIKey): string {
-  const title = getXaiQuotaDisplay(key)?.subscription_title
+  const display = getXaiQuotaDisplay(key)
+  if (display?.usage_label) return display.usage_label
+  const title = display?.subscription_title
   return title ? `使用额度 (${title})` : '使用额度'
+}
+
+function getXaiUsedPercent(key: EndpointAPIKey): number {
+  return Math.min(Math.max(100 - getXaiRemainingPercent(key), 0), 100)
+}
+
+function getXaiRemainingPercent(key: EndpointAPIKey): number {
+  const xai = getXaiQuotaDisplay(key)
+  if (xai?.remaining_percentage != null && Number.isFinite(xai.remaining_percentage)) {
+    return Math.min(Math.max(xai.remaining_percentage, 0), 100)
+  }
+  if (xai?.usage_percentage != null && Number.isFinite(xai.usage_percentage)) {
+    return Math.min(Math.max(100 - xai.usage_percentage, 0), 100)
+  }
+  return 0
 }
 
 function getXaiOnDemandUsedPercent(key: EndpointAPIKey): number {

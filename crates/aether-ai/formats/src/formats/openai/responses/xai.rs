@@ -6,6 +6,7 @@ const XAI_RESPONSES_UNSUPPORTED_BODY_FIELDS: &[&str] = &[
     "safety_identifier",
     "stream_options",
     "stop",
+    "metadata",
 ];
 const XAI_ENCRYPTED_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
 const XAI_WEB_SEARCH_TOOL_TYPE: &str = "web_search";
@@ -741,6 +742,9 @@ mod tests {
             "safety_identifier": "user-1",
             "stream_options": {"include_obfuscation": true},
             "stop": ["END"],
+            "metadata": {
+                "user_id": "{\"device_id\":\"dev-1\",\"account_uuid\":\"acct-1\",\"session_id\":\"sess-1\"}"
+            },
             "include": ["reasoning.encrypted_content", "file_search_call.results"],
             "tool_choice": "auto",
             "parallel_tool_calls": true,
