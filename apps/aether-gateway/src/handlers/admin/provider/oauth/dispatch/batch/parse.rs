@@ -1477,7 +1477,7 @@ mod tests {
                 &auth_config,
                 Some(0),
             ),
-            "antigravity_anti@example.com"
+            "anti@example.com"
         );
     }
 
