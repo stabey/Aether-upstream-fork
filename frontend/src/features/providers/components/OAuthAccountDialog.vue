@@ -1992,12 +1992,12 @@ function currentBrowserUserAgent(): string | undefined {
 
 function inferGrokBrowserProfile(userAgent: string | undefined): string | undefined {
   const value = (userAgent || '').toLowerCase()
-  if (!value) return 'chrome136'
+  if (!value) return 'chrome145'
   if (value.includes('firefox/')) return 'firefox'
   if (value.includes('safari/') && !value.includes('chrome/') && !value.includes('chromium/')) {
     return value.includes('iphone') || value.includes('ipad') ? 'safari_ios' : 'safari'
   }
-  return 'chrome136'
+  return 'chrome145'
 }
 
 function buildGrokCookieProfile(cookies: Map<string, string>): string | undefined {

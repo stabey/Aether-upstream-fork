@@ -15,12 +15,14 @@ use crate::snapshot::GatewayProviderTransportSnapshot;
 pub const GROK_INTERNAL_HEADER: &str = "x-aether-grok-runtime";
 pub const GROK_DEFAULT_BASE_URL: &str = "https://grok.com";
 pub const GROK_CHAT_PATH: &str = "/rest/app-chat/conversations/new";
+pub const GROK_GATEWAY_WS_PATH: &str = "/ws/mgw/";
+pub const GROK_SESSION_PATH: &str = "/api/auth/session";
 pub const GROK_RATE_LIMITS_PATH: &str = "/rest/rate-limits";
 pub const GROK_IMAGE_EDIT_MODEL_NAME: &str = "imagine-image-edit";
 pub const GROK_IMAGE_EDIT_MODEL_KIND: &str = "imagine";
 
-pub const GROK_DEFAULT_BROWSER_PROFILE: &str = "chrome136";
-pub const GROK_DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+pub const GROK_DEFAULT_BROWSER_PROFILE: &str = "chrome145";
+pub const GROK_DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 const GROK_IMAGE_GENERATION_MAX_COUNT: u64 = 4;
 const GROK_SEC_CH_UA_PLATFORM: &str = r#""macOS""#;
 const GROK_STATSIG_ID: &str = "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk=";
@@ -102,6 +104,340 @@ pub fn build_grok_upstream_url(transport: &GatewayProviderTransportSnapshot, pat
     } else {
         format!("{base_url}/{path}")
     }
+}
+
+pub fn grok_session_url(base_url: &str) -> String {
+    format!("{}{GROK_SESSION_PATH}", grok_base_url(base_url))
+}
+
+pub fn grok_gateway_ws_url(base_url: &str, user_id: &str) -> String {
+    let http_base = grok_base_url(base_url);
+    let ws_base = if let Some(rest) = http_base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = http_base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        "wss://grok.com".to_string()
+    };
+    format!("{ws_base}{GROK_GATEWAY_WS_PATH}?uid={user_id}")
+}
+
+pub fn grok_cookie_with_userid(cookie: &str, user_id: &str) -> String {
+    let user_id = user_id.trim();
+    let mut parts = cookie
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter(|part| !part.to_ascii_lowercase().starts_with("x-userid="))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if !user_id.is_empty() {
+        parts.push(format!("x-userid={user_id}"));
+    }
+    parts.join("; ")
+}
+
+pub fn parse_grok_session_user_id(value: &Value) -> Option<String> {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if status.eq_ignore_ascii_case("unauthenticated") || status.eq_ignore_ascii_case("blocked") {
+        return None;
+    }
+    let candidates = [
+        value
+            .get("session")
+            .and_then(|session| session.get("userId"))
+            .and_then(Value::as_str),
+        value
+            .get("user")
+            .and_then(|user| user.get("id"))
+            .and_then(Value::as_str),
+        value
+            .get("user")
+            .and_then(|user| user.get("userId"))
+            .and_then(Value::as_str),
+        value
+            .get("user")
+            .and_then(|user| user.get("sub"))
+            .and_then(Value::as_str),
+        value.get("id").and_then(Value::as_str),
+        value.get("userId").and_then(Value::as_str),
+        value.get("sub").and_then(Value::as_str),
+    ];
+    candidates.into_iter().find_map(|candidate| {
+        let candidate = candidate.map(str::trim).filter(|value| !value.is_empty())?;
+        Uuid::parse_str(candidate).ok()?;
+        Some(candidate.to_string())
+    })
+}
+
+pub fn grok_web_mode_id_for_model(model: Option<&str>) -> &'static str {
+    grok_mode_id_for_model(model)
+}
+
+pub fn grok_gateway_session_create_event(mode: &str, event_id: &str) -> Value {
+    json!({
+        "event": {
+            "type": "session.create",
+            "event_id": event_id,
+            "session": {
+                "model": mode,
+                "x_grok": {
+                    "protocol_capabilities": ["conversation_attached", "custom_methods_v1"],
+                    "use_chunk": true,
+                    "enable_side_by_side": true,
+                    "force_side_by_side": false,
+                    "enable_image_generation": true,
+                    "image_generation_count": 2,
+                    "disable_text_follow_ups": false,
+                    "disable_artifact": true,
+                    "force_concise": false,
+                    "keep_context": false,
+                    "is_temporary": true,
+                    "disable_memory": true,
+                }
+            }
+        }
+    })
+}
+
+pub fn grok_gateway_turn_events(
+    session_id: &str,
+    prompt: &str,
+    file_ids: &[String],
+    now_ms: u64,
+) -> (Value, Value) {
+    let mut chunks = Vec::with_capacity(file_ids.len() + 1);
+    for file_id in file_ids {
+        chunks.push(json!({
+            "mention": {
+                "target": {
+                    "file_mention": { "file_id": file_id }
+                }
+            }
+        }));
+    }
+    chunks.push(json!({ "text": { "text": prompt } }));
+    let mut item = json!({
+        "type": "message",
+        "role": "user",
+        "x_grok": {
+            "client_message_id": Uuid::new_v4().to_string(),
+            "input_chunks": chunks,
+        }
+    });
+    if !file_ids.is_empty() {
+        item["file_attachment_ids"] = json!(file_ids);
+    }
+    let mut item_event = json!({
+        "session_id": session_id,
+        "event": {
+            "type": "conversation.item.create",
+            "event_id": format!("evt_msg_{now_ms}"),
+            "item": item,
+        }
+    });
+    if !file_ids.is_empty() {
+        item_event["event"]["file_attachment_ids"] = json!(file_ids);
+    }
+    let response_event = json!({
+        "session_id": session_id,
+        "event": {
+            "type": "response.create",
+            "event_id": format!("evt_resp_{now_ms}"),
+        }
+    });
+    (item_event, response_event)
+}
+
+pub fn grok_gateway_ping_event(now_ms: u64) -> Value {
+    json!({
+        "event": {
+            "type": "ping",
+            "event_id": format!("evt_hb_{now_ms}")
+        }
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrokGatewayFrameKind {
+    SessionCreated {
+        session_id: Option<String>,
+        client_event_id: Option<String>,
+    },
+    ConversationAttached {
+        conversation_id: String,
+    },
+    TextDelta(String),
+    ReasoningDelta(String),
+    ImageUrl(String),
+    Done,
+    Error(String),
+    Other,
+}
+
+pub fn classify_grok_gateway_frame(value: &Value) -> GrokGatewayFrameKind {
+    let event = value.get("event").unwrap_or(value);
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "session.created" => GrokGatewayFrameKind::SessionCreated {
+            session_id: value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            client_event_id: event
+                .get("client_event_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+        },
+        "conversation.attached" => {
+            let conversation_id = event
+                .get("conversation")
+                .and_then(|conversation| conversation.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_default()
+                .to_string();
+            GrokGatewayFrameKind::ConversationAttached { conversation_id }
+        }
+        "response.chunk" => classify_grok_gateway_chunk(event.get("chunk")),
+        "response.output_text.delta" => event
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|delta| GrokGatewayFrameKind::TextDelta(delta.to_string()))
+            .unwrap_or(GrokGatewayFrameKind::Other),
+        "response.output_text.done" => GrokGatewayFrameKind::Other,
+        "response.done" => GrokGatewayFrameKind::Done,
+        "session.ended" => GrokGatewayFrameKind::Error(
+            "Grok Gateway session ended before the response completed".to_string(),
+        ),
+        "error" => GrokGatewayFrameKind::Error(grok_gateway_error_message(event)),
+        "response.grok.output" => classify_grok_gateway_output(event.get("output")),
+        _ => GrokGatewayFrameKind::Other,
+    }
+}
+
+fn classify_grok_gateway_chunk(chunk: Option<&Value>) -> GrokGatewayFrameKind {
+    let Some(chunk) = chunk else {
+        return GrokGatewayFrameKind::Other;
+    };
+    if let Some(cite) = chunk.get("render_citation") {
+        if let Some(url) = cite.get("url").and_then(Value::as_str).map(str::trim) {
+            if !url.is_empty() {
+                return GrokGatewayFrameKind::Other;
+            }
+        }
+    }
+    let text = chunk.get("text").and_then(Value::as_object);
+    let delta = text
+        .and_then(|text| text.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if delta.is_empty() {
+        return GrokGatewayFrameKind::Other;
+    }
+    let channel = text
+        .and_then(|text| text.get("channel"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if channel.contains("ANALYSIS") || channel.contains("REASONING") {
+        GrokGatewayFrameKind::ReasoningDelta(delta.to_string())
+    } else if channel.is_empty() || channel == "CHANNEL_ASSISTANT_RESPONSE" {
+        GrokGatewayFrameKind::TextDelta(delta.to_string())
+    } else {
+        GrokGatewayFrameKind::Other
+    }
+}
+
+fn classify_grok_gateway_output(output: Option<&Value>) -> GrokGatewayFrameKind {
+    let Some(output) = output else {
+        return GrokGatewayFrameKind::Other;
+    };
+    if let Some(stream_error) = output.get("stream_error") {
+        return GrokGatewayFrameKind::Error(grok_gateway_error_message(stream_error));
+    }
+    grok_gateway_image_url_from_card(output.get("card_attachment"))
+        .map(GrokGatewayFrameKind::ImageUrl)
+        .unwrap_or(GrokGatewayFrameKind::Other)
+}
+
+fn grok_gateway_image_url_from_card(card: Option<&Value>) -> Option<String> {
+    let card = card?;
+    match card {
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| grok_gateway_image_url_from_card(Some(item))),
+        Value::Object(object) => {
+            let parsed_json = object.get("jsonData").and_then(|value| match value {
+                Value::String(raw) => serde_json::from_str::<Value>(raw).ok(),
+                Value::Object(_) => Some(value.clone()),
+                _ => None,
+            });
+            let data = parsed_json.as_ref().unwrap_or(card);
+            let chunk = data
+                .get("image_chunk")
+                .or_else(|| data.get("imageChunk"))
+                .and_then(Value::as_object)?;
+            if chunk
+                .get("moderated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return None;
+            }
+            if chunk
+                .get("progress")
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+                < 100
+            {
+                return None;
+            }
+            chunk
+                .get("imageUrl")
+                .or_else(|| chunk.get("image_url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        }
+        _ => None,
+    }
+}
+
+fn grok_gateway_error_message(value: &Value) -> String {
+    value
+        .get("message")
+        .or_else(|| value.get("error"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(Value::as_object)
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "Grok Gateway returned an error".to_string())
 }
 
 pub fn resolve_grok_session_auth(
@@ -896,9 +1232,11 @@ mod tests {
 
     use super::{
         build_grok_app_chat_body, build_grok_browser_headers, build_grok_upstream_url,
-        grok_browser_resolved_transport_profile,
-        grok_browser_resolved_transport_profile_from_auth_config, resolve_grok_session_auth,
-        GrokHeaderInput, GROK_CHAT_PATH, GROK_INTERNAL_HEADER,
+        classify_grok_gateway_frame, grok_browser_resolved_transport_profile,
+        grok_browser_resolved_transport_profile_from_auth_config, grok_cookie_with_userid,
+        grok_gateway_session_create_event, grok_gateway_turn_events, grok_gateway_ws_url,
+        grok_session_url, parse_grok_session_user_id, resolve_grok_session_auth,
+        GrokGatewayFrameKind, GrokHeaderInput, GROK_CHAT_PATH, GROK_INTERNAL_HEADER,
     };
     use crate::snapshot::{
         GatewayProviderTransportEndpoint, GatewayProviderTransportKey,
@@ -1012,11 +1350,11 @@ mod tests {
         assert_eq!(headers.get("origin"), Some(&"https://grok.com".to_string()));
         assert!(headers
             .get("user-agent")
-            .is_some_and(|value| value.contains("Chrome/136.0.0.0")));
+            .is_some_and(|value| value.contains("Chrome/145.0.0.0")));
         assert_eq!(
             headers.get("sec-ch-ua"),
             Some(
-                &r#""Google Chrome";v="136", "Chromium";v="136", "Not(A:Brand";v="24""#.to_string()
+                &r#""Google Chrome";v="145", "Chromium";v="145", "Not(A:Brand";v="24""#.to_string()
             )
         );
         assert_eq!(
@@ -1356,6 +1694,111 @@ mod tests {
         assert_eq!(
             body["responseMetadata"]["modelConfigOverride"]["modelMap"]["imageEditModel"],
             "imagine"
+        );
+    }
+
+    #[test]
+    fn grok_gateway_urls_and_session_identity_match_web_protocol() {
+        let user_id = "497f19f8-49d4-458a-bee4-43ec3dcaf8ca";
+        assert_eq!(
+            grok_gateway_ws_url("https://grok.com", user_id),
+            format!("wss://grok.com/ws/mgw/?uid={user_id}")
+        );
+        assert_eq!(
+            grok_session_url("https://grok.com/"),
+            "https://grok.com/api/auth/session"
+        );
+        assert_eq!(
+            parse_grok_session_user_id(&json!({
+                "session": { "userId": user_id }
+            }))
+            .as_deref(),
+            Some(user_id)
+        );
+        assert!(parse_grok_session_user_id(&json!({
+            "status": "unauthenticated",
+            "session": { "userId": user_id }
+        }))
+        .is_none());
+        assert!(parse_grok_session_user_id(&json!({
+            "userId": "not-a-uuid"
+        }))
+        .is_none());
+        assert_eq!(
+            grok_cookie_with_userid("sso=abc; sso-rw=abc", user_id),
+            format!("sso=abc; sso-rw=abc; x-userid={user_id}")
+        );
+    }
+
+    #[test]
+    fn grok_gateway_session_and_turn_events_match_web_protocol() {
+        let created = grok_gateway_session_create_event("fast", "evt_init_1");
+        assert_eq!(created["event"]["type"], "session.create");
+        assert_eq!(created["event"]["session"]["model"], "fast");
+        assert_eq!(created["event"]["session"]["x_grok"]["is_temporary"], true);
+        assert_eq!(created["event"]["session"]["x_grok"]["keep_context"], false);
+
+        let (item, response) = grok_gateway_turn_events(
+            "conversation-1",
+            "hello",
+            &["file-1".to_string()],
+            1_700_000_000_000,
+        );
+        assert_eq!(item["session_id"], "conversation-1");
+        assert_eq!(item["event"]["type"], "conversation.item.create");
+        assert_eq!(item["event"]["file_attachment_ids"][0], "file-1");
+        assert_eq!(response["event"]["type"], "response.create");
+        let encoded = serde_json::to_string(&item).expect("item should serialize");
+        assert!(encoded.contains(r#""file_mention":{"file_id":"file-1"}"#));
+        assert!(encoded.contains(r#""text":{"text":"hello"}"#));
+        assert!(!serde_json::to_string(&response)
+            .expect("response should serialize")
+            .contains("castle_request_token"));
+    }
+
+    #[test]
+    fn grok_gateway_frames_collect_text_reasoning_and_completion() {
+        assert_eq!(
+            classify_grok_gateway_frame(&json!({
+                "session_id": "session-1",
+                "event": { "type": "session.created", "client_event_id": "evt_init_1" }
+            })),
+            GrokGatewayFrameKind::SessionCreated {
+                session_id: Some("session-1".to_string()),
+                client_event_id: Some("evt_init_1".to_string()),
+            }
+        );
+        assert_eq!(
+            classify_grok_gateway_frame(&json!({
+                "event": { "type": "conversation.attached", "conversation": { "id": "conversation-1" } }
+            })),
+            GrokGatewayFrameKind::ConversationAttached {
+                conversation_id: "conversation-1".to_string(),
+            }
+        );
+        assert_eq!(
+            classify_grok_gateway_frame(&json!({
+                "event": {
+                    "type": "response.chunk",
+                    "chunk": { "text": { "text": "TOKEN", "channel": "CHANNEL_ASSISTANT_RESPONSE" } }
+                }
+            })),
+            GrokGatewayFrameKind::TextDelta("TOKEN".to_string())
+        );
+        assert_eq!(
+            classify_grok_gateway_frame(&json!({
+                "event": {
+                    "type": "response.chunk",
+                    "chunk": { "text": { "text": "thought", "channel": "CHANNEL_ANALYSIS" } }
+                }
+            })),
+            GrokGatewayFrameKind::ReasoningDelta("thought".to_string())
+        );
+        assert_eq!(
+            classify_grok_gateway_frame(&json!({
+                "event": { "type": "response.done", "response": { "id": "response-1", "status": "completed" } }
+            })),
+            GrokGatewayFrameKind::Done
         );
     }
 }

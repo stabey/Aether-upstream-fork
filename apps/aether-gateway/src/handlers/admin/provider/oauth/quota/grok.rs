@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn quota_headers_default_to_chrome136_clearance_profile() {
+    fn quota_headers_default_to_chrome145_clearance_profile() {
         let auth_config = json!({
             "sso_token": "abc"
         });
@@ -689,11 +689,11 @@ mod tests {
 
         assert!(headers
             .get("user-agent")
-            .is_some_and(|value| value.contains("Chrome/136.0.0.0")));
+            .is_some_and(|value| value.contains("Chrome/145.0.0.0")));
         assert_eq!(
             headers.get("sec-ch-ua"),
             Some(
-                &r#""Google Chrome";v="136", "Chromium";v="136", "Not(A:Brand";v="24""#.to_string()
+                &r#""Google Chrome";v="145", "Chromium";v="145", "Not(A:Brand";v="24""#.to_string()
             )
         );
         assert_eq!(

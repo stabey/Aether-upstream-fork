@@ -959,7 +959,7 @@ describe('OAuthAccountDialog authorization and import', () => {
       cf_cookies: 'i18nextlng=zh; cf_clearance=cf-1; x-userid=user-1',
       cf_clearance: 'cf-1',
       user_agent: expect.any(String),
-      browser_profile: 'chrome136',
+      browser_profile: 'chrome145',
       user_id: 'user-1',
     }))
   })

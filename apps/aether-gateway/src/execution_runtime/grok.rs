@@ -3,21 +3,21 @@ use std::future::Future;
 use std::io::Error as IoError;
 use std::net::IpAddr;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aether_contracts::{
     ExecutionPlan, ExecutionResult, ExecutionStreamTerminalSummary, ExecutionTelemetry,
     RequestBody, ResponseBody, StandardizedUsage, StreamFrame, StreamFramePayload, StreamFrameType,
-    EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER,
+    EXECUTION_REQUEST_FOLLOW_REDIRECTS_HEADER, TRANSPORT_BACKEND_BROWSER_WREQ,
 };
 use axum::body::Bytes;
 use base64::Engine as _;
 use futures_util::stream::{self, BoxStream};
-use futures_util::StreamExt;
-use http::{HeaderMap, HeaderName, HeaderValue};
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
 use regex::{Captures, Regex};
 use serde_json::{json, Map, Value};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 use wreq::ws::message::Message as WreqWsMessage;
 
@@ -25,6 +25,12 @@ use crate::ai_serving::api::{
     convert_standard_chat_response, maybe_bridge_standard_sync_json_to_stream,
     CanonicalContentPart, CanonicalStreamEvent, CanonicalStreamFrame, ClaudeClientEmitter,
     OpenAIChatClientEmitter, OpenAIResponsesClientEmitter, StreamingCanonicalUsage,
+};
+use crate::ai_serving::transport::{
+    classify_grok_gateway_frame, grok_cookie_with_userid, grok_gateway_ping_event,
+    grok_gateway_session_create_event, grok_gateway_turn_events, grok_gateway_ws_url,
+    grok_session_url, grok_web_mode_id_for_model, parse_grok_session_user_id, GrokGatewayFrameKind,
+    GROK_DEFAULT_BASE_URL,
 };
 use crate::ai_serving::{
     openai_responses_message_item_id, openai_responses_synthetic_reasoning_item_id,
@@ -77,6 +83,9 @@ const GROK_MAX_IMAGINE_SLOTS: usize = 16;
 const GROK_MAX_ATTACHMENT_REDIRECTS: usize = 5;
 const GROK_IMAGINE_STREAM_TIMEOUT_MS: u64 = 10_000;
 const GROK_IMAGINE_ROUND_TIMEOUT_MS: u64 = 120_000;
+const GROK_GATEWAY_HEARTBEAT_MS: u64 = 25_000;
+const GROK_GATEWAY_ROUND_TIMEOUT_MS: u64 = 300_000;
+const GROK_GATEWAY_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 static GROK_RENDER_RE: OnceLock<Regex> = OnceLock::new();
 
@@ -230,6 +239,9 @@ async fn execute_grok_app_chat(
         return execute_grok_imagine_websocket(plan, report_context).await;
     }
     let upstream_plan = grok_upstream_plan(plan, report_context).await?;
+    if grok_should_use_gateway_websocket(plan, report_context)? {
+        return execute_grok_gateway_chat(&upstream_plan).await;
+    }
     let request_body = build_request_body(&upstream_plan)?;
     let started_at = Instant::now();
     let response = send_request(&upstream_plan, request_body).await?;
@@ -287,6 +299,9 @@ async fn execute_grok_app_chat_stream(
     report_context: Option<&Value>,
 ) -> Result<GrokRuntimeStream, ExecutionRuntimeTransportError> {
     let upstream_plan = grok_upstream_plan(plan, report_context).await?;
+    if grok_should_use_gateway_websocket(plan, report_context)? {
+        return execute_grok_gateway_chat_stream(&upstream_plan, report_context).await;
+    }
     let request_body = build_request_body(&upstream_plan)?;
     let started_at = Instant::now();
     let response = send_request(&upstream_plan, request_body).await?;
@@ -350,6 +365,29 @@ fn grok_should_use_imagine_websocket(
     let mapped_model = grok_upstream_model_name(report_context)?;
     let model = mapped_model.to_ascii_lowercase();
     Ok(model.contains("grok-imagine-image") && !model.contains("lite") && !model.contains("edit"))
+}
+
+fn grok_should_use_gateway_websocket(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> Result<bool, ExecutionRuntimeTransportError> {
+    if grok_should_use_imagine_websocket(plan, report_context)? {
+        return Ok(false);
+    }
+    if !grok_plan_uses_browser_wreq(plan) {
+        return Ok(false);
+    }
+    let mapped_model = grok_upstream_model_name(report_context)?;
+    Ok(!mapped_model.to_ascii_lowercase().contains("edit"))
+}
+
+fn grok_plan_uses_browser_wreq(plan: &ExecutionPlan) -> bool {
+    plan.transport_profile.as_ref().is_some_and(|profile| {
+        profile
+            .backend
+            .trim()
+            .eq_ignore_ascii_case(TRANSPORT_BACKEND_BROWSER_WREQ)
+    })
 }
 
 fn grok_should_collect_image_stream(
@@ -513,6 +551,410 @@ async fn grok_imagine_websocket_images(
         ));
     }
     Ok(images)
+}
+
+async fn execute_grok_gateway_chat(
+    plan: &ExecutionPlan,
+) -> Result<GrokCollected, ExecutionRuntimeTransportError> {
+    let started_at = Instant::now();
+    let mut adapter = GrokStreamAdapter::default();
+    let mut upstream_bytes = 0u64;
+    let mut ttfb_ms = None;
+    let body_stream = grok_gateway_ndjson_stream(plan).await?;
+    collect_grok_gateway_ndjson(
+        body_stream,
+        &mut adapter,
+        &mut upstream_bytes,
+        &mut ttfb_ms,
+        started_at,
+        execution_plan_response_body_limit_bytes(plan),
+    )
+    .await?;
+    Ok(GrokCollected {
+        status_code: 200,
+        headers: BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+        text: adapter.text,
+        thinking: adapter.thinking,
+        images: adapter.images,
+        telemetry: ExecutionTelemetry {
+            ttfb_ms,
+            elapsed_ms: Some(started_at.elapsed().as_millis() as u64),
+            upstream_bytes: Some(upstream_bytes),
+        },
+    })
+}
+
+async fn execute_grok_gateway_chat_stream(
+    plan: &ExecutionPlan,
+    report_context: Option<&Value>,
+) -> Result<GrokRuntimeStream, ExecutionRuntimeTransportError> {
+    let started_at = Instant::now();
+    let body_stream = grok_gateway_ndjson_stream(plan).await?;
+    Ok(GrokRuntimeStream {
+        frame_stream: grok_success_frame_stream(
+            plan.clone(),
+            200,
+            BTreeMap::from([("content-type".to_string(), "application/json".to_string())]),
+            started_at,
+            body_stream,
+        ),
+        report_context: report_context.cloned(),
+    })
+}
+
+async fn grok_gateway_ndjson_stream(
+    plan: &ExecutionPlan,
+) -> Result<GrokUpstreamBodyStream, ExecutionRuntimeTransportError> {
+    let user_id = resolve_grok_gateway_user_id(plan).await?;
+    let plan = grok_plan_with_userid(plan, &user_id);
+    let body = plan.body.json_body.as_ref().ok_or_else(|| {
+        ExecutionRuntimeTransportError::UpstreamRequest(
+            "Grok Gateway requires JSON request body".to_string(),
+        )
+    })?;
+    let prompt = grok_gateway_prompt_from_app_chat_body(body);
+    let file_ids = grok_gateway_file_ids_from_app_chat_body(body);
+    let mode = grok_web_mode_id_for_model(plan.model_name.as_deref()).to_string();
+    let ws_url = grok_gateway_ws_url(&grok_plan_http_origin(&plan.url), &user_id);
+    let (tx, rx) = mpsc::channel(32);
+    tokio::spawn(async move {
+        if let Err(err) =
+            run_grok_gateway_session(plan, ws_url, prompt, file_ids, mode, tx.clone()).await
+        {
+            let _ = tx.send(Err(err.to_string())).await;
+        }
+    });
+    Ok(async_stream::stream! {
+        let mut rx = rx;
+        while let Some(item) = rx.recv().await {
+            yield item;
+        }
+    }
+    .boxed())
+}
+
+async fn collect_grok_gateway_ndjson(
+    mut body_stream: GrokUpstreamBodyStream,
+    adapter: &mut GrokStreamAdapter,
+    upstream_bytes: &mut u64,
+    ttfb_ms: &mut Option<u64>,
+    started_at: Instant,
+    response_body_limit_bytes: usize,
+) -> Result<(), ExecutionRuntimeTransportError> {
+    while let Some(item) = body_stream.next().await {
+        let chunk = item.map_err(ExecutionRuntimeTransportError::UpstreamRequest)?;
+        if chunk.len()
+            > response_body_limit_bytes
+                .saturating_sub(usize::try_from(*upstream_bytes).unwrap_or(usize::MAX))
+        {
+            return Err(ExecutionRuntimeTransportError::UpstreamResponseTooLarge {
+                phase: UpstreamResponseBodyPhase::Wire,
+                limit_bytes: response_body_limit_bytes,
+            });
+        }
+        if ttfb_ms.is_none() {
+            *ttfb_ms = Some(started_at.elapsed().as_millis() as u64);
+        }
+        *upstream_bytes += chunk.len() as u64;
+        adapter.push_chunk(&chunk);
+    }
+    adapter.finish();
+    Ok(())
+}
+
+async fn resolve_grok_gateway_user_id(
+    plan: &ExecutionPlan,
+) -> Result<String, ExecutionRuntimeTransportError> {
+    if let Some(user_id) = grok_gateway_user_id_from_cookie(&plan.headers) {
+        return Ok(user_id);
+    }
+    let origin = grok_plan_http_origin(&plan.url);
+    let mut session_plan = plan.clone();
+    session_plan.method = "GET".to_string();
+    session_plan.url = grok_session_url(&origin);
+    session_plan.body = RequestBody {
+        json_body: None,
+        body_bytes_b64: None,
+        body_ref: None,
+    };
+    session_plan.stream = false;
+    session_plan.content_type = None;
+    let response = send_request(&session_plan, Vec::new()).await?;
+    let status_code = response.status_code();
+    let bytes = response.bytes().await?;
+    if !(200..300).contains(&status_code) {
+        return Err(ExecutionRuntimeTransportError::UpstreamRequest(format!(
+            "Grok session lookup returned {status_code}"
+        )));
+    }
+    let value = serde_json::from_slice::<Value>(&bytes).map_err(|err| {
+        ExecutionRuntimeTransportError::UpstreamRequest(format!(
+            "Grok session lookup returned invalid JSON: {err}"
+        ))
+    })?;
+    parse_grok_session_user_id(&value).ok_or_else(|| {
+        ExecutionRuntimeTransportError::UpstreamRequest(
+            "Grok cookie is missing x-userid; /api/auth/session did not return a UUID user id"
+                .to_string(),
+        )
+    })
+}
+
+fn grok_gateway_user_id_from_cookie(headers: &BTreeMap<String, String>) -> Option<String> {
+    let user_id = grok_user_id_from_cookie_header(headers)?;
+    let user_id = user_id.trim();
+    Uuid::parse_str(user_id).ok()?;
+    Some(user_id.to_string())
+}
+
+fn grok_plan_with_userid(plan: &ExecutionPlan, user_id: &str) -> ExecutionPlan {
+    let mut plan = plan.clone();
+    let cookie_key = plan
+        .headers
+        .keys()
+        .find(|name| name.eq_ignore_ascii_case("cookie"))
+        .cloned()
+        .unwrap_or_else(|| "cookie".to_string());
+    let cookie = plan.headers.get(&cookie_key).cloned().unwrap_or_default();
+    plan.headers
+        .insert(cookie_key, grok_cookie_with_userid(&cookie, user_id));
+    plan
+}
+
+fn grok_plan_http_origin(chat_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(chat_url) else {
+        return GROK_DEFAULT_BASE_URL.to_string();
+    };
+    match url.scheme() {
+        "http" | "https" => match url.host_str() {
+            Some(host) => match url.port() {
+                Some(port) => format!("{}://{host}:{port}", url.scheme()),
+                None => format!("{}://{host}", url.scheme()),
+            },
+            None => GROK_DEFAULT_BASE_URL.to_string(),
+        },
+        _ => GROK_DEFAULT_BASE_URL.to_string(),
+    }
+}
+
+fn grok_gateway_prompt_from_app_chat_body(body: &Value) -> String {
+    body.get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn grok_gateway_file_ids_from_app_chat_body(body: &Value) -> Vec<String> {
+    body.get("fileAttachments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn grok_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn grok_gateway_ndjson_line(value: &Value) -> Bytes {
+    let mut line = value.to_string();
+    line.push('\n');
+    Bytes::from(line)
+}
+
+fn grok_gateway_response_status(value: &Value) -> Option<&str> {
+    value
+        .get("event")
+        .unwrap_or(value)
+        .get("response")
+        .and_then(|response| response.get("status"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+async fn grok_gateway_send_json(
+    websocket: &mut wreq::ws::WebSocket,
+    value: &Value,
+) -> Result<(), ExecutionRuntimeTransportError> {
+    websocket
+        .send(WreqWsMessage::text(value.to_string()))
+        .await
+        .map_err(|err| {
+            ExecutionRuntimeTransportError::UpstreamRequest(format_wreq_upstream_request_error(
+                &err,
+            ))
+        })
+}
+
+async fn run_grok_gateway_session(
+    plan: ExecutionPlan,
+    ws_url: String,
+    prompt: String,
+    file_ids: Vec<String>,
+    mode: String,
+    tx: mpsc::Sender<Result<Bytes, String>>,
+) -> Result<(), ExecutionRuntimeTransportError> {
+    let headers = build_request_headers(&plan.headers, None, false)?;
+    let profile = plan.transport_profile.as_ref().ok_or_else(|| {
+        ExecutionRuntimeTransportError::UnsupportedTransportProfile("browser_wreq".to_string())
+    })?;
+    let client = build_browser_wreq_client(
+        plan.timeouts.as_ref(),
+        plan.proxy.as_ref(),
+        profile,
+        ExecutionTransportControls::default(),
+        true,
+    )?;
+    let response = client
+        .websocket(ws_url.as_str())
+        .headers(headers)
+        .max_frame_size(GROK_GATEWAY_MAX_FRAME_BYTES)
+        .max_message_size(GROK_GATEWAY_MAX_FRAME_BYTES)
+        .send()
+        .await
+        .map_err(|err| {
+            ExecutionRuntimeTransportError::UpstreamRequest(format_wreq_upstream_request_error(
+                &err,
+            ))
+        })?;
+    let status = response.status();
+    if !status.is_success() && status.as_u16() != 101 {
+        return Err(ExecutionRuntimeTransportError::UpstreamRequest(format!(
+            "Grok Gateway websocket returned {}",
+            status.as_u16()
+        )));
+    }
+    let mut websocket = response.into_websocket().await.map_err(|err| {
+        ExecutionRuntimeTransportError::UpstreamRequest(format_wreq_upstream_request_error(&err))
+    })?;
+    let initial_event_id = format!("evt_init_{}", Uuid::new_v4());
+    grok_gateway_send_json(
+        &mut websocket,
+        &grok_gateway_session_create_event(&mode, &initial_event_id),
+    )
+    .await?;
+
+    let deadline = Instant::now() + Duration::from_millis(GROK_GATEWAY_ROUND_TIMEOUT_MS);
+    let heartbeat = Duration::from_millis(GROK_GATEWAY_HEARTBEAT_MS);
+    let mut last_ping = Instant::now();
+    let mut session_created = false;
+    let mut conversation_attached = false;
+    let mut turn_sent = false;
+    let mut current_session_id = String::new();
+
+    loop {
+        if Instant::now() >= deadline {
+            return Err(ExecutionRuntimeTransportError::UpstreamRequest(
+                "Grok Gateway websocket timed out waiting for response.done".to_string(),
+            ));
+        }
+        if last_ping.elapsed() >= heartbeat {
+            grok_gateway_send_json(&mut websocket, &grok_gateway_ping_event(grok_unix_ms()))
+                .await?;
+            last_ping = Instant::now();
+        }
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(heartbeat.saturating_sub(last_ping.elapsed()));
+        let Ok(message) = tokio::time::timeout(wait, websocket.recv()).await else {
+            continue;
+        };
+        let Some(message) = message else {
+            return Err(ExecutionRuntimeTransportError::UpstreamRequest(
+                "Grok Gateway websocket closed before response.done".to_string(),
+            ));
+        };
+        let message = message.map_err(|err| {
+            ExecutionRuntimeTransportError::UpstreamRequest(format_wreq_upstream_request_error(
+                &err,
+            ))
+        })?;
+        let WreqWsMessage::Text(text) = message else {
+            continue;
+        };
+        if text.len() > GROK_GATEWAY_MAX_FRAME_BYTES {
+            return Err(ExecutionRuntimeTransportError::UpstreamRequest(
+                "Grok Gateway response frame exceeded the safety limit".to_string(),
+            ));
+        }
+        let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+            continue;
+        };
+        let _ = tx.send(Ok(grok_gateway_ndjson_line(&value))).await;
+        match classify_grok_gateway_frame(&value) {
+            GrokGatewayFrameKind::SessionCreated {
+                session_id,
+                client_event_id,
+            } => {
+                if client_event_id
+                    .as_deref()
+                    .is_some_and(|got| got != initial_event_id)
+                {
+                    continue;
+                }
+                session_created = true;
+                if current_session_id.is_empty() {
+                    if let Some(session_id) = session_id.filter(|value| !value.is_empty()) {
+                        current_session_id = session_id;
+                    }
+                }
+            }
+            GrokGatewayFrameKind::ConversationAttached { conversation_id } => {
+                if conversation_id.is_empty() {
+                    return Err(ExecutionRuntimeTransportError::UpstreamRequest(
+                        "Grok Gateway returned an empty conversation id".to_string(),
+                    ));
+                }
+                if current_session_id.is_empty() {
+                    current_session_id = conversation_id;
+                } else if current_session_id != conversation_id {
+                    return Err(ExecutionRuntimeTransportError::UpstreamRequest(
+                        "Grok Gateway returned an inconsistent conversation id".to_string(),
+                    ));
+                }
+                conversation_attached = true;
+            }
+            GrokGatewayFrameKind::Done => {
+                if let Some(status) = grok_gateway_response_status(&value) {
+                    if status != "completed" {
+                        return Err(ExecutionRuntimeTransportError::UpstreamRequest(format!(
+                            "Grok Gateway response status is {status}"
+                        )));
+                    }
+                }
+                return Ok(());
+            }
+            GrokGatewayFrameKind::Error(message) => {
+                return Err(ExecutionRuntimeTransportError::UpstreamRequest(message));
+            }
+            GrokGatewayFrameKind::TextDelta(_)
+            | GrokGatewayFrameKind::ReasoningDelta(_)
+            | GrokGatewayFrameKind::ImageUrl(_)
+            | GrokGatewayFrameKind::Other => {}
+        }
+        if session_created && conversation_attached && !turn_sent {
+            if current_session_id.is_empty() {
+                return Err(ExecutionRuntimeTransportError::UpstreamRequest(
+                    "Grok Gateway session.create completed without a conversation id".to_string(),
+                ));
+            }
+            turn_sent = true;
+            let (item_event, response_event) =
+                grok_gateway_turn_events(&current_session_id, &prompt, &file_ids, grok_unix_ms());
+            grok_gateway_send_json(&mut websocket, &item_event).await?;
+            grok_gateway_send_json(&mut websocket, &response_event).await?;
+        }
+    }
 }
 
 async fn collect_grok_response_stream(
@@ -2950,6 +3392,16 @@ impl GrokStreamAdapter {
     }
 
     fn handle_event(&mut self, value: &Value) {
+        if value
+            .get("event")
+            .unwrap_or(value)
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            self.handle_gateway_event(value);
+            return;
+        }
         let Some(response) = value
             .get("result")
             .and_then(|result| result.get("response"))
@@ -2972,6 +3424,26 @@ impl GrokStreamAdapter {
                 let cleaned = self.clean_token(token);
                 self.text.push_str(&cleaned);
             }
+        }
+    }
+
+    fn handle_gateway_event(&mut self, value: &Value) {
+        match classify_grok_gateway_frame(value) {
+            GrokGatewayFrameKind::TextDelta(delta) => {
+                let cleaned = self.clean_token(&delta);
+                self.text.push_str(&cleaned);
+            }
+            GrokGatewayFrameKind::ReasoningDelta(delta) => {
+                self.thinking.push_str(&delta);
+            }
+            GrokGatewayFrameKind::ImageUrl(url) => {
+                self.push_image_url(grok_asset_url(&url));
+            }
+            GrokGatewayFrameKind::SessionCreated { .. }
+            | GrokGatewayFrameKind::ConversationAttached { .. }
+            | GrokGatewayFrameKind::Done
+            | GrokGatewayFrameKind::Error(_)
+            | GrokGatewayFrameKind::Other => {}
         }
     }
 
@@ -3872,8 +4344,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use aether_contracts::{
-        ExecutionErrorKind, ExecutionPhase, ExecutionPlan, RequestBody, StreamFrame,
-        StreamFramePayload,
+        ExecutionErrorKind, ExecutionPhase, ExecutionPlan, RequestBody, ResolvedTransportProfile,
+        StreamFrame, StreamFramePayload, TRANSPORT_BACKEND_BROWSER_WREQ,
     };
     use axum::body::{Body, Bytes};
     use axum::extract::Request;
@@ -3889,12 +4361,14 @@ mod tests {
         grok_attachment_ip_is_public, grok_attachment_payload_from_data_uri,
         grok_attachment_payload_from_data_uri_with_limit, grok_auxiliary_http_error,
         grok_client_json_body, grok_client_stream_body, grok_data_image_parts_with_limit,
-        grok_execution_result, grok_handle_imagine_ws_message,
-        grok_handle_imagine_ws_message_with_slot_limit, grok_image_count_from_provider_body,
-        grok_image_mime_for_payload, grok_image_prompt_from_provider_body,
-        grok_imagine_blob_lengths_can_be_retained, grok_imagine_request_message,
-        grok_imagine_reset_message, grok_media_post_url,
-        grok_plan_uses_structured_image_generation, grok_should_collect_image_stream,
+        grok_execution_result, grok_gateway_file_ids_from_app_chat_body,
+        grok_gateway_prompt_from_app_chat_body, grok_gateway_user_id_from_cookie,
+        grok_handle_imagine_ws_message, grok_handle_imagine_ws_message_with_slot_limit,
+        grok_image_count_from_provider_body, grok_image_mime_for_payload,
+        grok_image_prompt_from_provider_body, grok_imagine_blob_lengths_can_be_retained,
+        grok_imagine_request_message, grok_imagine_reset_message, grok_media_post_url,
+        grok_plan_http_origin, grok_plan_uses_structured_image_generation,
+        grok_should_collect_image_stream, grok_should_use_gateway_websocket,
         grok_should_use_imagine_websocket, grok_success_frame_stream, grok_upload_url,
         grok_upstream_model_name, grok_usage_estimate, grok_user_id_from_cookie_header,
         materialize_grok_image_assets, maximum_base64_len_for_decoded_limit, openai_chat_body,
@@ -3925,6 +4399,15 @@ mod tests {
             transport_profile: None,
             timeouts: None,
         }
+    }
+
+    fn with_browser_wreq(mut plan: ExecutionPlan) -> ExecutionPlan {
+        plan.transport_profile = Some(ResolvedTransportProfile {
+            profile_id: "chrome145".to_string(),
+            backend: TRANSPORT_BACKEND_BROWSER_WREQ.to_string(),
+            ..ResolvedTransportProfile::default()
+        });
+        plan
     }
 
     fn report_context_with_mapped_model(mapped_model: &str) -> serde_json::Value {
@@ -4102,6 +4585,74 @@ mod tests {
         adapter.push_chunk(line.as_bytes());
 
         assert_eq!(adapter.text, "hello");
+        assert_eq!(
+            adapter.images,
+            vec!["https://assets.grok.com/generated/example.png"]
+        );
+    }
+
+    #[test]
+    fn adapter_extracts_gateway_text_reasoning_and_image() {
+        let mut adapter = GrokStreamAdapter::default();
+        adapter.push_chunk(
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "event": {
+                        "type": "response.chunk",
+                        "chunk": {
+                            "text": {
+                                "text": "hello",
+                                "channel": "CHANNEL_ASSISTANT_RESPONSE"
+                            }
+                        }
+                    }
+                })
+            )
+            .as_bytes(),
+        );
+        adapter.push_chunk(
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "event": {
+                        "type": "response.chunk",
+                        "chunk": {
+                            "text": {
+                                "text": "think",
+                                "channel": "CHANNEL_ANALYSIS"
+                            }
+                        }
+                    }
+                })
+            )
+            .as_bytes(),
+        );
+        adapter.push_chunk(
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "event": {
+                        "type": "response.grok.output",
+                        "output": {
+                            "card_attachment": {
+                                "jsonData": serde_json::json!({
+                                    "image_chunk": {
+                                        "progress": 100,
+                                        "imageUrl": "generated/example.png"
+                                    }
+                                })
+                                .to_string()
+                            }
+                        }
+                    }
+                })
+            )
+            .as_bytes(),
+        );
+
+        assert_eq!(adapter.text, "hello");
+        assert_eq!(adapter.thinking, "think");
         assert_eq!(
             adapter.images,
             vec!["https://assets.grok.com/generated/example.png"]
@@ -4424,7 +4975,7 @@ mod tests {
         );
         assert_eq!(grok_aspect_ratio_from_provider_body(&body), "16:9");
 
-        let plan = sample_plan(body, "openai:image");
+        let plan = with_browser_wreq(sample_plan(body, "openai:image"));
         assert!(grok_should_use_imagine_websocket(
             &plan,
             Some(&report_context_with_mapped_model("grok-imagine-image-pro"))
@@ -4435,6 +4986,79 @@ mod tests {
             Some(&report_context_with_mapped_model("grok-imagine-image-lite"))
         )
         .expect("route should resolve"));
+        assert!(grok_should_use_gateway_websocket(
+            &plan,
+            Some(&report_context_with_mapped_model("grok-imagine-image-lite"))
+        )
+        .expect("route should resolve"));
+        assert!(!grok_should_use_gateway_websocket(
+            &plan,
+            Some(&report_context_with_mapped_model("grok-imagine-image-pro"))
+        )
+        .expect("route should resolve"));
+        assert!(!grok_should_use_gateway_websocket(
+            &plan,
+            Some(&report_context_with_mapped_model("grok-imagine-image-edit"))
+        )
+        .expect("route should resolve"));
+
+        let chat_plan = with_browser_wreq(sample_plan(
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            "openai:chat",
+        ));
+        assert!(grok_should_use_gateway_websocket(
+            &chat_plan,
+            Some(&report_context_with_mapped_model("grok-4.20-fast"))
+        )
+        .expect("text chat should use gateway"));
+        assert!(!grok_should_use_gateway_websocket(
+            &sample_plan(
+                serde_json::json!({
+                    "messages": [{"role": "user", "content": "hello"}]
+                }),
+                "openai:chat",
+            ),
+            Some(&report_context_with_mapped_model("grok-4.20-fast"))
+        )
+        .expect("text chat without browser impersonation stays on REST"));
+        assert!(!grok_should_use_imagine_websocket(
+            &chat_plan,
+            Some(&report_context_with_mapped_model("grok-4.20-fast"))
+        )
+        .expect("text chat should not use imagine"));
+        assert_eq!(
+            grok_plan_http_origin("https://grok.com/rest/app-chat/conversations/new"),
+            "https://grok.com"
+        );
+        assert_eq!(
+            grok_gateway_prompt_from_app_chat_body(&serde_json::json!({
+                "message": "hello",
+                "fileAttachments": ["file-1", ""]
+            })),
+            "hello"
+        );
+        assert_eq!(
+            grok_gateway_file_ids_from_app_chat_body(&serde_json::json!({
+                "fileAttachments": ["file-1", ""]
+            })),
+            vec!["file-1".to_string()]
+        );
+        let mut headers = BTreeMap::new();
+        headers.insert(
+            "cookie".to_string(),
+            "sso=abc; x-userid=497f19f8-49d4-458a-bee4-43ec3dcaf8ca".to_string(),
+        );
+        assert_eq!(
+            grok_gateway_user_id_from_cookie(&headers).as_deref(),
+            Some("497f19f8-49d4-458a-bee4-43ec3dcaf8ca")
+        );
+        headers.insert(
+            "cookie".to_string(),
+            "sso=abc; x-userid=not-a-uuid".to_string(),
+        );
+        assert!(grok_gateway_user_id_from_cookie(&headers).is_none());
     }
 
     #[test]
