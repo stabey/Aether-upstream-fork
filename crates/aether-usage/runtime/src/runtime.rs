@@ -7867,15 +7867,16 @@ mod tests {
         .await
         .expect("a duplicate first-byte marker must release the terminal barrier");
 
-        let records = store.records.lock().expect("records lock");
-        assert_eq!(
-            records.len(),
-            2,
-            "the duplicate first byte must be coalesced"
-        );
-        assert_eq!(records[0].status, "streaming");
-        assert_eq!(records[1].status, "completed");
-        drop(records);
+        {
+            let records = store.records.lock().expect("records lock");
+            assert_eq!(
+                records.len(),
+                2,
+                "the duplicate first byte must be coalesced"
+            );
+            assert_eq!(records[0].status, "streaming");
+            assert_eq!(records[1].status, "completed");
+        }
 
         // The terminal persistence notification can arrive before the submission
         // dispatcher accounts for its completed task and releases admission.
@@ -7894,7 +7895,7 @@ mod tests {
                 {
                     break;
                 }
-                tokio::task::yield_now().await;
+                sleep(Duration::from_millis(1)).await;
             }
         })
         .await
