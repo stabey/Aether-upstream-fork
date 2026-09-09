@@ -7877,6 +7877,29 @@ mod tests {
         assert_eq!(records[1].status, "completed");
         drop(records);
 
+        // The terminal persistence notification can arrive before the submission
+        // dispatcher accounts for its completed task and releases admission.
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = runtime.metrics_snapshot();
+                if snapshot.lifecycle_submission_pending == 0
+                    && snapshot.first_byte_persistence_pending == 0
+                    && snapshot.ordered_lifecycle_pending == 0
+                    && runtime
+                        .lifecycle_submission
+                        .state
+                        .admission
+                        .available_permits()
+                        == CAPACITY
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("duplicate first-byte submission accounting should drain");
+
         let snapshot = runtime.metrics_snapshot();
         assert_eq!(snapshot.lifecycle_submission_pending, 0);
         assert_eq!(snapshot.first_byte_persistence_pending, 0);
