@@ -8,6 +8,7 @@ use crate::ai_serving::planner::{
     build_ai_execution_decision_response, resolve_transport_request_encoding_policy,
     AiExecutionDecisionResponseParts,
 };
+use crate::ai_serving::transport::xai::video::is_native_video_request;
 use crate::ai_serving::transport::{
     resolve_transport_execution_timeouts, resolve_transport_profile,
 };
@@ -52,10 +53,7 @@ pub(super) async fn maybe_build_local_video_create_decision_payload_for_candidat
         .await;
     let transport_profile = resolve_transport_profile(&transport);
     let mut extra_fields = serde_json::Map::new();
-    if aether_provider_transport::xai::video::is_native_video_request(
-        &transport.provider.provider_type,
-        parts.uri.path(),
-    ) {
+    if is_native_video_request(&transport.provider.provider_type, parts.uri.path()) {
         extra_fields.insert(
             "video_client_protocol".to_string(),
             serde_json::json!("xai"),

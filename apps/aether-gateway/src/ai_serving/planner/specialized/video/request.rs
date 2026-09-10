@@ -7,6 +7,9 @@ use crate::ai_serving::planner::candidate_preparation::{
     prepare_header_authenticated_candidate, resolve_candidate_mapped_model, OauthPreparationContext,
 };
 use crate::ai_serving::planner::spec_metadata::local_video_create_spec_metadata;
+use crate::ai_serving::transport::xai::video::{
+    convert_openai_video_request, is_explicit_native_video_path, is_native_video_request,
+};
 use crate::ai_serving::transport::{
     build_video_create_headers, build_video_create_request_body, build_video_create_upstream_url,
     resolve_video_create_auth, video_create_transport_unsupported_reason,
@@ -17,9 +20,6 @@ use crate::ai_serving::{
     PlannerAppState,
 };
 use crate::{AppState, GatewayError};
-use aether_provider_transport::xai::video::{
-    convert_openai_video_request, is_explicit_native_video_path, is_native_video_request,
-};
 
 use super::support::{
     mark_skipped_local_video_candidate, mark_skipped_local_video_candidate_with_failure_diagnostic,
