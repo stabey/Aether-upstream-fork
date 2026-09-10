@@ -19,12 +19,9 @@ impl LocalVideoTaskSeed {
     ) -> Option<Self> {
         let transport = LocalVideoTaskTransport::from_plan(plan)?;
         let persistence = LocalVideoTaskPersistence::from_report_context(report_context, plan);
-        match report_kind {
+        let mut seed = match report_kind {
             "openai_video_create_sync_finalize" => {
-                let upstream_id = provider_body.get("id").and_then(Value::as_str)?.trim();
-                if upstream_id.is_empty() {
-                    return None;
-                }
+                let upstream_id = openai_video_provider_task_id(provider_body)?;
 
                 Some(Self::OpenAiCreate(OpenAiVideoTaskSeed {
                     local_task_id: context_text(report_context, "local_task_id")
@@ -52,10 +49,7 @@ impl LocalVideoTaskSeed {
                 }))
             }
             "openai_video_remix_sync_finalize" => {
-                let upstream_id = provider_body.get("id").and_then(Value::as_str)?.trim();
-                if upstream_id.is_empty() {
-                    return None;
-                }
+                let upstream_id = openai_video_provider_task_id(provider_body)?;
 
                 Some(Self::OpenAiRemix(OpenAiVideoTaskSeed {
                     local_task_id: context_text(report_context, "local_task_id")
@@ -110,7 +104,11 @@ impl LocalVideoTaskSeed {
                 }))
             }
             _ => None,
+        }?;
+        if let Self::OpenAiCreate(task) | Self::OpenAiRemix(task) = &mut seed {
+            task.apply_provider_body(provider_body);
         }
+        Some(seed)
     }
 
     pub fn success_report_kind(&self) -> &'static str {
@@ -148,6 +146,16 @@ impl LocalVideoTaskSeed {
             Self::GeminiCreate(seed) => seed.client_body_json(),
         }
     }
+}
+
+fn openai_video_provider_task_id(body: &Map<String, Value>) -> Option<&str> {
+    // xAI's OpenAI-compatible video creation returns request_id instead of id.
+    ["id", "request_id"].into_iter().find_map(|field| {
+        body.get(field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
 }
 
 impl VideoTaskTruthSourceMode {
@@ -352,6 +360,150 @@ mod tests {
         resolve_local_sync_error_background_report_kind,
         resolve_local_sync_success_background_report_kind,
     };
+
+    #[test]
+    fn xai_video_lifecycle_creates_polls_persists_and_downloads() {
+        use crate::{
+            LocalVideoTaskContentAction, LocalVideoTaskSnapshot, VideoTaskService,
+            VideoTaskTruthSourceMode,
+        };
+        for api_root in ["https://cli-chat-proxy.grok.com/v1", "https://api.x.ai/v1"] {
+            let mut plan =
+                build_internal_finalize_video_plan("xai-create", "openai:video", None).unwrap();
+            plan.url = format!("{api_root}/videos/generations");
+            plan.headers
+                .insert("authorization".into(), "Bearer test-token".into());
+            let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
+            let context = json!({"local_task_id": "local-video", "model": "grok-imagine-video", "original_request_body": {"prompt": "A cat", "seconds": "6"}});
+            let success = service
+                .prepare_sync_success(
+                    "openai_video_create_sync_finalize",
+                    json!({"request_id": "xai-request"}).as_object().unwrap(),
+                    context.as_object().unwrap(),
+                    &plan,
+                )
+                .unwrap();
+            assert_eq!(success.client_body_json()["id"], "local-video");
+            assert_eq!(success.client_body_json()["status"], "queued");
+            let snapshot = success.to_snapshot();
+            assert_eq!(
+                snapshot.to_upsert_record().external_task_id.as_deref(),
+                Some("xai-request")
+            );
+            service.record_snapshot(snapshot.clone());
+            let poll = service
+                .prepare_poll_refresh_plan_for_snapshot(snapshot, "xai-poll")
+                .unwrap();
+            assert_eq!(poll.plan.method, "GET");
+            assert_eq!(poll.plan.url, format!("{api_root}/videos/xai-request"));
+            assert_eq!(
+                poll.plan.headers.get("authorization"),
+                plan.headers.get("authorization")
+            );
+            assert!(service.apply_read_refresh_projection(
+                &poll,
+                json!({"status": "pending"}).as_object().unwrap()
+            ));
+            assert_eq!(
+                service
+                    .read_response(Some("openai"), "/v1/videos/local-video")
+                    .unwrap()
+                    .body_json["status"],
+                "queued"
+            );
+            assert!(service.apply_read_refresh_projection(&poll, json!({
+                "status": "done", "video": {"url": "https://vidgen.x.ai/result.mp4", "duration": 6}
+            }).as_object().unwrap()));
+            let snapshot = service
+                .snapshot_for_route(Some("openai"), "/v1/videos/local-video")
+                .unwrap();
+            assert!(!snapshot.is_active_for_refresh());
+            let record = snapshot.to_upsert_record();
+            assert_eq!(
+                record.status,
+                aether_data_contracts::repository::video_tasks::VideoTaskStatus::Completed
+            );
+            assert_eq!(
+                record.video_url.as_deref(),
+                Some("https://vidgen.x.ai/result.mp4")
+            );
+            assert_eq!(record.duration_seconds, Some(6));
+            let response = snapshot.read_response();
+            assert_eq!(response.body_json["status"], "completed");
+            assert_eq!(response.body_json["progress"], 100);
+            assert_eq!(
+                response.body_json["video_url"],
+                "https://vidgen.x.ai/result.mp4"
+            );
+            let LocalVideoTaskSnapshot::OpenAi(seed) = snapshot else {
+                panic!("OpenAI video expected")
+            };
+            let Some(LocalVideoTaskContentAction::StreamPlan(download)) =
+                seed.build_content_stream_action(None, "download")
+            else {
+                panic!("download expected")
+            };
+            assert_eq!(download.url, "https://vidgen.x.ai/result.mp4");
+            assert!(
+                download.headers.is_empty(),
+                "provider credentials must not be sent to the media CDN"
+            );
+        }
+    }
+
+    #[test]
+    fn xai_video_errors_are_terminal_even_without_a_status() {
+        use crate::{LocalVideoTaskSnapshot, VideoTaskTruthSourceMode};
+        let mut plan =
+            build_internal_finalize_video_plan("xai-create", "openai:video", None).unwrap();
+        plan.url = "https://cli-chat-proxy.grok.com/v1/videos/generations".into();
+        for body in [
+            json!({"code": "content_policy_violation", "error": "Rejected"}),
+            json!({"error": {"code": "content_policy_violation", "message": "Rejected"}}),
+            json!({"status": "failed", "error": "Rejected"}),
+        ] {
+            let mut snapshot = VideoTaskTruthSourceMode::RustAuthoritative
+                .prepare_sync_success(
+                    "openai_video_create_sync_finalize",
+                    json!({"request_id": "xai-request"}).as_object().unwrap(),
+                    &Default::default(),
+                    &plan,
+                )
+                .unwrap()
+                .to_snapshot();
+            snapshot.apply_provider_body(body.as_object().unwrap());
+            assert!(!snapshot.is_active_for_refresh());
+            assert_eq!(snapshot.read_response().body_json["status"], "failed");
+            let LocalVideoTaskSnapshot::OpenAi(seed) = snapshot else {
+                panic!("OpenAI video expected")
+            };
+            assert!(seed.error_message.is_none());
+        }
+    }
+
+    #[test]
+    fn openai_video_id_takes_precedence_over_xai_alias() {
+        assert_eq!(
+            super::openai_video_provider_task_id(
+                json!({"id": "openai-id", "request_id": "trace-id"})
+                    .as_object()
+                    .unwrap()
+            ),
+            Some("openai-id")
+        );
+        assert_eq!(
+            super::openai_video_provider_task_id(
+                json!({"id": " ", "request_id": "xai-id"})
+                    .as_object()
+                    .unwrap()
+            ),
+            Some("xai-id")
+        );
+        assert_eq!(
+            super::openai_video_provider_task_id(json!({"request_id": " "}).as_object().unwrap()),
+            None
+        );
+    }
 
     #[test]
     fn builds_local_sync_finalize_read_response_for_supported_video_finalize_kinds() {

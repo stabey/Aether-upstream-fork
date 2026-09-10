@@ -8,7 +8,6 @@ const XAI_RESPONSES_UNSUPPORTED_BODY_FIELDS: &[&str] = &[
     "stop",
     "metadata",
 ];
-const XAI_ENCRYPTED_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
 const XAI_WEB_SEARCH_TOOL_TYPE: &str = "web_search";
 const XAI_IMAGE_GENERATION_TOOL_TYPE: &str = "image_generation";
 const XAI_TOOL_SEARCH_TOOL_TYPE: &str = "tool_search";
@@ -58,7 +57,6 @@ fn sanitize_xai_responses_body(body: &mut Value) {
     for field in XAI_RESPONSES_UNSUPPORTED_BODY_FIELDS {
         object.remove(*field);
     }
-    strip_xai_encrypted_reasoning_include(object);
     let keep_image_generation = object
         .get("model")
         .and_then(Value::as_str)
@@ -87,6 +85,20 @@ fn restore_xai_web_search_from_client(
         return;
     }
     ensure_xai_web_search_tool(body);
+    // Claude names a hosted tool in tool_choice just like a client function.
+    // Resolve that name against the original declaration, never by name alone.
+    if crate::normalize_api_format_alias(client_api_format) == "claude:messages" {
+        let choice = &client_body["tool_choice"];
+        if choice["type"] == "tool"
+            && choice["name"].as_str().is_some_and(|name| {
+                request_tools(client_body)
+                    .iter()
+                    .any(|tool| is_web_search_tool(tool) && tool_name(tool) == Some(name))
+            })
+        {
+            body["tool_choice"] = json!({"type": XAI_WEB_SEARCH_TOOL_TYPE});
+        }
+    }
 }
 
 fn client_requests_web_search(client_api_format: &str, client_body: &Value) -> bool {
@@ -96,10 +108,7 @@ fn client_requests_web_search(client_api_format: &str, client_body: &Value) -> b
             object_has_non_null_field(client_body, "web_search_options")
                 || request_tools(client_body).iter().any(is_web_search_tool)
         }
-        "claude:messages" => request_tools(client_body).iter().any(|tool| {
-            is_web_search_tool(tool)
-                || tool_name(tool).is_some_and(|name| name.eq_ignore_ascii_case("web_search"))
-        }),
+        "claude:messages" => request_tools(client_body).iter().any(is_web_search_tool),
         "gemini:generate_content" => gemini_request_has_google_search(client_body),
         _ => false,
     }
@@ -131,19 +140,6 @@ fn ensure_xai_web_search_tool(body: &mut Value) {
         .or_insert_with(|| Value::Array(Vec::new()));
     if let Some(tools) = tools.as_array_mut() {
         tools.push(json!({ "type": XAI_WEB_SEARCH_TOOL_TYPE }));
-    }
-}
-
-fn strip_xai_encrypted_reasoning_include(object: &mut Map<String, Value>) {
-    let Some(include) = object.get_mut("include").and_then(Value::as_array_mut) else {
-        return;
-    };
-    include.retain(|item| {
-        item.as_str()
-            .is_none_or(|value| value != XAI_ENCRYPTED_REASONING_INCLUDE)
-    });
-    if include.is_empty() {
-        object.remove("include");
     }
 }
 
@@ -241,9 +237,7 @@ fn rewrite_xai_web_search_tool_choice(object: &mut Map<String, Value>) {
     }) else {
         return;
     };
-    if is_web_search_choice_type(&choice_type)
-        || named_function_choice_is_web_search(choice.as_object())
-    {
+    if is_web_search_choice_type(&choice_type) {
         object.insert(
             "tool_choice".to_string(),
             json!({
@@ -252,10 +246,6 @@ fn rewrite_xai_web_search_tool_choice(object: &mut Map<String, Value>) {
                 "tools": [{ "type": XAI_WEB_SEARCH_TOOL_TYPE }]
             }),
         );
-        return;
-    }
-    if choice_type == "allowed_tools" {
-        filter_image_generation_from_allowed_tools(object);
     }
 }
 
@@ -269,15 +259,19 @@ fn rewrite_xai_image_generation_tool_choice(object: &mut Map<String, Value>) {
     let Some(choice) = object.get("tool_choice").cloned() else {
         return;
     };
-    if choice.as_object().is_some_and(|value| {
-        value.get("type").and_then(Value::as_str) == Some(XAI_IMAGE_GENERATION_TOOL_TYPE)
-            || is_allowed_tools_image_generation_only(&choice)
-    }) {
+    // xAI's allowed_tools schema cannot contain image_generation. Preserve an
+    // image-only restriction before filtering image entries out of mixed lists.
+    let image_only = is_allowed_tools_image_generation_only(&choice);
+    if choice["type"] == XAI_IMAGE_GENERATION_TOOL_TYPE || image_only {
+        let mode = if image_only && choice["mode"] == "auto" {
+            "auto"
+        } else {
+            "required"
+        };
         keep_only_image_generation_tools(object);
-        object.insert(
-            "tool_choice".to_string(),
-            Value::String("required".to_string()),
-        );
+        object.insert("tool_choice".to_string(), Value::String(mode.to_string()));
+    } else if choice["type"] == "allowed_tools" {
+        filter_image_generation_from_allowed_tools(object);
     }
 }
 
@@ -315,20 +309,6 @@ fn filter_image_generation_from_allowed_tools(object: &mut Map<String, Value>) {
     };
     tools
         .retain(|tool| tool_type(tool).is_none_or(|value| value != XAI_IMAGE_GENERATION_TOOL_TYPE));
-}
-
-fn named_function_choice_is_web_search(choice: Option<&Map<String, Value>>) -> bool {
-    let Some(choice) = choice else {
-        return false;
-    };
-    let choice_type = choice
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !matches!(choice_type, "function" | "custom" | "tool") {
-        return false;
-    }
-    tool_choice_name(choice).is_some_and(is_web_search_choice_type)
 }
 
 fn is_web_search_choice_type(value: &str) -> bool {
@@ -759,7 +739,10 @@ mod tests {
         assert!(body.get("tool_choice").is_none());
         assert!(body.get("parallel_tool_calls").is_none());
         assert!(body.get("tools").is_none());
-        assert_eq!(body["include"], json!(["file_search_call.results"]));
+        assert_eq!(
+            body["include"],
+            json!(["reasoning.encrypted_content", "file_search_call.results"])
+        );
         assert_eq!(body["model"], "grok-4.6");
         assert_eq!(body["input"], "hello");
     }

@@ -125,6 +125,11 @@ pub fn build_openai_image_headers(
         &BTreeMap::new(),
     );
     provider_request_headers.insert("content-type".to_string(), "application/json".to_string());
+    crate::xai::insert_cli_identity_headers_if_needed(
+        input.transport,
+        "openai:image",
+        &mut provider_request_headers,
+    );
     if let Some(accept) = input.accept {
         provider_request_headers.insert("accept".to_string(), accept.to_string());
     } else {
@@ -293,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_oauth_image_uses_official_api() {
+    fn xai_oauth_image_uses_cli_proxy() {
         let mut transport = sample_transport();
         transport.provider.provider_type = "xai".to_string();
         transport.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
@@ -307,11 +312,30 @@ mod tests {
         );
         assert_eq!(
             build_openai_image_upstream_url(&transport, Some("/v1/images/generations"), None),
-            "https://api.x.ai/v1/images/generations"
+            "https://cli-chat-proxy.grok.com/v1/images/generations"
         );
         assert_eq!(
             build_openai_image_upstream_url(&transport, Some("/v1/images/edits"), None),
-            "https://api.x.ai/v1/images/edits"
+            "https://cli-chat-proxy.grok.com/v1/images/edits"
+        );
+        let headers = build_openai_image_headers(ProviderOpenAiImageHeadersInput {
+            transport: &transport,
+            headers: &HeaderMap::new(),
+            auth_header: "authorization",
+            auth_value: "Bearer test-token",
+            accept: None,
+            header_rules: None,
+            provider_request_body: &json!({"prompt": "A cat"}),
+            original_request_body: &json!({"prompt": "A cat"}),
+        })
+        .unwrap();
+        assert_eq!(
+            headers.get("x-xai-token-auth").map(String::as_str),
+            Some("xai-grok-cli")
+        );
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer test-token")
         );
     }
 

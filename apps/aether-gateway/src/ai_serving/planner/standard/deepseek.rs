@@ -33,7 +33,9 @@ pub(crate) fn openai_responses_reasoning_replay_policy(
     base_url: &str,
     provider_model: &str,
 ) -> crate::ai_serving::OpenAiResponsesReasoningReplayPolicy {
-    if is_deepseek_upstream(provider_type, base_url, provider_model) {
+    if provider_type.trim().eq_ignore_ascii_case("xai") {
+        crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::XaiEncrypted
+    } else if is_deepseek_upstream(provider_type, base_url, provider_model) {
         crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::DeepSeekOpaque
     } else {
         crate::ai_serving::OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds
@@ -285,6 +287,27 @@ mod tests {
         apply_deepseek_tool_call_thinking_compat, is_deepseek_provider,
         openai_responses_reasoning_replay_policy,
     };
+
+    #[test]
+    fn xai_reasoning_policy_comes_from_provider_type() {
+        use crate::ai_serving::OpenAiResponsesReasoningReplayPolicy;
+        assert_eq!(
+            openai_responses_reasoning_replay_policy(
+                "xai",
+                "https://custom.example/v1",
+                "grok-4.6"
+            ),
+            OpenAiResponsesReasoningReplayPolicy::XaiEncrypted
+        );
+        assert_eq!(
+            openai_responses_reasoning_replay_policy(
+                "openai",
+                "https://custom.example/v1",
+                "grok-4.6"
+            ),
+            OpenAiResponsesReasoningReplayPolicy::OpenAiItemIds
+        );
+    }
 
     #[test]
     fn detects_deepseek_provider_by_type_or_host() {

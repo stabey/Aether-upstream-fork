@@ -173,6 +173,7 @@ pub(super) async fn resolve_local_video_create_candidate_payload_parts(
 
     let Some(provider_request_headers) =
         build_video_create_headers(ProviderVideoCreateHeadersInput {
+            transport,
             headers: effective_headers,
             auth_header: &auth_header,
             auth_value: &auth_value,

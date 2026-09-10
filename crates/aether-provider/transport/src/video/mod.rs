@@ -32,6 +32,7 @@ pub enum ProviderVideoCreateFamily {
 
 #[derive(Clone, Copy)]
 pub struct ProviderVideoCreateHeadersInput<'a> {
+    pub transport: &'a GatewayProviderTransportSnapshot,
     pub headers: &'a http::HeaderMap,
     pub auth_header: &'a str,
     pub auth_value: &'a str,
@@ -103,8 +104,8 @@ pub fn resolve_local_video_task_transport(
         _ => return None,
     };
 
-    Some(LocalVideoTaskTransport::from_bridge_input(
-        LocalVideoTaskTransportBridgeInput {
+    let mut resolved =
+        LocalVideoTaskTransport::from_bridge_input(LocalVideoTaskTransportBridgeInput {
             upstream_base_url: crate::xai::resolved_xai_request_base_url(transport, api_format),
             provider_name: Some(transport.provider.name.clone()),
             provider_id: transport.provider.id.clone(),
@@ -117,8 +118,9 @@ pub fn resolve_local_video_task_transport(
             proxy: None,
             transport_profile: resolve_transport_profile(transport),
             timeouts: resolve_transport_execution_timeouts(transport),
-        },
-    ))
+        });
+    crate::xai::insert_cli_identity_headers_if_needed(transport, api_format, &mut resolved.headers);
+    Some(resolved)
 }
 
 pub fn video_create_transport_unsupported_reason(
@@ -246,6 +248,11 @@ pub fn build_video_create_headers(
         input.auth_header,
         input.auth_value,
         &BTreeMap::new(),
+    );
+    crate::xai::insert_cli_identity_headers_if_needed(
+        input.transport,
+        "openai:video",
+        &mut provider_request_headers,
     );
     if !apply_local_header_rules_with_request_headers(
         &mut provider_request_headers,
@@ -505,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_oauth_video_uses_official_api() {
+    fn xai_oauth_video_uses_cli_proxy() {
         let mut transport = sample_transport("openai:video", "oauth");
         transport.provider.provider_type = "xai".to_string();
         transport.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".to_string();
@@ -520,7 +527,36 @@ mod tests {
         )
         .expect("url should build");
 
-        assert_eq!(url, "https://api.x.ai/v1/videos/generations");
+        assert_eq!(url, "https://cli-chat-proxy.grok.com/v1/videos/generations");
+        let headers = build_video_create_headers(ProviderVideoCreateHeadersInput {
+            transport: &transport,
+            headers: &http::HeaderMap::new(),
+            auth_header: "authorization",
+            auth_value: "Bearer test-token",
+            header_rules: None,
+            provider_request_body: &json!({"prompt": "A cat"}),
+            original_request_body: &json!({"prompt": "A cat"}),
+        })
+        .unwrap();
+        assert_eq!(
+            headers.get("x-xai-token-auth").map(String::as_str),
+            Some("xai-grok-cli")
+        );
+
+        let reconstructed = super::resolve_local_video_task_transport(
+            &transport,
+            "openai:video",
+            Some("grok-imagine-video".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            reconstructed.upstream_base_url,
+            "https://cli-chat-proxy.grok.com/v1"
+        );
+        assert_eq!(
+            reconstructed.headers.get("x-xai-token-auth"),
+            headers.get("x-xai-token-auth")
+        );
     }
 
     #[test]
@@ -546,6 +582,7 @@ mod tests {
         let provider_request_body = json!({"prompt": "make a clip"});
         let original_request_body = provider_request_body.clone();
         let headers = build_video_create_headers(ProviderVideoCreateHeadersInput {
+            transport: &sample_transport("openai:video", "bearer"),
             headers: &http::HeaderMap::new(),
             auth_header: "authorization",
             auth_value: "Bearer secret",

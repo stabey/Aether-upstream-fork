@@ -32,7 +32,7 @@ pub fn is_xai_provider_transport(transport: &GatewayProviderTransportSnapshot) -
 pub fn xai_uses_official_api(api_format: &str) -> bool {
     matches!(
         normalize_api_format_alias(api_format).as_str(),
-        "openai:responses:compact" | "openai:image" | "openai:video"
+        "openai:responses:compact"
     )
 }
 
@@ -344,18 +344,35 @@ mod tests {
     }
 
     #[test]
-    fn image_and_video_oauth_stay_on_official_api() {
-        let oauth = sample_transport(
-            "oauth",
-            Some(r#"{"refresh_token":"rt","using_api":false}"#),
-            XAI_CHAT_PROXY_BASE_URL,
-        );
+    fn media_routing_and_cli_headers_follow_auth_and_base_url() {
         for api_format in ["openai:image", "openai:video"] {
+            for stored in ["", XAI_API_BASE_URL, XAI_CHAT_PROXY_BASE_URL] {
+                for (auth_type, config, expected) in [
+                    (
+                        "oauth",
+                        Some(r#"{"refresh_token":"rt","using_api":false}"#),
+                        XAI_CHAT_PROXY_BASE_URL,
+                    ),
+                    ("oauth", Some(r#"{"using_api":true}"#), XAI_API_BASE_URL),
+                    ("bearer", None, XAI_API_BASE_URL),
+                ] {
+                    let transport = sample_transport(auth_type, config, stored);
+                    assert_eq!(
+                        resolved_xai_upstream_base_url(&transport, api_format).as_deref(),
+                        Some(expected)
+                    );
+                    assert_eq!(
+                        should_attach_cli_identity_headers(&transport, api_format),
+                        expected == XAI_CHAT_PROXY_BASE_URL
+                    );
+                }
+            }
+            let custom = sample_transport("oauth", None, "https://custom.example/v1");
             assert_eq!(
-                resolved_xai_upstream_base_url(&oauth, api_format).as_deref(),
-                Some(XAI_API_BASE_URL)
+                resolved_xai_upstream_base_url(&custom, api_format).as_deref(),
+                Some("https://custom.example/v1")
             );
-            assert!(!should_attach_cli_identity_headers(&oauth, api_format));
+            assert!(!should_attach_cli_identity_headers(&custom, api_format));
         }
     }
 

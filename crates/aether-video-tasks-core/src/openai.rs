@@ -97,15 +97,35 @@ impl OpenAiVideoTaskSeed {
             .and_then(Value::as_str)
             .map(str::trim)
             .unwrap_or_default();
-        self.status = match raw_status {
-            "queued" => LocalVideoTaskStatus::Queued,
-            "processing" => LocalVideoTaskStatus::Processing,
-            "completed" => LocalVideoTaskStatus::Completed,
-            "failed" => LocalVideoTaskStatus::Failed,
-            "cancelled" => LocalVideoTaskStatus::Cancelled,
+        // Accept xAI's native lifecycle vocabulary alongside OpenAI's fields.
+        self.status = match raw_status.to_ascii_lowercase().as_str() {
+            "queued" | "pending" => LocalVideoTaskStatus::Queued,
+            "processing" | "in_progress" | "running" => LocalVideoTaskStatus::Processing,
+            "completed" | "done" | "succeeded" | "success" => LocalVideoTaskStatus::Completed,
+            "failed" | "error" => LocalVideoTaskStatus::Failed,
+            "cancelled" | "canceled" => LocalVideoTaskStatus::Cancelled,
             "expired" => LocalVideoTaskStatus::Expired,
             _ => LocalVideoTaskStatus::Submitted,
         };
+        let error = provider_body.get("error").filter(|value| !value.is_null());
+        let error_code = provider_body
+            .get("code")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                error
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str)
+            });
+        // xAI may report a failed job as a 200 response with code/error only.
+        if (error.is_some() || error_code.is_some())
+            && !matches!(
+                self.status,
+                LocalVideoTaskStatus::Cancelled | LocalVideoTaskStatus::Expired
+            )
+        {
+            self.status = LocalVideoTaskStatus::Failed;
+        }
         self.progress_percent = provider_body
             .get("progress")
             .and_then(Value::as_u64)
@@ -117,20 +137,35 @@ impl OpenAiVideoTaskSeed {
             });
         self.completed_at_unix_secs = provider_body.get("completed_at").and_then(Value::as_u64);
         self.expires_at_unix_secs = provider_body.get("expires_at").and_then(Value::as_u64);
-        let error = provider_body.get("error").and_then(Value::as_object);
-        self.error_code = sanitize_video_task_error_code(
-            error
-                .and_then(|value| value.get("code"))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        );
+        self.error_code = sanitize_video_task_error_code(error_code.map(str::to_string));
         self.error_message = None;
         self.video_url = provider_body
             .get("video_url")
             .or_else(|| provider_body.get("url"))
             .or_else(|| provider_body.get("result_url"))
+            .or_else(|| {
+                provider_body
+                    .get("video")
+                    .and_then(|video| video.get("url"))
+            })
             .and_then(Value::as_str)
             .map(str::to_string);
+        if let Some(seconds) = provider_body
+            .get("seconds")
+            .or_else(|| {
+                provider_body
+                    .get("video")
+                    .and_then(|video| video.get("duration"))
+            })
+            .filter(|value| value.is_string() || value.is_number())
+        {
+            self.seconds = Some(
+                seconds
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| seconds.to_string()),
+            );
+        }
     }
 
     pub fn build_content_stream_action(
@@ -258,6 +293,9 @@ impl OpenAiVideoTaskSeed {
         }
         if let Some(seconds) = &self.seconds {
             body["seconds"] = Value::String(seconds.clone());
+        }
+        if let Some(video_url) = &self.video_url {
+            body["video_url"] = Value::String(video_url.clone());
         }
         if let Some(remixed_from_video_id) = &self.remixed_from_video_id {
             body["remixed_from_video_id"] = Value::String(remixed_from_video_id.clone());
@@ -589,7 +627,11 @@ impl OpenAiVideoTaskSeed {
             model: self.model.clone().or_else(|| Some(String::new())),
             prompt: self.prompt.clone().or_else(|| Some(String::new())),
             original_request_body: None,
-            duration_seconds: request_body_u32(&self.persistence.original_request_body, "seconds"),
+            duration_seconds: self
+                .seconds
+                .as_deref()
+                .and_then(|value| value.parse().ok())
+                .or_else(|| request_body_u32(&self.persistence.original_request_body, "seconds")),
             resolution: request_body_string(&self.persistence.original_request_body, "resolution"),
             aspect_ratio: request_body_string(
                 &self.persistence.original_request_body,
