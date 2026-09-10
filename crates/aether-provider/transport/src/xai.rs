@@ -1,3 +1,5 @@
+pub mod video;
+
 use std::collections::BTreeMap;
 
 use aether_ai_formats::normalize_api_format_alias;

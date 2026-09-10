@@ -43,6 +43,27 @@ pub fn map_openai_stored_task_to_read_response(
 }
 
 fn build_openai_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus) -> Value {
+    if task.client_api_format.as_deref() == Some("xai:video") {
+        let mut body = json!({"status":match status {
+            VideoTaskStatus::Completed => "done",
+            VideoTaskStatus::Expired => "expired",
+            VideoTaskStatus::Failed | VideoTaskStatus::Cancelled | VideoTaskStatus::Deleted => "failed",
+            _ => "pending",
+        }});
+        if let Some(model) = task.model {
+            body["model"] = json!(model);
+        }
+        if let Some(url) = task.video_url {
+            body["video"] = json!({"url":url});
+            if let Some(duration) = task.duration_seconds {
+                body["video"]["duration"] = json!(duration);
+            }
+        }
+        if status == VideoTaskStatus::Failed {
+            body["error"] = json!({"code":sanitize_video_task_error_code(task.error_code).unwrap_or_else(|| "unknown".into()),"message":"Video generation failed"});
+        }
+        return body;
+    }
     let mut body = json!({
         "id": task.id,
         "object": "video",
@@ -56,6 +77,9 @@ fn build_openai_stored_task_body(task: StoredVideoTask, status: VideoTaskStatus)
     }
     if let Some(prompt) = task.prompt {
         body["prompt"] = Value::String(prompt);
+    }
+    if let Some(seconds) = task.duration_seconds {
+        body["seconds"] = json!(seconds.to_string());
     }
     if let Some(size) = task.size {
         body["size"] = Value::String(size);
@@ -91,7 +115,63 @@ fn map_openai_stored_task_status(status: VideoTaskStatus) -> &'static str {
 }
 
 impl OpenAiVideoTaskSeed {
+    pub fn uses_xai_provider(&self) -> bool {
+        self.xai_provider || self.is_xai_native()
+    }
+
+    pub fn is_xai_native(&self) -> bool {
+        self.persistence.client_api_format == "xai:video"
+    }
+
+    pub fn native_create_body_json(&self) -> Value {
+        let mut body = self.native_response.clone().unwrap_or_else(|| json!({}));
+        body["request_id"] = json!(self.local_task_id);
+        if body.get("id").is_some() {
+            body["id"] = json!(self.local_task_id);
+        }
+        body
+    }
+
+    fn native_read_body_json(&self) -> Value {
+        if let Some(mut body) = self.native_response.clone().filter(|body| {
+            body.get("status").is_some()
+                || body.get("error").is_some()
+                || body.get("code").is_some()
+        }) {
+            if body.get("request_id").is_some() {
+                body["request_id"] = json!(self.local_task_id);
+            }
+            if body.get("id").is_some() {
+                body["id"] = json!(self.local_task_id);
+            }
+            return body;
+        }
+        let mut body = json!({"status":match self.status {
+            LocalVideoTaskStatus::Completed => "done",
+            LocalVideoTaskStatus::Expired => "expired",
+            LocalVideoTaskStatus::Failed | LocalVideoTaskStatus::Cancelled | LocalVideoTaskStatus::Deleted => "failed",
+            _ => "pending",
+        }});
+        if let Some(model) = &self.model {
+            body["model"] = json!(model);
+        }
+        if let Some(url) = &self.video_url {
+            body["video"] = json!({"url":url});
+            if let Some(duration) = self.seconds.as_deref().and_then(|v| v.parse::<u64>().ok()) {
+                body["video"]["duration"] = json!(duration);
+            }
+        }
+        if self.error_code.is_some() {
+            body["error"] = json!({"code":self.error_code,"message":"Video generation failed"});
+        }
+        body
+    }
+
     pub fn apply_provider_body(&mut self, provider_body: &Map<String, Value>) {
+        if self.uses_xai_provider() {
+            self.native_response = Some(Value::Object(provider_body.clone()));
+        }
+
         let raw_status = provider_body
             .get("status")
             .and_then(Value::as_str)
@@ -274,6 +354,9 @@ impl OpenAiVideoTaskSeed {
     }
 
     pub fn client_body_json(&self) -> Value {
+        if self.is_xai_native() {
+            return self.native_read_body_json();
+        }
         let mut body = json!({
             "id": self.local_task_id,
             "object": "video",
@@ -395,12 +478,20 @@ impl OpenAiVideoTaskSeed {
     }
 
     pub fn build_get_follow_up_plan(&self, trace_id: &str) -> Option<ExecutionPlan> {
-        if !matches!(
+        let refreshable = matches!(
             self.status,
             LocalVideoTaskStatus::Submitted
                 | LocalVideoTaskStatus::Queued
                 | LocalVideoTaskStatus::Processing
-        ) {
+        ) || (self.uses_xai_provider()
+            && self.native_response.is_none()
+            && matches!(
+                self.status,
+                LocalVideoTaskStatus::Completed
+                    | LocalVideoTaskStatus::Failed
+                    | LocalVideoTaskStatus::Expired
+            ));
+        if !refreshable {
             return None;
         }
 
@@ -739,6 +830,8 @@ mod tests {
     #[test]
     fn builds_minimal_openai_persistence_record_without_sensitive_snapshot() {
         let seed = OpenAiVideoTaskSeed {
+            native_response: None,
+            xai_provider: false,
             local_task_id: "task-openai-sensitive".to_string(),
             upstream_task_id: "upstream-openai-sensitive".to_string(),
             created_at_unix_ms: 1_712_345_678,

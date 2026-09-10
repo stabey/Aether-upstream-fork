@@ -11,6 +11,8 @@ use super::{
 fn rust_authoritative_service_builds_openai_cancel_follow_up_plan() {
     let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        native_response: None,
+        xai_provider: false,
         local_task_id: "task-local-123".to_string(),
         upstream_task_id: "ext-video-task-123".to_string(),
         created_at_unix_ms: 1712345678,
@@ -92,6 +94,8 @@ fn rust_authoritative_service_builds_openai_cancel_follow_up_plan() {
 fn rust_authoritative_service_builds_openai_remix_follow_up_plan() {
     let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        native_response: None,
+        xai_provider: false,
         local_task_id: "task-local-123".to_string(),
         upstream_task_id: "ext-video-task-123".to_string(),
         created_at_unix_ms: 1712345678,
@@ -177,6 +181,8 @@ fn rust_authoritative_service_builds_openai_remix_follow_up_plan() {
 fn rust_authoritative_service_builds_openai_delete_follow_up_plan() {
     let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        native_response: None,
+        xai_provider: false,
         local_task_id: "task-local-123".to_string(),
         upstream_task_id: "ext-video-task-123".to_string(),
         created_at_unix_ms: 1712345678,
@@ -332,6 +338,8 @@ fn rust_authoritative_service_builds_gemini_cancel_follow_up_plan() {
 fn rust_authoritative_service_builds_openai_read_refresh_plan() {
     let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        native_response: None,
+        xai_provider: false,
         local_task_id: "task-local-123".to_string(),
         upstream_task_id: "ext-video-task-123".to_string(),
         created_at_unix_ms: 1712345678,
@@ -407,6 +415,8 @@ fn rust_authoritative_service_builds_gemini_read_refresh_plan() {
 fn rust_authoritative_service_builds_poll_refresh_batch_for_active_tasks_only() {
     let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        native_response: None,
+        xai_provider: false,
         local_task_id: "task-active-123".to_string(),
         upstream_task_id: "ext-video-task-123".to_string(),
         created_at_unix_ms: 1712345678,
@@ -428,6 +438,8 @@ fn rust_authoritative_service_builds_poll_refresh_batch_for_active_tasks_only() 
         transport: sample_transport("https://api.openai.example", "openai:video"),
     }));
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        native_response: None,
+        xai_provider: false,
         local_task_id: "task-completed-123".to_string(),
         upstream_task_id: "ext-video-task-999".to_string(),
         created_at_unix_ms: 1712345678,
@@ -471,6 +483,8 @@ fn file_video_task_store_persists_snapshots_across_service_rebuilds() {
     )
     .expect("file-backed service should build");
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        native_response: None,
+        xai_provider: false,
         local_task_id: "task-file-123".to_string(),
         upstream_task_id: "ext-video-task-123".to_string(),
         created_at_unix_ms: 1712345678,

@@ -1,0 +1,325 @@
+use super::*;
+use aether_data::repository::auth::{
+    InMemoryAuthApiKeySnapshotRepository, StoredAuthApiKeySnapshot,
+};
+use aether_data::repository::candidate_selection::InMemoryMinimalCandidateSelectionReadRepository;
+use aether_data::repository::candidates::InMemoryRequestCandidateRepository;
+use aether_data_contracts::repository::candidate_selection::{
+    StoredMinimalCandidateSelectionRow, StoredProviderModelMapping,
+};
+use sha2::{Digest, Sha256};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn sample_auth_snapshot(api_key_id: &str, user_id: &str) -> StoredAuthApiKeySnapshot {
+    StoredAuthApiKeySnapshot::new(
+        user_id.to_string(),
+        "video-user".to_string(),
+        Some("video@example.com".to_string()),
+        "user".to_string(),
+        "local".to_string(),
+        true,
+        false,
+        Some(json!(["openai"])),
+        Some(json!(["openai:video"])),
+        Some(json!(["video-model"])),
+        api_key_id.to_string(),
+        Some("default".to_string()),
+        true,
+        false,
+        false,
+        Some(60),
+        Some(5),
+        Some(4_102_444_800),
+        Some(json!(["openai"])),
+        Some(json!(["openai:video"])),
+        Some(json!(["video-model"])),
+    )
+    .expect("auth snapshot should build")
+}
+
+fn sample_candidate_row() -> StoredMinimalCandidateSelectionRow {
+    StoredMinimalCandidateSelectionRow {
+        provider_id: "provider-openai-video-local-1".to_string(),
+        provider_name: "openai".to_string(),
+        provider_type: "xai".to_string(),
+        provider_priority: 10,
+        provider_is_active: true,
+        endpoint_id: "endpoint-openai-video-local-1".to_string(),
+        endpoint_api_format: "openai:video".to_string(),
+        endpoint_api_family: Some("openai".to_string()),
+        endpoint_kind: Some("video".to_string()),
+        endpoint_is_active: true,
+        key_id: "key-openai-video-local-1".to_string(),
+        key_name: "prod".to_string(),
+        key_auth_type: "api_key".to_string(),
+        key_is_active: true,
+        key_api_formats: Some(vec!["openai:video".to_string()]),
+        key_allowed_models: None,
+        key_capabilities: None,
+        key_internal_priority: 5,
+        key_global_priority_by_format: Some(json!({"openai:video": 1})),
+        model_id: "model-openai-video-local-1".to_string(),
+        global_model_id: "global-model-openai-video-local-1".to_string(),
+        global_model_name: "video-model".to_string(),
+        global_model_mappings: None,
+        global_model_supports_streaming: Some(false),
+        model_provider_model_name: "grok-imagine-video".to_string(),
+        model_provider_model_mappings: Some(vec![StoredProviderModelMapping {
+            name: "grok-imagine-video".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:video".to_string()]),
+            endpoint_ids: None,
+            operations: None,
+        }]),
+        model_supports_streaming: Some(false),
+        model_is_active: true,
+        model_is_available: true,
+    }
+}
+
+#[tokio::test]
+async fn xai_video_native_and_compatibility_http_lifecycle() {
+    let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let runtime = Router::new().route("/v1/execute/sync", any({
+        let seen = seen.clone(); let calls = calls.clone();
+        move |request: Request| {
+            let seen = seen.clone(); let calls = calls.clone();
+            async move {
+                let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
+                let plan: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                seen.lock().unwrap().push(plan.clone());
+                assert_eq!(plan["headers"]["authorization"], "Bearer upstream-video-key");
+                let body = if plan["method"] == "POST" {
+                    json!({"request_id":"upstream-video-id", "provider_extension":{"accepted":true}})
+                } else {
+                    assert_eq!(plan["url"], "https://api.x.ai/v1/videos/upstream-video-id");
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        json!({"status":"pending"})
+                    } else {
+                        json!({"status":"done", "model":"grok-imagine-video", "video":{"url":"https://vidgen.x.ai/test.mp4", "duration":6, "respect_moderation":true}, "provider_extension":"preserved"})
+                    }
+                };
+                Json(json!({"request_id":plan["request_id"],"status_code":200,"headers":{"content-type":"application/json"},"body":{"json_body":body},"telemetry":{"elapsed_ms":1}}))
+            }
+        }
+    }));
+    let (runtime_url, runtime_handle) = start_server(runtime).await;
+    let repository = Arc::new(InMemoryVideoTaskRepository::default());
+    let state_factory = || {
+        let auth = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![
+            (
+                Some(format!("{:x}", Sha256::digest(b"owner-key"))),
+                sample_auth_snapshot("owner-api-key", "owner"),
+            ),
+            (
+                Some(format!("{:x}", Sha256::digest(b"foreign-key"))),
+                sample_auth_snapshot("foreign-api-key", "foreign"),
+            ),
+        ]));
+        let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
+            sample_candidate_row(),
+        ]));
+        let catalog = video_provider_catalog_repository(
+            "provider-openai-video-local-1",
+            "xai",
+            "endpoint-openai-video-local-1",
+            "openai:video",
+            "https://cli-chat-proxy.grok.com/v1",
+            "key-openai-video-local-1",
+            "upstream-video-key",
+        );
+        build_state_with_execution_runtime_override(runtime_url.clone()).with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative).with_data_state_for_tests(
+            crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
+                auth, candidates, catalog, Arc::new(InMemoryRequestCandidateRepository::default()), DEVELOPMENT_ENCRYPTION_KEY
+            ).attach_video_task_repository_for_tests(repository.clone())
+        )
+    };
+    let (gateway_url, gateway_handle) =
+        start_server(build_router_with_state(state_factory())).await;
+    let client = reqwest::Client::new();
+    for (path, native) in [
+        ("/v1/videos/generations", true),
+        ("/v1/videos", true),
+        ("/v1/videos/edits", true),
+        ("/v1/videos/extensions", true),
+        ("/openai/v1/videos", false),
+    ] {
+        calls.store(0, Ordering::SeqCst);
+        let body = if native {
+            json!({"model":"video-model","prompt":"A cat","duration":6,"aspect_ratio":"1:1","video":{"url":"https://example.com/input.mp4"},"future_option":true})
+        } else {
+            json!({"model":"video-model","prompt":"A cat","seconds":"6","size":"1280x720"})
+        };
+        let response = client
+            .post(format!("{gateway_url}{path}"))
+            .bearer_auth("owner-key")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let result: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{path}: {result}");
+        let id = result[if native { "request_id" } else { "id" }]
+            .as_str()
+            .unwrap();
+        assert_ne!(id, "upstream-video-id");
+        if native {
+            assert!(result.get("id").is_none());
+            assert_eq!(result["provider_extension"]["accepted"], true);
+        } else {
+            assert_eq!(result["status"], "queued");
+        }
+        let request = seen.lock().unwrap().last().unwrap().clone();
+        let suffix = if path.ends_with("/edits") {
+            "edits"
+        } else if path.ends_with("/extensions") {
+            "extensions"
+        } else {
+            "generations"
+        };
+        assert_eq!(
+            request["url"],
+            format!("https://api.x.ai/v1/videos/{suffix}")
+        );
+        assert_eq!(request["body"]["json_body"]["model"], "grok-imagine-video");
+        assert_eq!(request["body"]["json_body"]["duration"], 6);
+        if native {
+            assert_eq!(request["body"]["json_body"]["future_option"], true);
+        } else {
+            assert_eq!(request["body"]["json_body"]["aspect_ratio"], "16:9");
+            assert_eq!(request["body"]["json_body"]["resolution"], "720p");
+            assert!(request["body"]["json_body"].get("seconds").is_none());
+            assert!(request["body"]["json_body"].get("size").is_none());
+        }
+        let query = format!(
+            "{gateway_url}{}/{id}",
+            if native {
+                "/v1/videos"
+            } else {
+                "/openai/v1/videos"
+            }
+        );
+        let before = seen.lock().unwrap().len();
+        let denied = client
+            .get(&query)
+            .bearer_auth("foreign-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+        assert_eq!(seen.lock().unwrap().len(), before);
+        let denied_content = client
+            .get(format!("{gateway_url}/openai/v1/videos/{id}/content"))
+            .bearer_auth("foreign-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(denied_content.status(), StatusCode::NOT_FOUND);
+        assert_eq!(seen.lock().unwrap().len(), before);
+        let pending: serde_json::Value = client
+            .get(&query)
+            .bearer_auth("owner-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            pending["status"],
+            if native { "pending" } else { "queued" },
+            "{path}: {pending}"
+        );
+        let done: serde_json::Value = client
+            .get(&query)
+            .bearer_auth("owner-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(done["status"], if native { "done" } else { "completed" });
+        if native {
+            assert_eq!(done["video"]["respect_moderation"], true);
+            assert_eq!(done["provider_extension"], "preserved");
+        } else {
+            assert_eq!(done["video_url"], "https://vidgen.x.ai/test.mp4");
+        }
+        let stored = repository
+            .find(VideoTaskLookupKey::Id(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.client_api_format.as_deref(),
+            Some(if native { "xai:video" } else { "openai:video" })
+        );
+        assert_eq!(
+            stored.external_task_id.as_deref(),
+            Some("upstream-video-id")
+        );
+        assert!(stored.request_metadata.is_none());
+        assert!(stored.original_request_body.is_none());
+        // A new gateway instance must reconstruct the pinned provider/credential and protocol.
+        let (restart_url, restart_handle) =
+            start_server(build_router_with_state(state_factory())).await;
+        let restored: serde_json::Value = client
+            .get(format!(
+                "{restart_url}{}/{id}",
+                if native {
+                    "/v1/videos"
+                } else {
+                    "/openai/v1/videos"
+                }
+            ))
+            .bearer_auth("owner-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(restored["status"], done["status"]);
+        if native {
+            assert_eq!(restored["video"]["respect_moderation"], true);
+        }
+        let compat: serde_json::Value = client
+            .get(format!("{restart_url}/openai/v1/videos/{id}"))
+            .bearer_auth("owner-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(compat["status"], "completed");
+        assert_eq!(compat["video_url"], "https://vidgen.x.ai/test.mp4");
+        let native_view: serde_json::Value = client
+            .get(format!("{restart_url}/v1/videos/{id}"))
+            .bearer_auth("owner-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(native_view["status"], "done");
+        assert_eq!(native_view["video"]["respect_moderation"], true);
+        restart_handle.abort();
+    }
+    let before = seen.lock().unwrap().len();
+    let bad = client
+        .post(format!("{gateway_url}/openai/v1/videos"))
+        .bearer_auth("owner-key")
+        .json(&json!({"model":"video-model","prompt":"cat","seconds":"wrong"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(seen.lock().unwrap().len(), before);
+    gateway_handle.abort();
+    runtime_handle.abort();
+}

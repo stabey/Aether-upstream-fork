@@ -24,6 +24,11 @@ impl LocalVideoTaskSeed {
                 let upstream_id = openai_video_provider_task_id(provider_body)?;
 
                 Some(Self::OpenAiCreate(OpenAiVideoTaskSeed {
+                    native_response: None,
+                    xai_provider: report_context
+                        .get("video_provider_xai")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     local_task_id: context_text(report_context, "local_task_id")
                         .unwrap_or_else(|| Uuid::new_v4().to_string()),
                     upstream_task_id: upstream_id.to_string(),
@@ -34,8 +39,12 @@ impl LocalVideoTaskSeed {
                     model: context_text(report_context, "model")
                         .or_else(|| request_body_text(report_context, "model")),
                     prompt: request_body_text(report_context, "prompt"),
-                    size: request_body_text(report_context, "size"),
-                    seconds: request_body_text(report_context, "seconds"),
+                    size: context_text(report_context, "video_size")
+                        .or_else(|| request_body_text(report_context, "size")),
+                    seconds: context_u64(report_context, "video_duration")
+                        .map(|v| v.to_string())
+                        .or_else(|| request_body_text(report_context, "seconds"))
+                        .or_else(|| request_body_text(report_context, "duration")),
                     remixed_from_video_id: None,
                     status: LocalVideoTaskStatus::Submitted,
                     progress_percent: 0,
@@ -52,6 +61,11 @@ impl LocalVideoTaskSeed {
                 let upstream_id = openai_video_provider_task_id(provider_body)?;
 
                 Some(Self::OpenAiRemix(OpenAiVideoTaskSeed {
+                    native_response: None,
+                    xai_provider: report_context
+                        .get("video_provider_xai")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                     local_task_id: context_text(report_context, "local_task_id")
                         .unwrap_or_else(|| Uuid::new_v4().to_string()),
                     upstream_task_id: upstream_id.to_string(),
@@ -62,8 +76,12 @@ impl LocalVideoTaskSeed {
                     model: context_text(report_context, "model")
                         .or_else(|| request_body_text(report_context, "model")),
                     prompt: request_body_text(report_context, "prompt"),
-                    size: request_body_text(report_context, "size"),
-                    seconds: request_body_text(report_context, "seconds"),
+                    size: context_text(report_context, "video_size")
+                        .or_else(|| request_body_text(report_context, "size")),
+                    seconds: context_u64(report_context, "video_duration")
+                        .map(|v| v.to_string())
+                        .or_else(|| request_body_text(report_context, "seconds"))
+                        .or_else(|| request_body_text(report_context, "duration")),
                     remixed_from_video_id: context_text(report_context, "task_id")
                         .or_else(|| request_body_text(report_context, "remix_video_id")),
                     status: LocalVideoTaskStatus::Submitted,
@@ -142,7 +160,13 @@ impl LocalVideoTaskSeed {
 
     pub fn client_body_json(&self) -> Value {
         match self {
-            Self::OpenAiCreate(seed) | Self::OpenAiRemix(seed) => seed.client_body_json(),
+            Self::OpenAiCreate(seed) | Self::OpenAiRemix(seed) => {
+                if seed.is_xai_native() {
+                    seed.native_create_body_json()
+                } else {
+                    seed.client_body_json()
+                }
+            }
             Self::GeminiCreate(seed) => seed.client_body_json(),
         }
     }
@@ -360,6 +384,90 @@ mod tests {
         resolve_local_sync_error_background_report_kind,
         resolve_local_sync_success_background_report_kind,
     };
+
+    #[test]
+    fn xai_native_video_protocol_survives_persistence_and_preserves_provider_fields() {
+        use crate::{
+            LocalVideoTaskContentAction, LocalVideoTaskSnapshot, VideoTaskService,
+            VideoTaskTruthSourceMode,
+        };
+        let mut plan =
+            build_internal_finalize_video_plan("native-create", "openai:video", None).unwrap();
+        plan.url = "https://api.x.ai/v1/videos/generations".into();
+        plan.headers
+            .insert("authorization".into(), "Bearer test-key".into());
+        let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
+        let context = json!({"local_task_id":"native-local", "user_id":"owner", "model":"grok-imagine-video", "video_client_protocol":"xai", "video_duration":6});
+        let success = service
+            .prepare_sync_success(
+                "openai_video_create_sync_finalize",
+                json!({"request_id":"native-upstream", "future_field":true})
+                    .as_object()
+                    .unwrap(),
+                context.as_object().unwrap(),
+                &plan,
+            )
+            .unwrap();
+        assert_eq!(
+            success.client_body_json(),
+            json!({"request_id":"native-local","future_field":true})
+        );
+        let mut snapshot = success.to_snapshot();
+        let body = json!({"status":"done","video":{"url":"https://vidgen.x.ai/video.mp4","duration":6,"respect_moderation":true},"future_field":[1,2]});
+        snapshot.apply_provider_body(body.as_object().unwrap());
+        assert_eq!(snapshot.read_response().body_json, body);
+        assert_eq!(
+            snapshot
+                .read_response_for_path("/openai/v1/videos/native-local")
+                .body_json["status"],
+            "completed"
+        );
+        let LocalVideoTaskSnapshot::OpenAi(seed) = &snapshot else {
+            panic!("openai task expected")
+        };
+        let Some(LocalVideoTaskContentAction::StreamPlan(download)) =
+            seed.build_content_stream_action(None, "download")
+        else {
+            panic!("download expected")
+        };
+        assert_eq!(download.url, "https://vidgen.x.ai/video.mp4");
+        assert!(download.headers.is_empty());
+        let stored = snapshot.to_upsert_record().into_stored();
+        assert!(stored.request_metadata.is_none());
+        assert_eq!(stored.client_api_format.as_deref(), Some("xai:video"));
+        let restored = LocalVideoTaskSnapshot::from_stored_task_with_transport(
+            &stored,
+            seed.transport.clone(),
+        )
+        .unwrap();
+        assert_eq!(restored.read_response().body_json["status"], "done");
+        service.record_snapshot(restored);
+        let poll = service
+            .prepare_read_refresh_sync_plan_for_user(
+                Some("openai"),
+                "/v1/videos/native-local",
+                "owner",
+                "poll",
+            )
+            .unwrap();
+        assert_eq!(poll.plan.url, "https://api.x.ai/v1/videos/native-upstream");
+        assert!(service
+            .prepare_read_refresh_sync_plan_for_user(
+                Some("openai"),
+                "/v1/videos/native-local",
+                "foreign",
+                "poll"
+            )
+            .is_none());
+        assert!(service.apply_read_refresh_projection(&poll, body.as_object().unwrap()));
+        assert_eq!(
+            service
+                .read_response_for_user(Some("openai"), "/v1/videos/native-local", "owner")
+                .unwrap()
+                .body_json,
+            body
+        );
+    }
 
     #[test]
     fn xai_video_lifecycle_creates_polls_persists_and_downloads() {

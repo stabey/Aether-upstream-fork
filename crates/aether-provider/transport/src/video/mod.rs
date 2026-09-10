@@ -220,7 +220,13 @@ pub fn build_video_create_upstream_url(
     match family {
         ProviderVideoCreateFamily::OpenAi => build_passthrough_path_url(
             &crate::xai::resolved_xai_request_base_url(transport, "openai:video"),
-            openai_video_api_root_request_path(request_path),
+            if crate::xai::is_xai_provider_transport(transport)
+                && matches!(request_path, "/v1/videos" | "/openai/v1/videos")
+            {
+                "/videos/generations"
+            } else {
+                openai_video_api_root_request_path(request_path)
+            },
             request_query,
             &[],
         ),
@@ -233,6 +239,7 @@ pub fn build_video_create_upstream_url(
 }
 
 fn openai_video_api_root_request_path(request_path: &str) -> &str {
+    let request_path = request_path.strip_prefix("/openai").unwrap_or(request_path);
     if request_path.starts_with("/v1/") {
         &request_path[3..]
     } else {
@@ -309,10 +316,12 @@ pub async fn reconstruct_local_video_task_snapshot(
         return Ok(None);
     };
 
-    Ok(LocalVideoTaskSnapshot::from_stored_task_with_transport(
-        task,
-        local_transport,
-    ))
+    let mut snapshot =
+        LocalVideoTaskSnapshot::from_stored_task_with_transport(task, local_transport);
+    if let Some(LocalVideoTaskSnapshot::OpenAi(seed)) = &mut snapshot {
+        seed.xai_provider = crate::xai::is_xai_provider_transport(&transport);
+    }
+    Ok(snapshot)
 }
 
 #[cfg(test)]
@@ -509,6 +518,72 @@ mod tests {
         .expect("url should build");
 
         assert_eq!(url, "https://api.openai.example/v1/videos?trace=1");
+    }
+
+    #[test]
+    fn xai_video_create_paths_preserve_auth_hosts_and_custom_endpoints() {
+        for (auth, base) in [
+            ("oauth", "https://cli-chat-proxy.grok.com/v1"),
+            ("api_key", "https://api.x.ai/v1"),
+        ] {
+            let mut transport = sample_transport("openai:video", auth);
+            transport.provider.provider_type = "xai".into();
+            transport.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".into();
+            transport.key.decrypted_auth_config =
+                (auth == "oauth").then(|| r#"{"using_api":false}"#.into());
+            for path in ["/v1/videos", "/openai/v1/videos", "/v1/videos/generations"] {
+                assert_eq!(
+                    build_video_create_upstream_url(
+                        &transport,
+                        path,
+                        Some("trace=1"),
+                        "grok-imagine-video",
+                        ProviderVideoCreateFamily::OpenAi
+                    )
+                    .unwrap(),
+                    format!("{base}/videos/generations?trace=1")
+                );
+            }
+            transport.endpoint.base_url = "https://gateway.example/prefix/v1".into();
+            assert_eq!(
+                build_video_create_upstream_url(
+                    &transport,
+                    "/openai/v1/videos",
+                    None,
+                    "grok-imagine-video",
+                    ProviderVideoCreateFamily::OpenAi
+                )
+                .unwrap(),
+                "https://gateway.example/prefix/v1/videos/generations"
+            );
+            transport.endpoint.custom_path = Some("/custom/videos/generations".into());
+            let url = build_video_create_upstream_url(
+                &transport,
+                "/openai/v1/videos",
+                None,
+                "grok-imagine-video",
+                ProviderVideoCreateFamily::OpenAi,
+            )
+            .unwrap();
+            assert!(url.ends_with("/custom/videos/generations"), "{url}");
+        }
+        let transport = sample_transport("openai:video", "api_key");
+        assert_eq!(
+            build_video_create_upstream_url(
+                &transport,
+                "/openai/v1/videos",
+                None,
+                "sora",
+                ProviderVideoCreateFamily::OpenAi
+            ),
+            build_video_create_upstream_url(
+                &transport,
+                "/v1/videos",
+                None,
+                "sora",
+                ProviderVideoCreateFamily::OpenAi
+            )
+        );
     }
 
     #[test]

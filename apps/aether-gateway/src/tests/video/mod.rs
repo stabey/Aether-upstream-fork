@@ -36,6 +36,7 @@ mod openai_sync_task;
 mod registry_poller;
 mod routing;
 mod stream;
+mod xai;
 
 /// Seed online manual proxy nodes for video execution fixtures.
 ///

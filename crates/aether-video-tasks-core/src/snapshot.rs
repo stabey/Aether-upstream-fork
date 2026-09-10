@@ -51,6 +51,8 @@ impl LocalVideoTaskSnapshot {
             "openai:video" => {
                 let upstream_task_id = non_empty_owned(task.external_task_id.as_ref())?;
                 Some(Self::OpenAi(OpenAiVideoTaskSeed {
+                    native_response: None,
+                    xai_provider: persistence.client_api_format == "xai:video",
                     local_task_id: task.id.clone(),
                     upstream_task_id,
                     created_at_unix_ms: task.created_at_unix_ms,
@@ -140,6 +142,19 @@ impl LocalVideoTaskSnapshot {
                 changed
             }
         }
+    }
+
+    pub fn read_response_for_path(&self, path: &str) -> LocalVideoTaskReadResponse {
+        if let Self::OpenAi(seed) = self {
+            let mut seed = seed.clone();
+            if path.starts_with("/openai/v1/videos/") {
+                seed.persistence.client_api_format = "openai:video".to_string();
+            } else if path.starts_with("/v1/videos/") && seed.uses_xai_provider() {
+                seed.persistence.client_api_format = "xai:video".to_string();
+            }
+            return Self::OpenAi(seed).read_response();
+        }
+        self.read_response()
     }
 
     pub fn read_response(&self) -> LocalVideoTaskReadResponse {

@@ -39,6 +39,42 @@ and failure payloads containing `code` / `error` without a status. Existing Open
 upstream task ID and selected credential. Completed video downloads use the returned
 media URL without forwarding provider authentication headers to the media host.
 
+### Public video protocols
+
+The xAI provider supports both of CPA's video surfaces:
+
+| Operation | xAI native | OpenAI compatible |
+| --- | --- | --- |
+| Create | `POST /v1/videos/generations` | `POST /openai/v1/videos` |
+| Edit / extend | `POST /v1/videos/edits`, `POST /v1/videos/extensions` | — |
+| Retrieve | `GET /v1/videos/{request_id}` | `GET /openai/v1/videos/{id}` |
+| Download | use the returned `video.url` | `GET /openai/v1/videos/{id}/content` |
+
+For xAI, `POST /v1/videos` is a native creation alias, matching CPA. Other
+providers retain Aether's existing OpenAI-compatible `/v1/videos` behavior.
+xAI callers using OpenAI `seconds` / `size` parameters must use
+`/openai/v1/videos`. The adapter maps these to numeric `duration`,
+`aspect_ratio`, and `resolution`; it also adapts image references. CPA's defaults
+(4 seconds, portrait, 720p), duration clamp (1–15), and input validation apply.
+Explicit native requests retain native parameters and additional provider fields.
+
+Default xAI creation targets `/videos/generations` on the selected upstream host.
+Explicit custom endpoint paths still take precedence. Native generation, editing,
+and extension paths only select xAI provider candidates.
+
+Native creation returns `request_id`; native retrieval preserves `done`, nested
+`video.url`, and provider fields such as `respect_moderation`. The identifier is
+an opaque Aether task ID so queries remain scoped to the owning user and pinned
+to the original upstream task and credential. The explicit `/openai/v1/videos`
+surface projects `id`, `completed`, and `video_url`.
+
+The task row records the native client protocol as `xai:video`, while its provider
+transport remains `openai:video`. This survives restart without storing request
+bodies or credentials. Raw native responses are cached only in memory; after
+reconstruction the gateway refreshes from the original provider to recover its
+response fields, including for completed tasks. If refreshing is unavailable,
+the stored task still provides the native status and media URL projection.
+
 ## Regression coverage
 
 The format tests cover client and hosted search choices, image-only and mixed tool
@@ -47,6 +83,10 @@ Transport tests cover OAuth/API-key/custom routing and media identity headers.
 Video-task tests exercise creation, polling, terminal projection, persistence fields,
 content-download planning, and status-less errors using local fixtures. They do not
 make paid generation requests.
+
+The HTTP regression exercises all native creation paths and the compatibility
+prefix through the public router and candidate planner, then checks polling,
+cross-user denial, persistence, and retrieval from a fresh gateway instance.
 
 ```sh
 cargo test -p aether-ai-formats -p aether-provider-transport -p aether-video-tasks-core --lib

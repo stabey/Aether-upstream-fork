@@ -201,6 +201,10 @@ pub struct LocalVideoTaskPersistence {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OpenAiVideoTaskSeed {
+    #[serde(default)]
+    pub native_response: Option<Value>,
+    #[serde(default)]
+    pub xai_provider: bool,
     pub local_task_id: String,
     pub upstream_task_id: String,
     pub created_at_unix_ms: u64,
