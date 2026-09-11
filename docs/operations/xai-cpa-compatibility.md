@@ -75,6 +75,12 @@ reconstruction the gateway refreshes from the original provider to recover its
 response fields, including for completed tasks. If refreshing is unavailable,
 the stored task still provides the native status and media URL projection.
 
+OpenAI/xAI task persistence supplies a stable 16-character `short_id`, as required
+by the PostgreSQL schema. Existing rows retain their original short ID across
+reconstruction, including legacy embedded snapshots. This internal identifier is
+separate from the opaque local task ID returned to clients; no schema change or
+historical row rewrite is needed.
+
 ### Runtime configuration
 
 Standalone Rust deployments must set
@@ -101,6 +107,11 @@ make paid generation requests.
 The HTTP regression exercises all native creation paths and the compatibility
 prefix through the public router and candidate planner, then checks polling,
 cross-user denial, persistence, and retrieval from a fresh gateway instance.
+CI also runs the same HTTP lifecycle with the PostgreSQL repository and the
+production column constraints/indexes in an isolated temporary table. This catches
+persistence failures that the in-memory repository cannot expose. The test uses
+local `initdb`, `postgres`, and `pg_ctl` (already provided by the gateway CI job),
+or an explicit `AETHER_TEST_DATABASE_URL` pointing to an isolated test database.
 
 ```sh
 cargo test -p aether-ai-formats -p aether-provider-transport -p aether-video-tasks-core --lib

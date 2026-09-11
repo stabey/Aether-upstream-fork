@@ -24,6 +24,7 @@ impl LocalVideoTaskSeed {
                 let upstream_id = openai_video_provider_task_id(provider_body)?;
 
                 Some(Self::OpenAiCreate(OpenAiVideoTaskSeed {
+                    local_short_id: None,
                     native_response: None,
                     xai_provider: report_context
                         .get("video_provider_xai")
@@ -61,6 +62,7 @@ impl LocalVideoTaskSeed {
                 let upstream_id = openai_video_provider_task_id(provider_body)?;
 
                 Some(Self::OpenAiRemix(OpenAiVideoTaskSeed {
+                    local_short_id: None,
                     native_response: None,
                     xai_provider: report_context
                         .get("video_provider_xai")

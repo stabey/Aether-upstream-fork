@@ -218,6 +218,7 @@ fn rust_authoritative_video_truth_source_can_background_success_report() {
 fn rust_authoritative_service_reads_openai_task_from_local_registry() {
     let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
     let snapshot = LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        local_short_id: None,
         native_response: None,
         xai_provider: false,
         local_task_id: "task-local-123".to_string(),
@@ -268,6 +269,7 @@ fn rust_authoritative_service_reads_openai_task_from_local_registry() {
 fn rust_authoritative_service_applies_cancel_and_delete_mutations() {
     let service = VideoTaskService::new(VideoTaskTruthSourceMode::RustAuthoritative);
     service.record_snapshot(LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+        local_short_id: None,
         native_response: None,
         xai_provider: false,
         local_task_id: "task-local-123".to_string(),

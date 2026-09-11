@@ -536,6 +536,7 @@ mod tests {
 
     fn sample_sparse_stored_task() -> StoredVideoTask {
         let snapshot = LocalVideoTaskSnapshot::OpenAi(OpenAiVideoTaskSeed {
+            local_short_id: None,
             native_response: None,
             xai_provider: false,
             local_task_id: "task-1".to_string(),

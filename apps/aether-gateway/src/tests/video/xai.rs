@@ -79,6 +79,54 @@ fn sample_candidate_row() -> StoredMinimalCandidateSelectionRow {
 
 #[tokio::test]
 async fn xai_video_native_and_compatibility_http_lifecycle() {
+    Box::pin(assert_xai_video_http_lifecycle(Arc::new(
+        InMemoryVideoTaskRepository::default(),
+    )))
+    .await;
+}
+
+#[tokio::test]
+async fn xai_video_native_and_compatibility_http_lifecycle_postgres() {
+    let configured_database_url = std::env::var("AETHER_TEST_DATABASE_URL").ok();
+    let managed_database = if configured_database_url.is_none() {
+        Some(
+            aether_testkit::ManagedPostgresServer::start()
+                .await
+                .expect("temporary PostgreSQL should start"),
+        )
+    } else {
+        None
+    };
+    let database_url = configured_database_url.unwrap_or_else(|| {
+        managed_database
+            .as_ref()
+            .expect("managed test database should exist")
+            .database_url()
+            .to_string()
+    });
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("test database should connect");
+    aether_data::driver::postgres::run_migrations(&pool)
+        .await
+        .expect("test database should migrate");
+    // Preserve the production column constraints and unique indexes while isolating test rows.
+    sqlx::query("CREATE TEMP TABLE video_tasks (LIKE public.video_tasks INCLUDING ALL)")
+        .execute(&pool)
+        .await
+        .expect("isolated video task table should be created");
+    let repository =
+        Arc::new(aether_data::repository::video_tasks::SqlxVideoTaskRepository::new(pool.clone()));
+    Box::pin(assert_xai_video_http_lifecycle(repository)).await;
+    pool.close().await;
+}
+
+async fn assert_xai_video_http_lifecycle<T>(repository: Arc<T>)
+where
+    T: aether_data_contracts::repository::video_tasks::VideoTaskRepository + 'static,
+{
     let static_dir = std::env::temp_dir().join(format!(
         "aether-xai-video-static-{}",
         std::time::SystemTime::now()
@@ -118,7 +166,6 @@ async fn xai_video_native_and_compatibility_http_lifecycle() {
         }
     }));
     let (runtime_url, runtime_handle) = start_server(runtime).await;
-    let repository = Arc::new(InMemoryVideoTaskRepository::default());
     let state_factory = || {
         let auth = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![
             (

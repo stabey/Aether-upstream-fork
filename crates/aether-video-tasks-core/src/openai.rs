@@ -702,7 +702,12 @@ impl OpenAiVideoTaskSeed {
         };
         let mut record = UpsertVideoTask {
             id: self.local_task_id.clone(),
-            short_id: None,
+            // The production schema requires a unique, non-null short_id (at most 16 chars).
+            // Derive it deterministically so repeated capture and legacy snapshot reloads agree.
+            short_id: Some(self.local_short_id.clone().unwrap_or_else(|| {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(self.local_task_id.as_bytes()))[..16].to_string()
+            })),
             request_id: self.persistence.request_id.clone(),
             user_id: self.user_id.clone(),
             api_key_id: self.api_key_id.clone(),
@@ -830,6 +835,7 @@ mod tests {
     #[test]
     fn builds_minimal_openai_persistence_record_without_sensitive_snapshot() {
         let seed = OpenAiVideoTaskSeed {
+            local_short_id: None,
             native_response: None,
             xai_provider: false,
             local_task_id: "task-openai-sensitive".to_string(),
@@ -882,6 +888,12 @@ mod tests {
 
         let record = seed.to_upsert_record();
 
+        let short_id = record
+            .short_id
+            .as_deref()
+            .expect("database short_id is required");
+        assert_eq!(short_id.len(), 16);
+        assert_eq!(seed.to_upsert_record().short_id, record.short_id);
         assert_eq!(record.error_code.as_deref(), Some("provider_error"));
         assert!(record.original_request_body.is_none());
         assert!(record.progress_message.is_none());
@@ -894,6 +906,8 @@ mod tests {
 
         let mut stored = record.into_stored();
         stored.status = VideoTaskStatus::Completed;
+        // Migrated tasks can already have a short ID unrelated to the derived ID.
+        stored.short_id = Some("legacy-short-id".to_string());
         let snapshot =
             LocalVideoTaskSnapshot::from_stored_task_with_transport(&stored, seed.transport)
                 .expect("stored task should reconstruct with current transport");
@@ -901,6 +915,21 @@ mod tests {
             panic!("expected OpenAI snapshot");
         };
         assert_eq!(restored.prompt, stored.prompt);
+        assert_eq!(restored.to_upsert_record().short_id, stored.short_id);
+        let mut embedded = stored.clone();
+        let mut legacy_snapshot =
+            serde_json::to_value(LocalVideoTaskSnapshot::OpenAi(restored.clone())).unwrap();
+        legacy_snapshot["OpenAi"]
+            .as_object_mut()
+            .unwrap()
+            .remove("local_short_id");
+        embedded.request_metadata = Some(json!({"rust_local_snapshot": legacy_snapshot}));
+        let embedded_snapshot = LocalVideoTaskSnapshot::from_stored_task(&embedded)
+            .expect("legacy embedded snapshot should hydrate");
+        assert_eq!(
+            embedded_snapshot.to_upsert_record().short_id,
+            stored.short_id
+        );
         assert_eq!(restored.to_upsert_record().video_url, stored.video_url);
         let Some(LocalVideoTaskContentAction::StreamPlan(plan)) =
             restored.build_content_stream_action(None, "trace-download")
