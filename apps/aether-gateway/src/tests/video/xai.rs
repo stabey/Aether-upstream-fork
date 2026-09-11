@@ -79,6 +79,19 @@ fn sample_candidate_row() -> StoredMinimalCandidateSelectionRow {
 
 #[tokio::test]
 async fn xai_video_native_and_compatibility_http_lifecycle() {
+    let static_dir = std::env::temp_dir().join(format!(
+        "aether-xai-video-static-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&static_dir).unwrap();
+    std::fs::write(
+        static_dir.join("index.html"),
+        "<html>Aether test frontend</html>",
+    )
+    .unwrap();
     let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let calls = Arc::new(AtomicUsize::new(0));
     let runtime = Router::new().route("/v1/execute/sync", any({
@@ -135,9 +148,21 @@ async fn xai_video_native_and_compatibility_http_lifecycle() {
             ).attach_video_task_repository_for_tests(repository.clone())
         )
     };
-    let (gateway_url, gateway_handle) =
-        start_server(build_router_with_state(state_factory())).await;
+    let router_factory =
+        || crate::attach_static_frontend(build_router_with_state(state_factory()), &static_dir);
+    let (gateway_url, gateway_handle) = start_server(router_factory()).await;
     let client = reqwest::Client::new();
+    assert_eq!(
+        client
+            .get(&gateway_url)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "<html>Aether test frontend</html>"
+    );
     for (path, native) in [
         ("/v1/videos/generations", true),
         ("/v1/videos", true),
@@ -264,8 +289,7 @@ async fn xai_video_native_and_compatibility_http_lifecycle() {
         assert!(stored.request_metadata.is_none());
         assert!(stored.original_request_body.is_none());
         // A new gateway instance must reconstruct the pinned provider/credential and protocol.
-        let (restart_url, restart_handle) =
-            start_server(build_router_with_state(state_factory())).await;
+        let (restart_url, restart_handle) = start_server(router_factory()).await;
         let restored: serde_json::Value = client
             .get(format!(
                 "{restart_url}{}/{id}",
@@ -322,4 +346,5 @@ async fn xai_video_native_and_compatibility_http_lifecycle() {
     assert_eq!(seen.lock().unwrap().len(), before);
     gateway_handle.abort();
     runtime_handle.abort();
+    std::fs::remove_dir_all(&static_dir).unwrap();
 }

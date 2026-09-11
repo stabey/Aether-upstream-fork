@@ -75,6 +75,20 @@ reconstruction the gateway refreshes from the original provider to recover its
 response fields, including for completed tasks. If refreshing is unavailable,
 the stored task still provides the native status and media URL projection.
 
+### Runtime configuration
+
+Standalone Rust deployments must set
+`AETHER_GATEWAY_VIDEO_TASK_TRUTH_SOURCE_MODE=rust-authoritative` and restart the
+gateway to enable video task retrieval, polling, and content downloads. The CLI's
+legacy default is `python-sync-report`: creation can return a task ID in that mode,
+but the local task read/refresh paths are disabled and may return HTTP 503.
+
+When the gateway also serves the frontend, `/openai/v1/videos` and its subpaths
+must bypass the static SPA handler and be mounted as API routes. Otherwise a
+successful-looking HTTP 200 response to a video query may contain `text/html`
+instead of the task's JSON response. The lifecycle regression includes the static
+frontend to cover this production configuration.
+
 ## Regression coverage
 
 The format tests cover client and hosted search choices, image-only and mixed tool
