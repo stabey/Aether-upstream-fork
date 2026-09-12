@@ -142,30 +142,50 @@ where
     .unwrap();
     let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
     let calls = Arc::new(AtomicUsize::new(0));
-    let runtime = Router::new().route("/v1/execute/sync", any({
-        let seen = seen.clone(); let calls = calls.clone();
-        move |request: Request| {
-            let seen = seen.clone(); let calls = calls.clone();
-            async move {
-                let bytes = to_bytes(request.into_body(), usize::MAX).await.unwrap();
-                let plan: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                seen.lock().unwrap().push(plan.clone());
-                assert_eq!(plan["headers"]["authorization"], "Bearer upstream-video-key");
-                let body = if plan["method"] == "POST" {
-                    json!({"request_id":"upstream-video-id", "provider_extension":{"accepted":true}})
-                } else {
-                    assert_eq!(plan["url"], "https://api.x.ai/v1/videos/upstream-video-id");
-                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                        json!({"status":"pending"})
+    // Exercise the real HTTP executor, including production method gates, instead of
+    // the test execution-runtime override that used to hide rejected GET requests.
+    let video_url = Arc::new(Mutex::new(String::new()));
+    let runtime = Router::new()
+        .route("/v1/videos/{operation}", any({
+            let seen = seen.clone();
+            let calls = calls.clone();
+            let video_url = video_url.clone();
+            move |request: Request| {
+                let seen = seen.clone();
+                let calls = calls.clone();
+                let video_url = video_url.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    assert_eq!(parts.headers["authorization"], "Bearer upstream-video-key");
+                    let bytes = to_bytes(body, usize::MAX).await.unwrap();
+                    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+                    seen.lock().unwrap().push(json!({
+                        "method": parts.method.as_str(),
+                        "url": parts.uri.path(),
+                        "body": {"json_body": body}
+                    }));
+                    let response = if parts.method == http::Method::POST {
+                        json!({"request_id":"upstream-video-id", "provider_extension":{"accepted":true}})
                     } else {
-                        json!({"status":"done", "model":"grok-imagine-video", "video":{"url":"https://vidgen.x.ai/test.mp4", "duration":6, "respect_moderation":true}, "provider_extension":"preserved"})
-                    }
-                };
-                Json(json!({"request_id":plan["request_id"],"status_code":200,"headers":{"content-type":"application/json"},"body":{"json_body":body},"telemetry":{"elapsed_ms":1}}))
+                        assert_eq!(parts.uri.path(), "/v1/videos/upstream-video-id");
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            json!({"status":"pending"})
+                        } else {
+                            json!({"status":"done", "model":"grok-imagine-video", "video":{"url":video_url.lock().unwrap().clone(), "duration":6, "respect_moderation":true}, "provider_extension":"preserved"})
+                        }
+                    };
+                    Json(response)
+                }
             }
-        }
-    }));
+        }))
+        .route("/test.mp4", any(|request: Request| async move {
+            assert!(request.headers().get("authorization").is_none());
+            assert!(request.headers().get("x-xai-token-auth").is_none());
+            ([("content-type", "video/mp4")], "test-video-bytes")
+        }));
     let (runtime_url, runtime_handle) = start_server(runtime).await;
+    let expected_video_url = format!("{runtime_url}/test.mp4");
+    *video_url.lock().unwrap() = expected_video_url.clone();
     let state_factory = || {
         let auth = Arc::new(InMemoryAuthApiKeySnapshotRepository::seed(vec![
             (
@@ -180,19 +200,21 @@ where
         let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
             sample_candidate_row(),
         ]));
-        let catalog = video_provider_catalog_repository(
+        let catalog = video_provider_catalog_repository_with_proxy(
             "provider-openai-video-local-1",
             "xai",
             "endpoint-openai-video-local-1",
             "openai:video",
-            "https://cli-chat-proxy.grok.com/v1",
+            "http://video-provider.invalid/v1",
             "key-openai-video-local-1",
             "upstream-video-key",
+            Some(json!({"enabled":true,"node_id":"video-proxy"})),
         );
-        build_state_with_execution_runtime_override(runtime_url.clone()).with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative).with_data_state_for_tests(
+        AppState::new().expect("gateway should build").with_video_task_truth_source_mode(VideoTaskTruthSourceMode::RustAuthoritative).with_data_state_for_tests(
             crate::data::GatewayDataState::with_auth_candidate_selection_provider_catalog_and_request_candidate_repository_for_tests(
                 auth, candidates, catalog, Arc::new(InMemoryRequestCandidateRepository::default()), DEVELOPMENT_ENCRYPTION_KEY
             ).attach_video_task_repository_for_tests(repository.clone())
+             .attach_proxy_node_repository_for_tests(video_proxy_node_repository_at_url(["video-proxy"], &runtime_url))
         )
     };
     let router_factory =
@@ -251,10 +273,7 @@ where
         } else {
             "generations"
         };
-        assert_eq!(
-            request["url"],
-            format!("https://api.x.ai/v1/videos/{suffix}")
-        );
+        assert_eq!(request["url"], format!("/v1/videos/{suffix}"));
         assert_eq!(request["body"]["json_body"]["model"], "grok-imagine-video");
         assert_eq!(request["body"]["json_body"]["duration"], 6);
         if native {
@@ -318,7 +337,7 @@ where
             assert_eq!(done["video"]["respect_moderation"], true);
             assert_eq!(done["provider_extension"], "preserved");
         } else {
-            assert_eq!(done["video_url"], "https://vidgen.x.ai/test.mp4");
+            assert_eq!(done["video_url"], expected_video_url);
         }
         let stored = repository
             .find(VideoTaskLookupKey::Id(id))
@@ -367,7 +386,7 @@ where
             .await
             .unwrap();
         assert_eq!(compat["status"], "completed");
-        assert_eq!(compat["video_url"], "https://vidgen.x.ai/test.mp4");
+        assert_eq!(compat["video_url"], expected_video_url);
         let native_view: serde_json::Value = client
             .get(format!("{restart_url}/v1/videos/{id}"))
             .bearer_auth("owner-key")
@@ -379,6 +398,17 @@ where
             .unwrap();
         assert_eq!(native_view["status"], "done");
         assert_eq!(native_view["video"]["respect_moderation"], true);
+        for prefix in ["/v1/videos", "/openai/v1/videos"] {
+            let content = client
+                .get(format!("{restart_url}{prefix}/{id}/content"))
+                .bearer_auth("owner-key")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(content.status(), StatusCode::OK);
+            assert_eq!(content.headers()["content-type"], "video/mp4");
+            assert_eq!(content.bytes().await.unwrap(), "test-video-bytes");
+        }
         restart_handle.abort();
     }
     let before = seen.lock().unwrap().len();

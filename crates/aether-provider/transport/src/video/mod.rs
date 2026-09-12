@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use aether_contracts::ProxySnapshot;
 use aether_data_contracts::repository::video_tasks::StoredVideoTask;
 use aether_video_tasks_core::{
     LocalVideoTaskSnapshot, LocalVideoTaskTransport, LocalVideoTaskTransportBridgeInput,
@@ -12,11 +13,13 @@ use super::auth::{
     build_passthrough_headers_with_auth, resolve_local_gemini_auth,
     resolve_local_openai_bearer_auth,
 };
-use super::network::{resolve_transport_execution_timeouts, resolve_transport_profile};
+use super::network::{
+    resolve_transport_execution_timeouts, resolve_transport_profile,
+    resolve_transport_proxy_snapshot,
+};
 use super::policy::{
     local_gemini_transport_unsupported_reason_with_network,
-    local_standard_transport_unsupported_reason_with_network, supports_local_gemini_transport,
-    supports_local_standard_transport,
+    local_standard_transport_unsupported_reason_with_network,
 };
 use super::rules::{
     apply_local_body_rules_with_request_headers, apply_local_header_rules_with_request_headers,
@@ -80,6 +83,13 @@ pub trait VideoTaskTransportSnapshotLookup: Send + Sync {
         endpoint_id: &str,
         key_id: &str,
     ) -> Result<Option<GatewayProviderTransportSnapshot>, String>;
+
+    async fn resolve_video_task_proxy(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+    ) -> Option<ProxySnapshot> {
+        resolve_transport_proxy_snapshot(transport)
+    }
 }
 
 pub fn resolve_local_video_task_transport(
@@ -90,13 +100,17 @@ pub fn resolve_local_video_task_transport(
     let api_format = api_format.trim();
     let (auth_header, auth_value) = match api_format {
         "openai:video" => {
-            if !supports_local_standard_transport(transport, api_format) {
+            if local_standard_transport_unsupported_reason_with_network(transport, api_format)
+                .is_some()
+            {
                 return None;
             }
             resolve_openai_compatible_video_auth(transport)?
         }
         "gemini:video" => {
-            if !supports_local_gemini_transport(transport, api_format) {
+            if local_gemini_transport_unsupported_reason_with_network(transport, api_format)
+                .is_some()
+            {
                 return None;
             }
             resolve_local_gemini_auth(transport)?
@@ -115,7 +129,7 @@ pub fn resolve_local_video_task_transport(
             auth_value,
             content_type: Some("application/json".to_string()),
             model_name,
-            proxy: None,
+            proxy: resolve_transport_proxy_snapshot(transport),
             transport_profile: resolve_transport_profile(transport),
             timeouts: resolve_transport_execution_timeouts(transport),
         });
@@ -310,11 +324,15 @@ pub async fn reconstruct_local_video_task_snapshot(
         return Ok(None);
     };
 
-    let Some(local_transport) =
+    let Some(mut local_transport) =
         resolve_local_video_task_transport(&transport, provider_api_format, task.model.clone())
     else {
         return Ok(None);
     };
+
+    // Resolve deployment-managed nodes, system defaults and tunnel affinity just as
+    // creation does; serialized task metadata intentionally contains no credentials.
+    local_transport.proxy = lookup.resolve_video_task_proxy(&transport).await;
 
     let mut snapshot =
         LocalVideoTaskSnapshot::from_stored_task_with_transport(task, local_transport);
@@ -470,6 +488,46 @@ mod tests {
         );
         assert_eq!(transport.model_name.as_deref(), Some("sora"));
         assert_eq!(transport.provider_id, "provider-1");
+    }
+
+    #[tokio::test]
+    async fn reconstructs_video_with_configured_proxy_and_profile() {
+        let mut transport = sample_transport("openai:video", "oauth");
+        transport.provider.provider_type = "xai".into();
+        transport.endpoint.base_url = "https://cli-chat-proxy.grok.com/v1".into();
+        transport.provider.proxy = Some(json!({"enabled":true,"url":"http://127.0.0.1:9876"}));
+        transport.provider.config = Some(json!({"fingerprint":{"transport_profile":{
+            "profile_id":"test-video","backend":"reqwest_rustls","http_mode":"auto","pool_scope":"key"
+        }}}));
+        transport.key.decrypted_auth_config = Some(r#"{"using_api":false}"#.into());
+        let lookup = TestLookup(Some(transport));
+        let snapshot = reconstruct_local_video_task_snapshot(&lookup, &sample_stored_video_task())
+            .await
+            .unwrap()
+            .expect("proxied video must resume after restart");
+        let LocalVideoTaskSnapshot::OpenAi(seed) = snapshot else {
+            panic!("expected OpenAI video")
+        };
+        assert!(seed.xai_provider);
+        assert_eq!(
+            seed.transport.proxy.as_ref().unwrap().url.as_deref(),
+            Some("http://127.0.0.1:9876/")
+        );
+        assert_eq!(
+            seed.transport
+                .transport_profile
+                .as_ref()
+                .unwrap()
+                .profile_id,
+            "test-video"
+        );
+        assert_eq!(
+            seed.transport
+                .headers
+                .get("x-xai-token-auth")
+                .map(String::as_str),
+            Some("xai-grok-cli")
+        );
     }
 
     #[test]

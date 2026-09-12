@@ -81,6 +81,11 @@ reconstruction, including legacy embedded snapshots. This internal identifier is
 separate from the opaque local task ID returned to clients; no schema change or
 historical row rewrite is needed.
 
+Task retrieval and content downloads are admitted by the production GET execution
+gate. Reconstructed tasks resolve proxy nodes, system proxy defaults, tunnel affinity,
+and transport profiles through the same deployment resolver used for creation;
+configured proxy routes must not silently turn into direct requests after restart.
+
 ### Runtime configuration
 
 Standalone Rust deployments must set
@@ -106,7 +111,11 @@ make paid generation requests.
 
 The HTTP regression exercises all native creation paths and the compatibility
 prefix through the public router and candidate planner, then checks polling,
-cross-user denial, persistence, and retrieval from a fresh gateway instance.
+cross-user denial, persistence, retrieval from a fresh gateway instance, and downloads
+through both prefixes without leaking authorization to the media host. It uses the
+real HTTP executor and a managed proxy node backed by a local test server, with no
+execution-runtime override. The background poller also has a real HTTP proxy-node
+regression, so production method guards and transport reconstruction are exercised.
 CI also runs the same HTTP lifecycle with the PostgreSQL repository and the
 production column constraints/indexes in an isolated temporary table. This catches
 persistence failures that the in-memory repository cannot expose. The test uses
