@@ -822,15 +822,20 @@ where
     let started_at = Instant::now();
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(1);
     let request_diagnostics = current_request_diagnostics();
+    let cancel_on_disconnect = crate::request_lifecycle::cancel_on_client_disconnect();
 
     tokio::spawn(async move {
         scope_request_diagnostics_with(request_diagnostics, async move {
-            let bytes = standard_text_sync_heartbeat_final_bytes(
+            let completion = standard_text_sync_heartbeat_final_bytes(
                 client_api_format.as_str(),
                 redaction_slot.as_ref(),
-                execute(state, parts, trace_id, decision, plan_kind, started_at).await,
-            )
-            .await;
+                tokio::select! {
+                    biased;
+                    _ = tx.closed(), if cancel_on_disconnect => return,
+                    result = execute(state, parts, trace_id, decision, plan_kind, started_at) => result,
+                },
+            );
+            let bytes = completion.await;
             let _ = tx.send(Ok(Bytes::from(bytes))).await;
         })
         .await;
@@ -1097,23 +1102,26 @@ fn build_openai_image_sync_heartbeat_shell_response(
     let started_at = Instant::now();
     let (tx, rx) = mpsc::channel::<Result<Bytes, IoError>>(1);
     let request_diagnostics = current_request_diagnostics();
+    let cancel_on_disconnect = crate::request_lifecycle::cancel_on_client_disconnect();
 
     tokio::spawn(async move {
         scope_request_diagnostics_with(request_diagnostics, async move {
-            let bytes = openai_image_sync_heartbeat_final_bytes(
-                execute_openai_image_sync_heartbeat_attempts(
-                    state,
-                    request_path,
-                    trace_id,
-                    decision,
-                    plan_kind,
-                    attempts,
-                    transfer_tracker,
-                    started_at,
-                )
-                .await,
-            )
-            .await;
+            let execution = execute_openai_image_sync_heartbeat_attempts(
+                state,
+                request_path,
+                trace_id,
+                decision,
+                plan_kind,
+                attempts,
+                transfer_tracker,
+                started_at,
+            );
+            let outcome = tokio::select! {
+                biased;
+                _ = tx.closed(), if cancel_on_disconnect => return,
+                result = execution => result,
+            };
+            let bytes = openai_image_sync_heartbeat_final_bytes(outcome).await;
             let _ = tx.send(Ok(Bytes::from(bytes))).await;
         })
         .await;
@@ -1456,6 +1464,22 @@ pub(crate) async fn maybe_execute_sync_via_local_video_decision(
     .await
 }
 
+fn supports_local_video_get(
+    parts: &http::request::Parts,
+    decision: &GatewayControlDecision,
+) -> bool {
+    parts.method == http::Method::GET
+        && decision.route_kind.as_deref() == Some("video")
+        && (crate::video_tasks::resolve_video_task_read_lookup_key(
+            decision.route_family.as_deref(),
+            parts.uri.path(),
+        )
+        .is_some()
+            || (decision.route_family.as_deref() == Some("openai")
+                && crate::video_tasks::extract_openai_task_id_from_content_path(parts.uri.path())
+                    .is_some()))
+}
+
 pub(crate) fn maybe_execute_sync_request<'a>(
     state: &'a AppState,
     parts: &'a http::request::Parts,
@@ -1469,7 +1493,7 @@ pub(crate) fn maybe_execute_sync_request<'a>(
         };
         #[cfg(not(test))]
         {
-            if parts.method != http::Method::POST {
+            if parts.method != http::Method::POST && !supports_local_video_get(parts, decision) {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
             return maybe_execute_sync_local_path(state, parts, body_bytes, trace_id, decision)
@@ -1482,6 +1506,7 @@ pub(crate) fn maybe_execute_sync_request<'a>(
                 .unwrap_or_default()
                 .is_empty()
                 && parts.method != http::Method::POST
+                && !supports_local_video_get(parts, decision)
             {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
@@ -1503,7 +1528,7 @@ pub(crate) fn maybe_execute_stream_request<'a>(
         };
         #[cfg(not(test))]
         {
-            if parts.method != http::Method::POST {
+            if parts.method != http::Method::POST && !supports_local_video_get(parts, decision) {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
             return maybe_execute_stream_local_path(state, parts, body_bytes, trace_id, decision)
@@ -1516,6 +1541,7 @@ pub(crate) fn maybe_execute_stream_request<'a>(
                 .unwrap_or_default()
                 .is_empty()
                 && parts.method != http::Method::POST
+                && !supports_local_video_get(parts, decision)
             {
                 return Ok(LocalExecutionRequestOutcome::NoPath);
             }
@@ -2329,6 +2355,45 @@ mod tests {
         })
         .await
         .expect("background completion should release admission");
+    }
+
+    #[tokio::test]
+    async fn standard_text_sync_heartbeat_cancels_when_routing_policy_enables_it() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (mut release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let response = crate::request_lifecycle::run_request(async move {
+            crate::request_lifecycle::configure_client_disconnect(
+                aether_routing_core::RoutingExecutionPolicy {
+                    cancel_on_client_disconnect: true,
+                    ..Default::default()
+                },
+            );
+            let (parts, _) = http::Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .body(())
+                .unwrap()
+                .into_parts();
+            build_standard_text_sync_heartbeat_shell_response(
+                AppState::new().unwrap(),
+                parts,
+                "trace-heartbeat-disconnect".to_string(),
+                test_standard_text_heartbeat_decision(),
+                TEST_STANDARD_TEXT_SYNC_PLAN_KIND.to_string(),
+                move |_, _, _, _, _, _| async move {
+                    started_tx.send(()).unwrap();
+                    release_rx.await.unwrap();
+                    Ok(LocalExecutionRequestOutcome::NoPath)
+                },
+            )
+        })
+        .await
+        .unwrap();
+        started_rx.await.unwrap();
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), release_tx.closed())
+            .await
+            .expect("heartbeat must drop upstream execution immediately");
     }
 
     #[tokio::test]

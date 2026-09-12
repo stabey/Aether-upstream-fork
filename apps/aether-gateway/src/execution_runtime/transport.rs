@@ -36,7 +36,7 @@ use hyper::body::Incoming as HyperIncomingBody;
 use hyper::client::conn::http2::SendRequest as HyperH2cSendRequest;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as HyperLegacyClient;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::redirect::Policy;
 use serde::Serialize;
@@ -50,6 +50,7 @@ use tokio::sync::OnceCell as TokioOnceCell;
 use crate::ai_serving::api::extract_provider_private_stream_error_body;
 #[cfg(test)]
 use crate::execution_runtime::remote_compat::execute_sync_plan_via_remote_execution_runtime;
+use crate::execution_runtime::stream_read_timeout::resolve_stream_idle_timeout;
 use crate::execution_runtime::windsurf::maybe_execute_windsurf_sync;
 use crate::frontdoor_loop_guard::{
     configured_gateway_frontdoor_base_url, gateway_frontdoor_self_loop_guard_error,
@@ -109,7 +110,7 @@ const DIRECT_REQWEST_PREWARM_SYNC_CLIENTS_ENV: &str =
     "AETHER_GATEWAY_DIRECT_REQWEST_PREWARM_SYNC_CLIENTS";
 const DEFAULT_H2_TARGET_STREAMS_PER_CLIENT: usize = 8;
 const DEFAULT_HTTP1_TARGET_STREAMS_PER_CLIENT: usize = 512;
-const DEFAULT_DIRECT_H2C_POOL_MAX_IDLE_PER_HOST: usize = 512;
+const DEFAULT_DIRECT_H2C_POOL_MAX_IDLE_PER_HOST: usize = 32;
 const DEFAULT_DIRECT_H2C_TARGET_STREAMS_PER_CLIENT: usize = 128;
 const DEFAULT_DIRECT_H2C_SENDER_SELECT_WINDOW: usize = 4;
 const MAX_DIRECT_H2C_DRIVER_RUNTIME_THREADS: usize = 16;
@@ -382,6 +383,7 @@ static DIRECT_H2C_SENDER_CACHE: LazyLock<
 static DIRECT_H2C_POOL_MAX_IDLE_PER_HOST: LazyLock<usize> = LazyLock::new(|| {
     env_positive_usize(DIRECT_H2C_POOL_MAX_IDLE_PER_HOST_ENV)
         .unwrap_or(DEFAULT_DIRECT_H2C_POOL_MAX_IDLE_PER_HOST)
+        .min(1024)
 });
 
 static DIRECT_H2C_SENDER_SELECT_WINDOW: LazyLock<usize> = LazyLock::new(|| {
@@ -438,7 +440,7 @@ static DIRECT_H2C_SENDER_CACHE_METRICS: LazyLock<DirectHyperH2cSenderCacheMetric
     LazyLock::new(DirectHyperH2cSenderCacheMetrics::default);
 
 #[derive(Debug, Clone, Copy, Default)]
-struct ExecutionSafeDnsResolver;
+pub(crate) struct ExecutionSafeDnsResolver;
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ExecutionSafeHyperDnsResolver;
@@ -446,10 +448,7 @@ struct ExecutionSafeHyperDnsResolver;
 fn dns_host_explicitly_allows_loopback(host: &str) -> bool {
     let host = host.trim_end_matches('.');
     host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
+        || aether_http::parse_ip_literal_host(host).is_some_and(|ip| ip.is_loopback())
 }
 
 fn validate_resolved_execution_addresses(
@@ -491,12 +490,9 @@ async fn resolve_execution_target_addresses_with_policy(
     port: u16,
     provider_execution: bool,
 ) -> Result<Vec<SocketAddr>, std::io::Error> {
-    let addresses = if let Ok(ip) = host.parse::<IpAddr>() {
-        vec![SocketAddr::new(ip, port)]
-    } else {
+    let addresses =
         aether_http::lookup_host_with_limits(host, port, aether_http::DEFAULT_DNS_LOOKUP_TIMEOUT)
-            .await?
-    };
+            .await?;
     validate_resolved_execution_addresses(host, addresses, provider_execution)
 }
 
@@ -1204,6 +1200,42 @@ pub(crate) enum DirectUpstreamResponse {
     LocalTunnel(tunnel::DirectRelayResponse),
 }
 
+pub(crate) fn direct_upstream_response_byte_stream(
+    prefetched_body: VecDeque<Result<Bytes, String>>,
+    response: DirectUpstreamResponse,
+) -> futures_util::stream::BoxStream<'static, Result<Bytes, String>> {
+    let response_stream = match response {
+        DirectUpstreamResponse::Reqwest(response) => response
+            .bytes_stream()
+            .map(|item| item.map_err(|err| format_upstream_request_error(&err)))
+            .boxed(),
+        DirectUpstreamResponse::HyperH2c(response) => response
+            .into_body()
+            .into_data_stream()
+            .map(|item| item.map_err(|err| format_hyper_error_chain(&err)))
+            .boxed(),
+        DirectUpstreamResponse::BrowserWreq(response) => response
+            .bytes_stream()
+            .map(|item| item.map_err(|err| format_wreq_upstream_request_error(&err)))
+            .boxed(),
+        DirectUpstreamResponse::LocalTunnel(mut response) => async_stream::stream! {
+            loop {
+                match response.next_chunk().await {
+                    Ok(Some(chunk)) => yield Ok(chunk),
+                    Ok(None) => break,
+                    Err(err) => {
+                        yield Err(err);
+                        break;
+                    }
+                }
+            }
+        }
+        .boxed(),
+    };
+    let upstream = futures_util::stream::iter(prefetched_body).chain(response_stream);
+    crate::execution_runtime::stream_read_timeout::skip_empty_upstream_chunks(upstream).boxed()
+}
+
 pub(crate) struct DirectUpstreamStreamExecution {
     pub(crate) request_id: String,
     pub(crate) candidate_id: Option<String>,
@@ -1220,6 +1252,7 @@ pub(crate) struct DirectUpstreamStreamExecution {
     pub(crate) started_at: Instant,
     pub(crate) response_observation: ExecutionResponseObservation,
     pub(crate) stream_first_byte_timeout: Option<Duration>,
+    pub(crate) stream_idle_timeout: Option<Duration>,
     pub(crate) upstream_target_permit: Option<UpstreamTargetAdmissionPermit>,
 }
 
@@ -1353,6 +1386,7 @@ impl DirectSyncExecutionRuntime {
                 request_order_id,
             },
             stream_first_byte_timeout: resolve_stream_first_byte_timeout(plan),
+            stream_idle_timeout: resolve_stream_idle_timeout(plan),
             upstream_target_permit: None,
         })
     }
@@ -1500,6 +1534,7 @@ pub(crate) async fn execute_stream_plan_via_local_tunnel(
             request_order_id,
         },
         stream_first_byte_timeout: resolve_stream_first_byte_timeout(plan),
+        stream_idle_timeout: resolve_stream_idle_timeout(plan),
         upstream_target_permit: None,
     }))
 }
@@ -2599,6 +2634,8 @@ fn build_direct_h2c_client_from_cache_key(
     builder.http2_only(true);
     builder.http2_adaptive_window(true);
     builder.pool_max_idle_per_host(cache_key.pool_max_idle_per_host);
+    builder.pool_timer(TokioTimer::new());
+    builder.pool_idle_timeout(Duration::from_millis(upstream_pool_idle_timeout_ms()));
     builder.build(connector)
 }
 
@@ -2860,8 +2897,18 @@ async fn send_via_browser_wreq_transport(
     let profile = plan.transport_profile.as_ref().ok_or_else(|| {
         ExecutionRuntimeTransportError::UnsupportedTransportProfile(String::new())
     })?;
+    let mut client_timeouts = plan.timeouts.clone();
+    if plan.stream {
+        if let Some(timeouts) = client_timeouts.as_mut() {
+            // Streamed responses use the shared idle reader; sync collectors retain
+            // their existing client read timeout. Zero explicitly disables either.
+            if apply_request_total_timeout || timeouts.read_ms == Some(0) {
+                timeouts.read_ms = None;
+            }
+        }
+    }
     let client = build_browser_wreq_client(
-        plan.timeouts.as_ref(),
+        client_timeouts.as_ref(),
         plan.proxy.as_ref(),
         profile,
         transport_controls,
@@ -4220,6 +4267,7 @@ fn build_direct_reqwest_client_from_cache_key(
         &HttpClientConfig {
             connect_timeout_ms: cache_key.connect_timeout_ms,
             pool_max_idle_per_host: Some(direct_reqwest_pool_max_idle_per_host()),
+            pool_idle_timeout_ms: Some(upstream_pool_idle_timeout_ms()),
             ..HttpClientConfig::default()
         },
     );
@@ -4239,12 +4287,22 @@ fn build_direct_reqwest_client_from_cache_key(
 }
 
 fn direct_reqwest_pool_max_idle_per_host() -> usize {
-    const DEFAULT_MAX_IDLE_PER_HOST: usize = 1024;
+    const DEFAULT_MAX_IDLE_PER_HOST: usize = 32;
     std::env::var("AETHER_GATEWAY_UPSTREAM_POOL_MAX_IDLE_PER_HOST")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_MAX_IDLE_PER_HOST)
+        .min(1024)
+}
+
+fn upstream_pool_idle_timeout_ms() -> u64 {
+    std::env::var("AETHER_GATEWAY_UPSTREAM_POOL_IDLE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(15_000)
+        .min(300_000)
 }
 
 pub(crate) fn direct_reqwest_client_cache_metric_samples() -> Vec<MetricSample> {
@@ -4591,7 +4649,11 @@ pub(crate) fn build_browser_wreq_client(
 ) -> Result<wreq::Client, ExecutionRuntimeTransportError> {
     let emulation = browser_wreq_emulation_from_profile(transport_profile)?;
     let proxy_url = resolve_proxy_url(proxy)?;
-    let mut builder = wreq::Client::builder().no_proxy().emulation(emulation);
+    let mut builder = wreq::Client::builder()
+        .no_proxy()
+        .emulation(emulation)
+        .pool_max_idle_per_host(direct_reqwest_pool_max_idle_per_host())
+        .pool_idle_timeout(Duration::from_millis(upstream_pool_idle_timeout_ms()));
     if proxy_url.is_none() {
         builder = builder.dns_resolver(ExecutionSafeDnsResolver);
     }
@@ -5149,7 +5211,7 @@ fn execution_log_url_host(url: &str) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn validate_execution_upstream_url(
+pub(crate) fn validate_execution_upstream_url(
     raw_url: &str,
 ) -> Result<url::Url, ExecutionRuntimeTransportError> {
     let url = url::Url::parse(raw_url).map_err(|_| {
@@ -5316,7 +5378,7 @@ pub(crate) fn build_execution_response_body(
 mod tests {
     use std::collections::BTreeMap;
     use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+    use std::sync::{Arc, Mutex};
 
     use aether_contracts::tunnel::{
         TUNNEL_RELAY_AUTH_NONCE_HEADER, TUNNEL_RELAY_AUTH_PAYLOAD_HEADER,
@@ -5440,6 +5502,8 @@ mod tests {
             "93.184.216.34:443".parse().unwrap(),
         ];
         for host in [
+            "chatgpt.com",
+            "api.openai.com",
             "oauth2.googleapis.com",
             "www.googleapis.com",
             "custom.example.test",
@@ -5449,6 +5513,46 @@ mod tests {
                     .expect("provider DNS answers should pass through"),
                 addresses
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_dns_handles_url_ipv6_without_weakening_relay_filtering() {
+        for provider_execution in [false, true] {
+            let addresses = super::resolve_execution_target_addresses_with_policy(
+                "[::1]",
+                8443,
+                provider_execution,
+            )
+            .await
+            .expect("literal IPv6 loopback should resolve without DNS");
+            assert_eq!(addresses, vec!["[::1]:8443".parse().unwrap()]);
+        }
+        let error = super::resolve_execution_target_addresses_with_policy("[fd00::1]", 443, false)
+            .await
+            .expect_err("private IPv6 must remain blocked for relay traffic");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn execution_dns_resolvers_preserve_provider_fake_ip_answers() {
+        for host in ["198.18.78.41", "198.19.1.2"] {
+            let expected = vec![format!("{host}:0").parse::<std::net::SocketAddr>().unwrap()];
+            let reqwest_addresses = reqwest::dns::Resolve::resolve(
+                &super::ExecutionSafeDnsResolver,
+                host.parse().unwrap(),
+            )
+            .await
+            .expect("HTTP provider DNS must accept Fake-IP answers")
+            .collect::<Vec<_>>();
+            let wreq_addresses =
+                wreq::dns::Resolve::resolve(&super::ExecutionSafeDnsResolver, host.into())
+                    .await
+                    .expect("WebSocket provider DNS must accept Fake-IP answers")
+                    .collect::<Vec<_>>();
+
+            assert_eq!(reqwest_addresses, expected);
+            assert_eq!(wreq_addresses, expected);
         }
     }
 
@@ -6228,16 +6332,14 @@ mod tests {
         TestEnvVarGuard { key, previous }
     }
 
-    fn direct_reqwest_env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("direct reqwest env lock")
+    fn direct_reqwest_env_lock() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        &LOCK
     }
 
     #[test]
     fn direct_reqwest_client_cache_key_includes_transport_profile() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let timeouts = ExecutionTimeouts {
             connect_ms: Some(5_000),
             ..ExecutionTimeouts::default()
@@ -6341,7 +6443,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_client_cache_evicts_least_recently_used_entry_at_capacity() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _capacity = set_test_env_var(super::DIRECT_REQWEST_CACHE_MAX_ENTRIES_ENV, "2");
         let cache_key = |suffix| {
             super::direct_reqwest_client_cache_key(
@@ -6439,7 +6541,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_client_cache_key_splits_origin_only_when_enabled() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let profile = ResolvedTransportProfile {
             profile_id: "mock-h2c-origin".into(),
             backend: TRANSPORT_BACKEND_REQWEST_RUSTLS.into(),
@@ -6626,14 +6728,14 @@ mod tests {
 
     #[test]
     fn direct_h2c_client_shards_respect_explicit_env() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _shards = set_test_env_var(super::DIRECT_H2C_CLIENT_SHARDS_ENV, "7");
         assert_eq!(super::direct_h2c_client_shard_count(), 7);
     }
 
     #[test]
     fn direct_h2c_adaptive_window_respects_explicit_env() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         {
             let _adaptive = set_test_env_var(super::DIRECT_H2C_ADAPTIVE_WINDOW_ENV, "0");
             assert!(!super::direct_h2c_adaptive_window_enabled());
@@ -6701,7 +6803,7 @@ mod tests {
 
     #[test]
     fn direct_h2c_prewarm_urls_parse_env_list() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _urls = set_test_env_var(
             super::DIRECT_H2C_PREWARM_URLS_ENV,
             " http://127.0.0.1:18184/v1/chat/completions,;http://127.0.0.1:18185/v1/chat/completions\nhttp://127.0.0.1:18186/v1/chat/completions ",
@@ -6719,7 +6821,7 @@ mod tests {
 
     #[test]
     fn direct_h2c_prewarm_cache_keys_dedup_by_origin() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let urls = vec![
             "http://127.0.0.1:18184/v1/chat/completions".to_string(),
             "http://127.0.0.1:18184/v1/responses".to_string(),
@@ -6745,7 +6847,7 @@ mod tests {
 
     #[test]
     fn direct_h2c_client_cache_splits_by_origin_and_shards() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _shards = set_test_env_var(super::DIRECT_H2C_CLIENT_SHARDS_ENV, "3");
         super::DIRECT_H2C_CLIENT_CACHE
             .lock()
@@ -6770,7 +6872,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_initial_client_shards_are_bounded_by_target() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         assert_eq!(super::direct_reqwest_initial_client_shard_count(1), 1);
         assert_eq!(super::direct_reqwest_initial_client_shard_count(2), 2);
         assert_eq!(
@@ -6781,7 +6883,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_initial_client_shards_cap_large_sync_env() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _sync = set_test_env_var(super::DIRECT_REQWEST_SYNC_WARM_CLIENTS_ENV, "128");
         assert_eq!(
             super::direct_reqwest_initial_client_shard_count(128),
@@ -6791,7 +6893,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_prewarm_client_shards_default_to_initial() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         assert_eq!(super::direct_reqwest_prewarm_client_shard_count(1), 1);
         assert_eq!(
             super::direct_reqwest_prewarm_client_shard_count(96),
@@ -6801,7 +6903,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_prewarm_client_shards_do_not_exceed_request_path_cap() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _sync = set_test_env_var(super::DIRECT_REQWEST_SYNC_WARM_CLIENTS_ENV, "4");
         let _prewarm = set_test_env_var(super::DIRECT_REQWEST_PREWARM_SYNC_CLIENTS_ENV, "128");
 
@@ -6810,7 +6912,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_prewarm_populates_cache_for_plan() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _shards = set_test_env_var(super::DIRECT_REQWEST_H2_CLIENT_SHARDS_ENV, "4");
         let profile = ResolvedTransportProfile {
             profile_id: "mock-h2c-prewarm".into(),
@@ -6872,7 +6974,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_prewarm_plan_keeps_large_sync_env_off_request_path() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _shards = set_test_env_var(super::DIRECT_REQWEST_H2_CLIENT_SHARDS_ENV, "128");
         let _sync = set_test_env_var(super::DIRECT_REQWEST_SYNC_WARM_CLIENTS_ENV, "4");
         let _prewarm = set_test_env_var(super::DIRECT_REQWEST_PREWARM_SYNC_CLIENTS_ENV, "128");
@@ -6932,7 +7034,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_prewarm_skips_h2c_fast_path() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _fast_path = set_test_env_var(super::DIRECT_H2C_FAST_PATH_ENV, "1");
         let profile = ResolvedTransportProfile {
             profile_id: "mock-h2c-fast-path-prewarm-skip".into(),
@@ -6985,7 +7087,7 @@ mod tests {
 
     #[test]
     fn direct_reqwest_cache_metrics_expose_ready_state() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().blocking_lock();
         let _shards = set_test_env_var(super::DIRECT_REQWEST_H2_CLIENT_SHARDS_ENV, "1");
         let profile = ResolvedTransportProfile {
             profile_id: "mock-h2c-ready-metrics".into(),
@@ -8569,7 +8671,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_sync_execution_runtime_supports_tunnel_relay() {
-        let _env_lock = direct_reqwest_env_lock();
+        let _env_lock = direct_reqwest_env_lock().lock().await;
         let _relay_secret = set_test_env_var("AETHER_TUNNEL_RELAY_AUTH_SECRET", RELAY_TEST_SECRET);
         let listener = crate::test_support::bind_loopback_listener()
             .await
@@ -8736,7 +8838,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_sync_execution_runtime_rejects_short_tunnel_relay_secret_before_send() {
-        let _env_lock = direct_reqwest_env_lock();
+        let _env_lock = direct_reqwest_env_lock().lock().await;
         let _relay_secret = set_test_env_var("AETHER_TUNNEL_RELAY_AUTH_SECRET", &"x".repeat(31));
         let execution_runtime = DirectSyncExecutionRuntime::new();
         let error = execution_runtime
@@ -8777,7 +8879,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_sync_execution_runtime_requires_tunnel_relay_secret_before_send() {
-        let _env_lock = direct_reqwest_env_lock();
+        let _env_lock = direct_reqwest_env_lock().lock().await;
         let _relay_secret = unset_test_env_var("AETHER_TUNNEL_RELAY_AUTH_SECRET");
         let execution_runtime = DirectSyncExecutionRuntime::new();
         let error = execution_runtime
@@ -9104,7 +9206,7 @@ mod tests {
 
     #[tokio::test]
     async fn direct_sync_execution_runtime_forwards_http1_only_control_to_tunnel_relay() {
-        let _env_lock = direct_reqwest_env_lock();
+        let _env_lock = direct_reqwest_env_lock().lock().await;
         let _relay_secret = set_test_env_var("AETHER_TUNNEL_RELAY_AUTH_SECRET", RELAY_TEST_SECRET);
         let listener = crate::test_support::bind_loopback_listener()
             .await
@@ -9320,7 +9422,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_sync_execution_runtime_uses_h2c_prior_knowledge_on_wire() {
-        let _guard = direct_reqwest_env_lock();
+        let _guard = direct_reqwest_env_lock().lock().await;
         let _shards = set_test_env_var(super::DIRECT_REQWEST_H2_CLIENT_SHARDS_ENV, "1");
         let listener = crate::test_support::bind_loopback_listener()
             .await
