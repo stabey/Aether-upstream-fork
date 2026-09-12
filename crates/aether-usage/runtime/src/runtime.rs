@@ -12378,12 +12378,9 @@ mod tests {
     async fn event_capture_budget_bounds_blocked_policy_waiters_and_releases_on_cancel_or_basic() {
         for limit in [0, 64 * 1024] {
             let runtime = UsageRuntime::new(UsageRuntimeConfig::default()).expect("runtime");
-            let store = BlockingPolicyQueueConfiguredUsageStore {
-                queue: Arc::new(RuntimeState::memory(MemoryRuntimeStateConfig::default())),
-                policy_started: Arc::new(tokio::sync::Notify::new()),
-                release_policy: Arc::new(tokio::sync::Notify::new()),
-                policy_reads: Arc::new(AtomicUsize::new(0)),
-            };
+            let store = BlockingPolicyQueueConfiguredUsageStore::new(Arc::new(
+                RuntimeState::memory(MemoryRuntimeStateConfig::default()),
+            ));
             let budget = Arc::new(crate::event_capture_budget::EventCaptureMemoryBudget::new(
                 limit,
             ));
@@ -12444,7 +12441,7 @@ mod tests {
                 .await
                 .expect("replacement policy read starts");
             assert_eq!(budget.retained_bytes(), retained);
-            store.release_policy.notify_one();
+            store.release_blocked_policy();
             let event = timeout(Duration::from_secs(2), completing)
                 .await
                 .expect("Basic policy completes")
