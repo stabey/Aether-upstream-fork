@@ -1453,6 +1453,7 @@ fn ai_serving_planner_separates_local_candidate_resolution_from_ranking() {
         "KiroProviderPoolAdapter",
         "ChatGptWebProviderPoolAdapter",
         "XaiProviderPoolAdapter",
+        "CursorProviderPoolAdapter",
         "CLAUDE_CODE_PROVIDER_POOL_ADAPTER",
         "VERTEX_AI_PROVIDER_POOL_ADAPTER",
         "provider_types_for_capability",
@@ -1480,6 +1481,7 @@ fn ai_serving_planner_separates_local_candidate_resolution_from_ranking() {
         "pub mod kiro;",
         "pub mod chatgpt_web;",
         "pub mod xai;",
+        "pub mod cursor;",
     ] {
         assert!(
             provider_pool_providers.contains(pattern),
@@ -1522,6 +1524,10 @@ fn ai_serving_planner_separates_local_candidate_resolution_from_ranking() {
                 "build_xai_pool_billing_request",
                 "quota_exhausted_from_bucket",
             ],
+        ),
+        (
+            "crates/aether-provider/pool/src/providers/cursor.rs",
+            vec!["CursorProviderPoolAdapter"],
         ),
         (
             "crates/aether-provider/pool/src/providers/chatgpt_web.rs",

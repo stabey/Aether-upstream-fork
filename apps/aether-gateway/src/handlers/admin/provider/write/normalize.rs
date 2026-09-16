@@ -4,9 +4,9 @@ pub(crate) fn normalize_provider_type_input(value: &str) -> Result<String, Strin
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "custom" | "claude_code" | "kiro" | "codex" | "chatgpt_web" | "gemini_cli"
-        | "antigravity" | "vertex_ai" | "grok" | "windsurf" | "xai" => Ok(normalized),
+        | "antigravity" | "vertex_ai" | "grok" | "windsurf" | "xai" | "cursor" => Ok(normalized),
         _ => Err(
-            "provider_type 仅支持 custom / claude_code / kiro / codex / chatgpt_web / gemini_cli / antigravity / vertex_ai / grok / windsurf / xai"
+            "provider_type 仅支持 custom / claude_code / kiro / codex / chatgpt_web / gemini_cli / antigravity / vertex_ai / grok / windsurf / xai / cursor"
                 .to_string(),
         ),
     }
@@ -410,6 +410,14 @@ mod tests {
         assert_eq!(
             normalize_provider_type_input(" xAI ").expect("type should normalize"),
             "xai"
+        );
+    }
+
+    #[test]
+    fn normalize_provider_type_supports_cursor() {
+        assert_eq!(
+            normalize_provider_type_input(" Cursor ").expect("type should normalize"),
+            "cursor"
         );
     }
 

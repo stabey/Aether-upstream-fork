@@ -286,6 +286,19 @@ const XAI_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
     ..STANDARD_RUNTIME_POLICY
 };
 
+/// Cursor talks to an external `@cursor/sdk` HTTP gateway (cursor-sdk2api /
+/// Cursor2API). Keys are Cursor User API Keys forwarded as Bearer tokens.
+const CURSOR_RUNTIME_POLICY: ProviderRuntimePolicy = ProviderRuntimePolicy {
+    fixed_provider: true,
+    api_format_inheritance: ProviderApiFormatInheritance::OAuthOrBearer,
+    enable_format_conversion_by_default: true,
+    oauth_is_bearer_like: false,
+    supports_model_fetch: true,
+    supports_local_openai_chat_transport: true,
+    supports_local_same_format_transport: true,
+    ..STANDARD_RUNTIME_POLICY
+};
+
 const CLAUDE_CODE_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
     provider_type: "claude_code",
     version: 2,
@@ -490,6 +503,33 @@ const XAI_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate
     runtime_policy: XAI_RUNTIME_POLICY,
 };
 
+const CURSOR_FIXED_PROVIDER_TEMPLATE: FixedProviderTemplate = FixedProviderTemplate {
+    provider_type: "cursor",
+    version: 1,
+    base_url: crate::cursor::CURSOR_DEFAULT_GATEWAY_BASE_URL,
+    endpoints: &[
+        FixedProviderEndpointTemplate {
+            item_key: "openai:chat",
+            api_format: "openai:chat",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "openai:responses",
+            api_format: "openai:responses",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+        FixedProviderEndpointTemplate {
+            item_key: "claude:messages",
+            api_format: "claude:messages",
+            custom_path: None,
+            config_defaults: EMPTY_ENDPOINT_CONFIG_DEFAULTS,
+        },
+    ],
+    runtime_policy: CURSOR_RUNTIME_POLICY,
+};
+
 pub fn provider_type_is_fixed(provider_type: &str) -> bool {
     provider_runtime_policy(provider_type).fixed_provider
 }
@@ -543,6 +583,7 @@ pub fn fixed_provider_template(provider_type: &str) -> Option<&'static FixedProv
         "antigravity" => Some(&ANTIGRAVITY_FIXED_PROVIDER_TEMPLATE),
         "windsurf" => Some(&WINDSURF_FIXED_PROVIDER_TEMPLATE),
         "xai" => Some(&XAI_FIXED_PROVIDER_TEMPLATE),
+        "cursor" => Some(&CURSOR_FIXED_PROVIDER_TEMPLATE),
         _ => None,
     }
 }
@@ -922,6 +963,35 @@ mod tests {
             aether_oauth::provider::providers::XAI_TOKEN_URL
         );
         assert!(!ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"xai"));
+    }
+
+    #[test]
+    fn cursor_fixed_provider_template_exposes_openai_and_claude_endpoints() {
+        let template = fixed_provider_template("cursor").expect("cursor template should exist");
+        assert_eq!(template.provider_type, "cursor");
+        assert_eq!(
+            template.base_url,
+            crate::cursor::CURSOR_DEFAULT_GATEWAY_BASE_URL
+        );
+        assert_eq!(template.version, 1);
+        assert_eq!(
+            template
+                .endpoints
+                .iter()
+                .map(|item| item.api_format)
+                .collect::<Vec<_>>(),
+            vec!["openai:chat", "openai:responses", "claude:messages"]
+        );
+
+        let policy = provider_runtime_policy("cursor");
+        assert!(policy.fixed_provider);
+        assert!(policy.enable_format_conversion_by_default);
+        assert!(policy.supports_model_fetch);
+        assert!(policy.supports_local_openai_chat_transport);
+        assert!(policy.supports_local_same_format_transport);
+        assert!(policy.key_inherits_api_formats("bearer", None));
+        assert!(provider_type_admin_oauth_template("cursor").is_none());
+        assert!(!ADMIN_PROVIDER_OAUTH_TEMPLATE_TYPES.contains(&"cursor"));
     }
 
     #[test]

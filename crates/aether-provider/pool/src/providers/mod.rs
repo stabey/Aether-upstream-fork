@@ -1,6 +1,7 @@
 pub mod antigravity;
 pub mod chatgpt_web;
 pub mod codex;
+pub mod cursor;
 pub mod default;
 pub mod gemini_cli;
 pub mod grok;
@@ -26,6 +27,7 @@ pub use codex::{
     build_codex_pool_reset_credits_request, CODEX_WHAM_RESET_CREDITS_CONSUME_URL,
     CODEX_WHAM_RESET_CREDITS_URL, CODEX_WHAM_USAGE_URL,
 };
+pub use cursor::CursorProviderPoolAdapter;
 pub use default::DefaultProviderPoolAdapter;
 pub use gemini_cli::GeminiCliProviderPoolAdapter;
 pub use gemini_cli::{

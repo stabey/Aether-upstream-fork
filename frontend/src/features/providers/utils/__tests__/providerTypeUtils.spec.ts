@@ -27,6 +27,12 @@ describe('providerTypeUtils', () => {
     expect(isOAuthAccountProviderType('Windsurf')).toBe(true)
     expect(isKeyManagedProviderType('windsurf')).toBe(false)
   })
+
+  it('treats cursor as a key-managed sidecar provider', () => {
+    expect(isOAuthAccountProviderType('cursor')).toBe(false)
+    expect(isKeyManagedProviderType('cursor')).toBe(true)
+    expect(isKeyManagedProviderType('Cursor')).toBe(true)
+  })
 })
 
 describe('normalizeBatchImportCredentials', () => {

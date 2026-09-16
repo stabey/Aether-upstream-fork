@@ -546,7 +546,7 @@ pub fn endpoint_supports_rust_models_fetch(api_format: &str) -> bool {
 pub fn provider_type_uses_preset_models(provider_type: &str) -> bool {
     matches!(
         provider_type.trim().to_ascii_lowercase().as_str(),
-        "claude_code" | "gemini_cli" | "grok" | "xai"
+        "claude_code" | "gemini_cli" | "grok" | "xai" | "cursor"
     )
 }
 
@@ -619,6 +619,13 @@ pub fn preset_models_for_provider(provider_type: &str) -> Option<Vec<Value>> {
             preset_model("grok-imagine-image-quality", "xai", "Grok Imagine Image Quality", "openai:image"),
             preset_model("grok-imagine-video", "xai", "Grok Imagine Video", "openai:video"),
             preset_model("grok-imagine-video-1.5", "xai", "Grok Imagine Video 1.5", "openai:video"),
+        ],
+        "cursor" => vec![
+            preset_model("composer-2.5", "cursor", "Composer 2.5", "openai:chat"),
+            preset_model("composer-2.5-fast", "cursor", "Composer 2.5 Fast", "openai:chat"),
+            preset_model("claude-sonnet-4-6", "anthropic", "Claude Sonnet 4.6", "claude:messages"),
+            preset_model("claude-opus-4-6", "anthropic", "Claude Opus 4.6", "claude:messages"),
+            preset_model("grok-4.6", "xai", "Grok 4.6", "openai:responses"),
         ],
         _ => return None,
     };
@@ -2027,5 +2034,29 @@ mod tests {
         assert!(models
             .iter()
             .any(|model| model["id"] == "grok-imagine-image"));
+    }
+
+    #[test]
+    fn preset_models_cover_cursor_sidecar_catalog() {
+        let models = preset_models_for_provider("cursor").expect("preset models should exist");
+        let model_ids = models
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model_ids,
+            vec![
+                "composer-2.5",
+                "composer-2.5-fast",
+                "claude-sonnet-4-6",
+                "claude-opus-4-6",
+                "grok-4.6",
+            ]
+        );
+        assert_eq!(models[0]["owned_by"], json!("cursor"));
+        assert_eq!(models[0]["api_formats"], json!(["openai:chat"]));
+        assert_eq!(models[2]["api_formats"], json!(["claude:messages"]));
+        assert_eq!(models[4]["api_formats"], json!(["openai:responses"]));
+        assert!(super::provider_type_uses_preset_models("cursor"));
     }
 }

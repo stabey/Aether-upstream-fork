@@ -7,6 +7,7 @@ mod cache;
 pub mod claude_code;
 mod codex_fingerprint;
 pub mod conversion;
+pub mod cursor;
 mod diagnostics;
 pub mod gemini_cli;
 mod gemini_files;
@@ -69,6 +70,10 @@ pub use conversion::{
     request_conversion_transport_supported, request_conversion_transport_unsupported_reason,
     request_pair_allowed_for_transport, request_pair_direct_auth,
     request_pair_transport_unsupported_reason, CandidateTransportPolicyFacts,
+};
+pub use cursor::{
+    is_cursor_provider_transport, is_cursor_provider_type, CURSOR_DEFAULT_GATEWAY_BASE_URL,
+    CURSOR_PROVIDER_TYPE,
 };
 pub use diagnostics::{
     append_transport_diagnostics_to_value, build_request_trace_proxy_value,
