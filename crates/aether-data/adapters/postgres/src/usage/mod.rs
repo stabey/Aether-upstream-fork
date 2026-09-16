@@ -1,9 +1,9 @@
 use aether_data_contracts::repository::usage::{
     canonical_usage_body_ref_for, parse_usage_body_ref, read_decompressed_usage_json,
     usage_body_ref, ApiKeyLastUsedDelta, ManagementTokenCounterDelta, ProxyNodeCounterDelta,
-    StoredUsageAuditAggregation, StoredUsageAuditSummary, StoredUsageBreakdownSummaryRow,
-    StoredUsageCacheAffinityHitSummary, StoredUsageCacheAffinityIntervalRow,
-    StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
+    StoredUsageAuditAggregation, StoredUsageAuditSummary, StoredUsageBodyPayload,
+    StoredUsageBreakdownSummaryRow, StoredUsageCacheAffinityHitSummary,
+    StoredUsageCacheAffinityIntervalRow, StoredUsageCacheHitSummary, StoredUsageCostSavingsSummary,
     StoredUsageDashboardDailyBreakdownRow, StoredUsageDashboardProviderCount,
     StoredUsageDashboardStatsSummary, StoredUsageDashboardSummary, StoredUsageErrorDistributionRow,
     StoredUsageLeaderboardSummary, StoredUsagePerformancePercentilesRow,
@@ -34,7 +34,7 @@ use sqlx::{
     PgPool, Postgres, QueryBuilder, Row,
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use uuid::Uuid;
 
 use crate::{
@@ -58,13 +58,33 @@ use aether_data_contracts::repository::usage::{
 use aether_data_contracts::DataLayerError;
 
 pub mod cleanup;
+mod preparation;
+
+use preparation::prepare_usage_in_background;
 
 // Legacy inline body columns on public.usage are deprecated. Keep the threshold at zero so
 // newly captured bodies always spill to usage_body_blobs and resolve through usage_http_audits.
 const MAX_INLINE_USAGE_BODY_BYTES: usize = 0;
 const MAX_SUPPORTED_UNIX_SECS: u64 = 253_402_300_799;
-const FIND_USAGE_BODY_BLOB_BY_REF_SQL: &str = r#"SELECT payload_gzip FROM usage_body_blobs WHERE body_ref = $1 AND request_id = $2 AND body_field = $3 LIMIT 1"#;
+const FIND_USAGE_BODY_BLOB_BY_REF_SQL: &str = r#"SELECT CASE WHEN octet_length(payload_gzip) <= $4 THEN payload_gzip END AS payload_gzip FROM usage_body_blobs WHERE body_ref = $1 AND request_id = $2 AND body_field = $3 LIMIT 1"#;
 const DELETE_USAGE_BODY_BLOB_SQL: &str = include_str!("queries/delete_usage_body_blob_sql.sql");
+static USAGE_BODY_DECODE_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+async fn decode_usage_body_in_background(
+    decode: impl FnOnce() -> Result<Option<Value>, DataLayerError> + Send + 'static,
+) -> Result<Option<Value>, DataLayerError> {
+    let permit = USAGE_BODY_DECODE_SLOTS.acquire().await.map_err(|error| {
+        DataLayerError::UnexpectedValue(format!("usage body decoder unavailable: {error}"))
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode()
+    })
+    .await
+    .map_err(|error| {
+        DataLayerError::UnexpectedValue(format!("usage body decoder failed: {error}"))
+    })?
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct AggregateRangeSplit {
@@ -2104,12 +2124,9 @@ impl PreparedPendingUsage {
             ));
         }
 
-        // Keep the capture input separate from the accounting row.  The persistence sanitizer
-        // intentionally removes HTTP bodies/headers/states, but the pending batch still needs
-        // those values to populate the canonical audit/blob tables.
-        let capture_usage = usage.clone();
-        let usage = sanitize_usage_for_persistence(usage);
-        let prepared = prepare_usage_upsert_context(&capture_usage)?;
+        // Prepare captures before the accounting sanitizer removes HTTP bodies/headers/states.
+        let (usage, prepared) = prepare_usage_for_persistence(usage);
+        let prepared = prepared?;
         let input_tokens = usage
             .input_tokens
             .map(to_i32)
@@ -2862,36 +2879,82 @@ ORDER BY request_count DESC, "usage".provider_name ASC
         Ok(items)
     }
 
-    pub async fn resolve_body_ref(&self, body_ref: &str) -> Result<Option<Value>, DataLayerError> {
+    pub async fn read_body_payload(
+        &self,
+        body_ref: &str,
+    ) -> Result<Option<StoredUsageBodyPayload>, DataLayerError> {
+        let json_limit =
+            aether_data_contracts::repository::usage::MAX_DECOMPRESSED_USAGE_JSON_BYTES as i64;
+        let encoded_limit = json_limit + 1024 * 1024;
         let Some((request_id, field)) = parse_usage_body_ref(body_ref) else {
             return Ok(None);
         };
         let canonical_ref = usage_body_ref(&request_id, field);
-        let blob_row = sqlx::query(FIND_USAGE_BODY_BLOB_BY_REF_SQL)
+        let row = sqlx::query(FIND_USAGE_BODY_BLOB_BY_REF_SQL)
             .bind(&canonical_ref)
             .bind(&request_id)
             .bind(field.as_storage_field())
+            .bind(encoded_limit)
             .fetch_optional(&self.pool)
             .await
             .map_postgres_err()?;
-        if let Some(row) = blob_row.as_ref() {
-            let payload_gzip = row
-                .try_get::<Vec<u8>, _>("payload_gzip")
-                .map_postgres_err()?;
-            return inflate_usage_json_value(&payload_gzip).map(Some);
+        if let Some(row) = row {
+            return row
+                .try_get::<Option<Vec<u8>>, _>("payload_gzip")
+                .map_postgres_err()?
+                .map(|bytes| Some(StoredUsageBodyPayload::Gzip(bytes)))
+                .ok_or_else(|| {
+                    DataLayerError::UnexpectedValue(format!(
+                        "encoded usage json exceeds {encoded_limit} bytes"
+                    ))
+                });
         }
         let (inline_column, compressed_column) = usage_body_sql_columns(field);
         let row = sqlx::query(&format!(
-            "SELECT {inline_column} AS inline_body, {compressed_column} AS compressed_body FROM \"usage\" WHERE request_id = $1 LIMIT 1"
+            "SELECT CASE WHEN octet_length({inline_column}::text) <= $2 THEN {inline_column}::text END AS inline_body, CASE WHEN octet_length({compressed_column}) <= $3 THEN {compressed_column} END AS compressed_body, (COALESCE(octet_length({inline_column}::text) > $2, false) OR ({inline_column} IS NULL AND COALESCE(octet_length({compressed_column}) > $3, false))) AS too_large FROM \"usage\" WHERE request_id = $1 LIMIT 1"
         ))
         .bind(request_id)
+        .bind(json_limit)
+        .bind(encoded_limit)
         .fetch_optional(&self.pool)
         .await
         .map_postgres_err()?;
-        row.as_ref()
-            .map(|row| usage_json_column(row, "inline_body", "compressed_body", true))
-            .transpose()
-            .map(|value| value.and_then(|column| column.value))
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        if row.try_get::<bool, _>("too_large").map_postgres_err()? {
+            return Err(DataLayerError::UnexpectedValue(
+                "encoded usage json exceeds preview limit".to_string(),
+            ));
+        }
+        if let Some(body) = row
+            .try_get::<Option<String>, _>("inline_body")
+            .map_postgres_err()?
+        {
+            return Ok(Some(StoredUsageBodyPayload::Json(body.into_bytes())));
+        }
+        Ok(row
+            .try_get::<Option<Vec<u8>>, _>("compressed_body")
+            .map_postgres_err()?
+            .map(StoredUsageBodyPayload::Gzip))
+    }
+
+    pub async fn resolve_body_ref(&self, body_ref: &str) -> Result<Option<Value>, DataLayerError> {
+        let Some(payload) = self.read_body_payload(body_ref).await? else {
+            return Ok(None);
+        };
+        decode_usage_body_in_background(move || match payload {
+            StoredUsageBodyPayload::Gzip(bytes) => inflate_usage_json_value(&bytes).map(Some),
+            StoredUsageBodyPayload::Json(bytes) => {
+                let bytes = read_decompressed_usage_json(std::io::Cursor::new(bytes))?;
+                serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                    DataLayerError::UnexpectedValue(format!(
+                        "failed to parse decompressed usage json: {error}"
+                    ))
+                })
+            }
+        })
+        .await
     }
 
     async fn hydrate_usage_body_refs(
@@ -8387,10 +8450,10 @@ ORDER BY "usage".user_id ASC
         usage: UpsertUsageRecord,
     ) -> Result<StoredRequestUsageAudit, DataLayerError> {
         usage.validate()?;
-        // `usage` is the sanitized accounting projection; prepare the auxiliary capture and
-        // snapshots from the original event so typed `none` markers can clear prior facts.
-        let capture_usage = usage.clone();
-        let usage = sanitize_usage_for_persistence(usage);
+        // Move the event before cloning or compressing captures, and do not hold a connection
+        // while preparing them. Stale lifecycle updates still ignore preparation errors below.
+        let (usage, prepared) =
+            prepare_usage_in_background(move || Ok(prepare_usage_for_persistence(usage))).await?;
         self.tx_runner
             .run_read_write(|tx| {
                 Box::pin(async move {
@@ -8456,7 +8519,7 @@ ORDER BY "usage".user_id ASC
                         clear_provider_request_body,
                         clear_response_body,
                         clear_client_response_body,
-                    } = prepare_usage_upsert_context(&capture_usage)?;
+                    } = prepared?;
                     let capture_update_allowed = recovers_terminal_failure
                         || usage_capture_update_allowed(
                             previous_usage.as_ref().map(|stored| {
@@ -8875,33 +8938,36 @@ ORDER BY "usage".user_id ASC
             return Ok(());
         }
 
-        let mut request_id_counts = BTreeMap::<String, usize>::new();
-        for usage in &usages {
-            *request_id_counts
-                .entry(usage.request_id.clone())
-                .or_default() += 1;
-        }
-
-        // Duplicate request IDs must retain the caller's exact sequential merge order. They are
-        // uncommon in lifecycle batches, so keep them on the canonical single-row path.
-        let mut batch_rows = Vec::<(usize, PreparedPendingUsage)>::new();
-        let mut fallback_rows = Vec::<(usize, UpsertUsageRecord)>::new();
-        for (sequence, usage) in usages.into_iter().enumerate() {
-            let original_usage = usage.clone();
-            let prepared = PreparedPendingUsage::try_from_usage(usage)?;
-            if request_id_counts
-                .get(&prepared.usage.request_id)
-                .copied()
-                .unwrap_or_default()
-                == 1
-            {
-                batch_rows.push((sequence, prepared));
-            } else {
-                // Preserve capture markers for the canonical fallback; that path performs the
-                // sanitized bind only after preparing the auxiliary audit/blob state.
-                fallback_rows.push((sequence, original_usage));
+        let (batch_rows, mut fallback_rows) = prepare_usage_in_background(move || {
+            let mut request_id_counts = BTreeMap::<String, usize>::new();
+            for usage in &usages {
+                *request_id_counts
+                    .entry(usage.request_id.clone())
+                    .or_default() += 1;
             }
-        }
+
+            // Duplicate request IDs must retain the caller's exact sequential merge order.
+            let mut batch_rows = Vec::<(usize, PreparedPendingUsage)>::new();
+            let mut fallback_rows = Vec::<(usize, UpsertUsageRecord)>::new();
+            for (sequence, usage) in usages.into_iter().enumerate() {
+                let duplicate = request_id_counts
+                    .get(&usage.request_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 1;
+                let original_usage = duplicate.then(|| usage.clone());
+                let prepared = PreparedPendingUsage::try_from_usage(usage)?;
+                if let Some(original_usage) = original_usage {
+                    // Preserve capture markers for the canonical fallback, including validation
+                    // of every row before starting the batch transaction.
+                    fallback_rows.push((sequence, original_usage));
+                } else {
+                    batch_rows.push((sequence, prepared));
+                }
+            }
+            Ok((batch_rows, fallback_rows))
+        })
+        .await?;
 
         let mut inserted_request_ids = BTreeSet::<String>::new();
         if !batch_rows.is_empty() {
@@ -10231,7 +10297,7 @@ RETURNING
 
     pub async fn rebuild_api_key_usage_stats(&self) -> Result<u64, DataLayerError> {
         self.tx_runner
-            .run_read_write(|tx| {
+            .run(crate::PostgresTransactionOptions::maintenance(), |tx| {
                 Box::pin(async move {
                     sqlx::query(RESET_API_KEY_USAGE_STATS_SQL)
                         .execute(&mut **tx)
@@ -10250,7 +10316,7 @@ RETURNING
 
     pub async fn rebuild_provider_api_key_usage_stats(&self) -> Result<u64, DataLayerError> {
         self.tx_runner
-            .run_read_write(|tx| {
+            .run(crate::PostgresTransactionOptions::maintenance(), |tx| {
                 Box::pin(async move {
                     sqlx::query(RESET_PROVIDER_API_KEY_USAGE_STATS_SQL)
                         .execute(&mut **tx)
@@ -10304,6 +10370,13 @@ impl UsageReadRepository for SqlxUsageReadRepository {
 
     async fn resolve_body_ref(&self, body_ref: &str) -> Result<Option<Value>, DataLayerError> {
         Self::resolve_body_ref(self, body_ref).await
+    }
+
+    async fn read_body_payload(
+        &self,
+        body_ref: &str,
+    ) -> Result<Option<StoredUsageBodyPayload>, DataLayerError> {
+        Self::read_body_payload(self, body_ref).await
     }
 
     async fn list_usage_audits(
@@ -12289,24 +12362,35 @@ fn prepare_usage_body_storage(value: Option<&Value>) -> Result<UsageBodyStorage,
             detached_blob_bytes: None,
         });
     };
-    let bytes = serde_json::to_vec(value).map_err(|err| {
-        DataLayerError::UnexpectedValue(format!("failed to serialize usage json: {err}"))
-    })?;
-    if bytes.len() == MAX_INLINE_USAGE_BODY_BYTES {
-        return Ok(UsageBodyStorage {
-            inline_json: Some(String::from_utf8(bytes).map_err(|err| {
-                DataLayerError::UnexpectedValue(format!(
-                    "failed to encode inline usage body as utf-8: {err}"
-                ))
-            })?),
-            detached_blob_bytes: None,
-        });
-    }
-
     let mut encoder = GzEncoder::new(Vec::new(), Compression::new(6));
-    encoder.write_all(&bytes).map_err(|err| {
-        DataLayerError::UnexpectedValue(format!("failed to compress usage json: {err}"))
-    })?;
+    if MAX_INLINE_USAGE_BODY_BYTES == 0 {
+        // Coalesce serde's punctuation/escape writes without allocating a full JSON buffer.
+        let mut writer = BufWriter::with_capacity(8 * 1024, &mut encoder);
+        serde_json::to_writer(&mut writer, value).map_err(|err| {
+            let operation = if err.is_io() { "compress" } else { "serialize" };
+            DataLayerError::UnexpectedValue(format!("failed to {operation} usage json: {err}"))
+        })?;
+        writer.into_inner().map_err(|err| {
+            DataLayerError::UnexpectedValue(format!("failed to compress usage json: {err}"))
+        })?;
+    } else {
+        let bytes = serde_json::to_vec(value).map_err(|err| {
+            DataLayerError::UnexpectedValue(format!("failed to serialize usage json: {err}"))
+        })?;
+        if bytes.len() == MAX_INLINE_USAGE_BODY_BYTES {
+            return Ok(UsageBodyStorage {
+                inline_json: Some(String::from_utf8(bytes).map_err(|err| {
+                    DataLayerError::UnexpectedValue(format!(
+                        "failed to encode inline usage body as utf-8: {err}"
+                    ))
+                })?),
+                detached_blob_bytes: None,
+            });
+        }
+        encoder.write_all(&bytes).map_err(|err| {
+            DataLayerError::UnexpectedValue(format!("failed to compress usage json: {err}"))
+        })?;
+    }
     let detached_blob_bytes = encoder.finish().map_err(|err| {
         DataLayerError::UnexpectedValue(format!("failed to finish usage json compression: {err}"))
     })?;
@@ -12359,11 +12443,40 @@ fn project_usage_request_metadata(
     }
 }
 
+fn prepare_usage_for_persistence(
+    mut usage: UpsertUsageRecord,
+) -> (
+    UpsertUsageRecord,
+    Result<PreparedUsageUpsert, DataLayerError>,
+) {
+    // Capture controls and accounting metadata have different sanitizers. Move the
+    // large payloads out before copying the metadata needed by both projections.
+    let request_body = usage.request_body.take();
+    let provider_request_body = usage.provider_request_body.take();
+    let response_body = usage.response_body.take();
+    let client_response_body = usage.client_response_body.take();
+    let request_headers = usage.request_headers.take();
+    let provider_request_headers = usage.provider_request_headers.take();
+    let response_headers = usage.response_headers.take();
+    let client_response_headers = usage.client_response_headers.take();
+    let mut capture = usage.clone();
+    capture.request_body = request_body;
+    capture.provider_request_body = provider_request_body;
+    capture.response_body = response_body;
+    capture.client_response_body = client_response_body;
+    capture.request_headers = request_headers;
+    capture.provider_request_headers = provider_request_headers;
+    capture.response_headers = response_headers;
+    capture.client_response_headers = client_response_headers;
+    capture.capture_retention = std::mem::take(&mut usage.capture_retention);
+    let capture = sanitize_usage_capture_controls_for_persistence(capture);
+    let prepared = prepare_usage_upsert_context(&capture);
+    (sanitize_usage_for_persistence(usage), prepared)
+}
+
 fn prepare_usage_upsert_context(
     usage: &UpsertUsageRecord,
 ) -> Result<PreparedUsageUpsert, DataLayerError> {
-    let usage = sanitize_usage_capture_controls_for_persistence(usage.clone());
-    let usage = &usage;
     let replace_client_request_body_facts = request_body_capture_replaces_derived_facts(
         usage.request_body.as_ref(),
         usage.request_body_state,

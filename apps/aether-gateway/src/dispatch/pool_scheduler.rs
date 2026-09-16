@@ -35,7 +35,6 @@ use crate::ai_serving::{
     SkippedLocalExecutionCandidate,
 };
 use crate::clock::current_unix_ms;
-use crate::handlers::shared::provider_pool::read_admin_provider_pool_runtime_state;
 use crate::handlers::shared::provider_pool::{
     admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config_from_config_value,
 };
@@ -43,6 +42,9 @@ use crate::handlers::shared::provider_pool::{
     admin_provider_pool_quota_probe_active_members_key,
     read_admin_provider_pool_key_cooldown_reason, AdminProviderPoolConfig,
     AdminProviderPoolRuntimeState, AdminProviderPoolSchedulingPreset,
+};
+use crate::handlers::shared::provider_pool::{
+    read_provider_pool_scheduling_runtime_state, read_provider_pool_sticky_bound_key_id,
 };
 use crate::handlers::shared::{parse_catalog_auth_config_json, provider_key_health_summary};
 use crate::maintenance::spawn_pool_quota_probe_replenish_for_request;
@@ -141,7 +143,7 @@ async fn schedule_pool_page_candidates(
             AdminProviderPoolRuntimeState::default()
         } else {
             let runtime_started_at = std::time::Instant::now();
-            let runtime = read_admin_provider_pool_runtime_state(
+            let runtime = read_provider_pool_scheduling_runtime_state(
                 state.app().runtime_state.as_ref(),
                 provider_id.as_str(),
                 &key_ids,
@@ -632,7 +634,9 @@ impl<'a> PoolKeyCursor<'a> {
 
         if !self.score_phase_exhausted {
             if let Some(score_candidates) = self.next_score_candidates().await {
-                return Some(score_candidates);
+                if !score_candidates.is_empty() {
+                    return Some(score_candidates);
+                }
             }
         }
 
@@ -982,15 +986,13 @@ impl<'a> PoolKeyCursor<'a> {
         if !admin_provider_pool_cache_affinity_enabled(&pool_config) {
             return None;
         }
-        let runtime = read_admin_provider_pool_runtime_state(
+        let sticky_key_id = read_provider_pool_sticky_bound_key_id(
             self.state.app().runtime_state.as_ref(),
             self.group.candidate.provider_id.as_str(),
-            &[],
             &pool_config,
             self.sticky_session_token.as_deref(),
         )
-        .await;
-        let sticky_key_id = runtime.sticky_bound_key_id?;
+        .await?;
         if self
             .routing_overlay
             .as_ref()
@@ -2028,7 +2030,9 @@ mod tests {
     };
     use crate::data::GatewayDataState;
     use crate::handlers::shared::provider_pool::{
-        admin_provider_pool_cache_affinity_enabled, record_admin_provider_pool_error,
+        admin_provider_pool_cache_affinity_enabled, admin_provider_pool_config_from_config_value,
+        read_admin_provider_pool_runtime_state, read_provider_pool_scheduling_runtime_state,
+        record_admin_provider_pool_error, record_admin_provider_pool_success,
         AdminProviderPoolRuntimeState,
     };
     use crate::orchestration::LocalExecutionCandidateMetadata;
@@ -2059,6 +2063,111 @@ mod tests {
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn scheduling_runtime_preserves_pool_ranking_and_cost_rejections() {
+        let runtime = aether_runtime_state::RuntimeState::memory(
+            aether_runtime_state::MemoryRuntimeStateConfig::default(),
+        );
+        let writer_config = admin_provider_pool_config_from_config_value(Some(&json!({
+            "pool_advanced": {
+                "cost_limit_per_key_tokens": 100,
+                "scheduling_presets": [
+                    {"preset": "cache_affinity", "enabled": true},
+                    {"preset": "latency_first", "enabled": true}
+                ]
+            }
+        })))
+        .expect("writer pool config");
+        for (key_id, cost, latency) in [("key-a", 100, 10), ("key-b", 20, 100)] {
+            record_admin_provider_pool_success(
+                &runtime,
+                "provider-pool",
+                key_id,
+                &writer_config,
+                Some(key_id),
+                cost,
+                Some(latency),
+            )
+            .await;
+        }
+        let key_ids = vec!["key-a".to_string(), "key-b".to_string()];
+        for (preset, cost_limit) in [
+            ("cache_affinity", None),
+            ("priority_first", None),
+            ("latency_first", None),
+            ("cost_first", None),
+            ("quota_balanced", None),
+            ("latency_first", Some(100)),
+        ] {
+            let provider_config = json!({
+                "pool_advanced": {
+                    "cost_limit_per_key_tokens": cost_limit,
+                    "scheduling_presets": [{"preset": preset, "enabled": true}]
+                }
+            });
+            let pool_config = admin_provider_pool_config_from_config_value(Some(&provider_config))
+                .expect("reader pool config");
+            let admin = read_admin_provider_pool_runtime_state(
+                &runtime,
+                "provider-pool",
+                &key_ids,
+                &pool_config,
+                Some("key-a"),
+            )
+            .await;
+            let scheduling = read_provider_pool_scheduling_runtime_state(
+                &runtime,
+                "provider-pool",
+                &key_ids,
+                &pool_config,
+                Some("key-a"),
+            )
+            .await;
+            let run = |snapshot| {
+                let candidates = key_ids
+                    .iter()
+                    .map(|key_id| {
+                        sample_eligible_candidate(
+                            "provider-pool",
+                            "endpoint-1",
+                            key_id,
+                            10,
+                            Some(provider_config.clone()),
+                        )
+                    })
+                    .collect();
+                let (scheduled, skipped) = apply_local_execution_pool_scheduler_with_runtime_map(
+                    candidates,
+                    &BTreeMap::from([("provider-pool".to_string(), snapshot)]),
+                    &BTreeMap::new(),
+                );
+                (
+                    scheduled
+                        .into_iter()
+                        .map(|item| item.candidate.key_id)
+                        .collect::<Vec<_>>(),
+                    skipped
+                        .into_iter()
+                        .map(|item| (item.candidate.key_id, item.skip_reason))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let expected = run(admin);
+            let actual = run(scheduling);
+            assert_eq!(
+                actual, expected,
+                "preset: {preset}, cost limit: {cost_limit:?}"
+            );
+            if cost_limit.is_some() {
+                assert_eq!(actual.0, vec!["key-b"]);
+                assert_eq!(
+                    actual.1,
+                    vec![("key-a".to_string(), "pool_cost_limit_reached")]
+                );
+            }
+        }
+    }
 
     #[test]
     fn pool_scheduler_groups_interleaved_candidates_and_reorders_internal_keys() {
@@ -4059,6 +4168,115 @@ mod tests {
             cursor.skip_reason_counts.get("pool_score_member_missing"),
             Some(&128)
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_pool_key_with_stale_score_does_not_exhaust_pool() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "score_top_n": 128,
+                "scheduling_presets": [
+                    {"preset": "single_account", "enabled": true},
+                    {"preset": "priority_first", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, mut keys, mut rows) =
+            large_pool_fixture(2, provider_config.clone());
+        keys[1].is_active = false;
+        rows.retain(|row| row.key_id != "key-00001");
+        let scores = vec![
+            sample_provider_key_pool_score("provider-pool", "key-00000", 5.0),
+            sample_provider_key_pool_score("provider-pool", "key-00001", 20.0),
+        ];
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_pool_score_repository_for_tests(Arc::new(
+                InMemoryPoolMemberScoreRepository::seed(scores),
+            ))
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("active key must stay schedulable beside a stale inactive score");
+
+        assert_eq!(candidate.candidate.key_id, "key-00000");
+        assert_eq!(
+            cursor.skip_reason_counts.get("pool_score_member_missing"),
+            Some(&1)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_inactive_score_only_does_not_exhaust_pool() {
+        let provider_config = Some(json!({
+            "pool_advanced": {
+                "score_top_n": 128,
+                "scheduling_presets": [
+                    {"preset": "single_account", "enabled": true},
+                    {"preset": "priority_first", "enabled": true}
+                ]
+            }
+        }));
+        let (provider, endpoint, mut keys, mut rows) =
+            large_pool_fixture(2, provider_config.clone());
+        keys[1].is_active = false;
+        rows.retain(|row| row.key_id != "key-00001");
+        let scores = vec![sample_provider_key_pool_score(
+            "provider-pool",
+            "key-00001",
+            20.0,
+        )];
+        let data_state =
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    keys,
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_pool_score_repository_for_tests(Arc::new(
+                InMemoryPoolMemberScoreRepository::seed(scores),
+            ))
+            .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+        let app = AppState::new()
+            .expect("state should build")
+            .with_data_state_for_tests(data_state);
+        let group = sample_eligible_candidate(
+            "provider-pool",
+            "endpoint-1",
+            "pool-group",
+            10,
+            provider_config,
+        );
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+
+        let candidate = cursor
+            .next_key()
+            .await
+            .expect("catalog rows must remain schedulable when the only score is stale");
+
+        assert_eq!(candidate.candidate.key_id, "key-00000");
     }
 
     #[tokio::test]

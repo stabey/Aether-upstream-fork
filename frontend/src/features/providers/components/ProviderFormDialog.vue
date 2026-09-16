@@ -60,6 +60,12 @@
                   <SelectItem value="grok">
                     Grok
                   </SelectItem>
+                  <SelectItem value="xai">
+                    xAI
+                  </SelectItem>
+                  <SelectItem value="cursor">
+                    Cursor
+                  </SelectItem>
                   <SelectItem value="kiro">
                     Kiro
                   </SelectItem>
@@ -93,6 +99,12 @@
                   <SelectItem value="grok">
                     Grok
                   </SelectItem>
+                  <SelectItem value="xai">
+                    xAI
+                  </SelectItem>
+                  <SelectItem value="cursor">
+                    Cursor
+                  </SelectItem>
                   <SelectItem value="kiro">
                     Kiro
                   </SelectItem>
@@ -106,7 +118,13 @@
               </SelectContent>
             </Select>
             <p
-              v-if="!isEditMode && form.provider_type !== 'custom'"
+              v-if="!isEditMode && form.provider_type === 'cursor'"
+              class="text-xs text-muted-foreground"
+            >
+              {{ legacyT('Rust 网关通过内部 URL 调用镜像内 @cursor/sdk sidecar（默认 http://127.0.0.1:8792/v1）；密钥填 Cursor User API Key') }}
+            </p>
+            <p
+              v-else-if="!isEditMode && form.provider_type !== 'custom'"
               class="text-xs text-muted-foreground"
             >
               {{ legacyT('反代使用固定端点且不可修改') }}

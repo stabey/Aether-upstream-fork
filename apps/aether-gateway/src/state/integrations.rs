@@ -290,6 +290,14 @@ impl provider_transport::VideoTaskTransportSnapshotLookup for AppState {
             .await
             .map_err(GatewayError::into_message)
     }
+
+    async fn resolve_video_task_proxy(
+        &self,
+        transport: &GatewayProviderTransportSnapshot,
+    ) -> Option<ProxySnapshot> {
+        self.resolve_transport_proxy_snapshot_with_tunnel_affinity(transport)
+            .await
+    }
 }
 
 #[async_trait]
@@ -671,7 +679,7 @@ impl SchedulerRuntimeState for AppState {
         &self,
         limit: usize,
     ) -> Result<Vec<StoredRequestCandidate>, GatewayError> {
-        AppState::read_recent_request_candidates(self, limit).await
+        AppState::read_recent_runtime_request_candidates(self, limit).await
     }
 
     fn provider_key_rpm_reset_at(&self, key_id: &str, now_unix_secs: u64) -> Option<u64> {

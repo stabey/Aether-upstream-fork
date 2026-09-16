@@ -396,6 +396,13 @@ pub fn build_standard_provider_request_headers(
         force_identity_accept_encoding(&mut headers);
     }
 
+    crate::xai::insert_cli_identity_headers_if_needed(
+        input.transport,
+        input.provider_api_format,
+        &mut headers,
+    );
+    crate::cursor::insert_cursor_sdk_identity_headers_if_needed(input.transport, &mut headers);
+
     let declared_connection_headers =
         crate::headers::declared_connection_header_names(input.headers, input.extra_headers);
     crate::headers::remove_declared_connection_headers(&mut headers, &declared_connection_headers);

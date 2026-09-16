@@ -120,6 +120,13 @@ fn build_transport_request_url_inner(
         return Some(url);
     }
 
+    let resolved_base =
+        crate::xai::resolved_xai_upstream_base_url(transport, &normalized_provider_api_format)
+            .or_else(|| crate::cursor::resolved_cursor_upstream_base_url(transport));
+    let request_base_url = resolved_base
+        .as_deref()
+        .unwrap_or(transport.endpoint.base_url.as_str());
+
     let custom_path_template = transport
         .endpoint
         .custom_path
@@ -164,7 +171,7 @@ fn build_transport_request_url_inner(
             path.to_string()
         };
         let mut url = build_passthrough_path_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             normalized_path.as_str(),
             params.request_query,
             blocked_keys,
@@ -190,75 +197,68 @@ fn build_transport_request_url_inner(
 
     let url = match normalized_provider_api_format.as_str() {
         "openai:chat" => Some(build_openai_chat_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             params.request_query,
         )),
         "openai:responses" => Some(build_openai_responses_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             params.request_query,
             false,
         )),
         "openai:responses:compact" => Some(build_openai_responses_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             params.request_query,
             true,
         )),
         "openai:search" => Some(build_openai_search_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             params.request_query,
         )),
         "openai:realtime" => build_passthrough_path_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             "/v1/realtime",
             params.request_query,
             GATEWAY_CREDENTIAL_QUERY_KEYS,
         )
         .and_then(|url| replace_realtime_model_query(url, params.mapped_model?)),
         "codex:live" => build_passthrough_path_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             "/live",
             params.request_query,
             GATEWAY_CREDENTIAL_QUERY_KEYS,
         ),
         "openai:embedding" | "jina:embedding" => {
-            build_provider_embedding_v1_url(&transport.endpoint.base_url, params.request_query)
+            build_provider_embedding_v1_url(request_base_url, params.request_query)
         }
-        "aliyun:multimodal_embedding" => build_aliyun_multimodal_embedding_url(
-            &transport.endpoint.base_url,
-            params.request_query,
-        ),
+        "aliyun:multimodal_embedding" => {
+            build_aliyun_multimodal_embedding_url(request_base_url, params.request_query)
+        }
         "openai:rerank" | "jina:rerank" => {
-            build_provider_rerank_v1_url(&transport.endpoint.base_url, params.request_query)
+            build_provider_rerank_v1_url(request_base_url, params.request_query)
         }
         "claude:messages" => Some(if is_claude_count_tokens {
-            build_default_claude_count_tokens_url(
-                &transport.endpoint.base_url,
-                params.request_query,
-            )
+            build_default_claude_count_tokens_url(request_base_url, params.request_query)
         } else {
-            build_claude_messages_url(&transport.endpoint.base_url, params.request_query)
+            build_claude_messages_url(request_base_url, params.request_query)
         }),
         "gemini:generate_content" => build_gemini_content_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             params.mapped_model?,
             params.upstream_is_stream,
             params.request_query,
         ),
         "gemini:embedding" => build_gemini_embedding_url(
-            &transport.endpoint.base_url,
+            request_base_url,
             params.mapped_model?,
             params.request_query,
             gemini_embedding_batch,
         ),
         "gemini:interactions" => {
-            build_gemini_interactions_url(&transport.endpoint.base_url, params.request_query)
+            build_gemini_interactions_url(request_base_url, params.request_query)
         }
-        "doubao:embedding" => build_passthrough_path_url(
-            &transport.endpoint.base_url,
-            "/embeddings",
-            params.request_query,
-            &[],
-        ),
+        "doubao:embedding" => {
+            build_passthrough_path_url(request_base_url, "/embeddings", params.request_query, &[])
+        }
         _ => None,
     }?;
 
@@ -2416,5 +2416,139 @@ mod tests {
             url,
             "https://api.example.com/v1/messages?model=claude%26admin%3Dtrue%23fragment"
         );
+    }
+
+    #[test]
+    fn xai_oauth_responses_use_cli_chat_proxy() {
+        let mut transport = sample_transport(
+            "xai",
+            "openai:responses",
+            "https://cli-chat-proxy.grok.com/v1",
+            None,
+        );
+        transport.key.auth_type = "oauth".to_string();
+        transport.key.decrypted_auth_config =
+            Some(r#"{"refresh_token":"rt","using_api":false}"#.to_string());
+
+        let url = build_transport_request_url(
+            &transport,
+            TransportRequestUrlParams {
+                provider_api_format: "openai:responses",
+                mapped_model: Some("grok-4"),
+                upstream_is_stream: true,
+                request_query: None,
+                kiro_api_region: None,
+                api_operation: None,
+            },
+        )
+        .expect("xai oauth responses URL");
+
+        assert_eq!(url, "https://cli-chat-proxy.grok.com/v1/responses");
+    }
+
+    #[test]
+    fn xai_compact_and_using_api_use_official_api() {
+        let mut oauth = sample_transport(
+            "xai",
+            "openai:responses:compact",
+            "https://cli-chat-proxy.grok.com/v1",
+            None,
+        );
+        oauth.key.auth_type = "oauth".to_string();
+        oauth.key.decrypted_auth_config =
+            Some(r#"{"refresh_token":"rt","using_api":false}"#.to_string());
+
+        let compact = build_transport_request_url(
+            &oauth,
+            TransportRequestUrlParams {
+                provider_api_format: "openai:responses:compact",
+                mapped_model: Some("grok-4"),
+                upstream_is_stream: false,
+                request_query: None,
+                kiro_api_region: None,
+                api_operation: None,
+            },
+        )
+        .expect("xai compact URL");
+        assert_eq!(compact, "https://api.x.ai/v1/responses/compact");
+
+        let mut api_key = sample_transport(
+            "xai",
+            "openai:responses",
+            "https://cli-chat-proxy.grok.com/v1",
+            None,
+        );
+        api_key.key.auth_type = "oauth".to_string();
+        api_key.key.decrypted_auth_config = Some(r#"{"using_api":true}"#.to_string());
+
+        let official = build_transport_request_url(
+            &api_key,
+            TransportRequestUrlParams {
+                provider_api_format: "openai:responses",
+                mapped_model: Some("grok-4"),
+                upstream_is_stream: true,
+                request_query: None,
+                kiro_api_region: None,
+                api_operation: None,
+            },
+        )
+        .expect("xai api key URL");
+        assert_eq!(official, "https://api.x.ai/v1/responses");
+    }
+
+    #[test]
+    fn cursor_loopback_chat_uses_internal_sdk_sidecar() {
+        let transport = sample_transport(
+            "cursor",
+            "openai:chat",
+            crate::cursor::CURSOR_DEFAULT_GATEWAY_BASE_URL,
+            None,
+        );
+
+        let url = build_transport_request_url(
+            &transport,
+            TransportRequestUrlParams {
+                provider_api_format: "openai:chat",
+                mapped_model: Some("composer-2.5"),
+                upstream_is_stream: true,
+                request_query: None,
+                kiro_api_region: None,
+                api_operation: None,
+            },
+        )
+        .expect("cursor chat URL");
+
+        assert_eq!(
+            url,
+            format!(
+                "{}/chat/completions",
+                crate::cursor::cursor_sdk_internal_base_url()
+            )
+        );
+    }
+
+    #[test]
+    fn cursor_custom_gateway_is_preserved() {
+        let transport = sample_transport(
+            "cursor",
+            "openai:chat",
+            "http://cursor-sdk2api:8080/v1",
+            None,
+        );
+
+        let url = build_transport_request_url(
+            &transport,
+            TransportRequestUrlParams {
+                provider_api_format: "openai:chat",
+                mapped_model: Some("composer-2.5"),
+                upstream_is_stream: false,
+                request_query: None,
+                kiro_api_region: None,
+                api_operation: None,
+            },
+        )
+        .expect("cursor custom URL");
+
+        assert_eq!(url, "http://cursor-sdk2api:8080/v1/chat/completions");
     }
 }

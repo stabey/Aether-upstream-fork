@@ -1,0 +1,36 @@
+# Optional overlay: run @cursor/sdk next to the Aether gateway.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cursor-sdk.yml up -d
+#
+# The gateway stays distroless. This sidecar is the Node process that owns
+# Agent.create / send; Aether talks to it like Codex talks to ChatGPT HTTP.
+
+services:
+  app:
+    environment:
+      AETHER_CURSOR_SDK_INTERNAL_URL: http://cursor-sdk:8792/v1
+    depends_on:
+      cursor-sdk:
+        condition: service_healthy
+
+  cursor-sdk:
+    build:
+      context: ./aether-cursor-sdk
+    image: ${AETHER_CURSOR_SDK_IMAGE:-aether-cursor-sdk:local}
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8792
+      AETHER_CURSOR_SDK_WORKSPACE: /var/lib/aether-cursor-sdk/workspace
+    expose:
+      - "8792"
+    volumes:
+      - cursor_sdk_data:/var/lib/aether-cursor-sdk
+    logging:
+      driver: local
+      options:
+        max-size: "50m"
+        max-file: "3"
+    restart: unless-stopped
+
+volumes:
+  cursor_sdk_data:

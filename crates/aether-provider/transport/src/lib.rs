@@ -7,6 +7,7 @@ mod cache;
 pub mod claude_code;
 mod codex_fingerprint;
 pub mod conversion;
+pub mod cursor;
 mod diagnostics;
 pub mod gemini_cli;
 mod gemini_files;
@@ -30,6 +31,7 @@ pub mod url;
 pub mod vertex;
 mod video;
 pub mod windsurf;
+pub mod xai;
 
 pub use aether_oauth as oauth;
 pub use agent_identity::{
@@ -68,6 +70,13 @@ pub use conversion::{
     request_conversion_transport_supported, request_conversion_transport_unsupported_reason,
     request_pair_allowed_for_transport, request_pair_direct_auth,
     request_pair_transport_unsupported_reason, CandidateTransportPolicyFacts,
+};
+pub use cursor::{
+    insert_cursor_sdk_identity_headers, insert_cursor_sdk_identity_headers_if_needed,
+    is_cursor_provider_transport, is_cursor_provider_type, resolved_cursor_request_base_url,
+    resolved_cursor_upstream_base_url, CURSOR_CLIENT_TYPE_HEADER, CURSOR_CLIENT_TYPE_VALUE,
+    CURSOR_CLIENT_VERSION_HEADER, CURSOR_DEFAULT_GATEWAY_BASE_URL, CURSOR_INTERNAL_URL_ENV,
+    CURSOR_PROVIDER_TYPE, CURSOR_SDK_CLIENT_VERSION,
 };
 pub use diagnostics::{
     append_transport_diagnostics_to_value, build_request_trace_proxy_value,
@@ -194,4 +203,11 @@ pub use windsurf::{
     build_windsurf_cascade_upstream_url, is_windsurf_provider_transport,
     local_windsurf_request_transport_unsupported_reason_with_network, GET_CHAT_MESSAGE_PATH,
     WINDSURF_ENVELOPE_NAME,
+};
+pub use xai::{
+    extract_xai_user_id_from_auth_config, extract_xai_user_id_from_value,
+    insert_cli_identity_headers, insert_cli_identity_headers_if_needed, is_xai_provider_transport,
+    resolved_xai_request_base_url, resolved_xai_upstream_base_url,
+    should_attach_cli_identity_headers, xai_auth_uses_api, xai_uses_official_api, XAI_API_BASE_URL,
+    XAI_CHAT_PROXY_BASE_URL, XAI_PROVIDER_TYPE,
 };

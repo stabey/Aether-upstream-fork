@@ -984,6 +984,297 @@ async fn gateway_rejects_generic_oauth_start_for_windsurf_provider_impl() {
 }
 
 #[test]
+fn gateway_rejects_generic_oauth_start_for_xai_provider() {
+    run_admin_oauth_test(
+        "gateway_rejects_generic_oauth_start_for_xai_provider",
+        gateway_rejects_generic_oauth_start_for_xai_provider_impl,
+    );
+}
+
+async fn gateway_rejects_generic_oauth_start_for_xai_provider_impl() {
+    let mut provider = sample_provider("provider-xai", "xai", 10);
+    provider.provider_type = "xai".to_string();
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![],
+        vec![],
+    ));
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ));
+
+    let response = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-xai/start",
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert!(
+        payload["detail"].as_str().is_some_and(|detail| {
+            detail.contains("设备授权") || detail.contains("导入凭据")
+        }),
+        "payload={payload}"
+    );
+}
+
+#[test]
+fn gateway_handles_admin_provider_oauth_device_authorize_for_xai() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_authorize_for_xai",
+        gateway_handles_admin_provider_oauth_device_authorize_for_xai_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_authorize_for_xai_impl() {
+    let authorize_hits = Arc::new(Mutex::new(0usize));
+    let authorize_hits_clone = Arc::clone(&authorize_hits);
+    let oidc_server = Router::new().fallback(any(move |_request: Request| {
+        let authorize_hits_inner = Arc::clone(&authorize_hits_clone);
+        async move {
+            *authorize_hits_inner.lock().expect("mutex should lock") += 1;
+            Json(json!({
+                "device_code": "xai-device-code",
+                "user_code": "XAI-CODE",
+                "verification_uri": "https://auth.x.ai/activate",
+                "verification_uri_complete": "https://auth.x.ai/activate?user_code=XAI-CODE",
+                "expires_in": 600,
+                "interval": 5,
+            }))
+        }
+    }));
+
+    let mut provider = sample_provider("provider-xai", "xai", 10);
+    provider.provider_type = "xai".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-xai-responses",
+        "provider-xai",
+        "openai:responses",
+        "https://cli-chat-proxy.grok.com/v1",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+    let (oidc_url, oidc_handle) = start_server(oidc_server).await;
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(GatewayDataState::with_provider_catalog_reader_for_tests(
+            provider_catalog_repository,
+        ))
+        .with_provider_oauth_token_url_for_tests(
+            "xai_device",
+            format!("{oidc_url}/oauth2/device/code"),
+        )
+        .with_provider_oauth_token_url_for_tests("xai", format!("{oidc_url}/oauth2/token"));
+
+    let response = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-xai/device-authorize",
+        Some(json!({ "proxy_node_id": "proxy-node-xai" })),
+    )
+    .await;
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    let session_id = payload["session_id"]
+        .as_str()
+        .expect("session_id should exist")
+        .to_string();
+    assert_eq!(payload["user_code"], "XAI-CODE");
+    assert_eq!(payload["verification_uri"], "https://auth.x.ai/activate");
+    assert_eq!(
+        payload["verification_uri_complete"],
+        "https://auth.x.ai/activate?user_code=XAI-CODE"
+    );
+    assert_eq!(payload["auth_type"], "device");
+    assert!(payload.get("callback_required").is_none() || payload["callback_required"] == false);
+    assert_eq!(*authorize_hits.lock().expect("mutex should lock"), 1);
+
+    let stored = state
+        .load_provider_oauth_device_session_for_tests(&format!("device_auth_session:{session_id}"))
+        .expect("device session should be stored");
+    let stored: serde_json::Value =
+        serde_json::from_str(&stored).expect("device session json should parse");
+    assert_eq!(stored["provider_id"], "provider-xai");
+    assert_eq!(stored["device_code"], "xai-device-code");
+    assert_eq!(stored["auth_type"], "device");
+    assert_eq!(stored["redirect_uri"], format!("{oidc_url}/oauth2/token"));
+    assert_eq!(stored["proxy_node_id"], "proxy-node-xai");
+    assert_eq!(stored["status"], "pending");
+
+    oidc_handle.abort();
+}
+
+#[test]
+fn gateway_handles_admin_provider_oauth_device_poll_for_xai() {
+    run_admin_oauth_test(
+        "gateway_handles_admin_provider_oauth_device_poll_for_xai",
+        gateway_handles_admin_provider_oauth_device_poll_for_xai_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_oauth_device_poll_for_xai_impl() {
+    let token_hits = Arc::new(Mutex::new(0usize));
+    let token_hits_clone = Arc::clone(&token_hits);
+    let access_token = sample_kiro_device_access_token("user@x.ai");
+    let id_token = access_token.clone();
+    let token_server = Router::new().fallback(any(move |_request: Request| {
+        let token_hits_inner = Arc::clone(&token_hits_clone);
+        let access_token = access_token.clone();
+        let id_token = id_token.clone();
+        async move {
+            let hit = {
+                let mut hits = token_hits_inner.lock().expect("mutex should lock");
+                *hits += 1;
+                *hits
+            };
+            if hit == 1 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "authorization_pending" })),
+                )
+                    .into_response();
+            }
+            Json(json!({
+                "access_token": access_token,
+                "refresh_token": "xai-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "id_token": id_token,
+            }))
+            .into_response()
+        }
+    }));
+
+    let mut provider = sample_provider("provider-xai", "xai", 10);
+    provider.provider_type = "xai".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-xai-responses",
+        "provider-xai",
+        "openai:responses",
+        "https://cli-chat-proxy.grok.com/v1",
+    );
+    let provider_catalog_repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![],
+    ));
+    let (token_url, token_handle) = start_server(token_server).await;
+    let resolved_token_url = format!("{token_url}/oauth2/token");
+    let state = AppState::new()
+        .expect("gateway should build")
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(
+                provider_catalog_repository.clone(),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        )
+        .with_provider_oauth_device_session_entry_for_tests(
+            "session-xai",
+            json!({
+                "provider_id": "provider-xai",
+                "region": "",
+                "client_id": "b1a00492-073a-47ea-816f-4c329264a828",
+                "client_secret": "",
+                "device_code": "xai-device-code",
+                "auth_type": "device",
+                "social_provider": null,
+                "code_verifier": null,
+                "redirect_uri": resolved_token_url,
+                "machine_id": null,
+                "interval": 5,
+                "expires_at_unix_secs": 4_102_444_800u64,
+                "status": "pending",
+                "proxy_node_id": null,
+                "created_at_unix_ms": 1_711_000_000u64,
+                "key_id": null,
+                "email": null,
+                "replaced": false,
+                "error_msg": null,
+            }),
+        )
+        .with_provider_oauth_token_url_for_tests("xai", resolved_token_url.clone());
+
+    let pending = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-xai/device-poll",
+        Some(json!({ "session_id": "session-xai" })),
+    )
+    .await;
+    let pending_body = to_bytes(pending.into_body(), usize::MAX)
+        .await
+        .expect("pending body should read");
+    let pending_payload: serde_json::Value =
+        serde_json::from_slice(&pending_body).expect("pending json should parse");
+    assert_eq!(
+        pending_payload["status"], "pending",
+        "payload={pending_payload}"
+    );
+
+    let authorized = local_admin_provider_oauth_response(
+        &state,
+        http::Method::POST,
+        "/api/admin/provider-oauth/providers/provider-xai/device-poll",
+        Some(json!({ "session_id": "session-xai" })),
+    )
+    .await;
+    let status = authorized.status();
+    let body = to_bytes(authorized.into_body(), usize::MAX)
+        .await
+        .expect("authorized body should read");
+    let payload: serde_json::Value = serde_json::from_slice(&body).expect("json body should parse");
+    assert_eq!(status, StatusCode::OK, "payload={payload}");
+    assert_eq!(payload["status"], "authorized");
+    assert_eq!(payload["email"], "user@x.ai");
+    assert_eq!(payload["replaced"], false);
+    assert_eq!(*token_hits.lock().expect("mutex should lock"), 2);
+
+    let stored = state
+        .load_provider_oauth_device_session_for_tests("device_auth_session:session-xai")
+        .expect("device session should persist");
+    let stored: serde_json::Value =
+        serde_json::from_str(&stored).expect("device session json should parse");
+    assert_eq!(stored["status"], "authorized");
+    let key_id = stored["key_id"]
+        .as_str()
+        .expect("key_id should be stored")
+        .to_string();
+    assert_eq!(payload["key_id"], key_id);
+
+    let persisted = provider_catalog_repository
+        .list_keys_by_ids(std::slice::from_ref(&key_id))
+        .await
+        .expect("keys should load")
+        .into_iter()
+        .next()
+        .expect("persisted key should exist");
+    assert_eq!(persisted.auth_type, "oauth");
+    let decrypted_auth_config = decrypt_persisted_provider_auth_config(&persisted);
+    let auth_config: serde_json::Value =
+        serde_json::from_str(&decrypted_auth_config).expect("auth config should parse");
+    assert_eq!(auth_config["provider_type"], "xai");
+    assert_eq!(auth_config["auth_method"], "oauth");
+    assert_eq!(auth_config["using_api"], false);
+    assert_eq!(auth_config["email"], "user@x.ai");
+
+    token_handle.abort();
+}
+
+#[test]
 fn gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_token() {
     run_admin_oauth_test(
         "gateway_handles_admin_provider_oauth_device_poll_for_windsurf_one_time_token",
@@ -3705,9 +3996,9 @@ async fn gateway_completes_admin_provider_oauth_key_locally_with_trusted_admin_p
         scores[0].hard_state.schedulable(),
         "OAuth completion should replace AuthInvalid with a schedulable score"
     );
-    let decrypted_api_key = decrypt_persisted_provider_api_key(&persisted);
+    let decrypted_api_key = decrypt_persisted_provider_api_key(persisted);
     assert_eq!(decrypted_api_key, "new-codex-access-token");
-    let decrypted_auth_config = decrypt_persisted_provider_auth_config(&persisted);
+    let decrypted_auth_config = decrypt_persisted_provider_auth_config(persisted);
     let auth_config: serde_json::Value =
         serde_json::from_str(&decrypted_auth_config).expect("auth config json should parse");
     assert_eq!(auth_config["provider_type"], "codex");
@@ -3916,11 +4207,47 @@ async fn gateway_completes_admin_provider_oauth_provider_locally_with_trusted_ad
 fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email() {
     run_admin_oauth_test(
         "gateway_names_new_antigravity_oauth_account_from_google_userinfo_email",
-        gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_impl,
+        || {
+            assert_antigravity_oauth_account_uses_google_userinfo_email(
+                "complete",
+                json!({
+                    "callback_url": "http://localhost:51121/oauth2callback?code=antigravity-code-123&state=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                }),
+            )
+        },
     );
 }
 
-async fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_impl() {
+#[test]
+fn gateway_names_imported_antigravity_oauth_account_from_google_userinfo_email() {
+    run_admin_oauth_test(
+        "gateway_names_imported_antigravity_oauth_account_from_google_userinfo_email",
+        || {
+            assert_antigravity_oauth_account_uses_google_userinfo_email(
+                "import-refresh-token",
+                json!({"refresh_token": "antigravity-import-refresh-token"}),
+            )
+        },
+    );
+}
+
+#[test]
+fn gateway_names_batch_imported_antigravity_oauth_account_from_google_userinfo_email() {
+    run_admin_oauth_test(
+        "gateway_names_batch_imported_antigravity_oauth_account_from_google_userinfo_email",
+        || {
+            assert_antigravity_oauth_account_uses_google_userinfo_email(
+                "batch-import",
+                json!({"credentials": "antigravity-import-refresh-token"}),
+            )
+        },
+    );
+}
+
+async fn assert_antigravity_oauth_account_uses_google_userinfo_email(
+    operation: &str,
+    request_body: Value,
+) {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);
     let upstream = Router::new().fallback(any(move |_request: Request| {
@@ -4025,15 +4352,13 @@ async fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_
 
     let response = reqwest::Client::new()
         .post(format!(
-            "{gateway_url}/api/admin/provider-oauth/providers/provider-antigravity/complete"
+            "{gateway_url}/api/admin/provider-oauth/providers/provider-antigravity/{operation}"
         ))
         .header(crate::constants::GATEWAY_HEADER, "rust-phase3b")
         .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
         .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
         .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
-        .json(&json!({
-            "callback_url": "http://localhost:51121/oauth2callback?code=antigravity-code-123&state=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-        }))
+        .json(&request_body)
         .send()
         .await
         .expect("request should succeed");
@@ -4041,9 +4366,22 @@ async fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_
     let status = response.status();
     let payload: Value = response.json().await.expect("json body should parse");
     assert_eq!(status, StatusCode::OK, "payload={payload}");
-    assert_eq!(payload["provider_type"], "antigravity");
-    assert_eq!(payload["email"], "new-antigravity@example.com");
-    assert_eq!(payload["replaced"], false);
+    let account_result = if operation == "batch-import" {
+        assert_eq!(payload["total"], 1);
+        assert_eq!(payload["success"], 1, "payload={payload}");
+        assert_eq!(payload["failed"], 0);
+        assert_eq!(payload["results"][0]["status"], "success");
+        assert_eq!(
+            payload["results"][0]["key_name"],
+            "new-antigravity@example.com"
+        );
+        &payload["results"][0]
+    } else {
+        assert_eq!(payload["provider_type"], "antigravity");
+        assert_eq!(payload["email"], "new-antigravity@example.com");
+        &payload
+    };
+    assert_eq!(account_result["replaced"], false);
     assert_eq!(*token_hits.lock().expect("mutex should lock"), 1);
     assert_eq!(*user_info_hits.lock().expect("mutex should lock"), 1);
     assert_eq!(
@@ -4055,7 +4393,7 @@ async fn gateway_names_new_antigravity_oauth_account_from_google_userinfo_email_
     );
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
-    let key_id = payload["key_id"]
+    let key_id = account_result["key_id"]
         .as_str()
         .expect("created key id should be returned")
         .to_string();

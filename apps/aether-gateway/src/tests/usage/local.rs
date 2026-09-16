@@ -475,7 +475,7 @@ async fn gateway_truncates_deep_request_echo_for_local_openai_chat_sync_usage_im
     );
     assert_eq!(
         stored_usage.request_headers.as_ref().unwrap()["authorization"],
-        "[redacted]"
+        "Bearer sk-client-openai-local-report-sync-deep"
     );
 
     gateway_handle.abort();
@@ -1100,7 +1100,7 @@ async fn sync_transport_error_policy_stops_or_retries_candidates_end_to_end_impl
         let mut second_candidate = sample_local_openai_candidate_row();
         second_candidate.key_id = "key-openai-usage-local-2".to_string();
         second_candidate.key_name = "secondary".to_string();
-        second_candidate.key_internal_priority = second_candidate.key_internal_priority - 1;
+        second_candidate.key_internal_priority -= 1;
         let candidate_selection_repository =
             Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
                 sample_local_openai_candidate_row(),
@@ -2094,7 +2094,7 @@ async fn gateway_records_failed_usage_when_all_local_claude_cli_candidates_are_s
     assert!(stored_usage.error_message.is_none());
     assert_eq!(
         stored_usage.request_headers.as_ref().unwrap()["authorization"],
-        "[redacted]"
+        "Bearer sk-client-claude-cli-usage-local-miss"
     );
     assert!(stored_usage.request_body.is_none());
     assert!(stored_usage.request_body_ref.is_none());
