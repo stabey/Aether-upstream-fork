@@ -1,0 +1,18 @@
+{
+  "name": "aether-cursor-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "In-image @cursor/sdk sidecar for the Aether Cursor provider. The Rust gateway talks to this process over HTTP; it does not embed Node.",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test server.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.0.30"
+  }
+}

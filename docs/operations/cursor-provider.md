@@ -1,80 +1,77 @@
 # Cursor provider behavior
 
-The `cursor` fixed provider integrates Cursor subscription models into Aether
-through an external OpenAI / Anthropic-compatible SDK gateway. Aether does
-**not** embed `@cursor/sdk` or reverse-engineer Cursor's private Agent
-transport.
+Codex is the mature in-Aether provider: the Rust gateway talks HTTP in-process
+because ChatGPT Codex already exposes an HTTP Responses API. Cursor is different.
+The official Agent harness is Node [`@cursor/sdk`](https://www.npmjs.com/package/@cursor/sdk).
+It cannot be linked into `aether-gateway`.
 
-This design follows the same split used by:
+## Can the Rust process embed `@cursor/sdk`?
 
-- [cursor-sdk2api](https://github.com/Sunnyender-org/cursor-sdk2api)
-- [Cursor2API](https://github.com/NGLSG/Cursor2API)
+No, not in this deployment:
 
-and matches how those projects integrate with gateways such as new-api: the
-upper layer speaks standard HTTP APIs; the sidecar owns the official Cursor
-Agent harness.
+- `@cursor/sdk` is a Node package (Agent.create / send / stream).
+- Production `Dockerfile.app` is distroless/static: only `aether-gateway`.
+- Compose runs the app container `read_only` with `noexec` `/tmp`, so the
+  gateway cannot spawn Node the way Windsurf optionally starts a local LS.
 
-## Architecture
+## Same-image interaction (this is the supported path)
+
+Follow `aether-vscodex`: keep Node next to the gateway, not inside the binary.
 
 ```text
-Client  →  Aether (Rust)  →  cursor-sdk2api / Cursor2API  →  @cursor/sdk  →  Cursor
+Client → aether-gateway (Rust, same as Codex) → aether-cursor-sdk → @cursor/sdk → Cursor
 ```
 
-| Layer | Responsibility |
-| --- | --- |
-| Aether | Multi-tenant auth, key pool, routing, format conversion, usage |
-| Sidecar | `@cursor/sdk` Agent create/send/stream, tool continuation |
-| Credential | Cursor User API Key (`crsr_…`) stored as an Aether provider key |
+| Process | Image | Role |
+| --- | --- | --- |
+| `aether-gateway` | distroless | Pool, routing, conversion, Bearer Cursor keys |
+| `cursor-sdk` | `node:22` | Official SDK Agent harness |
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cursor-sdk.yml up -d
+```
+
+The overlay sets `AETHER_CURSOR_SDK_INTERNAL_URL=http://cursor-sdk:8792/v1`.
+Loopback template URLs (`http://127.0.0.1:8792/v1`) are rewritten to that
+internal URL at request time, the same way Aether talks to vscodex.
+
+Local without Docker: `cd aether-cursor-sdk && npm ci && npm start`, then create
+a `cursor` provider (default base URL is already the sidecar).
+
+You can still point the provider at an external
+[cursor-sdk2api](https://github.com/Sunnyender-org/cursor-sdk2api) or
+[Cursor2API](https://github.com/NGLSG/Cursor2API) gateway. Explicit custom
+base URLs are preserved.
+
+## Codex-style Aether behavior
+
+- Same-format HTTP, not a dedicated protobuf client.
+- Native formats: `openai:chat`, `openai:responses`, `claude:messages`.
+  Other clients use Aether's existing conversion matrix.
+- Keys are Cursor User API Keys (`crsr_…`), forwarded as Bearer (Codex's
+  API-key channel, not ChatGPT OAuth).
+- Live `GET /v1/models` against the sidecar, with SDK identity headers
+  (`x-cursor-client-type: sdk`).
+- Format conversion is on by default.
 
 ## Setup
 
-1. Deploy a sidecar (recommended: cursor-sdk2api) with `AUTH_MODE=byok`.
-2. In Aether admin, create a provider with type `cursor`.
-3. Default base URL is `http://127.0.0.1:8080/v1`. Override for Docker, for
-   example `http://cursor-sdk2api:8080/v1`.
-4. Add one or more Cursor User API Keys as provider keys (Bearer).
-5. Associate models. Presets include `composer-2.5`, `composer-2.5-fast`,
-   `claude-sonnet-4-6`, `claude-opus-4-6`, and `grok-4.6`. Prefer live
-   `GET /v1/models` from the sidecar when available.
+1. Start the sidecar (Compose overlay or local `npm start`).
+2. Create provider type `cursor`.
+3. Add Cursor User API Keys as provider keys.
+4. Fetch models from the sidecar, or use presets (`composer-2.5`,
+   `composer-2.5-fast`, `claude-sonnet-4-6`, `claude-opus-4-6`, `grok-4.6`).
 
-## Endpoints
+## Out of scope
 
-The fixed template exposes:
-
-| API format | Upstream path (relative to base `/v1`) |
-| --- | --- |
-| `openai:chat` | `/chat/completions` |
-| `openai:responses` | `/responses` |
-| `claude:messages` | `/messages` |
-
-Cross-format clients still go through Aether's existing conversion matrix.
-Format conversion is enabled by default.
-
-## Auth and pooling
-
-- Keys are **key-managed**, not OAuth accounts.
-- Each Cursor User API Key is a pool member. Aether schedules them like other
-  Bearer providers.
-- Run the sidecar in BYOK mode so the Bearer token Aether forwards is the
-  Cursor key itself.
-- Managed-mode sidecars (one gateway key + internal Cursor pool) also work, but
-  then Aether only sees a single upstream key and loses per-Cursor-key
-  scheduling visibility.
-
-## Out of scope (v1)
-
-- Embedding `@cursor/sdk` inside the Rust gateway process
-- Re-implementing Connect+protobuf Composer chat from Cursor2API's worker
-- Cursor dashboard quota RPC refresh (use the sidecar console / Cursor
-  dashboard for now)
-- Cookie / CLI session scraping
+- Linking Node into the Rust binary
+- Re-implementing Cursor2API's private Connect+protobuf chat in Rust
+- Cursor dashboard quota RPC (use Cursor / sidecar for account health)
+- Full tool-bridge parity with cursor-sdk2api (v1 flattens the turn to
+  Agent.send text)
 
 ## Operational notes
 
-- Follow Cursor's terms of use. This provider is an integration surface, not a
-  bypass of Cursor account limits.
-- Tool-heavy clients (Claude Code, Codex, Grok Build) depend on the sidecar's
-  tool bridge fidelity. Validate against the sidecar's own smoke tests before
-  production traffic.
-- If the sidecar is down, Aether surfaces ordinary upstream connection errors;
-  there is no in-process Cursor fallback.
+Follow Cursor's terms. This is an integration surface, not a bypass of
+account limits. If the sidecar is down, Aether returns ordinary upstream
+connection errors.

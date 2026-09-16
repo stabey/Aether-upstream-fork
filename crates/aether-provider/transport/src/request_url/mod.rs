@@ -120,9 +120,10 @@ fn build_transport_request_url_inner(
         return Some(url);
     }
 
-    let xai_base =
-        crate::xai::resolved_xai_upstream_base_url(transport, &normalized_provider_api_format);
-    let request_base_url = xai_base
+    let resolved_base =
+        crate::xai::resolved_xai_upstream_base_url(transport, &normalized_provider_api_format)
+            .or_else(|| crate::cursor::resolved_cursor_upstream_base_url(transport));
+    let request_base_url = resolved_base
         .as_deref()
         .unwrap_or(transport.endpoint.base_url.as_str());
 
@@ -2493,5 +2494,61 @@ mod tests {
         )
         .expect("xai api key URL");
         assert_eq!(official, "https://api.x.ai/v1/responses");
+    }
+
+    #[test]
+    fn cursor_loopback_chat_uses_internal_sdk_sidecar() {
+        let transport = sample_transport(
+            "cursor",
+            "openai:chat",
+            crate::cursor::CURSOR_DEFAULT_GATEWAY_BASE_URL,
+            None,
+        );
+
+        let url = build_transport_request_url(
+            &transport,
+            TransportRequestUrlParams {
+                provider_api_format: "openai:chat",
+                mapped_model: Some("composer-2.5"),
+                upstream_is_stream: true,
+                request_query: None,
+                kiro_api_region: None,
+                api_operation: None,
+            },
+        )
+        .expect("cursor chat URL");
+
+        assert_eq!(
+            url,
+            format!(
+                "{}/chat/completions",
+                crate::cursor::cursor_sdk_internal_base_url()
+            )
+        );
+    }
+
+    #[test]
+    fn cursor_custom_gateway_is_preserved() {
+        let transport = sample_transport(
+            "cursor",
+            "openai:chat",
+            "http://cursor-sdk2api:8080/v1",
+            None,
+        );
+
+        let url = build_transport_request_url(
+            &transport,
+            TransportRequestUrlParams {
+                provider_api_format: "openai:chat",
+                mapped_model: Some("composer-2.5"),
+                upstream_is_stream: false,
+                request_query: None,
+                kiro_api_region: None,
+                api_operation: None,
+            },
+        )
+        .expect("cursor custom URL");
+
+        assert_eq!(url, "http://cursor-sdk2api:8080/v1/chat/completions");
     }
 }

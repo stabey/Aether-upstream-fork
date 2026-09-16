@@ -121,7 +121,7 @@
               v-if="!isEditMode && form.provider_type === 'cursor'"
               class="text-xs text-muted-foreground"
             >
-              {{ legacyT('需外置 cursor-sdk2api / Cursor2API 网关；默认 http://127.0.0.1:8080/v1，密钥填 Cursor User API Key') }}
+              {{ legacyT('Rust 网关通过内部 URL 调用镜像内 @cursor/sdk sidecar（默认 http://127.0.0.1:8792/v1）；密钥填 Cursor User API Key') }}
             </p>
             <p
               v-else-if="!isEditMode && form.provider_type !== 'custom'"

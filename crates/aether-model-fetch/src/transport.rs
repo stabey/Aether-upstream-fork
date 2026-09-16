@@ -645,6 +645,12 @@ fn standard_models_fetch_headers(
             ),
         ]);
     }
+    if provider_type == "cursor" {
+        let mut headers = BTreeMap::new();
+        aether_provider_transport::insert_cursor_sdk_identity_headers(&mut headers);
+        headers.insert("accept".to_string(), "application/json".to_string());
+        return headers;
+    }
     match api_format.as_str() {
         "openai:responses" | "openai:responses:compact" => BTreeMap::from([(
             "user-agent".to_string(),
@@ -704,10 +710,12 @@ fn build_standard_models_fetch_url(
         return Ok(append_query_param(url, "key", &secret));
     }
 
+    let models_base_url = aether_provider_transport::resolved_cursor_upstream_base_url(transport)
+        .unwrap_or_else(|| transport.endpoint.base_url.clone());
     let (mut url, _) = build_models_fetch_url_for_client_version(
         &transport.provider.provider_type,
         &transport.endpoint.api_format,
-        &transport.endpoint.base_url,
+        &models_base_url,
         codex_client_version,
     )
     .ok_or_else(|| "Rust models fetch does not support this provider format yet".to_string())?;

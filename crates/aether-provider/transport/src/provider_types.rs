@@ -982,6 +982,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["openai:chat", "openai:responses", "claude:messages"]
         );
+        assert_eq!(
+            template.base_url,
+            crate::cursor::CURSOR_DEFAULT_GATEWAY_BASE_URL
+        );
 
         let policy = provider_runtime_policy("cursor");
         assert!(policy.fixed_provider);

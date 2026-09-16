@@ -72,8 +72,11 @@ pub use conversion::{
     request_pair_transport_unsupported_reason, CandidateTransportPolicyFacts,
 };
 pub use cursor::{
-    is_cursor_provider_transport, is_cursor_provider_type, CURSOR_DEFAULT_GATEWAY_BASE_URL,
-    CURSOR_PROVIDER_TYPE,
+    insert_cursor_sdk_identity_headers, insert_cursor_sdk_identity_headers_if_needed,
+    is_cursor_provider_transport, is_cursor_provider_type, resolved_cursor_request_base_url,
+    resolved_cursor_upstream_base_url, CURSOR_CLIENT_TYPE_HEADER, CURSOR_CLIENT_TYPE_VALUE,
+    CURSOR_CLIENT_VERSION_HEADER, CURSOR_DEFAULT_GATEWAY_BASE_URL, CURSOR_INTERNAL_URL_ENV,
+    CURSOR_PROVIDER_TYPE, CURSOR_SDK_CLIENT_VERSION,
 };
 pub use diagnostics::{
     append_transport_diagnostics_to_value, build_request_trace_proxy_value,
