@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
 use aether_provider_transport::xai::{
     extract_xai_user_id_from_auth_config, insert_cli_identity_headers,
     should_attach_cli_identity_headers,
@@ -8,6 +9,58 @@ use aether_provider_transport::GatewayProviderTransportSnapshot;
 use serde_json::{json, Value};
 
 use crate::logic::{normalize_cached_model, ModelsFetchPage};
+
+const XAI_MEDIA_MODEL_CARDS: &[(&str, &str, &str)] = &[
+    ("grok-imagine-image", "Grok Imagine Image", "openai:image"),
+    (
+        "grok-imagine-image-quality",
+        "Grok Imagine Image Quality",
+        "openai:image",
+    ),
+    ("grok-imagine-video", "Grok Imagine Video", "openai:video"),
+    (
+        "grok-imagine-video-1.5",
+        "Grok Imagine Video 1.5",
+        "openai:video",
+    ),
+];
+
+/// Return the xAI media models that are supported by the key's configured API
+/// formats but may be omitted from the account `/v1/models` directory.
+pub fn media_models_for_key(key: &StoredProviderCatalogKey) -> Vec<Value> {
+    let formats = crate::logic::json_string_list(key.api_formats.as_ref())
+        .into_iter()
+        .map(|format| aether_ai_formats::normalize_api_format_alias(&format))
+        .collect::<std::collections::BTreeSet<_>>();
+    XAI_MEDIA_MODEL_CARDS
+        .iter()
+        .filter(|(_, _, api_format)| formats.is_empty() || formats.contains(*api_format))
+        .map(|(id, display_name, api_format)| {
+            let mut model = json!({
+                "id": id,
+                "display_name": display_name,
+                "owned_by": "xai",
+                "api_formats": [api_format],
+            });
+            if *api_format == "openai:image" {
+                model["supports_image_generation"] = json!(true);
+            }
+            model
+        })
+        .collect()
+}
+
+pub fn media_model_ids_for_key(key: &StoredProviderCatalogKey) -> Vec<String> {
+    media_models_for_key(key)
+        .into_iter()
+        .filter_map(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect()
+}
 
 pub(crate) fn models_fetch_headers(
     transport: &GatewayProviderTransportSnapshot,
@@ -123,8 +176,33 @@ fn model_id(item: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_models_response;
+    use super::{media_models_for_key, parse_models_response};
+    use aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey;
     use serde_json::json;
+
+    fn key_with_formats(formats: &[&str]) -> StoredProviderCatalogKey {
+        let mut key = StoredProviderCatalogKey::new(
+            "key-1".to_string(),
+            "provider-1".to_string(),
+            "key".to_string(),
+            "oauth".to_string(),
+            None,
+            true,
+        )
+        .expect("key should build");
+        key.api_formats = Some(json!(formats));
+        key
+    }
+
+    #[test]
+    fn xai_media_fallback_follows_key_api_formats() {
+        let models = media_models_for_key(&key_with_formats(&["openai:responses", "openai:image"]));
+        let ids = models
+            .iter()
+            .filter_map(|model| model.get("id").and_then(|value| value.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["grok-imagine-image", "grok-imagine-image-quality"]);
+    }
 
     #[test]
     fn xai_catalog_prefers_protocol_ids_and_keeps_display_names() {

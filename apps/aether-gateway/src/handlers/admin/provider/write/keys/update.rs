@@ -19,6 +19,7 @@ use aether_data_contracts::repository::provider_catalog::{
     ProviderCatalogKeyAdminCasUpdate, ProviderCatalogKeyOAuthCredentialFence,
     StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
+use aether_model_fetch::xai_media_model_ids_for_key;
 use aether_provider_transport::provider_types::provider_type_is_fixed;
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -361,6 +362,18 @@ pub(crate) fn build_admin_update_provider_key_record_with_existing_keys(
     if fields.contains("locked_models") {
         updated.locked_models =
             normalize_string_list(payload.locked_models).map(|value| json!(value));
+    }
+    if !existing.auto_fetch_models
+        && updated.auto_fetch_models
+        && provider.provider_type.trim().eq_ignore_ascii_case("xai")
+    {
+        let mut locked_models = json_string_list(updated.locked_models.as_ref());
+        for model_id in xai_media_model_ids_for_key(&updated) {
+            if !locked_models.iter().any(|locked| locked == &model_id) {
+                locked_models.push(model_id);
+            }
+        }
+        updated.locked_models = (!locked_models.is_empty()).then(|| json!(locked_models));
     }
     if fields.contains("model_include_patterns") {
         updated.model_include_patterns =

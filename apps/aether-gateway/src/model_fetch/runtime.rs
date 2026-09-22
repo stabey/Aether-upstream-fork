@@ -11,7 +11,8 @@ use aether_model_fetch::{
     model_catalog_upstream_metadata, model_fetch_interval_minutes,
     model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
     selected_models_fetch_endpoints_for_provider, sync_provider_model_whitelist_associations,
-    upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
+    upstream_metadata_namespace_updates, xai_media_model_ids_for_key, ModelFetchAssociationStore,
+    ModelFetchRunSummary,
 };
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -476,9 +477,28 @@ async fn fetch_and_persist_key_models(
         return Ok(KeyFetchDisposition::Failed);
     }
 
+    let mut locked_models = json_string_list(target.key.locked_models.as_ref());
+    if target
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("xai")
+    {
+        let fetched_model_ids = result
+            .fetched_model_ids
+            .iter()
+            .map(|model_id| model_id.trim())
+            .filter(|model_id| !model_id.is_empty())
+            .collect::<BTreeSet<_>>();
+        for model_id in xai_media_model_ids_for_key(&target.key) {
+            if !fetched_model_ids.contains(model_id.as_str()) {
+                locked_models.push(model_id);
+            }
+        }
+    }
     let filtered_models = apply_model_filters(
         &result.fetched_model_ids,
-        json_string_list(target.key.locked_models.as_ref()),
+        locked_models,
         json_string_list(target.key.model_include_patterns.as_ref()),
         json_string_list(target.key.model_exclude_patterns.as_ref()),
     );
@@ -1512,7 +1532,12 @@ mod tests {
 
     #[tokio::test]
     async fn xai_auto_model_sync_updates_whitelist_and_cache_from_live_catalog() {
-        let mut key = sample_key("key-xai", "provider-xai", "oauth", &["openai:responses"]);
+        let mut key = sample_key(
+            "key-xai",
+            "provider-xai",
+            "oauth",
+            &["openai:responses", "openai:image", "openai:video"],
+        );
         key.allowed_models = Some(json!(["grok-old"]));
         key.model_include_patterns = Some(json!(["grok-*"]));
         key.model_exclude_patterns = Some(json!(["grok-test-*"]));
@@ -1569,7 +1594,17 @@ mod tests {
             }
         );
         let key = state.key("key-xai");
-        assert_eq!(key.allowed_models, Some(json!(["grok-4.7", "grok-pinned"])));
+        assert_eq!(
+            key.allowed_models,
+            Some(json!([
+                "grok-4.7",
+                "grok-imagine-image",
+                "grok-imagine-image-quality",
+                "grok-imagine-video",
+                "grok-imagine-video-1.5",
+                "grok-pinned"
+            ]))
+        );
         assert!(key.last_models_fetch_at_unix_secs.is_some());
         assert!(key.last_models_fetch_error.is_none());
         assert_eq!(
@@ -1591,7 +1626,14 @@ mod tests {
         assert_eq!(summary.succeeded, 1);
         assert_eq!(
             state.key("key-xai").allowed_models,
-            Some(json!(["grok-next-release", "grok-pinned"]))
+            Some(json!([
+                "grok-imagine-image",
+                "grok-imagine-image-quality",
+                "grok-imagine-video",
+                "grok-imagine-video-1.5",
+                "grok-next-release",
+                "grok-pinned"
+            ]))
         );
         let plans = state.executed_plans.lock().unwrap();
         assert_eq!(plans.len(), 2);

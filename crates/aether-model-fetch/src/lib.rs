@@ -5,6 +5,11 @@ mod strategy;
 mod transport;
 mod xai;
 
+pub use xai::{
+    media_model_ids_for_key as xai_media_model_ids_for_key,
+    media_models_for_key as xai_media_models_for_key,
+};
+
 pub use association_sync::{
     sync_provider_model_whitelist_associations, ModelFetchAssociationStore,
 };

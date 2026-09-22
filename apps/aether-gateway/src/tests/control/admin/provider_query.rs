@@ -191,6 +191,7 @@ async fn gateway_handles_admin_provider_query_models_xai_live_catalog_also_updat
         "openai:responses",
         "live-secret-api-key",
     );
+    key.api_formats = Some(json!(["openai:responses", "openai:image", "openai:video"]));
     key.auto_fetch_models = true;
     key.allowed_models = Some(json!(["grok-old"]));
     key.locked_models = None;
@@ -225,7 +226,14 @@ async fn gateway_handles_admin_provider_query_models_xai_live_catalog_also_updat
         .remove(0);
     assert_eq!(
         key.allowed_models,
-        Some(json!(["grok-4.7", "grok-build-next"]))
+        Some(json!([
+            "grok-4.7",
+            "grok-build-next",
+            "grok-imagine-image",
+            "grok-imagine-image-quality",
+            "grok-imagine-video",
+            "grok-imagine-video-1.5"
+        ]))
     );
     assert!(key.last_models_fetch_error.is_none());
     assert!(key.last_models_fetch_at_unix_secs.is_some());
@@ -251,9 +259,21 @@ async fn gateway_handles_admin_provider_query_models_xai_live_catalog_also_updat
     assert_eq!(payload["data"]["from_cache"], false);
     assert_eq!(
         payload["data"]["models"].as_array().unwrap().len(),
-        3,
-        "manual discovery must expose the full upstream directory, before key filters"
+        7,
+        "manual discovery must expose the upstream directory and supported media fallbacks"
     );
+    for model_id in [
+        "grok-imagine-image",
+        "grok-imagine-image-quality",
+        "grok-imagine-video",
+        "grok-imagine-video-1.5",
+    ] {
+        assert!(payload["data"]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["id"] == model_id));
+    }
     assert_eq!(*requests.lock().unwrap(), 2);
     gateway_handle.abort();
     upstream_handle.abort();
