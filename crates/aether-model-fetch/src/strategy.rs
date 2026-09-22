@@ -395,6 +395,13 @@ async fn fetch_standard_models_for_transport(
                     codex_client_version
                 },
             )
+        } else if transport
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("xai")
+        {
+            crate::xai::parse_models_response(&transport.endpoint.api_format, &body_json)
         } else {
             parse_models_response_page(&transport.endpoint.api_format, &body_json)
         }

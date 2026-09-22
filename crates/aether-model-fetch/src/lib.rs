@@ -3,6 +3,12 @@ mod config;
 mod logic;
 mod strategy;
 mod transport;
+mod xai;
+
+pub use xai::{
+    media_model_ids_for_key as xai_media_model_ids_for_key,
+    media_models_for_key as xai_media_models_for_key,
+};
 
 pub use association_sync::{
     sync_provider_model_whitelist_associations, ModelFetchAssociationStore,
@@ -18,7 +24,8 @@ pub use logic::{
     parse_models_response_page, parse_windsurf_model_configs_response, preset_models_for_provider,
     project_codex_models_for_legacy_cache, provider_type_uses_preset_models,
     select_models_fetch_endpoint, selected_models_fetch_endpoints,
-    upstream_metadata_namespace_updates, ModelFetchRunSummary, ModelsFetchPage, ModelsFetchSuccess,
+    selected_models_fetch_endpoints_for_provider, upstream_metadata_namespace_updates,
+    ModelFetchRunSummary, ModelsFetchPage, ModelsFetchSuccess,
 };
 pub use strategy::{
     antigravity_model_id_is_routable, fetch_models_from_transports,

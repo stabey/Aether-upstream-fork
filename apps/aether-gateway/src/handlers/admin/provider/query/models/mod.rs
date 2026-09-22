@@ -65,7 +65,8 @@ use aether_data_contracts::repository::provider_catalog::{
 use aether_model_fetch::{
     aggregate_models_for_cache, fetch_models_from_transports_for_management, json_string_list,
     model_catalog_upstream_metadata, preset_models_for_provider, selected_models_fetch_endpoints,
-    upstream_metadata_namespace_updates,
+    selected_models_fetch_endpoints_for_provider, upstream_metadata_namespace_updates,
+    xai_media_models_for_key,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -260,6 +261,45 @@ fn provider_query_filter_models_for_key(
                 .is_some_and(|required_rank| required_rank <= allowed_rank)
         })
         .collect()
+}
+
+/// Keep models explicitly locked on a key visible in the management directory.
+///
+/// A key's locked models are intentionally independent of the upstream catalog:
+/// they may be media models, aliases, or other models that the upstream `/models`
+/// endpoint does not advertise.  The background sync already preserves these
+/// values in the key whitelist; the manual management query must preserve them in
+/// its response as well.
+fn provider_query_merge_locked_models(
+    provider: &StoredProviderCatalogProvider,
+    key: &StoredProviderCatalogKey,
+    models: Vec<Value>,
+) -> Vec<Value> {
+    let mut merged = models;
+    let mut known_model_ids = merged
+        .iter()
+        .filter_map(provider_query_model_id)
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    for model_id in json_string_list(key.locked_models.as_ref()) {
+        if known_model_ids.insert(model_id.clone()) {
+            merged.push(json!({"id": model_id}));
+        }
+    }
+
+    if provider.provider_type.trim().eq_ignore_ascii_case("xai") {
+        for model in xai_media_models_for_key(key) {
+            let Some(model_id) = provider_query_model_id(&model) else {
+                continue;
+            };
+            if known_model_ids.insert(model_id.to_string()) {
+                merged.push(model);
+            }
+        }
+    }
+
+    aggregate_models_for_cache(&merged)
 }
 
 fn provider_query_attach_model_test_capabilities(
@@ -533,7 +573,11 @@ async fn provider_query_fetch_models_for_key(
             provider_query_read_cached_models(state, &provider.id, &key.id).await
         };
         if let Some(cached_models) = cached_models {
-            let models = provider_query_filter_models_for_key(provider, key, cached_models);
+            let models = provider_query_merge_locked_models(
+                provider,
+                key,
+                provider_query_filter_models_for_key(provider, key, cached_models),
+            );
             return Ok(ProviderQueryKeyFetchResult {
                 models,
                 error: None,
@@ -544,12 +588,17 @@ async fn provider_query_fetch_models_for_key(
         }
     }
 
-    let selected_endpoints = selected_models_fetch_endpoints(endpoints, key);
+    let selected_endpoints =
+        selected_models_fetch_endpoints_for_provider(&provider.provider_type, endpoints, key);
     if selected_endpoints.is_empty() {
         if let Some(models) = preset_models_for_provider(&provider.provider_type) {
             let models = aggregate_models_for_cache(&models);
             provider_query_persist_preset_models(state, provider, key, &models).await?;
-            let models = provider_query_filter_models_for_key(provider, key, models);
+            let models = provider_query_merge_locked_models(
+                provider,
+                key,
+                provider_query_filter_models_for_key(provider, key, models),
+            );
             return Ok(ProviderQueryKeyFetchResult {
                 models,
                 error: None,
@@ -559,7 +608,7 @@ async fn provider_query_fetch_models_for_key(
             });
         }
         return Ok(ProviderQueryKeyFetchResult {
-            models: Vec::new(),
+            models: provider_query_merge_locked_models(provider, key, Vec::new()),
             error: Some(ADMIN_PROVIDER_QUERY_NO_ACTIVE_ENDPOINT_DETAIL.to_string()),
             warning: None,
             from_cache: false,
@@ -586,7 +635,7 @@ async fn provider_query_fetch_models_for_key(
 
     if transports.is_empty() {
         return Ok(ProviderQueryKeyFetchResult {
-            models: Vec::new(),
+            models: provider_query_merge_locked_models(provider, key, Vec::new()),
             error: Some(all_errors.join("; ")),
             warning: None,
             from_cache: false,
@@ -610,12 +659,15 @@ async fn provider_query_fetch_models_for_key(
                 if let Some(fallback) =
                     provider_query_codex_preset_fallback(provider, &all_errors.join("; "))
                 {
+                    let mut fallback = fallback;
+                    fallback.models =
+                        provider_query_merge_locked_models(provider, key, fallback.models);
                     provider_query_persist_preset_models(state, provider, key, &fallback.models)
                         .await?;
                     return Ok(fallback);
                 }
                 return Ok(ProviderQueryKeyFetchResult {
-                    models: Vec::new(),
+                    models: provider_query_merge_locked_models(provider, key, Vec::new()),
                     error: Some(all_errors.join("; ")),
                     warning: None,
                     from_cache: false,
@@ -655,6 +707,8 @@ async fn provider_query_fetch_models_for_key(
         if let Some(fallback) =
             provider_query_codex_preset_fallback(provider, &all_errors.join("; "))
         {
+            let mut fallback = fallback;
+            fallback.models = provider_query_merge_locked_models(provider, key, fallback.models);
             provider_query_persist_preset_models(state, provider, key, &fallback.models).await?;
             return Ok(fallback);
         }
@@ -676,7 +730,11 @@ async fn provider_query_fetch_models_for_key(
     }
 
     Ok(ProviderQueryKeyFetchResult {
-        models: provider_query_filter_models_for_key(provider, key, unique_models),
+        models: provider_query_merge_locked_models(
+            provider,
+            key,
+            provider_query_filter_models_for_key(provider, key, unique_models),
+        ),
         error,
         warning,
         from_cache: false,
@@ -968,6 +1026,58 @@ mod tests {
 
     fn model(id: &str) -> Value {
         json!({ "id": id })
+    }
+
+    #[test]
+    fn provider_query_keeps_locked_models_and_deduplicates_upstream_entries() {
+        let mut key = grok_key_with_quota(json!({ "pool_tier": "basic" }));
+        key.locked_models = Some(json!([
+            "grok-imagine-video",
+            "grok-4.7",
+            "  ",
+            "grok-imagine-video"
+        ]));
+
+        let filtered = provider_query_filter_models_for_key(
+            &grok_provider(),
+            &key,
+            vec![model("grok-4.7"), model("grok-imagine-image-lite")],
+        );
+        let merged = provider_query_merge_locked_models(&grok_provider(), &key, filtered);
+        let ids = merged
+            .iter()
+            .filter_map(provider_query_model_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            ["grok-4.7", "grok-imagine-image-lite", "grok-imagine-video"]
+        );
+    }
+
+    #[test]
+    fn provider_query_keeps_xai_media_models_when_directory_omits_them() {
+        let mut provider = grok_provider();
+        provider.provider_type = "xai".to_string();
+        let mut key = grok_key_with_quota(json!({}));
+        key.api_formats = Some(json!(["openai:responses", "openai:image", "openai:video"]));
+
+        let merged = provider_query_merge_locked_models(&provider, &key, vec![model("grok-4.7")]);
+        let ids = merged
+            .iter()
+            .filter_map(provider_query_model_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            [
+                "grok-4.7",
+                "grok-imagine-image",
+                "grok-imagine-image-quality",
+                "grok-imagine-video",
+                "grok-imagine-video-1.5"
+            ]
+        );
     }
 
     fn filtered_ids(key: &StoredProviderCatalogKey) -> Vec<String> {
