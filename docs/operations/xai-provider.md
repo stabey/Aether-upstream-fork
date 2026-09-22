@@ -43,6 +43,32 @@ Quota refresh reads `/user` and `/billing?format=credits` and stores a structure
 usage snapshot. A prepaid balance keeps an account selectable after the weekly
 allowance is exhausted. API-key accounts skip the subscription billing surface.
 
+## Model discovery
+
+xAI model discovery reads the account's live `/v1/models` directory. OAuth accounts
+use the CLI chat proxy and CLI identity headers; API-key or `using_api=true`
+accounts use the official API. Custom gateways and configured proxies are honored.
+Discovery uses the normal account host even for a compact-only endpoint, and
+image-only or video-only keys can also fetch the account directory.
+
+Enabling a key's **Auto-fetch models** setting triggers an immediate fetch. The
+startup and periodic model-fetch worker refreshes enabled keys thereafter (the
+default interval is 24 hours, configurable with `MODEL_FETCH_INTERVAL_MINUTES`).
+Each successful sync applies the key's include/exclude patterns and locked models
+to its allowed-model list, while caching the unfiltered directory for management
+queries. Manual **Fetch upstream models** uses the same live discovery path;
+force-refresh bypasses the cache.
+
+Only IDs returned by the account directory are discovered. If an OAuth directory
+omits separately supported image/video models, retain those IDs as locked models
+when enabling automatic whitelist synchronization.
+
+CLI catalog IDs are read from `model`, `modelId`, `model_id`, `id`, `slug`, or
+`_meta`, with `name` only as a fallback. Image/video models retain their respective
+API formats. New model names do not require a gateway release. Failed, malformed,
+or empty responses record a fetch error and retain the previous whitelist/cache;
+xAI no longer substitutes a static preset list as a successful upstream fetch.
+
 ## Images and videos
 
 OAuth media requests default to `https://cli-chat-proxy.grok.com/v1`; API-key or

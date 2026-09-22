@@ -10,7 +10,7 @@ use aether_model_fetch::{
     apply_model_filters, fetch_models_from_transports_for_management, json_string_list,
     model_catalog_upstream_metadata, model_fetch_interval_minutes,
     model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
-    selected_models_fetch_endpoints, sync_provider_model_whitelist_associations,
+    selected_models_fetch_endpoints_for_provider, sync_provider_model_whitelist_associations,
     upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
 };
 use serde_json::{json, Value};
@@ -181,7 +181,11 @@ where
             if !key.is_active || !key.auto_fetch_models {
                 continue;
             }
-            let selected_endpoints = selected_models_fetch_endpoints(&endpoints, &key);
+            let selected_endpoints = selected_models_fetch_endpoints_for_provider(
+                &provider.provider_type,
+                &endpoints,
+                &key,
+            );
             let key = sanitize_model_fetch_key(key);
             targets.push(SelectedFetchTarget {
                 provider: provider.clone(),
@@ -687,7 +691,7 @@ fn now_unix_secs() -> u64 {
 mod tests {
     use super::{
         perform_model_fetch_once_with_state, safe_model_fetch_error, sanitize_model_fetch_key,
-        state::ModelFetchRuntimeState,
+        state::ModelFetchRuntimeState, ModelFetchRunSummary,
     };
     use aether_contracts::{ExecutionPlan, ExecutionResult, ProxySnapshot};
     use aether_data_contracts::repository::global_models::{
@@ -1504,6 +1508,186 @@ mod tests {
             cached_models[0]["api_formats"],
             json!(["openai:chat", "openai:responses", "claude:messages"])
         );
+    }
+
+    #[tokio::test]
+    async fn xai_auto_model_sync_updates_whitelist_and_cache_from_live_catalog() {
+        let mut key = sample_key("key-xai", "provider-xai", "oauth", &["openai:responses"]);
+        key.allowed_models = Some(json!(["grok-old"]));
+        key.model_include_patterns = Some(json!(["grok-*"]));
+        key.model_exclude_patterns = Some(json!(["grok-test-*"]));
+        key.locked_models = Some(json!(["grok-pinned"]));
+        let mut disabled = key.clone();
+        disabled.id = "key-sync-disabled".to_string();
+        disabled.auto_fetch_models = false;
+        let mut transport = sample_transport(
+            "xai",
+            "provider-xai",
+            "endpoint-xai",
+            "key-xai",
+            "openai:responses",
+            "oauth",
+            Some(r#"{"using_api":false,"sub":"xai-user"}"#),
+        );
+        transport.endpoint.base_url = "https://api.x.ai/v1".to_string();
+        let state = TestState::new(
+            vec![sample_provider("provider-xai", "xai")],
+            vec![sample_endpoint(
+                "endpoint-xai",
+                "provider-xai",
+                "openai:responses",
+            )],
+            vec![key, disabled],
+            HashMap::from([(
+                (
+                    "provider-xai".to_string(),
+                    "endpoint-xai".to_string(),
+                    "key-xai".to_string(),
+                ),
+                transport,
+            )]),
+            vec![
+                execution_result(json!({"models": [
+                    {"id":"display-id", "model":"grok-4.7", "name":"Grok 4.7"},
+                    {"modelId":"grok-test-preview"},
+                    {"id":"other-model"}
+                ]})),
+                execution_result(json!({"data": [{"id":"grok-next-release"}]})),
+            ],
+        );
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("auto sync");
+        assert_eq!(
+            summary,
+            ModelFetchRunSummary {
+                attempted: 1,
+                succeeded: 1,
+                failed: 0,
+                skipped: 0
+            }
+        );
+        let key = state.key("key-xai");
+        assert_eq!(key.allowed_models, Some(json!(["grok-4.7", "grok-pinned"])));
+        assert!(key.last_models_fetch_at_unix_secs.is_some());
+        assert!(key.last_models_fetch_error.is_none());
+        assert_eq!(
+            state.key("key-sync-disabled").allowed_models,
+            Some(json!(["grok-old"]))
+        );
+        let cache_key = ("provider-xai".to_string(), "key-xai".to_string());
+        let cached = state.cached_models.lock().unwrap()[&cache_key].clone();
+        assert_eq!(
+            cached.len(),
+            3,
+            "admin cache must retain the unfiltered directory"
+        );
+        assert!(cached.iter().any(|model| model["id"] == "grok-4.7"));
+
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("next sync");
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(
+            state.key("key-xai").allowed_models,
+            Some(json!(["grok-next-release", "grok-pinned"]))
+        );
+        let plans = state.executed_plans.lock().unwrap();
+        assert_eq!(plans.len(), 2);
+        for plan in plans.iter() {
+            assert_eq!(plan.url, "https://cli-chat-proxy.grok.com/v1/models");
+            assert_eq!(plan.headers["authorization"], "Bearer oauth-token");
+            assert_eq!(plan.headers["x-xai-token-auth"], "xai-grok-cli");
+        }
+    }
+
+    #[tokio::test]
+    async fn xai_auto_model_sync_failures_preserve_whitelist_and_cached_catalog() {
+        for result in [
+            execution_result_with_status(401, json!({"error":{"message":"invalid token"}})),
+            execution_result_with_status(429, json!({"error":{"message":"rate limited"}})),
+            execution_result(json!({"data":[]})),
+            execution_result(json!({"unexpected":"schema"})),
+        ] {
+            let mut key = sample_key("key-xai", "provider-xai", "api_key", &["openai:video"]);
+            key.allowed_models = Some(json!(["grok-imagine-video-1.5"]));
+            let mut transport = sample_transport(
+                "xai",
+                "provider-xai",
+                "endpoint-xai",
+                "key-xai",
+                "openai:video",
+                "api_key",
+                None,
+            );
+            transport.endpoint.base_url = "https://api.x.ai/v1".to_string();
+            let state = TestState::new(
+                vec![sample_provider("provider-xai", "xai")],
+                vec![sample_endpoint(
+                    "endpoint-xai",
+                    "provider-xai",
+                    "openai:video",
+                )],
+                vec![key],
+                HashMap::from([(
+                    (
+                        "provider-xai".to_string(),
+                        "endpoint-xai".to_string(),
+                        "key-xai".to_string(),
+                    ),
+                    transport,
+                )]),
+                vec![result],
+            );
+            let cache_key = ("provider-xai".to_string(), "key-xai".to_string());
+            let cached =
+                vec![json!({"id":"grok-imagine-video-1.5", "api_formats":["openai:video"]})];
+            state
+                .cached_models
+                .lock()
+                .unwrap()
+                .insert(cache_key.clone(), cached.clone());
+
+            let summary = perform_model_fetch_once_with_state(&state)
+                .await
+                .expect("failed sync recorded");
+            assert_eq!(summary.failed, 1);
+            assert_eq!(summary.succeeded, 0);
+            assert_eq!(
+                state.key("key-xai").allowed_models,
+                Some(json!(["grok-imagine-video-1.5"]))
+            );
+            assert!(state.key("key-xai").last_models_fetch_error.is_some());
+            assert_eq!(state.cached_models.lock().unwrap()[&cache_key], cached);
+            assert_eq!(
+                state.executed_plans.lock().unwrap()[0].url,
+                "https://api.x.ai/v1/models"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn xai_auto_model_sync_without_endpoint_does_not_install_presets() {
+        let mut key = sample_key("key-xai", "provider-xai", "oauth", &["openai:responses"]);
+        key.allowed_models = Some(json!(["grok-old"]));
+        let state = TestState::new(
+            vec![sample_provider("provider-xai", "xai")],
+            vec![],
+            vec![key],
+            HashMap::new(),
+            vec![],
+        );
+        let summary = perform_model_fetch_once_with_state(&state)
+            .await
+            .expect("missing endpoint recorded");
+        assert_eq!(summary.succeeded, 0);
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(
+            state.key("key-xai").allowed_models,
+            Some(json!(["grok-old"]))
+        );
+        assert!(state.cached_models.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

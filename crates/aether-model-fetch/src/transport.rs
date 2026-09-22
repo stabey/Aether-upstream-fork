@@ -16,6 +16,7 @@ use aether_provider_transport::kiro::{
 };
 use aether_provider_transport::vertex::resolve_local_vertex_api_key_query_auth;
 use aether_provider_transport::windsurf::resolve_windsurf_cascade_auth;
+use aether_provider_transport::xai::resolved_xai_upstream_base_url;
 use aether_provider_transport::{
     apply_local_header_rules, resolve_transport_execution_timeouts, resolve_transport_profile,
     GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
@@ -131,6 +132,9 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
         && deepseek_anthropic_models_fetch_uses_openai_auth(&transport.endpoint.base_url);
     let mut headers =
         standard_models_fetch_headers(&api_format, &provider_type, codex_client_version);
+    if provider_type == "xai" {
+        headers = crate::xai::models_fetch_headers(transport);
+    }
     if is_codex_openai_models_fetch {
         headers.insert("accept".to_string(), "application/json".to_string());
     }
@@ -704,10 +708,15 @@ fn build_standard_models_fetch_url(
         return Ok(append_query_param(url, "key", &secret));
     }
 
+    // Model discovery follows the credential's normal xAI host, even when the
+    // only configured endpoint is compact (whose execution uses the API host).
+    let xai_base_url = resolved_xai_upstream_base_url(transport, "openai:responses");
     let (mut url, _) = build_models_fetch_url_for_client_version(
         &transport.provider.provider_type,
         &transport.endpoint.api_format,
-        &transport.endpoint.base_url,
+        xai_base_url
+            .as_deref()
+            .unwrap_or(&transport.endpoint.base_url),
         codex_client_version,
     )
     .ok_or_else(|| "Rust models fetch does not support this provider format yet".to_string())?;
@@ -876,6 +885,131 @@ mod tests {
                         .to_string(),
                 ),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn xai_models_fetch_uses_account_host_auth_and_proxy_for_every_endpoint_kind() {
+        use aether_provider_transport::xai::{
+            XAI_API_BASE_URL, XAI_CHAT_PROXY_BASE_URL, XAI_CLIENT_VERSION,
+        };
+
+        for (auth_type, base_url, using_api, expected_base, cli) in [
+            ("oauth", "", false, XAI_CHAT_PROXY_BASE_URL, true),
+            (
+                "oauth",
+                XAI_API_BASE_URL,
+                false,
+                XAI_CHAT_PROXY_BASE_URL,
+                true,
+            ),
+            (
+                "oauth",
+                XAI_CHAT_PROXY_BASE_URL,
+                false,
+                XAI_CHAT_PROXY_BASE_URL,
+                true,
+            ),
+            (
+                "api_key",
+                XAI_CHAT_PROXY_BASE_URL,
+                true,
+                XAI_API_BASE_URL,
+                false,
+            ),
+            (
+                "oauth",
+                XAI_CHAT_PROXY_BASE_URL,
+                true,
+                XAI_API_BASE_URL,
+                false,
+            ),
+            (
+                "oauth",
+                "https://custom.example/v1",
+                false,
+                "https://custom.example/v1",
+                false,
+            ),
+        ] {
+            for format in [
+                "openai:responses",
+                "openai:responses:compact",
+                "openai:chat",
+                "openai:image",
+                "openai:video",
+            ] {
+                let runtime = TestRuntime {
+                    oauth_auth: Some(
+                        aether_provider_transport::LocalResolvedOAuthRequestAuth::Header {
+                            name: "authorization".to_string(),
+                            value: "Bearer refreshed-access-token".to_string(),
+                        },
+                    ),
+                    proxy: Some(ProxySnapshot {
+                        enabled: Some(true),
+                        mode: Some("manual".to_string()),
+                        node_id: Some("xai-proxy".to_string()),
+                        label: None,
+                        url: Some("http://proxy.example:8080".to_string()),
+                        extra: None,
+                    }),
+                };
+                let mut transport = sample_transport("xai", format, auth_type);
+                transport.endpoint.base_url = base_url.to_string();
+                transport.endpoint.header_rules = Some(json!([
+                    {"action": "set", "key": "authorization", "value": "spoofed"},
+                    {"action": "set", "key": "x-custom", "value": "configured"}
+                ]));
+                transport.key.decrypted_auth_config = Some(
+                    json!({
+                        "using_api": using_api, "sub": "user-1", "email": "user@example.com",
+                        "refresh_token": "must-not-be-sent"
+                    })
+                    .to_string(),
+                );
+                let plan = build_models_fetch_execution_plan(&runtime, &transport)
+                    .await
+                    .expect("xAI plan");
+                assert_eq!(plan.url, format!("{expected_base}/models"));
+                assert_eq!(plan.method, "GET");
+                assert_eq!(
+                    plan.headers["authorization"],
+                    if auth_type == "oauth" {
+                        "Bearer refreshed-access-token"
+                    } else {
+                        "Bearer secret"
+                    }
+                );
+                assert_eq!(plan.headers["accept"], "application/json");
+                assert_eq!(plan.headers["x-custom"], "configured");
+                assert_eq!(
+                    plan.proxy
+                        .as_ref()
+                        .and_then(|proxy| proxy.node_id.as_deref()),
+                    Some("xai-proxy")
+                );
+                if cli {
+                    assert_eq!(plan.headers["x-grok-client-version"], XAI_CLIENT_VERSION);
+                    assert_eq!(plan.headers["x-xai-token-auth"], "xai-grok-cli");
+                    assert_eq!(plan.headers["x-userid"], "user-1");
+                    assert_eq!(plan.headers["x-email"], "user@example.com");
+                    assert!(plan.headers["user-agent"].starts_with("xai-grok-workspace/"));
+                } else {
+                    for header in [
+                        "x-grok-client-version",
+                        "x-xai-token-auth",
+                        "x-userid",
+                        "x-email",
+                    ] {
+                        assert!(!plan.headers.contains_key(header));
+                    }
+                }
+                assert!(!plan
+                    .headers
+                    .values()
+                    .any(|value| value.contains("must-not-be-sent")));
+            }
         }
     }
 

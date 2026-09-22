@@ -65,7 +65,7 @@ use aether_data_contracts::repository::provider_catalog::{
 use aether_model_fetch::{
     aggregate_models_for_cache, fetch_models_from_transports_for_management, json_string_list,
     model_catalog_upstream_metadata, preset_models_for_provider, selected_models_fetch_endpoints,
-    upstream_metadata_namespace_updates,
+    selected_models_fetch_endpoints_for_provider, upstream_metadata_namespace_updates,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -544,7 +544,8 @@ async fn provider_query_fetch_models_for_key(
         }
     }
 
-    let selected_endpoints = selected_models_fetch_endpoints(endpoints, key);
+    let selected_endpoints =
+        selected_models_fetch_endpoints_for_provider(&provider.provider_type, endpoints, key);
     if selected_endpoints.is_empty() {
         if let Some(models) = preset_models_for_provider(&provider.provider_type) {
             let models = aggregate_models_for_cache(&models);

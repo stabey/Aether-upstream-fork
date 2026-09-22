@@ -147,6 +147,119 @@ async fn assert_admin_provider_query_route(
 }
 
 #[test]
+fn gateway_handles_admin_provider_query_models_xai_live_catalog_also_updates_key() {
+    run_provider_query_test(
+        "gateway_handles_admin_provider_query_models_xai_live_catalog_also_updates_key",
+        gateway_handles_admin_provider_query_models_xai_live_catalog_also_updates_key_impl,
+    );
+}
+
+async fn gateway_handles_admin_provider_query_models_xai_live_catalog_also_updates_key_impl() {
+    let requests = Arc::new(Mutex::new(0));
+    let requests_for_handler = Arc::clone(&requests);
+    let upstream = Router::new().route(
+        "/v1/models",
+        any(move |request: Request| {
+            let requests = Arc::clone(&requests_for_handler);
+            async move {
+                assert_eq!(request.method(), "GET");
+                assert_eq!(
+                    request.headers()["authorization"],
+                    "Bearer live-secret-api-key"
+                );
+                *requests.lock().unwrap() += 1;
+                Json(json!({"models": [
+                    {"id":"display-grok", "model":"grok-4.7", "name":"Grok 4.7"},
+                    {"modelId":"grok-build-next"},
+                    {"model":"grok-beta"}
+                ]}))
+            }
+        }),
+    );
+    let (upstream_url, upstream_handle) = start_server(upstream).await;
+    let mut provider = sample_provider("provider-xai", "xAI", 10);
+    provider.provider_type = "xai".to_string();
+    let endpoint = sample_endpoint(
+        "endpoint-xai",
+        "provider-xai",
+        "openai:responses",
+        &format!("{upstream_url}/v1"),
+    );
+    let mut key = sample_bound_key(
+        "key-xai",
+        "provider-xai",
+        "openai:responses",
+        "live-secret-api-key",
+    );
+    key.auto_fetch_models = true;
+    key.allowed_models = Some(json!(["grok-old"]));
+    key.locked_models = None;
+    key.model_include_patterns = Some(json!(["grok-*"]));
+    key.model_exclude_patterns = Some(json!(["grok-beta"]));
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        vec![key],
+    ));
+    let data_state = crate::data::GatewayDataState::disabled()
+        .attach_provider_catalog_repository_for_tests(Arc::clone(&repository))
+        .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY);
+    let state = AppState::new()
+        .expect("gateway")
+        .with_data_state_for_tests(data_state);
+
+    let summary =
+        crate::model_fetch::perform_model_fetch_for_key(&state, "provider-xai", "key-xai")
+            .await
+            .expect("immediate auto fetch");
+    assert_eq!(summary.succeeded, 1);
+    assert_eq!(
+        *requests.lock().unwrap(),
+        1,
+        "discovery must actually contact the upstream"
+    );
+    let key = repository
+        .list_keys_by_ids(&["key-xai".to_string()])
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(
+        key.allowed_models,
+        Some(json!(["grok-4.7", "grok-build-next"]))
+    );
+    assert!(key.last_models_fetch_error.is_none());
+    assert!(key.last_models_fetch_at_unix_secs.is_some());
+
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state)).await;
+    let response = reqwest::Client::new()
+        .post(format!("{gateway_url}/api/admin/provider-query/models"))
+        .header(GATEWAY_HEADER, "rust-phase3b")
+        .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+        .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+        .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+        .json(&json!({
+            "provider_id": "provider-xai",
+            "api_key_id": "key-xai",
+            "force_refresh": true
+        }))
+        .send()
+        .await
+        .expect("manual model fetch");
+    assert_eq!(response.status(), StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload["success"], true);
+    assert_eq!(payload["data"]["from_cache"], false);
+    assert_eq!(
+        payload["data"]["models"].as_array().unwrap().len(),
+        3,
+        "manual discovery must expose the full upstream directory, before key filters"
+    );
+    assert_eq!(*requests.lock().unwrap(), 2);
+    gateway_handle.abort();
+    upstream_handle.abort();
+}
+
+#[test]
 fn gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key() {
     run_provider_query_test(
         "gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key",
