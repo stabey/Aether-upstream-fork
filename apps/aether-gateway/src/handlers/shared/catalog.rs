@@ -1442,7 +1442,7 @@ fn build_xai_quota_status_snapshot(
         || current_usage.is_some()
         || next_reset_at.is_some()
     {
-        windows.push(json!({
+        let mut usage_window = json!({
             "code": "usage",
             "label": usage_label,
             "scope": "account",
@@ -1454,7 +1454,11 @@ fn build_xai_quota_status_snapshot(
             "limit_value": usage_limit,
             "reset_at": next_reset_at,
             "reset_seconds": reset_seconds,
-        }));
+        });
+        if let Some(period_type @ ("weekly" | "monthly")) = period_type.as_deref() {
+            usage_window["window"] = json!(period_type);
+        }
+        windows.push(usage_window);
     }
 
     let prepaid_balance = metadata
@@ -4542,6 +4546,7 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].get("code"), Some(&json!("usage")));
         assert_eq!(windows[0].get("label"), Some(&json!("周额度")));
+        assert_eq!(windows[0].get("window"), Some(&json!("weekly")));
     }
 
     #[test]
