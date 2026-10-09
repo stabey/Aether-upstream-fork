@@ -2515,16 +2515,16 @@ pub(crate) fn openai_responses_input_to_canonical_messages(
                                 pending_tool_signature = Some(signature);
                                 continue;
                             }
-                            Some((signature, GeminiToolSignatureCarrierDirection::Previous)) => {
+                            Some((signature, GeminiToolSignatureCarrierDirection::Previous))
                                 if attach_gemini_signature_to_previous_tool_use(
                                     &mut messages,
-                                    signature,
-                                ) {
-                                    pending_reasoning = None;
-                                    continue;
-                                }
+                                    &signature,
+                                ) =>
+                            {
+                                pending_reasoning = None;
+                                continue;
                             }
-                            None => {}
+                            _ => {}
                         }
                         pending_reasoning = reasoning;
                     }
@@ -2781,7 +2781,7 @@ fn append_openai_responses_tool_use(
 
 fn attach_gemini_signature_to_previous_tool_use(
     messages: &mut [CanonicalMessage],
-    signature: String,
+    signature: &str,
 ) -> bool {
     let Some(message) = messages.last_mut() else {
         return false;
@@ -2792,8 +2792,10 @@ fn attach_gemini_signature_to_previous_tool_use(
     let Some(CanonicalContentBlock::ToolUse { extensions, .. }) = message.content.last_mut() else {
         return false;
     };
-    canonical_extension_object_mut(extensions, "gemini")
-        .insert("thoughtSignature".to_string(), Value::String(signature));
+    canonical_extension_object_mut(extensions, "gemini").insert(
+        "thoughtSignature".to_string(),
+        Value::String(signature.to_string()),
+    );
     true
 }
 
