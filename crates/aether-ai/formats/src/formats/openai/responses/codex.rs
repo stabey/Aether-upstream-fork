@@ -1047,12 +1047,12 @@ fn apply_codex_model_request_capabilities(
     if !is_openai_responses_compact_request(provider_api_format)
         && !body_rules_handle_path(body_rules, "include")
     {
-        let include = if body_object.get("reasoning").is_some_and(Value::is_object) {
-            json!([CODEX_REASONING_ENCRYPTED_CONTENT_INCLUDE])
-        } else {
-            json!([])
-        };
-        body_object.insert("include".to_string(), include);
+        let mut include = Vec::new();
+        if body_object.get("reasoning").is_some_and(Value::is_object) {
+            include.push(json!(CODEX_REASONING_ENCRYPTED_CONTENT_INCLUDE));
+        }
+        include.extend(codex_requested_web_search_includes(body_object));
+        body_object.insert("include".to_string(), Value::Array(include));
     }
 
     if !body_rules_handle_path(body_rules, "text") {
@@ -1079,6 +1079,40 @@ fn apply_codex_model_request_capabilities(
             }
         }
     }
+}
+
+/// Hosted web search only reports its sources when the client asks for them.
+/// Keep those client-requested includes while the hosted tool is present;
+/// every other include stays projected away for the Codex backend.
+fn codex_requested_web_search_includes(body_object: &serde_json::Map<String, Value>) -> Vec<Value> {
+    const WEB_SEARCH_INCLUDES: [&str; 2] =
+        ["web_search_call.action.sources", "web_search_call.results"];
+    let has_hosted_web_search = body_object
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                matches!(
+                    tool.get("type").and_then(Value::as_str),
+                    Some("web_search" | "web_search_preview")
+                )
+            })
+        });
+    if !has_hosted_web_search {
+        return Vec::new();
+    }
+    let Some(requested) = body_object.get("include").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    WEB_SEARCH_INCLUDES
+        .into_iter()
+        .filter(|include| {
+            requested
+                .iter()
+                .any(|value| value.as_str() == Some(include))
+        })
+        .map(|include| json!(include))
+        .collect()
 }
 
 fn ensure_codex_reasoning_defaults(
@@ -3164,6 +3198,50 @@ mod tests {
             json!(["reasoning.encrypted_content"])
         );
         assert_eq!(provider_request_body["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_keep_requested_web_search_includes_for_hosted_search() {
+        let mut provider_request_body = json!({
+            "model": "gpt-6-astra",
+            "input": "omp.sh",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"},
+            "include": ["web_search_call.action.sources", "file_search_call.results"],
+            "reasoning": {"effort": "medium"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(
+            provider_request_body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
+        );
+
+        let mut without_search_tool = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "include": ["web_search_call.action.sources"],
+            "reasoning": {"effort": "medium"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut without_search_tool,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(
+            without_search_tool["include"],
+            json!(["reasoning.encrypted_content"])
+        );
     }
 
     #[test]
