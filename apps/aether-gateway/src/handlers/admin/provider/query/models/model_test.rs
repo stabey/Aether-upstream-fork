@@ -3230,11 +3230,13 @@ async fn provider_query_execute_standard_test_candidate(
         require_body_stream_field,
     );
     let source_model = provider_query_request_body_model(&request_body, request_model);
+    // An admin model test is not a Codex client and never asserts Responses Lite.
     let codex_model_capabilities = crate::ai_serving::codex_model_capabilities_for_transport(
         &transport,
         provider_api_format,
         request_model,
         source_model,
+        false,
     );
     if matches!(
         normalized_provider_api_format.as_str(),

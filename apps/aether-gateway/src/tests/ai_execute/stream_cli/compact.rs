@@ -519,6 +519,8 @@ async fn gateway_executes_openai_responses_compact_as_unary_request_impl() {
         .header("x-client-rename", "rename-openai-compact")
         .header("x-drop-me", "drop-openai-compact")
         .header("x-codex-turn-state", "turn-state-inbound-123")
+        // A Codex Lite client asserts the contract; the gateway never infers it.
+        .header("x-openai-internal-codex-responses-lite", "true")
         .header("session-id", "session-compact-local-123")
         .header("thread-id", "thread-compact-local-123")
         .header(TRACE_ID_HEADER, "trace-openai-compact-local-123")

@@ -691,7 +691,8 @@ mod tests {
         });
 
         let normalization = ResponsesWebSocketBodyNormalization::for_tests("gpt-5.6-sol")
-            .with_provider_type_for_tests("codex");
+            .with_provider_type_for_tests("codex")
+            .with_client_responses_lite_for_tests();
         let normalized = normalized_continuation(&event, &normalization);
         let input = normalized["input"].as_array().expect("normalized input");
         assert_eq!(input[0]["type"], "additional_tools");
@@ -900,7 +901,8 @@ mod tests {
     #[test]
     fn lite_continuations_forward_only_each_turns_incremental_input() {
         let normalization = ResponsesWebSocketBodyNormalization::for_tests("gpt-5.6-sol")
-            .with_provider_type_for_tests("codex");
+            .with_provider_type_for_tests("codex")
+            .with_client_responses_lite_for_tests();
 
         for turn in 1..=4 {
             let event = json!({
@@ -1148,7 +1150,8 @@ mod tests {
         }))
         .expect("minimal decision");
         let normalization = ResponsesWebSocketBodyNormalization::for_tests("gpt-5.6-sol")
-            .with_provider_type_for_tests("codex");
+            .with_provider_type_for_tests("codex")
+            .with_client_responses_lite_for_tests();
         assert!(!planned_request_uses_codex_responses_lite(
             &decision,
             &normalization

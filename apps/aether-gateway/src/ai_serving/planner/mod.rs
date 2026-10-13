@@ -82,10 +82,12 @@ pub(crate) use self::standard::{
     build_local_stream_plan_and_reports as build_standard_family_stream_plan_and_reports,
     build_local_sync_attempt_source as build_standard_family_sync_attempt_source,
     build_local_sync_plan_and_reports as build_standard_family_sync_plan_and_reports,
-    codex_model_capabilities_for_transport, maybe_build_responses_websocket_decision,
-    openai_responses_reasoning_replay_policy, set_local_openai_chat_execution_exhausted_diagnostic,
-    validate_final_openai_provider_request, ResponsesWebSocketBodyNormalization,
-    ResponsesWebSocketDecision, ResponsesWebSocketPinnedCandidate,
+    client_requests_codex_responses_lite, codex_model_capabilities_for_transport,
+    maybe_build_responses_websocket_decision, openai_responses_reasoning_replay_policy,
+    planned_codex_request_uses_responses_lite,
+    set_local_openai_chat_execution_exhausted_diagnostic, validate_final_openai_provider_request,
+    ResponsesWebSocketBodyNormalization, ResponsesWebSocketDecision,
+    ResponsesWebSocketPinnedCandidate,
 };
 pub(crate) use self::state::{
     GatewayAuthApiKeySnapshot, GatewayProviderTransportSnapshot, LocalResolvedOAuthRequestAuth,
