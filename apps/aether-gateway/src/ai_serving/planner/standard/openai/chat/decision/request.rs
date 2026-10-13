@@ -134,11 +134,13 @@ fn finalize_openai_chat_provider_request_body(
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or(mapped_model);
+    // A Chat Completions client cannot assert the Responses Lite contract.
     let codex_model_capabilities = codex_model_capabilities_for_transport(
         transport,
         provider_api_format,
         mapped_model,
         source_model,
+        false,
     );
     let finalization_failure = crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
         provider_request_body,

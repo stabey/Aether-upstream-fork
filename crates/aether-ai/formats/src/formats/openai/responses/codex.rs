@@ -466,11 +466,11 @@ fn catalog_codex_model_card_for_identity<'a>(
     find(model_id).or_else(|| codex_namespaced_model_suffix(model_id).and_then(find))
 }
 
-pub fn resolve_codex_responses_model_capabilities(
+fn resolve_codex_model_card<'a>(
     provider_model: &str,
     source_model: &str,
-    upstream_metadata: Option<&Value>,
-) -> CodexResponsesModelCapabilities {
+    upstream_metadata: Option<&'a Value>,
+) -> Option<&'a Value> {
     let provider_model = provider_model.trim();
     let source_model = source_model.trim();
     let source_fallback = (provider_model.is_empty()
@@ -486,21 +486,57 @@ pub fn resolve_codex_responses_model_capabilities(
         .and_then(Value::as_object)
     {
         if !cards.is_empty() {
-            return catalog_codex_model_card_for_identity(cards, provider_model)
-                .or_else(|| {
-                    source_fallback
-                        .and_then(|model| catalog_codex_model_card_for_identity(cards, model))
-                })
-                .and_then(codex_responses_model_capabilities_from_card)
-                .map(|(_, capabilities)| capabilities)
-                .unwrap_or_else(conservative_codex_responses_model_capabilities);
+            return catalog_codex_model_card_for_identity(cards, provider_model).or_else(|| {
+                source_fallback
+                    .and_then(|model| catalog_codex_model_card_for_identity(cards, model))
+            });
         }
     }
     bundled_codex_model_card_for_identity(provider_model)
         .or_else(|| source_fallback.and_then(bundled_codex_model_card_for_identity))
+}
+
+/// Resolves what the model card declares. `use_responses_lite` here is the
+/// card's advertisement to Codex clients, not a request decision: use
+/// [`resolve_codex_responses_model_capabilities_for_request`] to shape a
+/// provider request.
+pub fn resolve_codex_responses_model_capabilities(
+    provider_model: &str,
+    source_model: &str,
+    upstream_metadata: Option<&Value>,
+) -> CodexResponsesModelCapabilities {
+    resolve_codex_model_card(provider_model, source_model, upstream_metadata)
         .and_then(codex_responses_model_capabilities_from_card)
         .map(|(_, capabilities)| capabilities)
         .unwrap_or_else(conservative_codex_responses_model_capabilities)
+}
+
+/// Resolves the capabilities that shape one provider request.
+///
+/// Responses Lite is a per-request contract asserted by the client with
+/// [`CODEX_RESPONSES_LITE_HEADER`]: a Codex client only sends it after its own
+/// catalog enabled Lite and it then sends a Lite-shaped body. The gateway
+/// never upgrades a request into Lite from the catalog. A card that explicitly
+/// disables Lite still vetoes the header, e.g. when the client's model is
+/// mapped onto a model the backend serves only with the standard contract; a
+/// missing card does not.
+pub fn resolve_codex_responses_model_capabilities_for_request(
+    provider_model: &str,
+    source_model: &str,
+    upstream_metadata: Option<&Value>,
+    client_requests_lite: bool,
+) -> CodexResponsesModelCapabilities {
+    let card = resolve_codex_model_card(provider_model, source_model, upstream_metadata);
+    let mut capabilities = card
+        .and_then(codex_responses_model_capabilities_from_card)
+        .map(|(_, capabilities)| capabilities)
+        .unwrap_or_else(conservative_codex_responses_model_capabilities);
+    let card_disables_lite = card
+        .and_then(|card| card.get("use_responses_lite"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    capabilities.use_responses_lite = client_requests_lite && !card_disables_lite;
+    capabilities
 }
 
 fn codex_openai_endpoint_kind(
@@ -1816,19 +1852,21 @@ fn apply_codex_openai_responses_special_body_edits_with_source_model_and_capabil
         .to_string();
     let bundled_capabilities;
     let capabilities = if effective_provider_model == CODEX_OPENAI_IMAGE_INTERNAL_MODEL {
-        bundled_capabilities = resolve_codex_responses_model_capabilities(
+        bundled_capabilities = resolve_codex_responses_model_capabilities_for_request(
             effective_provider_model.as_str(),
             source_model,
             None,
+            false,
         );
         &bundled_capabilities
     } else if let Some(capabilities) = model_capabilities {
         capabilities
     } else {
-        bundled_capabilities = resolve_codex_responses_model_capabilities(
+        bundled_capabilities = resolve_codex_responses_model_capabilities_for_request(
             effective_provider_model.as_str(),
             source_model,
             None,
+            false,
         );
         &bundled_capabilities
     };
@@ -1993,8 +2031,12 @@ pub fn apply_codex_openai_responses_lite_header_for_request_body_with_capabiliti
     let capabilities = if let Some(capabilities) = model_capabilities {
         capabilities
     } else {
-        bundled_capabilities =
-            resolve_codex_responses_model_capabilities(provider_model, source_model, None);
+        bundled_capabilities = resolve_codex_responses_model_capabilities_for_request(
+            provider_model,
+            source_model,
+            None,
+            false,
+        );
         &bundled_capabilities
     };
     if capabilities.use_responses_lite
@@ -2097,11 +2139,103 @@ mod tests {
         build_codex_model_catalog_metadata, bundled_codex_model_cards, effective_codex_model_cards,
         parse_codex_auth_identity, project_codex_catalog_model_card,
         resolve_codex_responses_model_capabilities,
-        validate_codex_openai_responses_compact_request_contract,
+        resolve_codex_responses_model_capabilities_for_request,
+        validate_codex_openai_responses_compact_request_contract, CodexResponsesModelCapabilities,
         CODEX_OPENAI_IMAGE_INTERNAL_MODEL, CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS,
         CODEX_RESPONSES_LITE_HEADER,
     };
     use serde_json::{json, Value};
+
+    /// Capabilities for a request whose client asserted Responses Lite.
+    fn client_lite_capabilities(model: &str) -> CodexResponsesModelCapabilities {
+        resolve_codex_responses_model_capabilities_for_request(model, model, None, true)
+    }
+
+    /// Applies the HTTP body contract to a request whose client asserted
+    /// Responses Lite, the way the gateway does for a Codex Lite client.
+    fn apply_client_lite_body_edits(body: &mut Value, provider_api_format: &str) {
+        let model = body["model"].as_str().unwrap_or_default().to_string();
+        let capabilities = client_lite_capabilities(&model);
+        apply_codex_openai_responses_special_body_edits_with_source_model_and_capabilities(
+            body,
+            "codex",
+            provider_api_format,
+            &model,
+            &model,
+            Some(&capabilities),
+            None,
+        );
+    }
+
+    #[test]
+    fn responses_lite_follows_the_client_assertion_not_the_catalog() {
+        let catalog =
+            resolve_codex_responses_model_capabilities("gpt-6-astra", "gpt-6-astra", None);
+        assert!(catalog.use_responses_lite, "the card still advertises Lite");
+
+        for (client_requests_lite, expected) in [(false, false), (true, true)] {
+            let capabilities = resolve_codex_responses_model_capabilities_for_request(
+                "gpt-6-astra",
+                "gpt-6-astra",
+                None,
+                client_requests_lite,
+            );
+            assert_eq!(capabilities.use_responses_lite, expected);
+        }
+
+        // A card that explicitly disables Lite vetoes the client header, e.g.
+        // a Lite client model mapped onto gpt-5.5.
+        assert!(
+            !resolve_codex_responses_model_capabilities_for_request(
+                "gpt-5.5", "gpt-5.5", None, true
+            )
+            .use_responses_lite
+        );
+        // A model missing from the account catalog does not veto it.
+        let metadata = build_codex_model_catalog_metadata(&[json!({
+            "slug": "gpt-6-astra",
+            "use_responses_lite": true
+        })]);
+        assert!(
+            resolve_codex_responses_model_capabilities_for_request(
+                "gpt-6.1-sol",
+                "gpt-6.1-sol",
+                Some(&metadata),
+                true
+            )
+            .use_responses_lite
+        );
+
+        // Without a client assertion the body keeps the standard contract
+        // even for a Lite-advertising model.
+        let mut body = json!({
+            "model": "gpt-6-astra",
+            "instructions": "Base instructions.",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(body["instructions"], "Base instructions.");
+        assert_eq!(body["tools"][0]["name"], "lookup");
+        assert!(body["reasoning"].get("context").is_none());
+        let mut headers = std::collections::BTreeMap::new();
+        apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+            &mut headers,
+            Some(&body),
+            "codex",
+            "openai:responses",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            None,
+        );
+        assert!(!headers.contains_key(CODEX_RESPONSES_LITE_HEADER));
+    }
 
     #[test]
     fn codex_client_user_agent_matches_originator_and_version() {
@@ -2387,13 +2521,7 @@ mod tests {
                 ],
                 "tool_choice": {"type": hosted_tool["type"].clone()}
             });
-            apply_codex_openai_responses_special_body_edits(
-                &mut body,
-                "codex",
-                "openai:responses",
-                None,
-                None,
-            );
+            apply_client_lite_body_edits(&mut body, "openai:responses");
 
             assert_eq!(body["tools"][1], hosted_tool);
             assert_eq!(body["tool_choice"]["type"], hosted_tool["type"]);
@@ -2416,7 +2544,7 @@ mod tests {
                 "openai:responses",
                 "gpt-6-astra",
                 "gpt-6-astra",
-                None,
+                Some(&client_lite_capabilities("gpt-6-astra")),
             );
             assert!(
                 !headers.contains_key(CODEX_RESPONSES_LITE_HEADER),
@@ -2429,13 +2557,7 @@ mod tests {
             "input": "hi",
             "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
         });
-        apply_codex_openai_responses_special_body_edits(
-            &mut client_only,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut client_only, "openai:responses");
         assert_eq!(client_only["input"][0]["type"], "additional_tools");
         let mut headers = std::collections::BTreeMap::new();
         apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
@@ -2445,7 +2567,7 @@ mod tests {
             "openai:responses",
             "gpt-6-astra",
             "gpt-6-astra",
-            None,
+            Some(&client_lite_capabilities("gpt-6-astra")),
         );
         assert_eq!(
             headers.get(CODEX_RESPONSES_LITE_HEADER).map(String::as_str),
@@ -2932,12 +3054,8 @@ mod tests {
 
         assert!(!headers.contains_key("chatgpt-account-id"));
         assert!(!headers.contains_key("x-openai-fedramp"));
-        assert_eq!(
-            headers
-                .get("x-openai-internal-codex-responses-lite")
-                .map(String::as_str),
-            Some("true")
-        );
+        // Identity headers never assert Responses Lite on the client's behalf.
+        assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
     }
 
     #[test]
@@ -3304,13 +3422,7 @@ mod tests {
             "instructions": "Lite base instructions.",
             "input": [explicit_system_message.clone()]
         });
-        apply_codex_openai_responses_special_body_edits(
-            &mut lite_body,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut lite_body, "openai:responses");
 
         assert!(lite_body.get("instructions").is_none());
         assert_eq!(lite_body["input"][0]["type"], "additional_tools");
@@ -3463,13 +3575,7 @@ mod tests {
             ]
         });
 
-        apply_codex_openai_responses_special_body_edits(
-            &mut provider_request_body,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut provider_request_body, "openai:responses");
 
         assert!(provider_request_body.get("tools").is_none());
         assert_eq!(
@@ -3494,13 +3600,7 @@ mod tests {
                 ]
             }]
         });
-        apply_codex_openai_responses_special_body_edits(
-            &mut existing_additional_tools,
-            "codex",
-            "openai:responses:compact",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut existing_additional_tools, "openai:responses:compact");
         assert_eq!(
             existing_additional_tools["input"][0]["tools"],
             json!([{"type": "function", "name": "shell", "parameters": {}}])
@@ -3544,7 +3644,7 @@ mod tests {
             "openai:responses",
             "gpt-5.6-sol",
             "gpt-5.6-sol",
-            None,
+            Some(&client_lite_capabilities("gpt-5.6-sol")),
             None,
         );
 
@@ -3561,7 +3661,7 @@ mod tests {
             "openai:responses",
             "gpt-5.6-sol",
             "gpt-5.6-sol",
-            None,
+            Some(&client_lite_capabilities("gpt-5.6-sol")),
             None,
         );
         assert_eq!(provider_request_body, once);
@@ -3598,7 +3698,7 @@ mod tests {
             "openai:responses",
             "gpt-5.6-sol",
             "gpt-5.6-sol",
-            None,
+            Some(&client_lite_capabilities("gpt-5.6-sol")),
             None,
         );
 
@@ -3621,13 +3721,7 @@ mod tests {
             "input": [{"type": "message", "role": "user", "content": []}]
         });
 
-        apply_codex_openai_responses_special_body_edits(
-            &mut provider_request_body,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut provider_request_body, "openai:responses");
 
         assert!(provider_request_body.get("previous_response_id").is_none());
         assert_eq!(
@@ -3648,13 +3742,7 @@ mod tests {
             "input": [{"type": "message", "role": "user", "content": []}]
         });
 
-        apply_codex_openai_responses_special_body_edits(
-            &mut provider_request_body,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut provider_request_body, "openai:responses");
 
         assert!(provider_request_body.get("previous_response_id").is_none());
         assert_eq!(
@@ -3885,13 +3973,7 @@ mod tests {
             }]
         });
 
-        apply_codex_openai_responses_special_body_edits(
-            &mut provider_request_body,
-            "codex",
-            "openai:responses:compact",
-            None,
-            Some("key-a"),
-        );
+        apply_client_lite_body_edits(&mut provider_request_body, "openai:responses:compact");
 
         assert!(provider_request_body.get("tools").is_none());
         assert_eq!(
@@ -4017,13 +4099,7 @@ mod tests {
             "input": [],
             "instructions": " "
         });
-        apply_codex_openai_responses_special_body_edits(
-            &mut whitespace,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut whitespace, "openai:responses");
         assert!(whitespace.get("instructions").is_none());
         assert_eq!(whitespace["input"][0]["type"], "additional_tools");
         assert_eq!(whitespace["input"][1]["role"], "developer");
@@ -4178,17 +4254,14 @@ mod tests {
                 provider_request_body["include"],
                 json!(["reasoning.encrypted_content"])
             );
-            let uses_responses_lite = model.starts_with("gpt-5.6");
+            // A Chat Completions client never asserts Responses Lite, so the
+            // standard contract applies even to Lite-advertising models.
+            let capabilities = resolve_codex_responses_model_capabilities(model, model, None);
             assert_eq!(
                 provider_request_body["parallel_tool_calls"],
-                json!(!uses_responses_lite)
+                json!(capabilities.supports_parallel_tool_calls)
             );
-            assert_eq!(
-                provider_request_body["reasoning"]
-                    .get("context")
-                    .and_then(Value::as_str),
-                uses_responses_lite.then_some("all_turns")
-            );
+            assert!(provider_request_body["reasoning"].get("context").is_none());
         }
     }
 

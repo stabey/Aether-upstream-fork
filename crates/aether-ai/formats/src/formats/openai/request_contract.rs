@@ -93,10 +93,11 @@ fn finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_
             || crate::api_format_alias_matches(finalization.provider_api_format, "openai:search"));
     let resolved_model_capabilities = (is_codex_reasoning_endpoint && model_capabilities.is_none())
         .then(|| {
-            super::responses::codex::resolve_codex_responses_model_capabilities(
+            super::responses::codex::resolve_codex_responses_model_capabilities_for_request(
                 finalization.provider_model,
                 finalization.source_model,
                 None,
+                false,
             )
         });
     let model_capabilities = is_codex_reasoning_endpoint
@@ -236,7 +237,9 @@ mod tests {
         finalize_openai_provider_request_with_codex_model_capabilities,
         validate_openai_provider_request_contract, OpenAiProviderRequestFinalization,
     };
-    use crate::CodexResponsesModelCapabilities;
+    use crate::{
+        resolve_codex_responses_model_capabilities_for_request, CodexResponsesModelCapabilities,
+    };
 
     #[test]
     fn finalization_bounds_responses_call_ids_and_preserves_pairing() {
@@ -898,11 +901,26 @@ mod tests {
             upstream_is_stream: true,
             require_body_stream_field: true,
         };
-        finalize_openai_provider_request(&mut body, finalization)
-            .expect("GPT-5.6 Sol should satisfy the Responses Lite contract");
+        // The client asserted Responses Lite (Codex sends the Lite header).
+        let capabilities = resolve_codex_responses_model_capabilities_for_request(
+            "gpt-5.6-sol",
+            "gpt-5.6-sol",
+            None,
+            true,
+        );
+        finalize_openai_provider_request_with_codex_model_capabilities(
+            &mut body,
+            finalization,
+            Some(&capabilities),
+        )
+        .expect("GPT-5.6 Sol should satisfy the Responses Lite contract");
         let first = body.clone();
-        finalize_openai_provider_request(&mut body, finalization)
-            .expect("Responses Lite finalization should be idempotent");
+        finalize_openai_provider_request_with_codex_model_capabilities(
+            &mut body,
+            finalization,
+            Some(&capabilities),
+        )
+        .expect("Responses Lite finalization should be idempotent");
 
         assert_eq!(body, first);
         assert!(body.get("instructions").is_none());
@@ -984,7 +1002,14 @@ mod tests {
             "parallel_tool_calls": true
         });
 
-        finalize_openai_provider_request(
+        // The client asserted Responses Lite; the card comes from the source model.
+        let capabilities = resolve_codex_responses_model_capabilities_for_request(
+            "azure-production",
+            "gpt-5.6-terra",
+            None,
+            true,
+        );
+        finalize_openai_provider_request_with_codex_model_capabilities(
             &mut body,
             OpenAiProviderRequestFinalization {
                 source_api_format: "openai:responses",
@@ -996,6 +1021,7 @@ mod tests {
                 upstream_is_stream: false,
                 require_body_stream_field: true,
             },
+            Some(&capabilities),
         )
         .expect("opaque Codex deployment should use the exact source model card");
 
@@ -1100,12 +1126,13 @@ mod tests {
             ] {
                 assert!(body.get(field).is_none(), "{field} must not reach Compact");
             }
-            assert_eq!(body["parallel_tool_calls"], false);
+            // A converted Claude/Gemini request never asserts Responses Lite,
+            // so Compact keeps the standard contract.
             assert_eq!(body["reasoning"]["effort"], "max");
-            assert_eq!(body["reasoning"]["context"], "all_turns");
+            assert!(body["reasoning"].get("context").is_none());
             assert_eq!(body["text"]["verbosity"], "medium");
-            assert!(body.get("tools").is_none());
-            assert_eq!(body["input"][0]["tools"][0]["name"], "lookup");
+            assert_eq!(body["tools"][0]["name"], "lookup");
+            assert_eq!(body["input"], json!([]));
         }
     }
 }

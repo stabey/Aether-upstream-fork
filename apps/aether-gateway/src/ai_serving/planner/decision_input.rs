@@ -124,6 +124,11 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
     websocket_continuation: bool,
 ) -> Result<(), GatewayError> {
     let native_memories = decision.decision_kind.as_deref() == Some(OPENAI_MEMORIES_SYNC_PLAN_KIND);
+    // The first planning pass derived Lite from the client's request; routing
+    // mutations below re-run the provider contract and must keep that choice.
+    let client_requested_lite = crate::ai_serving::planned_codex_request_uses_responses_lite(
+        &decision.provider_request_headers,
+    );
     let provider_api_format = decision
         .provider_api_format
         .clone()
@@ -149,6 +154,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
             provider_api_format.as_str(),
             terminal_provider_model,
             input.requested_model.as_str(),
+            client_requested_lite,
         )
     });
     if native_memories {
@@ -283,6 +289,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
                 provider_api_format.as_str(),
                 provider_model.as_str(),
                 input.requested_model.as_str(),
+                client_requested_lite,
             )
         });
         {
@@ -344,6 +351,7 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
             provider_api_format.as_str(),
             provider_model,
             input.requested_model.as_str(),
+            client_requested_lite,
         )
     });
     crate::ai_serving::apply_codex_openai_responses_identity_headers(
@@ -2499,6 +2507,11 @@ mod tests {
             "input": [],
             "tools": []
         }));
+        // The first planning pass converged Lite for a client that asserted it;
+        // routing mutations must keep that contract, not re-derive it.
+        decision
+            .provider_request_headers
+            .insert(CODEX_RESPONSES_LITE_HEADER.to_string(), "true".to_string());
         let transport = sample_codex_transport_with_card();
 
         apply_provider_request_routing_policy_to_decision(&input, &mut decision, Some(&transport))

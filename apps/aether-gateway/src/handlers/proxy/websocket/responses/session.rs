@@ -1875,7 +1875,8 @@ mod tests {
             "true".to_string(),
         );
         let normalization = ResponsesWebSocketBodyNormalization::for_tests("gpt-5.6-sol")
-            .with_provider_type_for_tests("codex");
+            .with_provider_type_for_tests("codex")
+            .with_client_responses_lite_for_tests();
 
         let effective_lite =
             super::planned_request_uses_codex_responses_lite(&decision, &normalization);
