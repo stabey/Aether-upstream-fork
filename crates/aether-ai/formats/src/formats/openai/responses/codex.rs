@@ -1087,7 +1087,7 @@ fn apply_codex_model_request_capabilities(
         if body_object.get("reasoning").is_some_and(Value::is_object) {
             include.push(json!(CODEX_REASONING_ENCRYPTED_CONTENT_INCLUDE));
         }
-        include.extend(codex_requested_web_search_includes(body_object));
+        include.extend(codex_requested_passthrough_includes(body_object));
         body_object.insert("include".to_string(), Value::Array(include));
     }
 
@@ -1117,30 +1117,19 @@ fn apply_codex_model_request_capabilities(
     }
 }
 
-/// Hosted web search only reports its sources when the client asks for them.
-/// Keep those client-requested includes while the hosted tool is present;
-/// every other include stays projected away for the Codex backend.
-fn codex_requested_web_search_includes(body_object: &serde_json::Map<String, Value>) -> Vec<Value> {
-    const WEB_SEARCH_INCLUDES: [&str; 2] =
-        ["web_search_call.action.sources", "web_search_call.results"];
-    let has_hosted_web_search = body_object
-        .get("tools")
-        .and_then(Value::as_array)
-        .is_some_and(|tools| {
-            tools.iter().any(|tool| {
-                matches!(
-                    tool.get("type").and_then(Value::as_str),
-                    Some("web_search" | "web_search_preview")
-                )
-            })
-        });
-    if !has_hosted_web_search {
-        return Vec::new();
-    }
+/// Client includes the Codex backend accepts beyond the reasoning ciphertext:
+/// hosted web search sources, and the output ciphertext Codex itself requests
+/// for output-token replay. Every other include stays projected away.
+const CODEX_PASSTHROUGH_INCLUDES: [&str; 2] =
+    ["web_search_call.action.sources", "output.encrypted_content"];
+
+fn codex_requested_passthrough_includes(
+    body_object: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
     let Some(requested) = body_object.get("include").and_then(Value::as_array) else {
         return Vec::new();
     };
-    WEB_SEARCH_INCLUDES
+    CODEX_PASSTHROUGH_INCLUDES
         .into_iter()
         .filter(|include| {
             requested
@@ -3313,19 +3302,27 @@ mod tests {
         );
         assert_eq!(
             provider_request_body["include"],
-            json!(["reasoning.encrypted_content"])
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
         );
         assert_eq!(provider_request_body["parallel_tool_calls"], json!(false));
     }
 
     #[test]
-    fn codex_responses_body_edits_keep_requested_web_search_includes_for_hosted_search() {
+    fn codex_responses_body_edits_keep_only_whitelisted_client_includes() {
         let mut provider_request_body = json!({
             "model": "gpt-6-astra",
             "input": "omp.sh",
             "tools": [{"type": "web_search"}],
             "tool_choice": {"type": "web_search"},
-            "include": ["web_search_call.action.sources", "file_search_call.results"],
+            "include": [
+                "file_search_call.results",
+                "web_search_call.results",
+                "output.encrypted_content",
+                "web_search_call.action.sources"
+            ],
             "reasoning": {"effort": "medium"}
         });
         apply_codex_openai_responses_special_body_edits(
@@ -3339,15 +3336,16 @@ mod tests {
             provider_request_body["include"],
             json!([
                 "reasoning.encrypted_content",
-                "web_search_call.action.sources"
+                "web_search_call.action.sources",
+                "output.encrypted_content"
             ])
         );
 
+        // Requested sources survive even without a declared search tool.
         let mut without_search_tool = json!({
             "model": "gpt-6-astra",
             "input": "hi",
-            "include": ["web_search_call.action.sources"],
-            "reasoning": {"effort": "medium"}
+            "include": ["web_search_call.action.sources"]
         });
         apply_codex_openai_responses_special_body_edits(
             &mut without_search_tool,
@@ -3358,7 +3356,10 @@ mod tests {
         );
         assert_eq!(
             without_search_tool["include"],
-            json!(["reasoning.encrypted_content"])
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
         );
     }
 
