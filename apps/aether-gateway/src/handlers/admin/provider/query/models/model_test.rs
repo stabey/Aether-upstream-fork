@@ -3230,11 +3230,13 @@ async fn provider_query_execute_standard_test_candidate(
         require_body_stream_field,
     );
     let source_model = provider_query_request_body_model(&request_body, request_model);
+    // An admin model test is not a Codex client and never asserts Responses Lite.
     let codex_model_capabilities = crate::ai_serving::codex_model_capabilities_for_transport(
         &transport,
         provider_api_format,
         request_model,
         source_model,
+        false,
     );
     if matches!(
         normalized_provider_api_format.as_str(),
@@ -3462,7 +3464,7 @@ async fn provider_query_execute_standard_test_candidate(
     {
         request_headers
             .entry("user-agent".to_string())
-            .or_insert_with(|| crate::provider_transport::GEMINI_CLI_USER_AGENT.to_string());
+            .or_insert_with(aether_provider_transport::gemini_cli::gemini_cli_client_user_agent);
     }
     let protected_headers = if uses_vertex_query_auth {
         vec!["content-type"]

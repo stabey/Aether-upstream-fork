@@ -471,6 +471,7 @@ pub(crate) async fn resolve_local_openai_responses_candidate_payload_parts_with_
         provider_api_format,
         mapped_model.as_str(),
         source_model,
+        crate::ai_serving::client_requests_codex_responses_lite(effective_headers, Some(body_json)),
     );
     let Some(mut base_provider_request_body) = (if is_grok
         && is_grok_text_provider_api_format(provider_api_format)

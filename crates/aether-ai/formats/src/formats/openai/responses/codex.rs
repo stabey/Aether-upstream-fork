@@ -380,149 +380,22 @@ fn bundled_codex_model_card(spec: BundledCodexModelCardSpec<'_>) -> Value {
     })
 }
 
-fn bundled_gpt_5_6_codex_model_card(
-    model_id: &str,
-    display_name: &str,
-    description: &str,
-    default_reasoning_level: &str,
-    priority: u64,
-    multi_agent_version: &str,
-    supports_ultra: bool,
-) -> Value {
-    let mut efforts = vec!["low", "medium", "high", "xhigh", "max"];
-    if supports_ultra {
-        efforts.push("ultra");
-    }
-    let mut card = bundled_codex_model_card(BundledCodexModelCardSpec {
-        model_id,
-        display_name,
-        description,
-        default_reasoning_level,
-        default_reasoning_summary: "none",
-        use_responses_lite: true,
-        efforts: &efforts,
-        default_verbosity: "low",
-        supports_priority_tier: true,
-    });
-    let object = card
-        .as_object_mut()
-        .expect("bundled Codex model card must be an object");
-    object.extend(
-        json!({
-            "shell_type": "shell_command",
-            "supports_image_detail_original": true,
-            "supports_search_tool": true,
-            "input_modalities": ["text", "image"],
-            "context_window": 372_000,
-            "max_context_window": 372_000,
-            "comp_hash": "3000",
-            "experimental_supported_tools": [],
-            "visibility": "list",
-            "supported_in_api": true,
-            "priority": priority,
-            "additional_speed_tiers": ["fast"],
-            "multi_agent_version": multi_agent_version,
-            "tool_mode": "code_mode_only",
-            "prefer_websockets": true,
-            "reasoning_summary_format": "experimental",
-            "include_skills_usage_instructions": false,
-            "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": "text_and_image",
-            "truncation_policy": { "mode": "tokens", "limit": 10_000 },
-            "minimal_client_version": "0.144.0",
-        })
-        .as_object()
-        .expect("bundled Codex model card extension must be an object")
-        .clone(),
-    );
-    card
-}
-
-fn bundled_codex_auto_review_model_card() -> Value {
-    let mut card = bundled_codex_model_card(BundledCodexModelCardSpec {
-        model_id: "codex-auto-review",
-        display_name: "Codex Auto Review",
-        description: "Automatic approval review model for Codex.",
-        default_reasoning_level: "medium",
-        default_reasoning_summary: "none",
-        use_responses_lite: false,
-        efforts: &["low", "medium", "high", "xhigh"],
-        default_verbosity: "low",
-        supports_priority_tier: false,
-    });
-    let object = card
-        .as_object_mut()
-        .expect("bundled Codex model card must be an object");
-    object.extend(
-        json!({
-            "shell_type": "shell_command",
-            "supports_image_detail_original": true,
-            "supports_search_tool": true,
-            "input_modalities": ["text", "image"],
-            "context_window": 272_000,
-            "max_context_window": 1_000_000,
-            "experimental_supported_tools": [],
-            "visibility": "hide",
-            "supported_in_api": true,
-            "priority": 43,
-            "additional_speed_tiers": [],
-            "prefer_websockets": true,
-            "reasoning_summary_format": "experimental",
-            "include_skills_usage_instructions": false,
-            "apply_patch_tool_type": "freeform",
-            "web_search_tool_type": "text_and_image",
-            "truncation_policy": { "mode": "tokens", "limit": 10_000 },
-            "minimal_client_version": "0.98.0",
-        })
-        .as_object()
-        .expect("bundled Codex model card extension must be an object")
-        .clone(),
-    );
-    card
-}
-
 pub fn bundled_codex_model_cards() -> &'static [Value] {
     static CARDS: OnceLock<Vec<Value>> = OnceLock::new();
     CARDS.get_or_init(|| {
-        vec![
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-sol",
-                "GPT-5.6-Sol",
-                "Latest frontier agentic coding model.",
-                "low",
-                1,
-                "v2",
-                true,
-            ),
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-terra",
-                "GPT-5.6-Terra",
-                "Balanced agentic coding model for everyday work.",
-                "medium",
-                2,
-                "v2",
-                true,
-            ),
-            bundled_gpt_5_6_codex_model_card(
-                "gpt-5.6-luna",
-                "GPT-5.6-Luna",
-                "Fast and affordable agentic coding model.",
-                "medium",
-                3,
-                "v1",
-                false,
-            ),
-            bundled_codex_model_card(BundledCodexModelCardSpec {
-                model_id: "gpt-5.5",
-                display_name: "GPT-5.5",
-                description: "Frontier model for complex coding, research, and real-world work.",
-                default_reasoning_level: "medium",
-                default_reasoning_summary: "none",
-                use_responses_lite: false,
-                efforts: &["low", "medium", "high", "xhigh"],
-                default_verbosity: "low",
-                supports_priority_tier: true,
-            }),
+        // 公开能力快照来自 openai/codex rust-v0.159.3 的
+        // codex-rs/models-manager/models.json；账户远端目录继续优先。
+        let mut cards: Vec<Value> = serde_json::from_str(include_str!("codex_models_0_159_3.json"))
+            .expect("bundled Codex model capability snapshot must be valid JSON");
+        for card in &mut cards {
+            let object = card.as_object_mut().expect("model card must be an object");
+            object.insert("id".to_string(), object["slug"].clone());
+            object.insert("object".to_string(), json!("model"));
+            object.insert("owned_by".to_string(), json!("openai"));
+            object.insert("api_formats".to_string(), json!(["openai:responses"]));
+        }
+        // 保留现有配置路由使用的旧模型标识。
+        cards.extend(vec![
             bundled_codex_model_card(BundledCodexModelCardSpec {
                 model_id: "gpt-5.4",
                 display_name: "GPT-5.4",
@@ -556,8 +429,8 @@ pub fn bundled_codex_model_cards() -> &'static [Value] {
                 default_verbosity: "low",
                 supports_priority_tier: false,
             }),
-            bundled_codex_auto_review_model_card(),
-        ]
+        ]);
+        cards
     })
 }
 
@@ -593,11 +466,11 @@ fn catalog_codex_model_card_for_identity<'a>(
     find(model_id).or_else(|| codex_namespaced_model_suffix(model_id).and_then(find))
 }
 
-pub fn resolve_codex_responses_model_capabilities(
+fn resolve_codex_model_card<'a>(
     provider_model: &str,
     source_model: &str,
-    upstream_metadata: Option<&Value>,
-) -> CodexResponsesModelCapabilities {
+    upstream_metadata: Option<&'a Value>,
+) -> Option<&'a Value> {
     let provider_model = provider_model.trim();
     let source_model = source_model.trim();
     let source_fallback = (provider_model.is_empty()
@@ -613,21 +486,57 @@ pub fn resolve_codex_responses_model_capabilities(
         .and_then(Value::as_object)
     {
         if !cards.is_empty() {
-            return catalog_codex_model_card_for_identity(cards, provider_model)
-                .or_else(|| {
-                    source_fallback
-                        .and_then(|model| catalog_codex_model_card_for_identity(cards, model))
-                })
-                .and_then(codex_responses_model_capabilities_from_card)
-                .map(|(_, capabilities)| capabilities)
-                .unwrap_or_else(conservative_codex_responses_model_capabilities);
+            return catalog_codex_model_card_for_identity(cards, provider_model).or_else(|| {
+                source_fallback
+                    .and_then(|model| catalog_codex_model_card_for_identity(cards, model))
+            });
         }
     }
     bundled_codex_model_card_for_identity(provider_model)
         .or_else(|| source_fallback.and_then(bundled_codex_model_card_for_identity))
+}
+
+/// Resolves what the model card declares. `use_responses_lite` here is the
+/// card's advertisement to Codex clients, not a request decision: use
+/// [`resolve_codex_responses_model_capabilities_for_request`] to shape a
+/// provider request.
+pub fn resolve_codex_responses_model_capabilities(
+    provider_model: &str,
+    source_model: &str,
+    upstream_metadata: Option<&Value>,
+) -> CodexResponsesModelCapabilities {
+    resolve_codex_model_card(provider_model, source_model, upstream_metadata)
         .and_then(codex_responses_model_capabilities_from_card)
         .map(|(_, capabilities)| capabilities)
         .unwrap_or_else(conservative_codex_responses_model_capabilities)
+}
+
+/// Resolves the capabilities that shape one provider request.
+///
+/// Responses Lite is a per-request contract asserted by the client with
+/// [`CODEX_RESPONSES_LITE_HEADER`]: a Codex client only sends it after its own
+/// catalog enabled Lite and it then sends a Lite-shaped body. The gateway
+/// never upgrades a request into Lite from the catalog. A card that explicitly
+/// disables Lite still vetoes the header, e.g. when the client's model is
+/// mapped onto a model the backend serves only with the standard contract; a
+/// missing card does not.
+pub fn resolve_codex_responses_model_capabilities_for_request(
+    provider_model: &str,
+    source_model: &str,
+    upstream_metadata: Option<&Value>,
+    client_requests_lite: bool,
+) -> CodexResponsesModelCapabilities {
+    let card = resolve_codex_model_card(provider_model, source_model, upstream_metadata);
+    let mut capabilities = card
+        .and_then(codex_responses_model_capabilities_from_card)
+        .map(|(_, capabilities)| capabilities)
+        .unwrap_or_else(conservative_codex_responses_model_capabilities);
+    let card_disables_lite = card
+        .and_then(|card| card.get("use_responses_lite"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    capabilities.use_responses_lite = client_requests_lite && !card_disables_lite;
+    capabilities
 }
 
 fn codex_openai_endpoint_kind(
@@ -1174,12 +1083,12 @@ fn apply_codex_model_request_capabilities(
     if !is_openai_responses_compact_request(provider_api_format)
         && !body_rules_handle_path(body_rules, "include")
     {
-        let include = if body_object.get("reasoning").is_some_and(Value::is_object) {
-            json!([CODEX_REASONING_ENCRYPTED_CONTENT_INCLUDE])
-        } else {
-            json!([])
-        };
-        body_object.insert("include".to_string(), include);
+        let mut include = Vec::new();
+        if body_object.get("reasoning").is_some_and(Value::is_object) {
+            include.push(json!(CODEX_REASONING_ENCRYPTED_CONTENT_INCLUDE));
+        }
+        include.extend(codex_requested_passthrough_includes(body_object));
+        body_object.insert("include".to_string(), Value::Array(include));
     }
 
     if !body_rules_handle_path(body_rules, "text") {
@@ -1206,6 +1115,29 @@ fn apply_codex_model_request_capabilities(
             }
         }
     }
+}
+
+/// Client includes the Codex backend accepts beyond the reasoning ciphertext:
+/// hosted web search sources, and the output ciphertext Codex itself requests
+/// for output-token replay. Every other include stays projected away.
+const CODEX_PASSTHROUGH_INCLUDES: [&str; 2] =
+    ["web_search_call.action.sources", "output.encrypted_content"];
+
+fn codex_requested_passthrough_includes(
+    body_object: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
+    let Some(requested) = body_object.get("include").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    CODEX_PASSTHROUGH_INCLUDES
+        .into_iter()
+        .filter(|include| {
+            requested
+                .iter()
+                .any(|value| value.as_str() == Some(include))
+        })
+        .map(|include| json!(include))
+        .collect()
 }
 
 fn ensure_codex_reasoning_defaults(
@@ -1397,10 +1329,28 @@ fn codex_responses_lite_supports_context_management(context_management: Option<&
     context_management.is_none_or(Value::is_null)
 }
 
-fn codex_responses_lite_supports_request_body(provider_request_body: Option<&Value>) -> bool {
-    provider_request_body.is_none_or(|body| {
-        codex_responses_lite_supports_context_management(body.get("context_management"))
+/// Responses Lite has no wire slot for hosted tools: Codex itself replaces
+/// them with client-executed standalone tools. Dropping a requested hosted
+/// tool would also leave a `tool_choice` that names it dangling, so such a
+/// request keeps the standard contract instead.
+fn codex_responses_lite_supports_tools(tools: Option<&Value>) -> bool {
+    tools.and_then(Value::as_array).is_none_or(|tools| {
+        tools.iter().all(|tool| {
+            tool.get("type").and_then(Value::as_str).is_none()
+                || codex_responses_lite_tool_is_client_executed(tool)
+        })
     })
+}
+
+fn codex_responses_lite_supports_body_object(body: &serde_json::Map<String, Value>) -> bool {
+    codex_responses_lite_supports_context_management(body.get("context_management"))
+        && codex_responses_lite_supports_tools(body.get("tools"))
+}
+
+fn codex_responses_lite_supports_request_body(provider_request_body: Option<&Value>) -> bool {
+    provider_request_body
+        .and_then(Value::as_object)
+        .is_none_or(codex_responses_lite_supports_body_object)
 }
 
 fn apply_codex_responses_lite_body_contract(
@@ -1556,6 +1506,120 @@ fn strip_codex_hosted_tool_names_for_backend(body_object: &mut serde_json::Map<S
         {
             tool_object.remove("name");
         }
+    }
+}
+
+/// Tool types declared by the request: top-level `tools` plus every Responses
+/// Lite `additional_tools` input item.
+fn codex_declared_tool_types(body_object: &serde_json::Map<String, Value>) -> Vec<String> {
+    let top_level = body_object
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let additional = body_object
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| is_codex_responses_lite_additional_tools_item(item))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten();
+    top_level
+        .chain(additional)
+        .filter_map(|tool| tool.get("type").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// The Codex backend answers "response protection is unavailable" for a
+/// request whose history replays `web_search_call` items without declaring
+/// web search (observed since 2026-10-06, e.g. Codex local compaction sends
+/// `tools: []`). Declare search without granting live web access, as sub2api
+/// and Magpie do: top-level for the standard contract, inside
+/// `additional_tools` for Responses Lite, which rejects top-level hosted tools.
+fn declare_codex_web_search_for_replayed_calls(
+    body_object: &mut serde_json::Map<String, Value>,
+    use_responses_lite: bool,
+) {
+    let replays_web_search = body_object
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|input| {
+            input
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+        });
+    if !replays_web_search {
+        return;
+    }
+    let declared = codex_declared_tool_types(body_object);
+    if declared.iter().any(|kind| kind.starts_with("web_search")) {
+        return;
+    }
+    let declaration = json!({"type": "web_search", "external_web_access": false});
+    if use_responses_lite {
+        let Some(input) = body_object.get_mut("input").and_then(Value::as_array_mut) else {
+            return;
+        };
+        match input
+            .iter_mut()
+            .find(|item| is_codex_responses_lite_additional_tools_item(item))
+            .and_then(|item| item.get_mut("tools"))
+            .and_then(Value::as_array_mut)
+        {
+            Some(tools) => tools.push(declaration),
+            None => input.insert(
+                0,
+                json!({
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [declaration],
+                }),
+            ),
+        }
+    } else {
+        match body_object.get_mut("tools").and_then(Value::as_array_mut) {
+            Some(tools) => tools.push(declaration),
+            None => {
+                body_object.insert("tools".to_string(), json!([declaration]));
+            }
+        }
+    }
+    // The declaration only satisfies history replay; a client that offered
+    // no tools must not have the model start searching.
+    if declared.is_empty()
+        && body_object
+            .get("tool_choice")
+            .is_none_or(|choice| choice.as_str() == Some("auto"))
+    {
+        body_object.insert("tool_choice".to_string(), json!("none"));
+    }
+}
+
+/// A `tool_choice` that forces a tool type the request no longer declares is
+/// rejected upstream ("Tool choice '<type>' must be specified with 'tools'
+/// parameter"). Fall back to `auto` like sub2api. Named function/custom
+/// choices and `allowed_tools` are left alone: their targets can live inside
+/// namespaces this check does not resolve.
+fn downgrade_dangling_codex_tool_choice(body_object: &mut serde_json::Map<String, Value>) {
+    let Some(choice_type) = body_object
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    if matches!(
+        choice_type.as_str(),
+        "function" | "custom" | "allowed_tools" | "mcp"
+    ) {
+        return;
+    }
+    if !codex_declared_tool_types(body_object).contains(&choice_type) {
+        body_object.insert("tool_choice".to_string(), json!("auto"));
     }
 }
 
@@ -1891,26 +1955,26 @@ fn apply_codex_openai_responses_special_body_edits_with_source_model_and_capabil
         .to_string();
     let bundled_capabilities;
     let capabilities = if effective_provider_model == CODEX_OPENAI_IMAGE_INTERNAL_MODEL {
-        bundled_capabilities = resolve_codex_responses_model_capabilities(
+        bundled_capabilities = resolve_codex_responses_model_capabilities_for_request(
             effective_provider_model.as_str(),
             source_model,
             None,
+            false,
         );
         &bundled_capabilities
     } else if let Some(capabilities) = model_capabilities {
         capabilities
     } else {
-        bundled_capabilities = resolve_codex_responses_model_capabilities(
+        bundled_capabilities = resolve_codex_responses_model_capabilities_for_request(
             effective_provider_model.as_str(),
             source_model,
             None,
+            false,
         );
         &bundled_capabilities
     };
     let standard_contract_capabilities = (capabilities.use_responses_lite
-        && !codex_responses_lite_supports_context_management(
-            body_object.get("context_management"),
-        ))
+        && !codex_responses_lite_supports_body_object(body_object))
     .then(|| CodexResponsesModelCapabilities {
         use_responses_lite: false,
         ..capabilities.clone()
@@ -1936,6 +2000,15 @@ fn apply_codex_openai_responses_special_body_edits_with_source_model_and_capabil
         body_rules,
     );
     apply_codex_responses_lite_body_contract(body_object, capabilities, websocket_continuation);
+    if !is_openai_responses_compact_request(provider_api_format) {
+        if !websocket_continuation {
+            declare_codex_web_search_for_replayed_calls(
+                body_object,
+                capabilities.use_responses_lite,
+            );
+        }
+        downgrade_dangling_codex_tool_choice(body_object);
+    }
     strip_codex_cache_control_fields(provider_request_body);
     apply_codex_openai_responses_compact_body_edits(
         provider_request_body,
@@ -2070,8 +2143,12 @@ pub fn apply_codex_openai_responses_lite_header_for_request_body_with_capabiliti
     let capabilities = if let Some(capabilities) = model_capabilities {
         capabilities
     } else {
-        bundled_capabilities =
-            resolve_codex_responses_model_capabilities(provider_model, source_model, None);
+        bundled_capabilities = resolve_codex_responses_model_capabilities_for_request(
+            provider_model,
+            source_model,
+            None,
+            false,
+        );
         &bundled_capabilities
     };
     if capabilities.use_responses_lite
@@ -2174,19 +2251,147 @@ mod tests {
         build_codex_model_catalog_metadata, bundled_codex_model_cards, effective_codex_model_cards,
         parse_codex_auth_identity, project_codex_catalog_model_card,
         resolve_codex_responses_model_capabilities,
-        validate_codex_openai_responses_compact_request_contract,
+        resolve_codex_responses_model_capabilities_for_request,
+        validate_codex_openai_responses_compact_request_contract, CodexResponsesModelCapabilities,
         CODEX_OPENAI_IMAGE_INTERNAL_MODEL, CODEX_OPENAI_RESPONSES_UNSUPPORTED_BODY_FIELDS,
         CODEX_RESPONSES_LITE_HEADER,
     };
     use serde_json::{json, Value};
 
+    /// Capabilities for a request whose client asserted Responses Lite.
+    fn client_lite_capabilities(model: &str) -> CodexResponsesModelCapabilities {
+        resolve_codex_responses_model_capabilities_for_request(model, model, None, true)
+    }
+
+    /// Applies the HTTP body contract to a request whose client asserted
+    /// Responses Lite, the way the gateway does for a Codex Lite client.
+    fn apply_client_lite_body_edits(body: &mut Value, provider_api_format: &str) {
+        let model = body["model"].as_str().unwrap_or_default().to_string();
+        let capabilities = client_lite_capabilities(&model);
+        apply_codex_openai_responses_special_body_edits_with_source_model_and_capabilities(
+            body,
+            "codex",
+            provider_api_format,
+            &model,
+            &model,
+            Some(&capabilities),
+            None,
+        );
+    }
+
+    #[test]
+    fn responses_lite_follows_the_client_assertion_not_the_catalog() {
+        let catalog =
+            resolve_codex_responses_model_capabilities("gpt-6-astra", "gpt-6-astra", None);
+        assert!(catalog.use_responses_lite, "the card still advertises Lite");
+
+        for (client_requests_lite, expected) in [(false, false), (true, true)] {
+            let capabilities = resolve_codex_responses_model_capabilities_for_request(
+                "gpt-6-astra",
+                "gpt-6-astra",
+                None,
+                client_requests_lite,
+            );
+            assert_eq!(capabilities.use_responses_lite, expected);
+        }
+
+        // A card that explicitly disables Lite vetoes the client header, e.g.
+        // a Lite client model mapped onto gpt-5.5.
+        assert!(
+            !resolve_codex_responses_model_capabilities_for_request(
+                "gpt-5.5", "gpt-5.5", None, true
+            )
+            .use_responses_lite
+        );
+        // A model missing from the account catalog does not veto it.
+        let metadata = build_codex_model_catalog_metadata(&[json!({
+            "slug": "gpt-6-astra",
+            "use_responses_lite": true
+        })]);
+        assert!(
+            resolve_codex_responses_model_capabilities_for_request(
+                "gpt-6.1-sol",
+                "gpt-6.1-sol",
+                Some(&metadata),
+                true
+            )
+            .use_responses_lite
+        );
+
+        // Without a client assertion the body keeps the standard contract
+        // even for a Lite-advertising model.
+        let mut body = json!({
+            "model": "gpt-6-astra",
+            "instructions": "Base instructions.",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(body["instructions"], "Base instructions.");
+        assert_eq!(body["tools"][0]["name"], "lookup");
+        assert!(body["reasoning"].get("context").is_none());
+        let mut headers = std::collections::BTreeMap::new();
+        apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+            &mut headers,
+            Some(&body),
+            "codex",
+            "openai:responses",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            None,
+        );
+        assert!(!headers.contains_key(CODEX_RESPONSES_LITE_HEADER));
+    }
+
     #[test]
     fn codex_client_user_agent_matches_originator_and_version() {
         let profile = crate::codex_client_profile();
-        assert_eq!(
-            profile.user_agent,
-            format!("{}/{}", profile.originator, profile.codex_version)
-        );
+        assert!(profile.user_agent.starts_with(&format!(
+            "{}/{} (",
+            profile.originator, profile.codex_version
+        )));
+        assert!(profile.user_agent.ends_with(") unknown"));
+    }
+
+    #[test]
+    fn bundled_latest_cli_models_preserve_capabilities_without_account_data() {
+        for model in ["gpt-6-astra", "gpt-6.1-sol"] {
+            let card = bundled_codex_model_cards()
+                .iter()
+                .find(|card| card["slug"] == model)
+                .unwrap();
+            assert_eq!(card["context_window"], 272_000);
+            assert_eq!(card["max_context_window"], 872_000);
+            assert_eq!(card["comp_hash"], "3000");
+            assert_eq!(card["minimal_client_version"], "0.153.0");
+            assert_eq!(
+                card["supported_reasoning_levels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|level| level["effort"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["low", "medium", "high", "xhigh", "max", "ultra"]
+            );
+            for private in [
+                "account_id",
+                "user_id",
+                "installation_id",
+                "cookie",
+                "authorization",
+            ] {
+                assert!(
+                    card.get(private).is_none(),
+                    "unexpected account field: {private}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2408,6 +2613,78 @@ mod tests {
         );
 
         assert!(!headers.contains_key(CODEX_RESPONSES_LITE_HEADER));
+    }
+
+    #[test]
+    fn codex_responses_lite_keeps_standard_contract_for_hosted_tools() {
+        for hosted_tool in [
+            json!({"type": "web_search"}),
+            json!({"type": "tool_search", "execution": "server"}),
+            json!({"type": "tool_search"}),
+            json!({"type": "future_tool"}),
+        ] {
+            let mut body = json!({
+                "model": "gpt-6-astra",
+                "instructions": "Web research assistant.",
+                "input": "omp.sh",
+                "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {}},
+                    hosted_tool.clone()
+                ],
+                "tool_choice": {"type": hosted_tool["type"].clone()}
+            });
+            apply_client_lite_body_edits(&mut body, "openai:responses");
+
+            assert_eq!(body["tools"][1], hosted_tool);
+            assert_eq!(body["tool_choice"]["type"], hosted_tool["type"]);
+            assert_eq!(body["instructions"], "Web research assistant.");
+            assert!(!body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "additional_tools"));
+            assert!(body["reasoning"].get("context").is_none());
+
+            let mut headers = std::collections::BTreeMap::from([(
+                CODEX_RESPONSES_LITE_HEADER.to_string(),
+                "true".to_string(),
+            )]);
+            apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+                &mut headers,
+                Some(&body),
+                "codex",
+                "openai:responses",
+                "gpt-6-astra",
+                "gpt-6-astra",
+                Some(&client_lite_capabilities("gpt-6-astra")),
+            );
+            assert!(
+                !headers.contains_key(CODEX_RESPONSES_LITE_HEADER),
+                "hosted tool: {hosted_tool}"
+            );
+        }
+
+        let mut client_only = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        });
+        apply_client_lite_body_edits(&mut client_only, "openai:responses");
+        assert_eq!(client_only["input"][0]["type"], "additional_tools");
+        let mut headers = std::collections::BTreeMap::new();
+        apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+            &mut headers,
+            Some(&client_only),
+            "codex",
+            "openai:responses",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            Some(&client_lite_capabilities("gpt-6-astra")),
+        );
+        assert_eq!(
+            headers.get(CODEX_RESPONSES_LITE_HEADER).map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -2824,7 +3101,7 @@ mod tests {
             "codex-auto-review",
             None,
         );
-        assert!(!capabilities.use_responses_lite);
+        assert!(capabilities.use_responses_lite);
         assert_eq!(
             capabilities.default_reasoning_effort.as_deref(),
             Some("medium")
@@ -2832,7 +3109,7 @@ mod tests {
         assert_eq!(capabilities.default_reasoning_summary, None);
         assert!(capabilities.supports_parallel_tool_calls);
         assert_eq!(capabilities.default_verbosity.as_deref(), Some("low"));
-        assert!(capabilities.supported_service_tiers.is_empty());
+        assert_eq!(capabilities.supported_service_tiers, vec!["priority"]);
     }
 
     #[test]
@@ -2889,12 +3166,8 @@ mod tests {
 
         assert!(!headers.contains_key("chatgpt-account-id"));
         assert!(!headers.contains_key("x-openai-fedramp"));
-        assert_eq!(
-            headers
-                .get("x-openai-internal-codex-responses-lite")
-                .map(String::as_str),
-            Some("true")
-        );
+        // Identity headers never assert Responses Lite on the client's behalf.
+        assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
     }
 
     #[test]
@@ -3152,9 +3425,229 @@ mod tests {
         );
         assert_eq!(
             provider_request_body["include"],
-            json!(["reasoning.encrypted_content"])
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
         );
         assert_eq!(provider_request_body["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_downgrade_dangling_tool_choice() {
+        let mut dangling = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}],
+            "tool_choice": {"type": "web_search"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut dangling,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(dangling["tool_choice"], "auto");
+
+        let mut declared = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut declared,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(declared["tool_choice"], json!({"type": "web_search"}));
+
+        // Named function choices may target namespaced tools; leave them.
+        let mut named = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "tool_choice": {"type": "function", "name": "lookup"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut named,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(
+            named["tool_choice"],
+            json!({"type": "function", "name": "lookup"})
+        );
+
+        // The image generation route still supplies its own tool.
+        let mut image = json!({
+            "model": "gpt-6-astra",
+            "input": "draw",
+            "tool_choice": {"type": "image_generation"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut image,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(image["tool_choice"]["type"], "image_generation");
+    }
+
+    #[test]
+    fn codex_responses_body_edits_declare_web_search_for_replayed_calls() {
+        let web_search_call = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "weather"}
+        });
+        let declaration = json!({"type": "web_search", "external_web_access": false});
+
+        // Standard contract: declare top-level and keep the client's choice.
+        let mut standard = json!({
+            "model": "gpt-6-astra",
+            "input": [web_search_call.clone()],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut standard,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(standard["tools"][1], declaration);
+        assert_eq!(standard["tool_choice"], "auto");
+
+        // No client tools at all (Codex local compaction): declare, but
+        // forbid the model from starting a search.
+        let mut no_tools = json!({
+            "model": "gpt-6-astra",
+            "input": [web_search_call.clone()],
+            "tools": []
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut no_tools,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(no_tools["tools"], json!([declaration.clone()]));
+        assert_eq!(no_tools["tool_choice"], "none");
+
+        // Responses Lite rejects top-level hosted tools: declare inside
+        // additional_tools and keep the Lite header.
+        let mut lite = json!({
+            "model": "gpt-6-astra",
+            "input": [web_search_call.clone()],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        });
+        apply_client_lite_body_edits(&mut lite, "openai:responses");
+        assert!(lite.get("tools").is_none());
+        assert_eq!(lite["input"][0]["type"], "additional_tools");
+        assert_eq!(lite["input"][0]["tools"][0]["name"], "lookup");
+        assert_eq!(lite["input"][0]["tools"][1], declaration);
+        let mut headers = std::collections::BTreeMap::new();
+        apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+            &mut headers,
+            Some(&lite),
+            "codex",
+            "openai:responses",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            Some(&client_lite_capabilities("gpt-6-astra")),
+        );
+        assert_eq!(
+            headers.get(CODEX_RESPONSES_LITE_HEADER).map(String::as_str),
+            Some("true")
+        );
+
+        // An existing declaration is left untouched.
+        let mut already = json!({
+            "model": "gpt-6-astra",
+            "input": [web_search_call.clone()],
+            "tools": [{"type": "web_search_preview"}]
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut already,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(already["tools"], json!([{"type": "web_search_preview"}]));
+
+        // Without replayed search calls nothing is declared.
+        let mut plain = json!({"model": "gpt-6-astra", "input": "hi", "tools": []});
+        apply_codex_openai_responses_special_body_edits(
+            &mut plain,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(plain["tools"], json!([]));
+        assert_eq!(plain["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn codex_responses_body_edits_keep_only_whitelisted_client_includes() {
+        let mut provider_request_body = json!({
+            "model": "gpt-6-astra",
+            "input": "omp.sh",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"},
+            "include": [
+                "file_search_call.results",
+                "web_search_call.results",
+                "output.encrypted_content",
+                "web_search_call.action.sources"
+            ],
+            "reasoning": {"effort": "medium"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut provider_request_body,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(
+            provider_request_body["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources",
+                "output.encrypted_content"
+            ])
+        );
+
+        // Requested sources survive even without a declared search tool.
+        let mut without_search_tool = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "include": ["web_search_call.action.sources"]
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut without_search_tool,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(
+            without_search_tool["include"],
+            json!([
+                "reasoning.encrypted_content",
+                "web_search_call.action.sources"
+            ])
+        );
     }
 
     #[test]
@@ -3217,13 +3710,7 @@ mod tests {
             "instructions": "Lite base instructions.",
             "input": [explicit_system_message.clone()]
         });
-        apply_codex_openai_responses_special_body_edits(
-            &mut lite_body,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut lite_body, "openai:responses");
 
         assert!(lite_body.get("instructions").is_none());
         assert_eq!(lite_body["input"][0]["type"], "additional_tools");
@@ -3371,23 +3858,12 @@ mod tests {
                 {"type": "function", "name": "lookup", "parameters": {}},
                 {"type": "custom", "name": "apply_patch", "description": "Apply a patch", "format": {}},
                 {"type": "namespace", "name": "web", "description": "Web tools", "tools": []},
-                {"type": "web_search"},
-                {"type": "image_generation"},
                 {"type": "tool_search", "execution": "client"},
-                {"type": "tool_search", "execution": "server"},
-                {"type": "tool_search"},
-                {"type": "future_tool"},
                 {"name": "missing_type"}
             ]
         });
 
-        apply_codex_openai_responses_special_body_edits(
-            &mut provider_request_body,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut provider_request_body, "openai:responses");
 
         assert!(provider_request_body.get("tools").is_none());
         assert_eq!(
@@ -3412,13 +3888,7 @@ mod tests {
                 ]
             }]
         });
-        apply_codex_openai_responses_special_body_edits(
-            &mut existing_additional_tools,
-            "codex",
-            "openai:responses:compact",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut existing_additional_tools, "openai:responses:compact");
         assert_eq!(
             existing_additional_tools["input"][0]["tools"],
             json!([{"type": "function", "name": "shell", "parameters": {}}])
@@ -3462,7 +3932,7 @@ mod tests {
             "openai:responses",
             "gpt-5.6-sol",
             "gpt-5.6-sol",
-            None,
+            Some(&client_lite_capabilities("gpt-5.6-sol")),
             None,
         );
 
@@ -3479,7 +3949,7 @@ mod tests {
             "openai:responses",
             "gpt-5.6-sol",
             "gpt-5.6-sol",
-            None,
+            Some(&client_lite_capabilities("gpt-5.6-sol")),
             None,
         );
         assert_eq!(provider_request_body, once);
@@ -3516,7 +3986,7 @@ mod tests {
             "openai:responses",
             "gpt-5.6-sol",
             "gpt-5.6-sol",
-            None,
+            Some(&client_lite_capabilities("gpt-5.6-sol")),
             None,
         );
 
@@ -3539,13 +4009,7 @@ mod tests {
             "input": [{"type": "message", "role": "user", "content": []}]
         });
 
-        apply_codex_openai_responses_special_body_edits(
-            &mut provider_request_body,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut provider_request_body, "openai:responses");
 
         assert!(provider_request_body.get("previous_response_id").is_none());
         assert_eq!(
@@ -3566,13 +4030,7 @@ mod tests {
             "input": [{"type": "message", "role": "user", "content": []}]
         });
 
-        apply_codex_openai_responses_special_body_edits(
-            &mut provider_request_body,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut provider_request_body, "openai:responses");
 
         assert!(provider_request_body.get("previous_response_id").is_none());
         assert_eq!(
@@ -3803,13 +4261,7 @@ mod tests {
             }]
         });
 
-        apply_codex_openai_responses_special_body_edits(
-            &mut provider_request_body,
-            "codex",
-            "openai:responses:compact",
-            None,
-            Some("key-a"),
-        );
+        apply_client_lite_body_edits(&mut provider_request_body, "openai:responses:compact");
 
         assert!(provider_request_body.get("tools").is_none());
         assert_eq!(
@@ -3935,13 +4387,7 @@ mod tests {
             "input": [],
             "instructions": " "
         });
-        apply_codex_openai_responses_special_body_edits(
-            &mut whitespace,
-            "codex",
-            "openai:responses",
-            None,
-            None,
-        );
+        apply_client_lite_body_edits(&mut whitespace, "openai:responses");
         assert!(whitespace.get("instructions").is_none());
         assert_eq!(whitespace["input"][0]["type"], "additional_tools");
         assert_eq!(whitespace["input"][1]["role"], "developer");
@@ -4096,17 +4542,14 @@ mod tests {
                 provider_request_body["include"],
                 json!(["reasoning.encrypted_content"])
             );
-            let uses_responses_lite = model.starts_with("gpt-5.6");
+            // A Chat Completions client never asserts Responses Lite, so the
+            // standard contract applies even to Lite-advertising models.
+            let capabilities = resolve_codex_responses_model_capabilities(model, model, None);
             assert_eq!(
                 provider_request_body["parallel_tool_calls"],
-                json!(!uses_responses_lite)
+                json!(capabilities.supports_parallel_tool_calls)
             );
-            assert_eq!(
-                provider_request_body["reasoning"]
-                    .get("context")
-                    .and_then(Value::as_str),
-                uses_responses_lite.then_some("all_turns")
-            );
+            assert!(provider_request_body["reasoning"].get("context").is_none());
         }
     }
 

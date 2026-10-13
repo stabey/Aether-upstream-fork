@@ -761,6 +761,10 @@ pub(crate) async fn resolve_local_standard_candidate_payload_parts(
             provider_api_format,
             prepared_candidate.mapped_model.as_str(),
             source_model,
+            crate::ai_serving::client_requests_codex_responses_lite(
+                effective_headers,
+                Some(body_json),
+            ),
         );
         if let Err(violation) =
             crate::ai_serving::finalize_openai_provider_request_with_codex_model_capabilities_and_reasoning_replay_policy(
