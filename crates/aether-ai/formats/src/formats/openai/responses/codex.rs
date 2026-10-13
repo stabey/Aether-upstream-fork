@@ -1509,6 +1509,58 @@ fn strip_codex_hosted_tool_names_for_backend(body_object: &mut serde_json::Map<S
     }
 }
 
+/// Tool types declared by the request: top-level `tools` plus every Responses
+/// Lite `additional_tools` input item.
+fn codex_declared_tool_types(body_object: &serde_json::Map<String, Value>) -> Vec<String> {
+    let top_level = body_object
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let additional = body_object
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| is_codex_responses_lite_additional_tools_item(item))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten();
+    top_level
+        .chain(additional)
+        .filter_map(|tool| tool.get("type").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// A `tool_choice` that forces a tool type the request no longer declares is
+/// rejected upstream ("Tool choice '<type>' must be specified with 'tools'
+/// parameter"). Fall back to `auto` like sub2api. Named function/custom
+/// choices and `allowed_tools` are left alone: their targets can live inside
+/// namespaces this check does not resolve.
+fn downgrade_dangling_codex_tool_choice(body_object: &mut serde_json::Map<String, Value>) {
+    let Some(choice_type) = body_object
+        .get("tool_choice")
+        .and_then(Value::as_object)
+        .and_then(|choice| choice.get("type"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+    else {
+        return;
+    };
+    if matches!(
+        choice_type.as_str(),
+        "function" | "custom" | "allowed_tools" | "mcp"
+    ) {
+        return;
+    }
+    if !codex_declared_tool_types(body_object)
+        .iter()
+        .any(|kind| *kind == choice_type)
+    {
+        body_object.insert("tool_choice".to_string(), json!("auto"));
+    }
+}
+
 fn strip_codex_hosted_tool_choice_name_for_backend(
     body_object: &mut serde_json::Map<String, Value>,
 ) {
@@ -1886,6 +1938,9 @@ fn apply_codex_openai_responses_special_body_edits_with_source_model_and_capabil
         body_rules,
     );
     apply_codex_responses_lite_body_contract(body_object, capabilities, websocket_continuation);
+    if !is_openai_responses_compact_request(provider_api_format) {
+        downgrade_dangling_codex_tool_choice(body_object);
+    }
     strip_codex_cache_control_fields(provider_request_body);
     apply_codex_openai_responses_compact_body_edits(
         provider_request_body,
@@ -3308,6 +3363,72 @@ mod tests {
             ])
         );
         assert_eq!(provider_request_body["parallel_tool_calls"], json!(false));
+    }
+
+    #[test]
+    fn codex_responses_body_edits_downgrade_dangling_tool_choice() {
+        let mut dangling = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}],
+            "tool_choice": {"type": "web_search"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut dangling,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(dangling["tool_choice"], "auto");
+
+        let mut declared = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut declared,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(declared["tool_choice"], json!({"type": "web_search"}));
+
+        // Named function choices may target namespaced tools; leave them.
+        let mut named = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "tool_choice": {"type": "function", "name": "lookup"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut named,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(
+            named["tool_choice"],
+            json!({"type": "function", "name": "lookup"})
+        );
+
+        // The image generation route still supplies its own tool.
+        let mut image = json!({
+            "model": "gpt-6-astra",
+            "input": "draw",
+            "tool_choice": {"type": "image_generation"}
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut image,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(image["tool_choice"]["type"], "image_generation");
     }
 
     #[test]
