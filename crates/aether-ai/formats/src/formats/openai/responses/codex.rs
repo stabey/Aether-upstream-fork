@@ -1270,10 +1270,28 @@ fn codex_responses_lite_supports_context_management(context_management: Option<&
     context_management.is_none_or(Value::is_null)
 }
 
-fn codex_responses_lite_supports_request_body(provider_request_body: Option<&Value>) -> bool {
-    provider_request_body.is_none_or(|body| {
-        codex_responses_lite_supports_context_management(body.get("context_management"))
+/// Responses Lite has no wire slot for hosted tools: Codex itself replaces
+/// them with client-executed standalone tools. Dropping a requested hosted
+/// tool would also leave a `tool_choice` that names it dangling, so such a
+/// request keeps the standard contract instead.
+fn codex_responses_lite_supports_tools(tools: Option<&Value>) -> bool {
+    tools.and_then(Value::as_array).is_none_or(|tools| {
+        tools.iter().all(|tool| {
+            tool.get("type").and_then(Value::as_str).is_none()
+                || codex_responses_lite_tool_is_client_executed(tool)
+        })
     })
+}
+
+fn codex_responses_lite_supports_body_object(body: &serde_json::Map<String, Value>) -> bool {
+    codex_responses_lite_supports_context_management(body.get("context_management"))
+        && codex_responses_lite_supports_tools(body.get("tools"))
+}
+
+fn codex_responses_lite_supports_request_body(provider_request_body: Option<&Value>) -> bool {
+    provider_request_body
+        .and_then(Value::as_object)
+        .is_none_or(codex_responses_lite_supports_body_object)
 }
 
 fn apply_codex_responses_lite_body_contract(
@@ -1781,9 +1799,7 @@ fn apply_codex_openai_responses_special_body_edits_with_source_model_and_capabil
         &bundled_capabilities
     };
     let standard_contract_capabilities = (capabilities.use_responses_lite
-        && !codex_responses_lite_supports_context_management(
-            body_object.get("context_management"),
-        ))
+        && !codex_responses_lite_supports_body_object(body_object))
     .then(|| CodexResponsesModelCapabilities {
         use_responses_lite: false,
         ..capabilities.clone()
@@ -2317,6 +2333,90 @@ mod tests {
         );
 
         assert!(!headers.contains_key(CODEX_RESPONSES_LITE_HEADER));
+    }
+
+    #[test]
+    fn codex_responses_lite_keeps_standard_contract_for_hosted_tools() {
+        for hosted_tool in [
+            json!({"type": "web_search"}),
+            json!({"type": "tool_search", "execution": "server"}),
+            json!({"type": "tool_search"}),
+            json!({"type": "future_tool"}),
+        ] {
+            let mut body = json!({
+                "model": "gpt-6-astra",
+                "instructions": "Web research assistant.",
+                "input": "omp.sh",
+                "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {}},
+                    hosted_tool.clone()
+                ],
+                "tool_choice": {"type": hosted_tool["type"].clone()}
+            });
+            apply_codex_openai_responses_special_body_edits(
+                &mut body,
+                "codex",
+                "openai:responses",
+                None,
+                None,
+            );
+
+            assert_eq!(body["tools"][1], hosted_tool);
+            assert_eq!(body["tool_choice"]["type"], hosted_tool["type"]);
+            assert_eq!(body["instructions"], "Web research assistant.");
+            assert!(!body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["type"] == "additional_tools"));
+            assert!(body["reasoning"].get("context").is_none());
+
+            let mut headers = std::collections::BTreeMap::from([(
+                CODEX_RESPONSES_LITE_HEADER.to_string(),
+                "true".to_string(),
+            )]);
+            apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+                &mut headers,
+                Some(&body),
+                "codex",
+                "openai:responses",
+                "gpt-6-astra",
+                "gpt-6-astra",
+                None,
+            );
+            assert!(
+                !headers.contains_key(CODEX_RESPONSES_LITE_HEADER),
+                "hosted tool: {hosted_tool}"
+            );
+        }
+
+        let mut client_only = json!({
+            "model": "gpt-6-astra",
+            "input": "hi",
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut client_only,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(client_only["input"][0]["type"], "additional_tools");
+        let mut headers = std::collections::BTreeMap::new();
+        apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+            &mut headers,
+            Some(&client_only),
+            "codex",
+            "openai:responses",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            None,
+        );
+        assert_eq!(
+            headers.get(CODEX_RESPONSES_LITE_HEADER).map(String::as_str),
+            Some("true")
+        );
     }
 
     #[test]
@@ -3280,12 +3380,7 @@ mod tests {
                 {"type": "function", "name": "lookup", "parameters": {}},
                 {"type": "custom", "name": "apply_patch", "description": "Apply a patch", "format": {}},
                 {"type": "namespace", "name": "web", "description": "Web tools", "tools": []},
-                {"type": "web_search"},
-                {"type": "image_generation"},
                 {"type": "tool_search", "execution": "client"},
-                {"type": "tool_search", "execution": "server"},
-                {"type": "tool_search"},
-                {"type": "future_tool"},
                 {"name": "missing_type"}
             ]
         });
