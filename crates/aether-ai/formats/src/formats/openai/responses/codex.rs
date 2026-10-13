@@ -1532,6 +1532,71 @@ fn codex_declared_tool_types(body_object: &serde_json::Map<String, Value>) -> Ve
         .collect()
 }
 
+/// The Codex backend answers "response protection is unavailable" for a
+/// request whose history replays `web_search_call` items without declaring
+/// web search (observed since 2026-10-06, e.g. Codex local compaction sends
+/// `tools: []`). Declare search without granting live web access, as sub2api
+/// and Magpie do: top-level for the standard contract, inside
+/// `additional_tools` for Responses Lite, which rejects top-level hosted tools.
+fn declare_codex_web_search_for_replayed_calls(
+    body_object: &mut serde_json::Map<String, Value>,
+    use_responses_lite: bool,
+) {
+    let replays_web_search = body_object
+        .get("input")
+        .and_then(Value::as_array)
+        .is_some_and(|input| {
+            input
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("web_search_call"))
+        });
+    if !replays_web_search {
+        return;
+    }
+    let declared = codex_declared_tool_types(body_object);
+    if declared.iter().any(|kind| kind.starts_with("web_search")) {
+        return;
+    }
+    let declaration = json!({"type": "web_search", "external_web_access": false});
+    if use_responses_lite {
+        let Some(input) = body_object.get_mut("input").and_then(Value::as_array_mut) else {
+            return;
+        };
+        match input
+            .iter_mut()
+            .find(|item| is_codex_responses_lite_additional_tools_item(item))
+            .and_then(|item| item.get_mut("tools"))
+            .and_then(Value::as_array_mut)
+        {
+            Some(tools) => tools.push(declaration),
+            None => input.insert(
+                0,
+                json!({
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [declaration],
+                }),
+            ),
+        }
+    } else {
+        match body_object.get_mut("tools").and_then(Value::as_array_mut) {
+            Some(tools) => tools.push(declaration),
+            None => {
+                body_object.insert("tools".to_string(), json!([declaration]));
+            }
+        }
+    }
+    // The declaration only satisfies history replay; a client that offered
+    // no tools must not have the model start searching.
+    if declared.is_empty()
+        && body_object
+            .get("tool_choice")
+            .is_none_or(|choice| choice.as_str() == Some("auto"))
+    {
+        body_object.insert("tool_choice".to_string(), json!("none"));
+    }
+}
+
 /// A `tool_choice` that forces a tool type the request no longer declares is
 /// rejected upstream ("Tool choice '<type>' must be specified with 'tools'
 /// parameter"). Fall back to `auto` like sub2api. Named function/custom
@@ -1939,6 +2004,12 @@ fn apply_codex_openai_responses_special_body_edits_with_source_model_and_capabil
     );
     apply_codex_responses_lite_body_contract(body_object, capabilities, websocket_continuation);
     if !is_openai_responses_compact_request(provider_api_format) {
+        if !websocket_continuation {
+            declare_codex_web_search_for_replayed_calls(
+                body_object,
+                capabilities.use_responses_lite,
+            );
+        }
         downgrade_dangling_codex_tool_choice(body_object);
     }
     strip_codex_cache_control_fields(provider_request_body);
@@ -3429,6 +3500,104 @@ mod tests {
             None,
         );
         assert_eq!(image["tool_choice"]["type"], "image_generation");
+    }
+
+    #[test]
+    fn codex_responses_body_edits_declare_web_search_for_replayed_calls() {
+        let web_search_call = json!({
+            "type": "web_search_call",
+            "id": "ws_1",
+            "status": "completed",
+            "action": {"type": "search", "query": "weather"}
+        });
+        let declaration = json!({"type": "web_search", "external_web_access": false});
+
+        // Standard contract: declare top-level and keep the client's choice.
+        let mut standard = json!({
+            "model": "gpt-6-astra",
+            "input": [web_search_call.clone()],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut standard,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(standard["tools"][1], declaration);
+        assert_eq!(standard["tool_choice"], "auto");
+
+        // No client tools at all (Codex local compaction): declare, but
+        // forbid the model from starting a search.
+        let mut no_tools = json!({
+            "model": "gpt-6-astra",
+            "input": [web_search_call.clone()],
+            "tools": []
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut no_tools,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(no_tools["tools"], json!([declaration.clone()]));
+        assert_eq!(no_tools["tool_choice"], "none");
+
+        // Responses Lite rejects top-level hosted tools: declare inside
+        // additional_tools and keep the Lite header.
+        let mut lite = json!({
+            "model": "gpt-6-astra",
+            "input": [web_search_call.clone()],
+            "tools": [{"type": "function", "name": "lookup", "parameters": {}}]
+        });
+        apply_client_lite_body_edits(&mut lite, "openai:responses");
+        assert!(lite.get("tools").is_none());
+        assert_eq!(lite["input"][0]["type"], "additional_tools");
+        assert_eq!(lite["input"][0]["tools"][0]["name"], "lookup");
+        assert_eq!(lite["input"][0]["tools"][1], declaration);
+        let mut headers = std::collections::BTreeMap::new();
+        apply_codex_openai_responses_lite_header_for_request_body_with_capabilities(
+            &mut headers,
+            Some(&lite),
+            "codex",
+            "openai:responses",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            Some(&client_lite_capabilities("gpt-6-astra")),
+        );
+        assert_eq!(
+            headers.get(CODEX_RESPONSES_LITE_HEADER).map(String::as_str),
+            Some("true")
+        );
+
+        // An existing declaration is left untouched.
+        let mut already = json!({
+            "model": "gpt-6-astra",
+            "input": [web_search_call.clone()],
+            "tools": [{"type": "web_search_preview"}]
+        });
+        apply_codex_openai_responses_special_body_edits(
+            &mut already,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(already["tools"], json!([{"type": "web_search_preview"}]));
+
+        // Without replayed search calls nothing is declared.
+        let mut plain = json!({"model": "gpt-6-astra", "input": "hi", "tools": []});
+        apply_codex_openai_responses_special_body_edits(
+            &mut plain,
+            "codex",
+            "openai:responses",
+            None,
+            None,
+        );
+        assert_eq!(plain["tools"], json!([]));
+        assert_eq!(plain["tool_choice"], "auto");
     }
 
     #[test]
