@@ -1618,10 +1618,7 @@ fn downgrade_dangling_codex_tool_choice(body_object: &mut serde_json::Map<String
     ) {
         return;
     }
-    if !codex_declared_tool_types(body_object)
-        .iter()
-        .any(|kind| *kind == choice_type)
-    {
+    if !codex_declared_tool_types(body_object).contains(&choice_type) {
         body_object.insert("tool_choice".to_string(), json!("auto"));
     }
 }
