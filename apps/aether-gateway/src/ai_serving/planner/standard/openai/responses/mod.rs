@@ -356,6 +356,25 @@ impl ResponsesWebSocketBodyNormalization {
         self
     }
 
+    /// Marks the downstream client as a Codex Responses Lite client, the way
+    /// planning does when the client sends the Lite header.
+    #[cfg(test)]
+    pub(crate) fn with_client_responses_lite_for_tests(mut self) -> Self {
+        self.request_headers.insert(
+            crate::ai_serving::CODEX_RESPONSES_LITE_HEADER,
+            http::HeaderValue::from_static("true"),
+        );
+        self.codex_model_capabilities = Some(
+            crate::ai_serving::resolve_codex_responses_model_capabilities_for_request(
+                self.mapped_model.as_str(),
+                self.requested_model.as_str(),
+                None,
+                true,
+            ),
+        );
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_body_rules_for_tests(mut self, body_rules: serde_json::Value) -> Self {
         self.body_rules = Some(body_rules);
@@ -385,16 +404,11 @@ impl ResponsesWebSocketBodyNormalization {
         {
             return false;
         }
+        // Lite is asserted per request by the client; without request-scoped
+        // capabilities there is no assertion to honor.
         self.codex_model_capabilities
-            .clone()
-            .unwrap_or_else(|| {
-                crate::ai_serving::resolve_codex_responses_model_capabilities(
-                    self.mapped_model.as_str(),
-                    self.requested_model.as_str(),
-                    None,
-                )
-            })
-            .use_responses_lite
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.use_responses_lite)
     }
 
     pub(crate) fn reasoning_replay_policy(
@@ -891,6 +905,10 @@ pub(crate) async fn maybe_build_responses_websocket_decision(
                     candidate_provider_api_format.as_str(),
                     mapped_model.as_str(),
                     source_model,
+                    crate::ai_serving::client_requests_codex_responses_lite(
+                        input.effective_headers(&parts.headers),
+                        Some(body_json),
+                    ),
                 ),
                 reasoning_replay_policy: openai_responses_reasoning_replay_policy(
                     transport.provider.provider_type.as_str(),

@@ -278,6 +278,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         prepared.provider_api_format.as_str(),
         prepared.mapped_model.as_str(),
         source_model,
+        crate::ai_serving::client_requests_codex_responses_lite(effective_headers, Some(body_json)),
     );
     if spec.operation != Some(crate::ai_serving::ApiOperation::OpenAiMemoriesSummarize) {
         if let Err(violation) =

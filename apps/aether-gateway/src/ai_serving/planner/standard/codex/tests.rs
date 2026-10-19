@@ -28,6 +28,7 @@ fn search_uses_live_codex_model_catalog_capabilities() {
         "gpt-search-custom",
         "gpt-search-custom",
         Some(&metadata),
+        false,
     )
     .expect("Search should resolve capabilities from the Codex model catalog");
 
@@ -45,6 +46,7 @@ fn search_uses_live_codex_model_catalog_capabilities() {
         "gpt-search-custom",
         "gpt-search-custom",
         Some(&metadata),
+        false,
     )
     .is_none());
 }
@@ -788,4 +790,59 @@ fn compact_projects_uuid_prompt_cache_identity_into_session_headers() {
         headers.get("thread-id").map(String::as_str),
         Some("172c39e6-c0a0-5a70-8b63-e0f8e0d185a3")
     );
+}
+
+#[test]
+fn client_lite_assertion_comes_from_the_header_or_websocket_client_metadata() {
+    use super::{client_requests_codex_responses_lite, planned_codex_request_uses_responses_lite};
+
+    let mut headers = http::HeaderMap::new();
+    assert!(!client_requests_codex_responses_lite(&headers, None));
+    assert!(!client_requests_codex_responses_lite(
+        &headers,
+        Some(&json!({"client_metadata": {"other": "true"}}))
+    ));
+    assert!(client_requests_codex_responses_lite(
+        &headers,
+        Some(&json!({
+            "client_metadata": {
+                "ws_request_header_x_openai_internal_codex_responses_lite": "true"
+            }
+        }))
+    ));
+    headers.insert(
+        crate::ai_serving::CODEX_RESPONSES_LITE_HEADER,
+        http::HeaderValue::from_static("TRUE"),
+    );
+    assert!(client_requests_codex_responses_lite(&headers, None));
+    headers.insert(
+        crate::ai_serving::CODEX_RESPONSES_LITE_HEADER,
+        http::HeaderValue::from_static("false"),
+    );
+    assert!(!client_requests_codex_responses_lite(&headers, None));
+
+    let planned = std::collections::BTreeMap::from([(
+        "X-OpenAI-Internal-Codex-Responses-Lite".to_string(),
+        "true".to_string(),
+    )]);
+    assert!(planned_codex_request_uses_responses_lite(&planned));
+    assert!(!planned_codex_request_uses_responses_lite(
+        &std::collections::BTreeMap::new()
+    ));
+}
+
+#[test]
+fn codex_capabilities_enable_lite_only_for_a_client_assertion() {
+    for (client_requests_lite, expected) in [(false, false), (true, true)] {
+        let capabilities = codex_model_capabilities(
+            "codex",
+            "openai:responses",
+            "gpt-6-astra",
+            "gpt-6-astra",
+            None,
+            client_requests_lite,
+        )
+        .expect("Codex Responses resolves capabilities");
+        assert_eq!(capabilities.use_responses_lite, expected);
+    }
 }
