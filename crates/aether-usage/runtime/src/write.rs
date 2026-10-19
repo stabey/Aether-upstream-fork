@@ -924,19 +924,24 @@ pub fn build_sync_terminal_usage_payload_seed(
         .and_then(|context| context.get(UPSTREAM_IS_STREAM_KEY))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let provider_response_full = if upstream_is_stream
-        && payload.body_base64.is_some()
-        && !body_json_has_terminal_error(payload.body_json.as_ref())
-    {
-        decode_body_for_storage(payload.body_base64.as_deref())
-            .or_else(|| payload.body_json.as_ref().cloned())
-    } else {
-        payload
-            .body_json
-            .as_ref()
-            .cloned()
-            .or_else(|| decode_body_for_storage(payload.body_base64.as_deref()))
-    };
+    let has_terminal_error = body_json_has_terminal_error(payload.body_json.as_ref());
+    let mut provider_response_full =
+        if upstream_is_stream && payload.body_base64.is_some() && !has_terminal_error {
+            decode_body_for_storage(payload.body_base64.as_deref())
+                .or_else(|| payload.body_json.as_ref().cloned())
+        } else {
+            payload
+                .body_json
+                .as_ref()
+                .cloned()
+                .or_else(|| decode_body_for_storage(payload.body_base64.as_deref()))
+        };
+    if upstream_is_stream && has_terminal_error {
+        attach_failed_stream_capture(
+            provider_response_full.as_mut(),
+            payload.body_base64.as_deref(),
+        );
+    }
     let has_provider_response = provider_response_full.is_some();
     let client_response = payload.client_body_json.as_ref().cloned();
     let has_client_response = client_response.is_some();
@@ -984,6 +989,148 @@ fn body_json_has_terminal_error(body_json: Option<&Value>) -> bool {
     body_json
         .and_then(|value| value.get("error"))
         .is_some_and(|error| !error.is_null())
+}
+
+// A failed stream stores the terminal error instead of the provider stream, so
+// keep a bounded excerpt beside it: what the provider was emitting when it broke.
+const FAILED_STREAM_CAPTURE_KEY: &str = "stream_capture";
+const FAILED_STREAM_CAPTURE_HEAD_EVENTS: usize = 50;
+const FAILED_STREAM_CAPTURE_TAIL_EVENTS: usize = 300;
+const FAILED_STREAM_CAPTURE_MAX_EXCERPT_BYTES: usize = 512 * 1024;
+const FAILED_STREAM_CAPTURE_MAX_EVENT_TYPES: usize = 64;
+const FAILED_STREAM_CAPTURE_RAW_PREFIX_BYTES: usize = 8 * 1024;
+
+fn attach_failed_stream_capture(response: Option<&mut Value>, body_base64: Option<&str>) {
+    let Some(object) = response.and_then(Value::as_object_mut) else {
+        return;
+    };
+    if object.contains_key(FAILED_STREAM_CAPTURE_KEY) {
+        return;
+    }
+    let Some(bytes) = body_base64.and_then(|body| decode_internal_report_body_base64(body).ok())
+    else {
+        return;
+    };
+    if let Some(capture) = build_failed_stream_capture(&bytes) {
+        object.insert(FAILED_STREAM_CAPTURE_KEY.to_string(), capture);
+    }
+}
+
+fn build_failed_stream_capture(bytes: &[u8]) -> Option<Value> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let mut total_events = 0_usize;
+    let mut saw_done = false;
+    let mut event_types = BTreeMap::<String, u64>::new();
+    let mut first_sequence_number = None;
+    let mut last_sequence_number = None;
+    let mut safety_buffering_events = 0_u64;
+    let mut head = Vec::new();
+    let mut tail = std::collections::VecDeque::new();
+    for_each_sse_payload(&text, |payload| {
+        if payload == "[DONE]" {
+            saw_done = true;
+            return;
+        }
+        let parsed = serde_json::from_str::<Value>(payload).ok();
+        let event_type = match parsed.as_ref() {
+            Some(event) => event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("<untyped>"),
+            None => "<invalid_json>",
+        };
+        let event_type = if event_types.contains_key(event_type)
+            || event_types.len() < FAILED_STREAM_CAPTURE_MAX_EVENT_TYPES
+        {
+            event_type.to_string()
+        } else {
+            "<other>".to_string()
+        };
+        *event_types.entry(event_type).or_default() += 1;
+        if let Some(event) = parsed.as_ref() {
+            if let Some(sequence_number) = event.get("sequence_number").and_then(Value::as_u64) {
+                first_sequence_number.get_or_insert(sequence_number);
+                last_sequence_number = Some(sequence_number);
+            }
+            if event.get("safety_buffering").and_then(Value::as_bool) == Some(true) {
+                safety_buffering_events += 1;
+            }
+        }
+        let stored = (
+            payload.len(),
+            parsed.unwrap_or_else(|| Value::String(payload.to_string())),
+        );
+        if head.len() < FAILED_STREAM_CAPTURE_HEAD_EVENTS {
+            head.push(stored);
+        } else {
+            if tail.len() == FAILED_STREAM_CAPTURE_TAIL_EVENTS {
+                tail.pop_front();
+            }
+            tail.push_back(stored);
+        }
+        total_events += 1;
+    });
+
+    let mut capture = Map::from_iter([
+        ("total_bytes".to_string(), json!(bytes.len())),
+        ("total_events".to_string(), json!(total_events)),
+    ]);
+    if total_events == 0 {
+        let mut prefix_end = text.len().min(FAILED_STREAM_CAPTURE_RAW_PREFIX_BYTES);
+        while !text.is_char_boundary(prefix_end) {
+            prefix_end -= 1;
+        }
+        capture.insert(
+            "raw_prefix".to_string(),
+            Value::String(text[..prefix_end].to_string()),
+        );
+        capture.insert("saw_done".to_string(), Value::Bool(saw_done));
+        return Some(Value::Object(capture));
+    }
+
+    // Keep the newest events when the byte ceiling bites: the tail shows how the
+    // stream ended, the head only how it started.
+    let mut budget = FAILED_STREAM_CAPTURE_MAX_EXCERPT_BYTES;
+    let mut kept_tail = Vec::with_capacity(tail.len());
+    for (len, event) in tail.into_iter().rev() {
+        if len > budget {
+            break;
+        }
+        budget -= len;
+        kept_tail.push(event);
+    }
+    kept_tail.reverse();
+    let mut kept_head = Vec::with_capacity(head.len());
+    for (len, event) in head {
+        if len > budget {
+            break;
+        }
+        budget -= len;
+        kept_head.push(event);
+    }
+
+    capture.insert(
+        "omitted_events".to_string(),
+        json!(total_events - kept_head.len() - kept_tail.len()),
+    );
+    capture.insert("event_types".to_string(), json!(event_types));
+    if let Some(sequence_number) = first_sequence_number {
+        capture.insert("first_sequence_number".to_string(), json!(sequence_number));
+    }
+    if let Some(sequence_number) = last_sequence_number {
+        capture.insert("last_sequence_number".to_string(), json!(sequence_number));
+    }
+    capture.insert(
+        "safety_buffering_events".to_string(),
+        json!(safety_buffering_events),
+    );
+    capture.insert("saw_done".to_string(), Value::Bool(saw_done));
+    capture.insert("head_events".to_string(), Value::Array(kept_head));
+    capture.insert("tail_events".to_string(), Value::Array(kept_tail));
+    Some(Value::Object(capture))
 }
 
 pub fn build_stream_terminal_usage_payload_seed(
@@ -3614,18 +3761,20 @@ fn empty_to_none(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pending_usage_event_from_owned_seed, build_pending_usage_record,
-        build_pending_usage_record_from_seed, build_stream_terminal_usage_event,
-        build_streaming_usage_event_from_owned_seed, build_streaming_usage_record,
-        build_sync_terminal_usage_event, build_sync_terminal_usage_payload_seed,
-        build_sync_terminal_usage_seed, build_terminal_usage_context_seed,
-        build_terminal_usage_event_from_seed, build_usage_event_data_seed,
-        build_usage_event_data_seed_describing_request_bodies, decode_body_for_storage,
-        extract_token_counts_from_json, extract_token_counts_from_value, headers_to_json,
-        mask_sensitive_body_fields, parse_sse_body_for_storage, resolve_error_message,
-        trim_owned_non_empty_string, validate_usage_headers_in_json_value, LifecycleUsageSeed,
-        TerminalUsageSeed, UsageBodyRefsSeed, UsageBodyStatesSeed, UsageRoutingSeed,
-        UsageTerminalState, MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
+        build_failed_stream_capture, build_pending_usage_event_from_owned_seed,
+        build_pending_usage_record, build_pending_usage_record_from_seed,
+        build_stream_terminal_usage_event, build_streaming_usage_event_from_owned_seed,
+        build_streaming_usage_record, build_sync_terminal_usage_event,
+        build_sync_terminal_usage_payload_seed, build_sync_terminal_usage_seed,
+        build_terminal_usage_context_seed, build_terminal_usage_event_from_seed,
+        build_usage_event_data_seed, build_usage_event_data_seed_describing_request_bodies,
+        decode_body_for_storage, extract_token_counts_from_json, extract_token_counts_from_value,
+        headers_to_json, mask_sensitive_body_fields, parse_sse_body_for_storage,
+        resolve_error_message, trim_owned_non_empty_string, validate_usage_headers_in_json_value,
+        LifecycleUsageSeed, TerminalUsageSeed, UsageBodyRefsSeed, UsageBodyStatesSeed,
+        UsageRoutingSeed, UsageTerminalState, FAILED_STREAM_CAPTURE_HEAD_EVENTS,
+        FAILED_STREAM_CAPTURE_MAX_EXCERPT_BYTES, FAILED_STREAM_CAPTURE_RAW_PREFIX_BYTES,
+        FAILED_STREAM_CAPTURE_TAIL_EVENTS, MAX_USAGE_CAPTURE_BYTES, MAX_USAGE_CAPTURE_DEPTH,
     };
     use crate::{
         build_upsert_usage_record_from_event, GatewayStreamReportRequest, GatewaySyncReportRequest,
@@ -6040,6 +6189,150 @@ mod tests {
                 .and_then(Value::as_str),
             Some("internal")
         );
+        let capture = event
+            .data
+            .response_body
+            .as_ref()
+            .and_then(|value| value.get("stream_capture"))
+            .expect("failed stream should keep an excerpt of the provider stream");
+        assert_eq!(capture["total_bytes"], json!(partial_sse_body.len()));
+        assert_eq!(capture["total_events"], json!(3));
+        assert_eq!(capture["omitted_events"], json!(0));
+        assert_eq!(
+            capture["event_types"],
+            json!({
+                "response.created": 1,
+                "response.function_call_arguments.delta": 1,
+                "response.output_item.added": 1
+            })
+        );
+        assert_eq!(
+            capture
+                .pointer("/head_events/1/item/name")
+                .and_then(Value::as_str),
+            Some("exec_command")
+        );
+        assert_eq!(capture["tail_events"], json!([]));
+
+        let mut without_stream = payload.clone();
+        without_stream.body_base64 = None;
+        let event = build_sync_terminal_usage_event(
+            &plan,
+            without_stream.report_context.as_ref(),
+            &without_stream,
+        )
+        .expect("usage event should build");
+        assert!(event
+            .data
+            .response_body
+            .as_ref()
+            .is_some_and(|value| value.get("stream_capture").is_none()));
+    }
+
+    #[test]
+    fn failed_stream_capture_keeps_disjoint_head_and_tail_with_full_stream_summary() {
+        let mut sse_body = String::new();
+        for sequence_number in 0..1000_u64 {
+            let event_type = if sequence_number == 0 {
+                "response.created"
+            } else {
+                "response.function_call_arguments.delta"
+            };
+            sse_body.push_str(&format!(
+                "event: {event_type}\ndata: {}\n\n",
+                json!({
+                    "type": event_type,
+                    "sequence_number": sequence_number,
+                    "safety_buffering": sequence_number % 2 == 0,
+                })
+            ));
+        }
+
+        let capture =
+            build_failed_stream_capture(sse_body.as_bytes()).expect("stream capture should build");
+
+        assert_eq!(capture["total_events"], json!(1000));
+        assert_eq!(
+            capture["event_types"],
+            json!({
+                "response.created": 1,
+                "response.function_call_arguments.delta": 999
+            })
+        );
+        assert_eq!(capture["first_sequence_number"], json!(0));
+        assert_eq!(capture["last_sequence_number"], json!(999));
+        assert_eq!(capture["safety_buffering_events"], json!(500));
+        assert_eq!(capture["saw_done"], json!(false));
+        let head = capture["head_events"].as_array().expect("head events");
+        let tail = capture["tail_events"].as_array().expect("tail events");
+        assert_eq!(head.len(), FAILED_STREAM_CAPTURE_HEAD_EVENTS);
+        assert_eq!(tail.len(), FAILED_STREAM_CAPTURE_TAIL_EVENTS);
+        assert_eq!(
+            capture["omitted_events"],
+            json!(1000 - FAILED_STREAM_CAPTURE_HEAD_EVENTS - FAILED_STREAM_CAPTURE_TAIL_EVENTS)
+        );
+        assert_eq!(head[0]["sequence_number"], json!(0));
+        assert_eq!(
+            head.last().map(|event| &event["sequence_number"]),
+            Some(&json!(FAILED_STREAM_CAPTURE_HEAD_EVENTS - 1))
+        );
+        assert_eq!(
+            tail[0]["sequence_number"],
+            json!(1000 - FAILED_STREAM_CAPTURE_TAIL_EVENTS)
+        );
+        assert_eq!(
+            tail.last().map(|event| &event["sequence_number"]),
+            Some(&json!(999))
+        );
+    }
+
+    #[test]
+    fn failed_stream_capture_prefers_tail_events_under_byte_ceiling() {
+        let delta = "x".repeat(4 * 1024);
+        let mut sse_body = String::new();
+        for sequence_number in 0..400_u64 {
+            sse_body.push_str(&format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.output_text.delta",
+                    "sequence_number": sequence_number,
+                    "delta": delta,
+                })
+            ));
+        }
+
+        let capture =
+            build_failed_stream_capture(sse_body.as_bytes()).expect("stream capture should build");
+
+        let head = capture["head_events"].as_array().expect("head events");
+        let tail = capture["tail_events"].as_array().expect("tail events");
+        let kept_bytes = head
+            .iter()
+            .chain(tail)
+            .map(|event| event.to_string().len())
+            .sum::<usize>();
+        assert!(kept_bytes <= FAILED_STREAM_CAPTURE_MAX_EXCERPT_BYTES);
+        assert!(head.is_empty());
+        assert!(!tail.is_empty() && tail.len() < FAILED_STREAM_CAPTURE_TAIL_EVENTS);
+        assert_eq!(
+            tail.last().map(|event| &event["sequence_number"]),
+            Some(&json!(399))
+        );
+        assert_eq!(capture["omitted_events"], json!(400 - tail.len()));
+    }
+
+    #[test]
+    fn failed_stream_capture_keeps_raw_prefix_for_non_sse_bytes() {
+        let body = "é".repeat(FAILED_STREAM_CAPTURE_RAW_PREFIX_BYTES);
+
+        let capture =
+            build_failed_stream_capture(body.as_bytes()).expect("stream capture should build");
+
+        assert_eq!(capture["total_events"], json!(0));
+        let prefix = capture["raw_prefix"].as_str().expect("raw prefix");
+        assert!(prefix.len() <= FAILED_STREAM_CAPTURE_RAW_PREFIX_BYTES);
+        assert!(body.starts_with(prefix));
+        assert!(build_failed_stream_capture(b"").is_none());
     }
 
     #[test]
