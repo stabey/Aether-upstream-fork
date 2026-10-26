@@ -523,6 +523,12 @@ pub(crate) fn safe_model_fetch_error(error: &str) -> String {
     }
 
     let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("upstream address rejected by security policy")
+        || lower.contains("upstream url must not target a private or reserved address")
+        || lower.contains("upstream dns resolution returned a private or reserved address")
+    {
+        return "上游地址被安全策略拒绝 (upstream address rejected by security policy)".to_string();
+    }
     if let Some(status) = model_fetch_error_http_status(&lower) {
         return match status {
             401 => "Upstream models fetch authentication failed (status 401)".to_string(),
@@ -1171,6 +1177,21 @@ mod tests {
             "example.test",
         ] {
             assert!(!safe_error.contains(secret));
+        }
+    }
+
+    #[test]
+    fn model_fetch_error_projection_reports_security_policy_without_secrets() {
+        for reason in [
+            "upstream URL must not target a private or reserved address",
+            "upstream DNS resolution returned a private or reserved address",
+            "上游地址被安全策略拒绝 (upstream address rejected by security policy)",
+        ] {
+            let error = format!("{reason}: http://user:secret@100.64.0.6:65500?key=secret Authorization: Bearer secret");
+            assert_eq!(
+                safe_model_fetch_error(&error),
+                "上游地址被安全策略拒绝 (upstream address rejected by security policy)"
+            );
         }
     }
 

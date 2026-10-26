@@ -4692,6 +4692,11 @@ fn same_origin_reqwest_redirect_policy() -> Policy {
             .previous()
             .last()
             .is_some_and(|previous| reqwest_urls_have_same_origin(previous, attempt.url()));
+        if same_origin {
+            if let Err(error) = validate_execution_upstream_url(attempt.url().as_str()) {
+                return attempt.error(error);
+            }
+        }
         match safe_redirect_decision(attempt.previous().len(), same_origin) {
             SafeRedirectDecision::Follow => attempt.follow(),
             SafeRedirectDecision::Stop => attempt.stop(),
@@ -4706,6 +4711,11 @@ fn same_origin_wreq_redirect_policy() -> wreq::redirect::Policy {
             .previous
             .last()
             .is_some_and(|previous| http_uris_have_same_origin(previous, &attempt.uri));
+        if same_origin {
+            if let Err(error) = validate_execution_upstream_url(&attempt.uri.to_string()) {
+                return attempt.error(error);
+            }
+        }
         match safe_redirect_decision(attempt.previous.len(), same_origin) {
             SafeRedirectDecision::Follow => attempt.follow(),
             SafeRedirectDecision::Stop => attempt.stop(),
@@ -5211,8 +5221,28 @@ fn execution_log_url_host(url: &str) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+const TRUSTED_UPSTREAM_ORIGINS_ENV: &str = "AETHER_TRUSTED_UPSTREAM_ORIGINS";
+static TRUSTED_UPSTREAM_ORIGINS: LazyLock<Result<aether_http::TrustedUpstreamOrigins, &'static str>> =
+    LazyLock::new(|| match std::env::var(TRUSTED_UPSTREAM_ORIGINS_ENV) {
+        Ok(value) => aether_http::TrustedUpstreamOrigins::parse(&value),
+        Err(std::env::VarError::NotPresent) => Ok(aether_http::TrustedUpstreamOrigins::default()),
+        Err(_) => Err("trusted upstream configuration must be UTF-8"),
+    });
+
 pub(crate) fn validate_execution_upstream_url(
     raw_url: &str,
+) -> Result<url::Url, ExecutionRuntimeTransportError> {
+    let policy = TRUSTED_UPSTREAM_ORIGINS.as_ref().map_err(|_| {
+        ExecutionRuntimeTransportError::UpstreamRequest(
+            "invalid AETHER_TRUSTED_UPSTREAM_ORIGINS configuration".to_string(),
+        )
+    })?;
+    validate_execution_upstream_url_with_policy(raw_url, policy)
+}
+
+fn validate_execution_upstream_url_with_policy(
+    raw_url: &str,
+    policy: &aether_http::TrustedUpstreamOrigins,
 ) -> Result<url::Url, ExecutionRuntimeTransportError> {
     let url = url::Url::parse(raw_url).map_err(|_| {
         ExecutionRuntimeTransportError::UpstreamRequest("invalid upstream URL".to_string())
@@ -5238,7 +5268,9 @@ pub(crate) fn validate_execution_upstream_url(
         _ => None,
     };
     if literal_ip.is_some_and(|ip| {
-        is_private_or_reserved_ip(ip) && !(url.scheme() == "http" && ip.is_loopback())
+        is_private_or_reserved_ip(ip)
+            && !(url.scheme() == "http" && ip.is_loopback())
+            && !policy.allows(&url)
     }) {
         return Err(ExecutionRuntimeTransportError::UpstreamRequest(
             "upstream URL must not target a private or reserved address".to_string(),
@@ -5477,6 +5509,71 @@ mod tests {
                 "URL should be rejected: {rejected}"
             );
         }
+    }
+
+    #[test]
+    fn trusted_upstream_policy_is_shared_by_models_and_inference() {
+        let policy = aether_http::TrustedUpstreamOrigins::parse("http://100.64.0.6:65500").unwrap();
+        for path in [
+            "/models",
+            "/v1/models",
+            "/v1/messages",
+            "/v1/chat/completions",
+        ] {
+            let target = format!("http://100.64.0.6:65500{path}");
+            assert!(super::validate_execution_upstream_url_with_policy(&target, &policy).is_ok());
+            assert!(super::validate_execution_upstream_url_with_policy(
+                &target,
+                &aether_http::TrustedUpstreamOrigins::default()
+            )
+            .is_err());
+        }
+        for target in [
+            "http://100.64.0.7:65500/v1/models",
+            "http://100.64.0.6:65501/v1/messages",
+            "https://100.64.0.6:65500/v1/messages",
+            "http://169.254.169.254:65500/latest/meta-data",
+            "http://secret@100.64.0.6:65500/v1/models",
+            "http://100.64.0.6:65500/v1/models#secret",
+        ] {
+            assert!(super::validate_execution_upstream_url_with_policy(target, &policy).is_err());
+        }
+    }
+
+    #[test]
+    fn trusted_upstream_redirects_cannot_change_origin_even_to_another_trusted_target() {
+        let policy = aether_http::TrustedUpstreamOrigins::parse(
+            "http://100.64.0.6:65500,http://100.64.0.7:65500,http://100.64.0.6:65501,https://100.64.0.6:65500"
+        ).unwrap();
+        let initial = reqwest::Url::parse("http://100.64.0.6:65500/models").unwrap();
+        let initial_uri: http::Uri = initial.as_str().parse().unwrap();
+        for target in [
+            "http://100.64.0.6:65500/v1/models",
+            "http://100.64.0.7:65500/v1/models",
+            "http://100.64.0.6:65501/v1/models",
+            "https://100.64.0.6:65500/v1/models",
+            "https://example.com/v1/models",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let next = reqwest::Url::parse(target).unwrap();
+            let same_origin = super::reqwest_urls_have_same_origin(&initial, &next);
+            assert_eq!(
+                same_origin,
+                super::http_uris_have_same_origin(&initial_uri, &target.parse().unwrap())
+            );
+            let follows = safe_redirect_decision(1, same_origin)
+                == super::SafeRedirectDecision::Follow
+                && super::validate_execution_upstream_url_with_policy(target, &policy).is_ok();
+            assert_eq!(follows, target == "http://100.64.0.6:65500/v1/models");
+        }
+        // Literal exceptions must not modify relay DNS or authorize DNS names.
+        assert!(super::validate_resolved_execution_addresses(
+            "100.64.0.6",
+            vec!["100.64.0.6:65500".parse().unwrap()],
+            false
+        )
+        .is_err());
+        assert!(!policy.allows(&reqwest::Url::parse("http://magpie.local:65500/models").unwrap()));
     }
 
     #[test]
