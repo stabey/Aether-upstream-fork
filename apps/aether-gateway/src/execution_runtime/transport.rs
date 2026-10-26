@@ -5222,12 +5222,13 @@ fn execution_log_url_host(url: &str) -> String {
 }
 
 const TRUSTED_UPSTREAM_ORIGINS_ENV: &str = "AETHER_TRUSTED_UPSTREAM_ORIGINS";
-static TRUSTED_UPSTREAM_ORIGINS: LazyLock<Result<aether_http::TrustedUpstreamOrigins, &'static str>> =
-    LazyLock::new(|| match std::env::var(TRUSTED_UPSTREAM_ORIGINS_ENV) {
-        Ok(value) => aether_http::TrustedUpstreamOrigins::parse(&value),
-        Err(std::env::VarError::NotPresent) => Ok(aether_http::TrustedUpstreamOrigins::default()),
-        Err(_) => Err("trusted upstream configuration must be UTF-8"),
-    });
+static TRUSTED_UPSTREAM_ORIGINS: LazyLock<
+    Result<aether_http::TrustedUpstreamOrigins, &'static str>,
+> = LazyLock::new(|| match std::env::var(TRUSTED_UPSTREAM_ORIGINS_ENV) {
+    Ok(value) => aether_http::TrustedUpstreamOrigins::parse(&value),
+    Err(std::env::VarError::NotPresent) => Ok(aether_http::TrustedUpstreamOrigins::default()),
+    Err(_) => Err("trusted upstream configuration must be UTF-8"),
+});
 
 pub(crate) fn validate_execution_upstream_url(
     raw_url: &str,
