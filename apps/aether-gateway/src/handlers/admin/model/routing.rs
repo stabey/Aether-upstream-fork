@@ -7,6 +7,10 @@ use aether_data_contracts::repository::global_models::{
 use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey,
 };
+use aether_data_contracts::repository::routing_profiles::RoutingGroupLookupKey;
+use aether_routing_core::{
+    resolve_routing_policy, RoutingGroupConfig, RoutingPolicyInput, RoutingRulePhase,
+};
 use aether_scheduler_core::{
     is_provider_key_circuit_open_at, matches_model_mapping,
     provider_key_circuit_payload_is_active_open_at, provider_key_health_score,
@@ -67,14 +71,43 @@ pub(crate) async fn build_admin_global_model_routing_payload(
             .push(key);
     }
 
-    // The admin view reports the system-default routing strategy.
+    // Preview the saved system-default group's model policy, including the
+    // priority overlays edited by provider drag-and-drop. Catalog priorities
+    // are only fallbacks. Request rules need a concrete request and are not
+    // simulated by this static catalog view.
+    let routing_group = state
+        .app()
+        .find_routing_group(RoutingGroupLookupKey::SystemDefault)
+        .await
+        .ok()?
+        .filter(|group| group.enabled);
+    let mut routing_config = match routing_group.as_ref() {
+        Some(group) => {
+            serde_json::from_value::<RoutingGroupConfig>(group.config_json.clone()).ok()?
+        }
+        None => RoutingGroupConfig::default(),
+    };
+    routing_config.rules.clear();
+    let routing_policy = resolve_routing_policy(
+        &routing_config,
+        RoutingPolicyInput {
+            group_id: routing_group.as_ref().map(|group| group.id.as_str()),
+            group_version: routing_group.as_ref().map(|group| group.version),
+            selection_source: "system_default",
+            requested_model: &global_model.name,
+            resolved_model: &global_model.name,
+            api_format: "",
+            user_id: None,
+            api_key_id: None,
+            headers: &json!({}),
+            body: &json!({}),
+            phase: RoutingRulePhase::ClientRequest,
+        },
+    )
+    .ok()?;
+    let overlay = &routing_policy.ranking_overlay;
     let ordering_config =
-        match crate::scheduler::config::read_system_default_routing_ordering_config(state.app())
-            .await
-        {
-            Ok(Some(config)) => config,
-            Ok(None) | Err(_) => crate::scheduler::config::SchedulerOrderingConfig::default(),
-        };
+        crate::scheduler::config::SchedulerOrderingConfig::from_routing_policy(&routing_policy);
     let scheduling_mode = ordering_config.scheduling_mode_str().to_string();
     let priority_mode = ordering_config.priority_mode_str().to_string();
     let keep_priority_on_conversion = ordering_config.keep_priority_on_conversion;
@@ -103,6 +136,9 @@ pub(crate) async fn build_admin_global_model_routing_payload(
         let Some(provider) = providers.get(&model.provider_id) else {
             continue;
         };
+        if !overlay.provider_allowed(&provider.id) {
+            continue;
+        }
         let provider_model_mapping_names =
             provider_model_mapping_names_for_routing(model.provider_model_mappings.as_ref());
         let key_match_model_names = key_match_model_names_for_routing(
@@ -125,6 +161,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
+                .filter(|key| overlay.key_allowed(&key.id))
                 .filter(|key| {
                     provider_catalog_key_supports_format(
                         key,
@@ -138,6 +175,14 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                         &key_match_model_names,
                         &global_model_mappings,
                     )
+                })
+                .map(|mut key| {
+                    key.internal_priority = overlay.key_priority_for_format(
+                        &key.id,
+                        &endpoint.api_format,
+                        key.internal_priority,
+                    );
+                    key
                 })
                 .collect::<Vec<_>>();
             endpoint_keys.sort_by(|left, right| {
@@ -180,6 +225,11 @@ pub(crate) async fn build_admin_global_model_routing_payload(
                     let payload = json!({
                         "id": key.id,
                         "name": key.name,
+                        "internal_priority": key.internal_priority,
+                        "global_priority_by_format": key.global_priority_by_format,
+                        "rpm_limit": key.rpm_limit,
+                        "cache_ttl_minutes": key.cache_ttl_minutes,
+                        "api_formats": key.api_formats,
                         "masked_key": state.masked_catalog_api_key_for_provider(
                             key,
                             &provider.provider_type,
@@ -218,7 +268,7 @@ pub(crate) async fn build_admin_global_model_routing_payload(
             "id": &provider.id,
             "name": &provider.name,
             "model_id": &model.id,
-            "provider_priority": provider.provider_priority,
+            "provider_priority": overlay.provider_priority(&provider.id, provider.provider_priority),
             "enable_format_conversion": provider.enable_format_conversion,
             "keep_priority_on_conversion": provider.keep_priority_on_conversion,
             "billing_type": provider.billing_type.clone(),
@@ -312,6 +362,8 @@ pub(crate) async fn build_admin_global_model_routing_payload(
         "providers": providers_payload,
         "total_providers": total_providers,
         "active_providers": active_providers,
+        "routing_group_id": routing_group.as_ref().map(|group| &group.id),
+        "routing_group_name": routing_group.as_ref().map(|group| &group.name),
         "scheduling_mode": scheduling_mode,
         "priority_mode": priority_mode,
         "keep_priority_on_conversion": keep_priority_on_conversion,

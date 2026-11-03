@@ -934,6 +934,153 @@ async fn gateway_handles_admin_global_model_routing_locally_with_trusted_admin_p
 }
 
 #[tokio::test]
+async fn gateway_global_model_routing_uses_saved_group_model_priorities() {
+    use aether_data::repository::routing_profiles::InMemoryRoutingGroupRepository;
+    use aether_data_contracts::repository::routing_profiles::{
+        CreateRoutingGroupRecord, RoutingGroupWriteRepository,
+    };
+    use tower::ServiceExt;
+
+    let model_name = "gemini-4-argon";
+    let provider_catalog = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![
+            sample_provider("anti", "anti", 4),
+            sample_provider("vertex", "vertex", 0),
+            sample_provider("fallback", "fallback", 50),
+            sample_provider("disabled", "disabled", 1),
+        ],
+        vec![sample_endpoint(
+            "anti-endpoint",
+            "anti",
+            "gemini:generate_content",
+            "https://anti.example",
+        )],
+        ["anti-key-a", "anti-key-b", "excluded-key"]
+            .into_iter()
+            .enumerate()
+            .map(|(priority, id)| {
+                let mut key = sample_bound_key(id, "anti", "gemini:generate_content", "test-key");
+                key.internal_priority = priority as i32;
+                key
+            })
+            .collect(),
+    ));
+    let models = Arc::new(
+        InMemoryGlobalModelReadRepository::seed(vec![])
+            .with_admin_global_models(vec![sample_admin_global_model(
+                "argon", model_name, "Argon",
+            )])
+            .with_admin_provider_models(
+                ["anti", "vertex", "fallback", "disabled"]
+                    .into_iter()
+                    .map(|id| sample_admin_provider_model(id, id, "argon", model_name)),
+            ),
+    );
+    // A drag changes the saved group overlay, not the catalog's original P4/P0.
+    // Model-specific priorities must use the same merge order as live routing.
+    for (mut model_policies, expected_order, expected_priorities) in [
+        (
+            json!([{"model": "*", "provider_priority_overrides": {"anti": 0, "vertex": 2}}]),
+            ["anti", "vertex", "fallback"],
+            [0, 2, 50],
+        ),
+        (
+            json!([
+                {"model": "*", "provider_priority_overrides": {"anti": 0, "vertex": 2}},
+                {"model": model_name, "provider_priority_overrides": {"anti": 3}},
+                {"model": "another-model", "provider_priority_overrides": {"fallback": 0}}
+            ]),
+            ["vertex", "anti", "fallback"],
+            [2, 3, 50],
+        ),
+    ] {
+        model_policies[0]["allowed_keys"] = json!(["anti-key-a", "anti-key-b"]);
+        model_policies[0]["key_priority_overrides_by_format"] = json!({
+            "gemini:generate_content": {"anti-key-a": 8, "anti-key-b": 0}
+        });
+        let groups = Arc::new(InMemoryRoutingGroupRepository::default());
+        groups
+            .create_routing_group(CreateRoutingGroupRecord {
+                id: "default-group".to_string(),
+                name: "Saved strategy".to_string(),
+                description: None,
+                enabled: true,
+                is_system_default: true,
+                sort_order: 0,
+                config_json: json!({
+                    "default_policy": {"scheduling_mode": "fixed_order"},
+                    "disabled_providers": ["disabled"],
+                    "model_policies": model_policies,
+                    // This static view must not pretend to simulate request rules.
+                    "rules": [{
+                        "id": "request-rule", "conditions": {},
+                        "actions": [{"type": "restrict_providers", "provider_ids": ["vertex"]}]
+                    }],
+                }),
+                version: 7,
+                created_at: 1,
+                updated_at: 1,
+                published_at: None,
+            })
+            .await
+            .unwrap();
+        let state = AppState::new().unwrap().with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_reader_for_tests(provider_catalog.clone())
+                .with_global_model_repository_for_tests(models.clone())
+                .with_routing_group_repository_for_tests(groups),
+        );
+        let response = build_router_with_state(state)
+            .oneshot(
+                http::Request::builder()
+                    .uri("/api/admin/models/global/argon/routing")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        12345,
+                    ))))
+                    .header(GATEWAY_HEADER, "rust-phase3b")
+                    .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+                    .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+                    .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let providers = payload["providers"].as_array().unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|p| p["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            expected_order
+        );
+        assert_eq!(
+            providers
+                .iter()
+                .map(|p| p["provider_priority"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            expected_priorities
+        );
+        assert_eq!(payload["scheduling_mode"], "fixed_order");
+        assert_eq!(payload["routing_group_id"], "default-group");
+        assert_eq!(payload["routing_group_name"], "Saved strategy");
+        let anti = providers.iter().find(|p| p["id"] == "anti").unwrap();
+        let keys = anti["endpoints"][0]["keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0]["id"], "anti-key-b");
+        assert_eq!(keys[0]["internal_priority"], 0);
+        assert_eq!(keys[1]["id"], "anti-key-a");
+        assert_eq!(keys[1]["internal_priority"], 8);
+    }
+}
+
+#[tokio::test]
 async fn gateway_global_model_routing_counts_image_provider_keys_by_provider_model_name() {
     let upstream_hits = Arc::new(Mutex::new(0usize));
     let upstream_hits_clone = Arc::clone(&upstream_hits);

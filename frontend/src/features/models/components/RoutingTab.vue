@@ -42,6 +42,12 @@
           </Button>
         </div>
       </div>
+      <p
+        v-if="routingData"
+        class="mt-2 text-xs text-muted-foreground"
+      >
+        {{ t('ui.routingPreviewScope', { group: routingData.routing_group_name || t('ui.systemDefault') }) }}
+      </p>
     </div>
 
     <!-- 加载状态 -->

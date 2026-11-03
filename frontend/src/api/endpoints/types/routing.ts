@@ -96,6 +96,8 @@ export interface ModelRoutingPreviewResponse {
   providers: RoutingProviderInfo[]
   total_providers: number
   active_providers: number
+  routing_group_id?: string | null
+  routing_group_name?: string | null
   scheduling_mode: string
   priority_mode: string
   keep_priority_on_conversion?: boolean
