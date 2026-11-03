@@ -1399,6 +1399,43 @@ async fn execute_in_process_stream_with_oauth_retry(
 ) -> Result<DirectUpstreamStreamExecution, InProcessStreamExecutionError> {
     let mut execution = execute_in_process_stream(state, plan, trace_id).await?;
     apply_stream_summary_report_context(&mut execution, report_context);
+    if aether_provider_transport::vertex::is_vertex_request_url(&plan.url) {
+        // This runs before returning the execution to the client-facing stream.
+        // Never replay after the precommit gate has committed or on HTTP 200 SSE.
+        for retry_index in 0..2 {
+            if execution.status_code != 429 || execution.stream_precommit_committed {
+                break;
+            }
+            let body = prefetch_direct_stream_error_body(&mut execution).await;
+            if matches!(
+                crate::orchestration::resolve_local_failover_analysis_for_attempt(
+                    state,
+                    plan,
+                    report_context,
+                    execution.status_code,
+                    body.as_deref(),
+                )
+                .await
+                .decision,
+                LocalFailoverDecision::StopLocalFailover
+            ) {
+                break;
+            }
+            let Some(delay) = aether_provider_transport::vertex::vertex_capacity_retry_delay(
+                execution.status_code,
+                &execution.headers,
+                body.as_deref(),
+                retry_index,
+            ) else {
+                break;
+            };
+            drop(execution);
+            tokio::time::sleep(delay).await;
+            execution = execute_in_process_stream(state, plan, trace_id).await?;
+            apply_stream_summary_report_context(&mut execution, report_context);
+        }
+    }
+
     let uses_oauth_credential = stream_plan_uses_oauth_credential(state, plan).await;
     let embedded_oauth_credential = execution.status_code == 200
         && plan
@@ -1513,6 +1550,7 @@ async fn stream_plan_uses_oauth_credential(state: &AppState, plan: &ExecutionPla
         .is_some_and(|transport| {
             aether_provider_transport::auth::resolve_local_auth_type_for_transport_format(transport)
                 .eq_ignore_ascii_case("oauth")
+                || aether_provider_transport::is_vertex_service_account_transport_context(transport)
         })
 }
 
@@ -6280,8 +6318,8 @@ async fn execute_stream_from_frame_stream_with_retry_scope(
             "gateway resolved execution runtime stream failover decision"
         );
         if matches!(failover_decision, LocalFailoverDecision::RetryNextCandidate) {
-            let failure_disposition = classify_failure_disposition(
-                &plan.provider_api_format,
+            let failure_disposition = crate::orchestration::classify_plan_failure_disposition(
+                &plan,
                 failover_analysis.classification,
                 status_code,
             );

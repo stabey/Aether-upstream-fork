@@ -1654,6 +1654,18 @@ impl AppState {
         Option<provider_transport::CachedOAuthEntry>,
         provider_transport::LocalOAuthRefreshError,
     > {
+        self.force_local_oauth_refresh_entry_for_rejected(transport, None)
+            .await
+    }
+
+    pub(crate) async fn force_local_oauth_refresh_entry_for_rejected(
+        &self,
+        transport: &provider_transport::GatewayProviderTransportSnapshot,
+        rejected_authorization: Option<&str>,
+    ) -> Result<
+        Option<provider_transport::CachedOAuthEntry>,
+        provider_transport::LocalOAuthRefreshError,
+    > {
         let distributed_lock = self.runtime_state.as_ref();
         let lock_owner = format!("aether-gateway-admin-{}", std::process::id());
         let initial_transport = transport.clone();
@@ -1717,16 +1729,25 @@ impl AppState {
                 }
                 None => None,
             };
-            let mut resolution = self
-                .oauth_refresh
-                .force_refresh_with_result_fenced(
-                    &executor,
-                    &current_transport,
-                    Some(distributed_lock),
-                    Some(lock_owner.as_str()),
-                    expected_refresh_fingerprint.as_deref(),
-                )
-                .await?;
+            let mut resolution = if let Some(rejected) = rejected_authorization {
+                self.oauth_refresh
+                    .refresh_rejected_authorization_with_result(
+                        &executor,
+                        &current_transport,
+                        rejected,
+                    )
+                    .await
+            } else {
+                self.oauth_refresh
+                    .force_refresh_with_result_fenced(
+                        &executor,
+                        &current_transport,
+                        Some(distributed_lock),
+                        Some(lock_owner.as_str()),
+                        expected_refresh_fingerprint.as_deref(),
+                    )
+                    .await
+            }?;
 
             if resolution
                 .as_ref()
@@ -2972,6 +2993,17 @@ impl AppState {
             return Ok(false);
         }
 
+        let vertex_service_account =
+            provider_transport::is_vertex_service_account_transport_context(transport);
+        if vertex_service_account
+            && !provider_transport::vertex::vertex_service_account_credentials_invalid(
+                status_code,
+                body_excerpt,
+            )
+        {
+            return Ok(false);
+        }
+
         let transport_has_auth_config = transport
             .key
             .decrypted_auth_config
@@ -2999,7 +3031,10 @@ impl AppState {
             return Ok(false);
         };
 
-        if !provider_key_is_oauth_managed(&latest_key, transport.provider.provider_type.as_str()) {
+        if !provider_key_is_oauth_managed(&latest_key, transport.provider.provider_type.as_str())
+            && !(vertex_service_account
+                && matches!(latest_key.auth_type.trim(), "service_account" | "vertex_ai"))
+        {
             return Ok(false);
         }
 
@@ -3013,10 +3048,14 @@ impl AppState {
             return Ok(false);
         }
 
-        let refresh_reason = format!(
-            "{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败 ({status_code}): {}",
-            normalize_local_oauth_refresh_error_message(Some(status_code), Some(body_excerpt))
-        );
+        let refresh_reason = if vertex_service_account {
+            "[ACCOUNT_BLOCK] account_disabled: Service account no longer exists or is disabled; replace the service-account credentials".to_string()
+        } else {
+            format!(
+                "{OAUTH_REFRESH_FAILED_PREFIX}Token 续期失败 ({status_code}): {}",
+                normalize_local_oauth_refresh_error_message(Some(status_code), Some(body_excerpt))
+            )
+        };
         let Some(merged_reason) = merge_local_oauth_refresh_failure_reason(
             latest_key.oauth_invalid_reason.as_deref(),
             &refresh_reason,
@@ -3096,9 +3135,10 @@ impl AppState {
             }
         }
 
-        let should_auto_remove = admin_provider_quota_pure::provider_auto_remove_banned_keys(
-            transport.provider.config.as_ref(),
-        )
+        let should_auto_remove = !vertex_service_account
+            && admin_provider_quota_pure::provider_auto_remove_banned_keys(
+                transport.provider.config.as_ref(),
+            )
             && admin_provider_quota_pure::should_auto_remove_oauth_invalid_key(
                 &latest_key,
                 None,
@@ -4614,6 +4654,89 @@ mod tests {
                     .to_string()
             ),
         );
+    }
+
+    #[tokio::test]
+    async fn vertex_service_account_failure_state_is_precise_fenced_and_recoverable() {
+        let (state, repository, _) = vertex_service_account_state();
+        let transport = state
+            .read_provider_transport_snapshot("provider-1", "endpoint-1", "key-1")
+            .await
+            .unwrap()
+            .unwrap();
+        for (status, body) in [
+            (
+                400,
+                r#"{"error":"invalid_grant","error_description":"Invalid JWT Signature."}"#,
+            ),
+            (403, r#"{"error":"permission_denied"}"#),
+            (503, r#"{"error":"temporarily_unavailable"}"#),
+        ] {
+            assert!(!state
+                .persist_local_oauth_refresh_failure_state(&transport, status, body, false)
+                .await
+                .unwrap());
+        }
+        let deleted = r#"{"error":"invalid_grant","error_description":"Account not found"}"#;
+        assert!(!state
+            .persist_local_oauth_refresh_failure_state(&transport, 400, deleted, false)
+            .await
+            .unwrap());
+        let blocked = repository
+            .list_keys_by_ids(&["key-1".into()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(blocked
+            .oauth_invalid_reason
+            .as_deref()
+            .unwrap()
+            .starts_with("[ACCOUNT_BLOCK]"));
+        assert!(
+            blocked.is_active,
+            "invalid credentials are quarantined, not deleted or disabled by the admin flag"
+        );
+        assert!(state
+            .clear_provider_catalog_key_oauth_invalid_marker("key-1")
+            .await
+            .unwrap());
+        assert!(repository
+            .list_keys_by_ids(&["key-1".into()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .oauth_invalid_reason
+            .is_none());
+        // A late failure for the old key cannot poison a replacement installed
+        // by the existing credential CAS, which also resets runtime markers.
+        assert!(!state
+            .persist_local_oauth_refresh_failure_state(&transport, 400, deleted, false)
+            .await
+            .unwrap());
+        let mut replacement = repository
+            .list_keys_by_ids(&["key-1".into()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        replacement.encrypted_auth_config = Some(state.seal_provider_catalog_key_auth_config(
+            "provider-1", "key-1", &json!({"client_email":"new@example.iam.gserviceaccount.com", "private_key":"NEW-KEY", "project_id":"demo-project"}).to_string()
+        ).unwrap());
+        replace_key_credential_for_test(repository.as_ref(), replacement, "vertex_ai").await;
+        assert!(!state
+            .persist_local_oauth_refresh_failure_state(&transport, 400, deleted, false)
+            .await
+            .unwrap());
+        let latest = repository
+            .list_keys_by_ids(&["key-1".into()])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert!(latest.oauth_invalid_reason.is_none());
+        assert!(latest.oauth_invalid_at_unix_secs.is_none());
     }
 
     #[test]

@@ -107,10 +107,10 @@ fn build_vertex_service_account_google_model_url(
     }
 
     let region = resolve_vertex_service_account_region(trimmed_model, auth_config);
-    let base_url = if region == "global" {
-        VERTEX_API_KEY_BASE_URL.to_string()
-    } else {
-        format!("https://{region}-aiplatform.googleapis.com")
+    let base_url = match region.as_str() {
+        "global" => VERTEX_API_KEY_BASE_URL.to_string(),
+        "us" | "eu" => format!("https://aiplatform.{region}.rep.googleapis.com"),
+        _ => format!("https://{region}-aiplatform.googleapis.com"),
     };
     // URL parsers normalize dot-only segments even when the dots are percent-encoded.
     if matches!(project_id, "." | "..") {
@@ -139,9 +139,6 @@ pub fn resolve_vertex_service_account_region(
     {
         return region.to_string();
     }
-    if let Some(region) = default_vertex_model_region(trimmed_model) {
-        return region.to_string();
-    }
     if let Some(region) = auth_config
         .region
         .as_deref()
@@ -150,7 +147,9 @@ pub fn resolve_vertex_service_account_region(
     {
         return region.to_string();
     }
-    "global".to_string()
+    default_vertex_model_region(trimmed_model)
+        .unwrap_or("global")
+        .to_string()
 }
 
 fn default_vertex_model_region(model: &str) -> Option<&'static str> {
@@ -247,6 +246,56 @@ mod tests {
         build_vertex_service_account_gemini_content_url, resolve_vertex_service_account_region,
     };
     use crate::vertex::VertexServiceAccountAuthConfig;
+
+    #[test]
+    fn multi_region_hosts_and_explicit_region_precede_builtin_defaults() {
+        let mut config = VertexServiceAccountAuthConfig {
+            client_email: "unused".into(),
+            private_key: "unused".into(),
+            project_id: "project".into(),
+            token_uri: "https://oauth2.googleapis.com/token".into(),
+            region: Some("us".into()),
+            model_regions: BTreeMap::new(),
+        };
+        for region in ["us", "eu"] {
+            config.region = Some(region.into());
+            let url = build_vertex_service_account_gemini_content_url(
+                "gemini-3.1-pro-preview",
+                false,
+                &config,
+                None,
+            )
+            .unwrap();
+            assert!(url.starts_with(&format!("https://aiplatform.{region}.rep.googleapis.com/")));
+            assert!(url.contains(&format!("/locations/{region}/")));
+            let embedding = super::build_vertex_service_account_gemini_embedding_url(
+                "text-embedding-005",
+                &config,
+                None,
+            )
+            .unwrap();
+            assert!(
+                embedding.starts_with(&format!("https://aiplatform.{region}.rep.googleapis.com/"))
+            );
+            assert!(embedding.ends_with(":predict"));
+        }
+        config
+            .model_regions
+            .insert("gemini-3.1-pro-preview".into(), "us-central1".into());
+        assert_eq!(
+            resolve_vertex_service_account_region("gemini-3.1-pro-preview", &config),
+            "us-central1"
+        );
+        config.region = None;
+        assert_eq!(
+            resolve_vertex_service_account_region("gemini-2.0-flash", &config),
+            "us-central1"
+        );
+        assert_eq!(
+            resolve_vertex_service_account_region("unknown", &config),
+            "global"
+        );
+    }
 
     #[test]
     fn builds_vertex_gemini_api_key_stream_url() {

@@ -48,6 +48,14 @@ pub(crate) async fn refresh_oauth_plan_auth_for_retry(
         }
     };
 
+    if aether_provider_transport::is_vertex_service_account_transport_context(&transport)
+        && status_code != 401
+    {
+        // IAM and model-access 403 responses cannot be repaired by minting the
+        // same SA's access token again.
+        return false;
+    }
+
     let current_uses_agent_identity =
         aether_provider_transport::is_codex_agent_identity_transport(&transport);
     if request_uses_agent_identity {
@@ -96,7 +104,15 @@ pub(crate) async fn refresh_oauth_plan_auth_for_retry(
         return false;
     }
 
-    match state.force_local_oauth_refresh_entry(&transport).await {
+    let refresh_result =
+        if aether_provider_transport::is_vertex_service_account_transport_context(&transport) {
+            state
+                .force_local_oauth_refresh_entry_for_rejected(&transport, request_authorization)
+                .await
+        } else {
+            state.force_local_oauth_refresh_entry(&transport).await
+        };
+    match refresh_result {
         Ok(Some(entry)) => {
             let header_name = entry.auth_header_name.trim().to_ascii_lowercase();
             let header_value = entry.auth_header_value.trim();

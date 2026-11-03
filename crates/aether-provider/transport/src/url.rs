@@ -451,7 +451,10 @@ fn bigmodel_coding_models_base_is_supported(base_url: &str) -> bool {
 fn looks_like_vertex_ai_host(host: &str) -> bool {
     const VERTEX_AI_HOST: &str = "aiplatform.googleapis.com";
     let host = host.trim().to_ascii_lowercase();
-    host == VERTEX_AI_HOST
+    matches!(
+        host.as_str(),
+        "aiplatform.us.rep.googleapis.com" | "aiplatform.eu.rep.googleapis.com"
+    ) || host == VERTEX_AI_HOST
         || host
             .strip_suffix(&format!("-{VERTEX_AI_HOST}"))
             .is_some_and(is_vertex_region_label)

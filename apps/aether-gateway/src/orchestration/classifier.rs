@@ -296,6 +296,45 @@ pub(crate) fn classify_failure_disposition(
     }
 }
 
+/// Execution plans retain the actual upstream URL, including remote-runtime
+/// plans. Keep the Vertex policy separate from other Gemini-compatible APIs.
+pub(crate) fn classify_plan_failure_disposition(
+    plan: &aether_contracts::ExecutionPlan,
+    classification: LocalFailoverClassification,
+    status_code: u16,
+) -> FailureDisposition {
+    if aether_provider_transport::vertex::is_vertex_request_url(&plan.url)
+        && matches!(status_code, 401 | 403 | 429)
+    {
+        let retry_action = if matches!(
+            classification,
+            LocalFailoverClassification::StopStatusCode
+                | LocalFailoverClassification::StopErrorPattern
+                | LocalFailoverClassification::StopExecutionError
+                | LocalFailoverClassification::StopCyberPolicy
+        ) {
+            FailureRetryAction::Stop
+        } else {
+            FailureRetryAction::NextCredential
+        };
+        return FailureDisposition::new(
+            retry_action,
+            if status_code == 401 {
+                FailureScope::Credential
+            } else {
+                FailureScope::CredentialModel
+            },
+            if status_code == 401 {
+                FailureTokenAction::ForceRefresh
+            } else {
+                FailureTokenAction::None
+            },
+            true,
+        );
+    }
+    classify_failure_disposition(&plan.provider_api_format, classification, status_code)
+}
+
 pub(crate) fn classify_local_failover(
     policy: &LocalFailoverPolicy,
     input: LocalFailoverInput<'_>,

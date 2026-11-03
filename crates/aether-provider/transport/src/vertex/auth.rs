@@ -266,6 +266,12 @@ impl LocalOAuthRefreshAdapter for VertexServiceAccountRefreshAdapter {
         )
     }
 
+    fn should_backoff_after_error(&self, _error: &LocalOAuthRefreshError) -> bool {
+        // The coordinator applies per-credential, bounded exponential backoff.
+        // Even rejected JWTs must not cause an unbounded token endpoint storm.
+        true
+    }
+
     fn shares_refresh_through_transport_persistence(&self) -> bool {
         false
     }
@@ -338,6 +344,28 @@ impl LocalOAuthRefreshAdapter for VertexServiceAccountRefreshAdapter {
             source_fingerprint: vertex_service_account_credential_fingerprint(transport),
         }))
     }
+}
+
+/// Only Google's explicit account-not-found response proves that the source
+/// service account is gone. Other invalid_grant responses include clock skew,
+/// expired assertions and signature/configuration errors; 403 is usually IAM.
+pub fn vertex_service_account_credentials_invalid(status_code: u16, body: &str) -> bool {
+    if status_code != 400 {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value.get("error").and_then(Value::as_str) == Some("invalid_grant")
+        && value
+            .get("error_description")
+            .and_then(Value::as_str)
+            .is_some_and(|description| {
+                let description = description.to_ascii_lowercase();
+                description.contains("account not found")
+                    || description.contains("service account has been deleted")
+                    || description.contains("service account is disabled")
+            })
 }
 
 fn vertex_service_account_credential_fingerprint(
@@ -448,6 +476,43 @@ mod tests {
         VERTEX_API_KEY_QUERY_PARAM, VERTEX_SERVICE_ACCOUNT_AUTH_HEADER,
         VERTEX_SERVICE_ACCOUNT_PROVIDER_TYPE,
     };
+
+    #[test]
+    fn service_account_only_explicit_missing_identity_is_permanent() {
+        for description in [
+            "Account not found",
+            "Service account has been deleted",
+            "Service account is disabled",
+        ] {
+            let body =
+                json!({"error":"invalid_grant", "error_description":description}).to_string();
+            assert!(super::vertex_service_account_credentials_invalid(
+                400, &body
+            ));
+            assert!(!super::vertex_service_account_credentials_invalid(
+                403, &body
+            ));
+        }
+        for body in [
+            r#"{"error":"invalid_grant","error_description":"Invalid JWT: Token must be a short-lived token and in a reasonable timeframe"}"#,
+            r#"{"error":"invalid_grant","error_description":"Invalid JWT Signature."}"#,
+            r#"{"error":"invalid_grant"}"#,
+            r#"{"error":"temporarily_unavailable","error_description":"Account not found"}"#,
+            "Account not found",
+        ] {
+            assert!(!super::vertex_service_account_credentials_invalid(
+                400, body
+            ));
+        }
+        assert!(
+            VertexServiceAccountRefreshAdapter.should_backoff_after_error(
+                &super::LocalOAuthRefreshError::TransportMessage {
+                    provider_type: VERTEX_SERVICE_ACCOUNT_PROVIDER_TYPE,
+                    message: "timeout".into()
+                }
+            )
+        );
+    }
 
     #[test]
     fn vertex_auth_debug_output_redacts_api_keys_and_private_keys() {

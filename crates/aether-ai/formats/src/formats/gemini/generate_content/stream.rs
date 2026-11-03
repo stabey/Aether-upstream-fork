@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
@@ -17,6 +17,10 @@ struct GeminiProviderToolState {
     arguments: String,
     thought_signature: String,
     started_emitted: bool,
+    partial_arguments: Option<Value>,
+    continuing: bool,
+    partial_position: usize,
+    partial_open_paths: BTreeSet<Vec<ArgumentPathSegment>>,
 }
 
 #[derive(Default)]
@@ -39,6 +43,7 @@ pub struct GeminiProviderState {
     content_parts: BTreeMap<usize, CanonicalContentPart>,
     tool_calls: BTreeMap<usize, GeminiProviderToolState>,
     tool_results: BTreeMap<usize, GeminiProviderToolResultState>,
+    partial_argument_budget: usize,
     /// Last `groundingMetadata` seen. Gemini resends it cumulatively, so the
     /// newest copy is the complete one; citations are emitted once at finish,
     /// when the answer text they index into is whole.
@@ -73,6 +78,19 @@ impl GeminiProviderState {
             event: CanonicalStreamEvent::Start,
         });
         self.started = true;
+    }
+
+    fn ensure_partial_calls_complete(&self) -> Result<(), AiSurfaceFinalizeError> {
+        if self
+            .tool_calls
+            .values()
+            .any(|state| state.continuing || !state.partial_open_paths.is_empty())
+        {
+            return Err(AiSurfaceFinalizeError::new(
+                "Gemini stream ended during a partial function call",
+            ));
+        }
+        Ok(())
     }
 
     /// Turn the grounding metadata collected over the stream into citations.
@@ -175,6 +193,7 @@ impl GeminiProviderState {
                 self.ensure_started(report_context, &mut out);
             }
             let (id, model) = self.identity(report_context);
+            let mut chunk_tool_calls = BTreeSet::new();
             for (index, part) in parts.iter().enumerate() {
                 let Some(part_object) = part.as_object() else {
                     continue;
@@ -323,12 +342,62 @@ impl GeminiProviderState {
                     self.observed_tool_calls = true;
                     continue;
                 }
-                // Gemini streams are incremental and every functionCall part is a
-                // complete call, so parallel calls arriving in separate chunks all
-                // sit at parts[0]. Key calls by arrival order, not part position.
-                // Ids cannot disambiguate: they are optional, and the Antigravity
-                // envelope synthesizes per-chunk ids that repeat across chunks.
-                let index = self.tool_calls.len();
+                // Complete calls retain arrival-order identity (some adapters repeat
+                // synthetic ids). Partial calls instead reuse their open call, keyed
+                // by the provider id when available, then unambiguous open
+                // name/position matches. Text parts may disappear between chunks.
+                let provider_id = function_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
+                let call_name = function_call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|name| !name.is_empty());
+                let by_id = provider_id.and_then(|call_id| {
+                    self.tool_calls
+                        .iter()
+                        .find(|(_, state)| {
+                            state.call_id == call_id && state.partial_arguments.is_some()
+                        })
+                        .map(|(index, _)| *index)
+                });
+                let open = self
+                    .tool_calls
+                    .iter()
+                    .filter(|(index, state)| {
+                        !chunk_tool_calls.contains(*index)
+                            && state.continuing
+                            && provider_id
+                                .is_none_or(|id| state.call_id.is_empty() || state.call_id == id)
+                            && call_name
+                                .is_none_or(|name| state.name.is_empty() || state.name == name)
+                    })
+                    .map(|(index, _)| *index)
+                    .collect::<Vec<_>>();
+                let existing = by_id.or_else(|| match open.as_slice() {
+                    [only] => Some(*only),
+                    _ => open
+                        .iter()
+                        .copied()
+                        .find(|key| self.tool_calls[key].partial_position == index),
+                });
+                let partial = function_call.contains_key("partialArgs")
+                    || function_call.contains_key("willContinue")
+                    || existing.is_some();
+                if partial && existing.is_none() && open.len() > 1 {
+                    return Err(AiSurfaceFinalizeError::new(
+                        "Ambiguous Gemini partial function call identity",
+                    ));
+                }
+                let position = index;
+                let index = existing.unwrap_or(self.tool_calls.len());
+                if index >= 1024 {
+                    return Err(AiSurfaceFinalizeError::new(
+                        "Gemini tool call count exceeds limit",
+                    ));
+                }
+                chunk_tool_calls.insert(index);
                 let tool_state = self.tool_calls.entry(index).or_default();
                 tool_state.call_id = function_call
                     .get("id")
@@ -341,14 +410,78 @@ impl GeminiProviderState {
                     .unwrap_or(tool_state.name.as_str())
                     .to_string();
                 if let Some(signature) = reasoning_signature {
-                    if tool_state.thought_signature != signature {
-                        tool_state.thought_signature = signature.clone();
-                        out.push(CanonicalStreamFrame {
-                            id: id.clone(),
-                            model: model.clone(),
-                            event: CanonicalStreamEvent::ToolCallSignature { index, signature },
-                        });
+                    tool_state.thought_signature = signature;
+                }
+                // Canonical argument deltas are append-only JSON text. Buffer
+                // JSONPath updates until the call closes so later fields and
+                // string fragments cannot invalidate already emitted JSON.
+                if partial && !tool_state.arguments.is_empty() {
+                    continue;
+                }
+                if partial {
+                    tool_state.partial_position = position;
+                    tool_state.continuing = function_call
+                        .get("willContinue")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let arguments = tool_state
+                        .partial_arguments
+                        .get_or_insert_with(|| json!({}));
+                    if let Some(args) = function_call.get("args") {
+                        charge_partial_argument_budget(
+                            &mut self.partial_argument_budget,
+                            serde_json::to_vec(args)
+                                .map(|bytes| bytes.len())
+                                .unwrap_or(usize::MAX),
+                        )?;
+                        *arguments = args.clone();
+                        tool_state.partial_open_paths.clear();
                     }
+                    if let Some(parts) = function_call.get("partialArgs").and_then(Value::as_array)
+                    {
+                        for part in parts {
+                            let path = apply_partial_argument(
+                                arguments,
+                                part,
+                                &mut self.partial_argument_budget,
+                            )?;
+                            if part
+                                .get("willContinue")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                            {
+                                tool_state.partial_open_paths.insert(path);
+                            } else {
+                                tool_state.partial_open_paths.remove(&path);
+                            }
+                        }
+                    }
+                    if !tool_state.continuing && !tool_state.partial_open_paths.is_empty() {
+                        return Err(AiSurfaceFinalizeError::new(
+                            "Gemini function call closed before its argument",
+                        ));
+                    }
+                    if tool_state.continuing {
+                        continue;
+                    }
+                }
+                // Partial calls can announce their name or id in a later chunk.
+                // Emit identity only when the call closes, alongside its buffered
+                // arguments, so every downstream format receives the final identity.
+                if partial && tool_state.name.is_empty() {
+                    return Err(AiSurfaceFinalizeError::new(
+                        "Gemini partial function call completed without a name",
+                    ));
+                }
+                if !tool_state.thought_signature.is_empty() {
+                    out.push(CanonicalStreamFrame {
+                        id: id.clone(),
+                        model: model.clone(),
+                        event: CanonicalStreamEvent::ToolCallSignature {
+                            index,
+                            signature: tool_state.thought_signature.clone(),
+                        },
+                    });
                 }
                 if !tool_state.started_emitted {
                     out.push(CanonicalStreamFrame {
@@ -370,7 +503,12 @@ impl GeminiProviderState {
                     });
                     tool_state.started_emitted = true;
                 }
-                let arguments = canonicalize_tool_arguments(function_call.get("args").cloned());
+                let arguments = canonicalize_tool_arguments(
+                    tool_state
+                        .partial_arguments
+                        .clone()
+                        .or_else(|| function_call.get("args").cloned()),
+                );
                 let delta = if arguments.starts_with(&tool_state.arguments) {
                     arguments[tool_state.arguments.len()..].to_string()
                 } else if tool_state.arguments == arguments {
@@ -404,6 +542,7 @@ impl GeminiProviderState {
                 if has_tool_calls && finish_reason.as_deref().is_none_or(|value| value == "stop") {
                     finish_reason = Some("tool_calls".to_string());
                 }
+                self.ensure_partial_calls_complete()?;
                 self.push_citations_frame(&id, &model, &mut out);
                 out.push(CanonicalStreamFrame {
                     id,
@@ -430,6 +569,7 @@ impl GeminiProviderState {
         self.finished = true;
         let (id, model) = self.identity(report_context);
         let mut out = Vec::new();
+        self.ensure_partial_calls_complete()?;
         self.push_citations_frame(&id, &model, &mut out);
         out.push(CanonicalStreamFrame {
             id,
@@ -441,6 +581,192 @@ impl GeminiProviderState {
         });
         Ok(out)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ArgumentPathSegment {
+    Key(String),
+    Index(usize),
+}
+
+/// Function arguments identify a single value, not a JSONPath query. Accept
+/// member and array selectors, including quoted member names; reject wildcards,
+/// slices and recursive selectors rather than guessing their meaning.
+fn partial_argument_path(path: &str) -> Option<Vec<ArgumentPathSegment>> {
+    let mut remaining = path.strip_prefix('$')?;
+    let mut segments = Vec::new();
+    while !remaining.is_empty() {
+        if segments.len() >= 128 {
+            return None;
+        }
+        if let Some(rest) = remaining.strip_prefix('.') {
+            let end = rest.find(['.', '[']).unwrap_or(rest.len());
+            let key = &rest[..end];
+            if key.is_empty() || !key.chars().all(|c| c == '_' || c.is_alphanumeric()) {
+                return None;
+            }
+            segments.push(ArgumentPathSegment::Key(key.to_string()));
+            remaining = &rest[end..];
+        } else if let Some(rest) = remaining.strip_prefix('[') {
+            if rest.starts_with(['\"', '\'']) {
+                let quote = rest.chars().next()?;
+                let mut escaped = false;
+                let mut end = None;
+                for (offset, c) in rest.char_indices().skip(1) {
+                    if escaped {
+                        escaped = false;
+                        continue;
+                    }
+                    if c == '\\' {
+                        escaped = true;
+                        continue;
+                    }
+                    if c == quote {
+                        end = Some(offset);
+                        break;
+                    }
+                }
+                let end = end?;
+                let raw = &rest[1..end];
+                // JSONPath single quoted names use the same escapes, with
+                // \' instead of \". Convert only those quoting differences.
+                let key: String = if quote == '\"' {
+                    serde_json::from_str(&rest[..=end]).ok()?
+                } else {
+                    let mut json = String::from("\"");
+                    let mut chars = raw.chars();
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '\\' => match chars.next()? {
+                                '\'' => json.push('\''),
+                                other => {
+                                    json.push('\\');
+                                    json.push(other);
+                                }
+                            },
+                            '\"' => json.push_str("\\\""),
+                            other => json.push(other),
+                        }
+                    }
+                    json.push('\"');
+                    serde_json::from_str(&json).ok()?
+                };
+                remaining = rest[end + 1..].strip_prefix(']')?;
+                segments.push(ArgumentPathSegment::Key(key));
+            } else {
+                let end = rest.find(']')?;
+                let raw = &rest[..end];
+                if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                let index: usize = raw.parse().ok()?;
+                // Avoid unbounded allocation on malformed upstream paths.
+                if index > 65535 {
+                    return None;
+                }
+                segments.push(ArgumentPathSegment::Index(index));
+                remaining = &rest[end + 1..];
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(segments)
+}
+
+fn charge_partial_argument_budget(
+    budget: &mut usize,
+    amount: usize,
+) -> Result<(), AiSurfaceFinalizeError> {
+    *budget = budget.saturating_add(amount);
+    if *budget > 8 * 1024 * 1024 {
+        return Err(AiSurfaceFinalizeError::new(
+            "Gemini partial arguments exceed buffer limit",
+        ));
+    }
+    Ok(())
+}
+
+fn apply_partial_argument(
+    arguments: &mut Value,
+    part: &Value,
+    budget: &mut usize,
+) -> Result<Vec<ArgumentPathSegment>, AiSurfaceFinalizeError> {
+    let Some(path) = part
+        .get("jsonPath")
+        .and_then(Value::as_str)
+        .and_then(partial_argument_path)
+    else {
+        return Err(AiSurfaceFinalizeError::new(
+            "Invalid Gemini partial argument path or value",
+        ));
+    };
+    let mut deltas = ["stringValue", "numberValue", "boolValue", "nullValue"]
+        .iter()
+        .filter_map(|key| part.get(*key).map(|value| (*key, value)));
+    let Some((kind, delta)) = deltas.next() else {
+        return Err(AiSurfaceFinalizeError::new(
+            "Missing Gemini partial argument scalar",
+        ));
+    };
+    if deltas.next().is_some()
+        || !match kind {
+            "stringValue" => delta.is_string(),
+            "numberValue" => delta.is_number(),
+            "boolValue" => delta.is_boolean(),
+            "nullValue" => delta.is_null(),
+            _ => false,
+        }
+    {
+        return Err(AiSurfaceFinalizeError::new(
+            "Invalid Gemini partial argument scalar union",
+        ));
+    }
+    charge_partial_argument_budget(
+        budget,
+        serde_json::to_vec(part)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX),
+    )?;
+    let mut target = arguments;
+    for segment in path.clone() {
+        match segment {
+            ArgumentPathSegment::Key(key) => {
+                if target.is_null() {
+                    *target = json!({});
+                }
+                let Some(object) = target.as_object_mut() else {
+                    return Err(AiSurfaceFinalizeError::new(
+                        "Invalid Gemini partial argument path or value",
+                    ));
+                };
+                target = object.entry(key).or_insert(Value::Null);
+            }
+            ArgumentPathSegment::Index(index) => {
+                if target.is_null() {
+                    *target = json!([]);
+                }
+                let Some(array) = target.as_array_mut() else {
+                    return Err(AiSurfaceFinalizeError::new(
+                        "Invalid Gemini partial argument path or value",
+                    ));
+                };
+                if array.len() <= index {
+                    charge_partial_argument_budget(
+                        budget,
+                        (index + 1 - array.len()) * std::mem::size_of::<Value>(),
+                    )?;
+                    array.resize(index + 1, Value::Null);
+                }
+                target = &mut array[index];
+            }
+        }
+    }
+    match (target, delta) {
+        (Value::String(existing), Value::String(delta)) => existing.push_str(delta),
+        (target, delta) => *target = delta.clone(),
+    }
+    Ok(path)
 }
 
 fn gemini_stream_terminal_error_payload(
@@ -1010,6 +1336,353 @@ mod tests {
 
     fn data_line(value: Value) -> Vec<u8> {
         format!("data: {}\n", value).into_bytes()
+    }
+
+    fn partial_chunk(parts: Vec<Value>) -> Vec<u8> {
+        data_line(json!({"candidates": [{"content": {"parts": parts}}]}))
+    }
+
+    fn argument_deltas(frames: &[CanonicalStreamFrame]) -> Vec<(usize, Value)> {
+        frames
+            .iter()
+            .filter_map(|frame| match &frame.event {
+                CanonicalStreamEvent::ToolCallArgumentsDelta { index, arguments } => {
+                    Some((*index, serde_json::from_str(arguments).unwrap()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn vertex_partial_args_parallel_calls_keep_ids_signatures_and_nested_values() {
+        let mut state = GeminiProviderState::default();
+        let first = state.push_line(&json!({}), partial_chunk(vec![
+            json!({"thoughtSignature":"sig-a", "functionCall": {"id":"a", "name":"search", "willContinue":true,
+                "partialArgs":[{"jsonPath":"$.items[0]['text.value']", "stringValue":"hel", "willContinue":true}]}}),
+            json!({"functionCall": {"id":"b", "name":"search", "willContinue":true,
+                "partialArgs":[{"jsonPath":"$.ok", "boolValue":true}]}}),
+        ])).unwrap();
+        assert!(argument_deltas(&first).is_empty());
+        assert_eq!(
+            first
+                .iter()
+                .filter(|f| matches!(f.event, CanonicalStreamEvent::ToolCallStart { .. }))
+                .count(),
+            0
+        );
+        assert!(!first
+            .iter()
+            .any(|f| matches!(&f.event, CanonicalStreamEvent::ToolCallSignature { .. })));
+        // Reordered parts are associated by id, even when both tools have the same name.
+        let last = state.push_line(&json!({}), partial_chunk(vec![
+            json!({"functionCall":{"id":"b", "willContinue":false, "partialArgs":[{"jsonPath":"$.count", "numberValue":2}]}}),
+            json!({"functionCall":{"id":"a", "willContinue":false, "partialArgs":[
+                {"jsonPath":"$['items'][0]['text.value']", "stringValue":"lo"},
+                {"jsonPath":"$.items[1]", "nullValue":null}]}}),
+        ])).unwrap();
+        assert_eq!(
+            argument_deltas(&last),
+            vec![
+                (1, json!({"ok":true,"count":2})),
+                (0, json!({"items":[{"text.value":"hello"},null]}))
+            ]
+        );
+        assert_eq!(
+            last.iter()
+                .filter(|f| matches!(f.event, CanonicalStreamEvent::ToolCallStart { .. }))
+                .count(),
+            2
+        );
+        assert!(last.iter().any(|f| matches!(&f.event, CanonicalStreamEvent::ToolCallSignature {index:0, signature} if signature == "sig-a")));
+        assert!(state.finish(&json!({})).is_ok());
+    }
+
+    #[test]
+    fn vertex_partial_args_idless_parallel_calls_and_full_args_completion() {
+        let mut state = GeminiProviderState::default();
+        state.push_line(&json!({}), partial_chunk(vec![
+            json!({"functionCall":{"name":"f", "willContinue":true, "partialArgs":[{"jsonPath":"$.x", "stringValue":"a", "willContinue":true}]}}),
+            json!({"functionCall":{"name":"f", "willContinue":true, "partialArgs":[{"jsonPath":"$.y", "numberValue":1}]}}),
+        ])).unwrap();
+        let frames = state
+            .push_line(
+                &json!({}),
+                partial_chunk(vec![
+                    json!({"functionCall":{"args":{"x":"authoritative"}}}),
+                    json!({"functionCall":{"partialArgs":[{"jsonPath":"$.y", "numberValue":2}]}}),
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            argument_deltas(&frames),
+            vec![(0, json!({"x":"authoritative"})), (1, json!({"y":2}))]
+        );
+        assert_eq!(state.tool_calls.len(), 2);
+        assert_eq!(state.tool_calls[&0].call_id, "");
+        assert!(state.finish(&json!({})).is_ok());
+    }
+
+    #[test]
+    fn vertex_partial_args_incomplete_stream_is_error_and_never_emits_arguments() {
+        let mut state = GeminiProviderState::default();
+        let frames = state.push_line(&json!({}), partial_chunk(vec![json!({"functionCall":{
+            "name":"f", "willContinue":true, "partialArgs":[{"jsonPath":"$.x", "stringValue":"unfinished", "willContinue":true}]
+        }})])).unwrap();
+        assert!(argument_deltas(&frames).is_empty());
+        assert!(state.finish(&json!({})).is_err());
+        assert!(state.tool_calls[&0].arguments.is_empty());
+    }
+
+    #[test]
+    fn vertex_partial_args_extends_initial_args_and_deduplicates_completed_id() {
+        let mut state = GeminiProviderState::default();
+        state
+            .push_line(
+                &json!({}),
+                partial_chunk(vec![json!({"functionCall":{
+                    "id":"a", "name":"f", "args":{"x":"a"}, "willContinue":true
+                }})]),
+            )
+            .unwrap();
+        let final_chunk = partial_chunk(vec![json!({"functionCall":{
+            "id":"a", "partialArgs":[{"jsonPath":"$.x", "stringValue":"b"}]
+        }})]);
+        let frames = state.push_line(&json!({}), final_chunk.clone()).unwrap();
+        assert_eq!(argument_deltas(&frames), vec![(0, json!({"x":"ab"}))]);
+        assert!(state.push_line(&json!({}), final_chunk).unwrap().is_empty());
+        assert_eq!(state.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn vertex_partial_args_tracks_unique_call_when_text_part_disappears() {
+        let mut state = GeminiProviderState::default();
+        state.push_line(&json!({}), partial_chunk(vec![json!({"text":"thinking"}), json!({"functionCall":{
+            "name":"f", "willContinue":true, "partialArgs":[{"jsonPath":"$.x", "stringValue":"a", "willContinue":true}]
+        }})])).unwrap();
+        let last = state
+            .push_line(
+                &json!({}),
+                partial_chunk(vec![json!({"functionCall":{
+                    "willContinue":false, "partialArgs":[{"jsonPath":"$.x", "stringValue":"b"}]
+                }})]),
+            )
+            .unwrap();
+        assert_eq!(state.tool_calls.len(), 1);
+        assert_eq!(argument_deltas(&last), vec![(0, json!({"x":"ab"}))]);
+        assert!(state.finish(&json!({})).is_ok());
+    }
+
+    #[test]
+    fn vertex_partial_args_rejects_ambiguous_idless_continuation() {
+        let mut state = GeminiProviderState::default();
+        state
+            .push_line(
+                &json!({}),
+                partial_chunk(vec![
+                    json!({"text":"a"}),
+                    json!({"text":"b"}),
+                    json!({"functionCall":{"name":"f", "willContinue":true, "partialArgs":[]}}),
+                    json!({"functionCall":{"name":"f", "willContinue":true, "partialArgs":[]}}),
+                ]),
+            )
+            .unwrap();
+        assert!(state
+            .push_line(
+                &json!({}),
+                partial_chunk(vec![json!({"functionCall":{
+                    "partialArgs":[{"jsonPath":"$.x", "numberValue":1}]
+                }})])
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn vertex_partial_args_converts_to_chat_responses_claude_and_gemini() {
+        use crate::formats::shared::stream_core::format_matrix::StreamingStandardFormatMatrix;
+        let expected = json!({"nested":[{"text":"hello"}]});
+        for client in [
+            "openai:chat",
+            "openai:responses",
+            "claude:messages",
+            "gemini:generate_content",
+        ] {
+            let context = json!({"provider_api_format":"gemini:generate_content", "client_api_format":client, "mapped_model":"test"});
+            let mut matrix = StreamingStandardFormatMatrix::default();
+            let mut output = matrix.transform_line(&context, partial_chunk(vec![json!({
+                "thoughtSignature":"sig-roundtrip", "functionCall":{"willContinue":true,
+                "partialArgs":[{"jsonPath":"$.nested[0].text", "stringValue":"hel", "willContinue":true}]}
+            })])).unwrap();
+            output.extend(matrix.transform_line(&context, data_line(json!({"candidates":[{"finishReason":"STOP", "content":{"parts":[{
+                "functionCall":{"id":"call_vertex", "name":"f", "willContinue":false,
+                    "partialArgs":[{"jsonPath":"$.nested[0].text", "stringValue":"lo"}]}
+            }]}}]}))).unwrap());
+            output.extend(matrix.finish(&context).unwrap());
+            assert!(
+                !String::from_utf8_lossy(&output).contains("unknown"),
+                "{client}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output).contains("call_vertex"),
+                "{client}"
+            );
+            let events = String::from_utf8(output)
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .collect::<Vec<_>>();
+            let args = match client {
+                "openai:chat" => events.iter().find_map(|event| {
+                    event
+                        .pointer("/choices/0/delta/tool_calls/0/function/arguments")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                }),
+                "openai:responses" => events
+                    .iter()
+                    .find(|event| event["type"] == "response.function_call_arguments.done")
+                    .and_then(|event| event["arguments"].as_str()),
+                "claude:messages" => events
+                    .iter()
+                    .find_map(|event| event.pointer("/delta/partial_json").and_then(Value::as_str)),
+                _ => None,
+            };
+            if client == "gemini:generate_content" {
+                let part = events
+                    .iter()
+                    .filter_map(|event| event.pointer("/candidates/0/content/parts/0"))
+                    .find(|part| part.get("functionCall").is_some())
+                    .expect("Gemini tool call");
+                assert_eq!(part["functionCall"]["args"], expected);
+                assert_eq!(part["thoughtSignature"], "sig-roundtrip");
+                assert_eq!(part["functionCall"]["id"], "call_vertex");
+            } else {
+                assert_eq!(
+                    serde_json::from_str::<Value>(args.expect(client)).unwrap(),
+                    expected,
+                    "{client}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vertex_partial_args_waits_for_late_name_and_id() {
+        let mut state = GeminiProviderState::default();
+        let first = state.push_line(&json!({}), partial_chunk(vec![json!({
+            "thoughtSignature":"late-signature", "functionCall":{"willContinue":true,
+            "partialArgs":[{"jsonPath":"$.text", "stringValue":"first", "willContinue":true}]}
+        })])).unwrap();
+        assert!(!first.iter().any(|frame| matches!(
+            frame.event,
+            CanonicalStreamEvent::ToolCallStart { .. }
+                | CanonicalStreamEvent::ToolCallSignature { .. }
+                | CanonicalStreamEvent::ToolCallArgumentsDelta { .. }
+        )));
+        let middle = state.push_line(&json!({}), partial_chunk(vec![json!({"functionCall":{
+            "name":"real_function", "id":"real_id", "willContinue":true,
+            "partialArgs":[{"jsonPath":"$.text", "stringValue":" second", "willContinue":true}]
+        }})])).unwrap();
+        assert!(middle.is_empty());
+        let last = state
+            .push_line(
+                &json!({}),
+                partial_chunk(vec![json!({"functionCall":{
+                    "partialArgs":[{"jsonPath":"$.text", "stringValue":" third"}]
+                }})]),
+            )
+            .unwrap();
+        assert!(last.iter().any(|frame| matches!(&frame.event,
+            CanonicalStreamEvent::ToolCallStart {index:0, call_id, name}
+                if call_id == "real_id" && name == "real_function")));
+        assert!(last.iter().any(|frame| matches!(&frame.event,
+            CanonicalStreamEvent::ToolCallSignature {index:0, signature} if signature == "late-signature")));
+        assert_eq!(
+            argument_deltas(&last),
+            vec![(0, json!({"text":"first second third"}))]
+        );
+        assert_eq!(state.tool_calls.len(), 1);
+        assert_eq!(state.tool_calls[&0].call_id, "real_id");
+    }
+
+    #[test]
+    fn vertex_partial_args_strictly_validates_scalar_union() {
+        for part in [
+            json!({"jsonPath":"$.x", "stringValue":1}),
+            json!({"jsonPath":"$.x", "numberValue":"1"}),
+            json!({"jsonPath":"$.x", "boolValue":null}),
+            json!({"jsonPath":"$.x", "nullValue":false}),
+            json!({"jsonPath":"$.x", "stringValue":"a", "numberValue":1}),
+            json!({"jsonPath":"$.x"}),
+        ] {
+            let mut args = json!({});
+            assert!(
+                apply_partial_argument(&mut args, &part, &mut 0).is_err(),
+                "{part}"
+            );
+            assert_eq!(args, json!({}));
+        }
+        let mut args = json!({});
+        let mut budget = 0;
+        for _ in 0..2048 {
+            apply_partial_argument(
+                &mut args,
+                &json!({"jsonPath":"$.long", "stringValue":"fragment"}),
+                &mut budget,
+            )
+            .unwrap();
+        }
+        assert_eq!(args["long"].as_str().unwrap(), "fragment".repeat(2048));
+        let mut state = GeminiProviderState::default();
+        assert!(state
+            .push_line(
+                &json!({}),
+                partial_chunk(vec![json!({"functionCall":{
+                    "partialArgs":[{"jsonPath":"$.x", "stringValue":"nameless"}]
+                }})])
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn vertex_partial_args_rejects_invalid_paths_and_bounds_buffer() {
+        for path in [
+            "$..x",
+            "$[*]",
+            "$.x[-1]",
+            "$.x[65536]",
+            "$.x[999999999999999999999999]",
+            "$['unterminated]",
+        ] {
+            assert!(partial_argument_path(path).is_none(), "{path}");
+        }
+        assert!(partial_argument_path(&format!("${}", ".x".repeat(129))).is_none());
+        let mut args = json!({});
+        let mut budget = 0;
+        apply_partial_argument(
+            &mut args,
+            &json!({"jsonPath":"$[\"a\\\"b\"][0]", "stringValue":"x"}),
+            &mut budget,
+        )
+        .unwrap();
+        assert_eq!(args, json!({"a\"b":["x"]}));
+        budget = 8 * 1024 * 1024;
+        assert!(apply_partial_argument(
+            &mut args,
+            &json!({"jsonPath":"$.x", "stringValue":"y"}),
+            &mut budget
+        )
+        .is_err());
+        let mut state = GeminiProviderState::default();
+        assert!(state
+            .push_line(
+                &json!({}),
+                partial_chunk(vec![json!({"functionCall":{
+                    "partialArgs":[{"jsonPath":"$.x", "stringValue":"open", "willContinue":true}]
+                }})])
+            )
+            .is_err());
     }
 
     fn terminal_frames(frames: Vec<CanonicalStreamFrame>) -> Vec<CanonicalStreamFrame> {

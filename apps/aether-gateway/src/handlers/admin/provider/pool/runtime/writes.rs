@@ -89,7 +89,13 @@ fn parse_retry_after_seconds(headers: Option<&BTreeMap<String, String>>) -> Opti
             .map(|(_, value)| value.trim())
             .filter(|value| !value.is_empty())
     })?;
-    let seconds = raw.parse::<u64>().ok()?;
+    let seconds = raw.parse::<u64>().ok().or_else(|| {
+        chrono::DateTime::parse_from_rfc2822(raw).ok().map(|date| {
+            date.timestamp()
+                .saturating_sub(chrono::Utc::now().timestamp())
+                .max(0) as u64
+        })
+    })?;
     Some(seconds.clamp(1, MAX_POOL_COOLDOWN_SECONDS))
 }
 
@@ -137,6 +143,19 @@ fn parse_google_quota_cooldown_seconds_at(
 
     if let Some(details) = error.get("details").and_then(serde_json::Value::as_array) {
         for detail in details {
+            if detail.get("@type").and_then(serde_json::Value::as_str)
+                == Some("type.googleapis.com/google.rpc.RetryInfo")
+            {
+                if let Some(seconds) = detail
+                    .get("retryDelay")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|delay| delay.strip_suffix('s'))
+                    .and_then(|delay| delay.parse::<f64>().ok())
+                    .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+                {
+                    return Some((seconds.ceil() as u64).max(1));
+                }
+            }
             let Some(metadata) = detail
                 .get("metadata")
                 .and_then(serde_json::Value::as_object)
@@ -704,6 +723,19 @@ mod tests {
             .await
             .expect("active members should read");
         assert!(members.is_empty());
+    }
+
+    #[test]
+    fn vertex_retry_info_cooldown_rounds_up() {
+        assert_eq!(
+            parse_google_quota_cooldown_seconds_at(
+                Some(
+                    r#"{"error":{"details":[{"@type":"type.googleapis.com/google.rpc.RetryInfo","retryDelay":"12.25s"}]}}"#
+                ),
+                0
+            ),
+            Some(13)
+        );
     }
 
     #[test]

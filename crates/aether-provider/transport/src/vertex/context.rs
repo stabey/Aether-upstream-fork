@@ -55,7 +55,10 @@ pub fn looks_like_vertex_ai_host(base_url: &str) -> bool {
         return false;
     };
 
-    host == VERTEX_AI_HOST
+    matches!(
+        host.as_str(),
+        "aiplatform.us.rep.googleapis.com" | "aiplatform.eu.rep.googleapis.com"
+    ) || host == VERTEX_AI_HOST
         || host
             .strip_suffix(&format!("-{VERTEX_AI_HOST}"))
             .is_some_and(is_valid_vertex_region)
@@ -200,6 +203,33 @@ mod tests {
                 decrypted_auth_config: None,
             },
         }
+    }
+
+    #[test]
+    fn multi_region_hosts_are_exact_and_keep_url_security_checks() {
+        for region in ["us", "eu"] {
+            let origin = format!("https://aiplatform.{region}.rep.googleapis.com");
+            assert!(looks_like_vertex_ai_host(&origin));
+            assert!(looks_like_vertex_ai_host(&format!(
+                "{origin}/v1/projects/p/locations/{region}"
+            )));
+            for bad in [
+                format!("{origin}.evil.test"),
+                format!("{origin}:8443"),
+                format!("{origin}?token=x"),
+                format!("{origin}#fragment"),
+                origin.replace("https://", "http://"),
+                origin.replace("https://", "https://user@"),
+            ] {
+                assert!(!looks_like_vertex_ai_host(&bad), "{bad}");
+            }
+        }
+        assert!(!looks_like_vertex_ai_host(
+            "https://aiplatform.asia.rep.googleapis.com"
+        ));
+        assert!(!looks_like_vertex_ai_host(
+            "https://foo.aiplatform.us.rep.googleapis.com"
+        ));
     }
 
     #[test]

@@ -1,12 +1,14 @@
 mod auth;
 mod context;
+mod errors;
 mod policy;
 mod url;
 
 pub use auth::{
     parse_vertex_service_account_auth_config, resolve_local_vertex_api_key_query_auth,
     resolve_local_vertex_service_account_auth_config,
-    supports_local_vertex_service_account_auth_resolution, VertexApiKeyQueryAuth,
+    supports_local_vertex_service_account_auth_resolution,
+    vertex_service_account_credentials_invalid, VertexApiKeyQueryAuth,
     VertexServiceAccountAuthConfig, VertexServiceAccountRefreshAdapter, VERTEX_API_KEY_QUERY_PARAM,
     VERTEX_SERVICE_ACCOUNT_AUTH_HEADER, VERTEX_SERVICE_ACCOUNT_PROVIDER_TYPE,
 };
@@ -29,6 +31,10 @@ pub use url::{
     build_vertex_api_key_imagen_content_url, build_vertex_service_account_gemini_content_url,
     build_vertex_service_account_gemini_embedding_url, resolve_vertex_service_account_region,
     VERTEX_API_KEY_BASE_URL,
+};
+
+pub use errors::{
+    is_vertex_request_url, vertex_capacity_retry_delay, vertex_error_has_quota_evidence,
 };
 
 pub const PROVIDER_TYPE: &str = "vertex_ai";

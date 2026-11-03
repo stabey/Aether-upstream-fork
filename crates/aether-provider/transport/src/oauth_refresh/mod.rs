@@ -660,6 +660,7 @@ impl LocalOAuthRefreshCoordinator {
             distributed_owner,
             false,
             None,
+            None,
         )
         .await
     }
@@ -699,6 +700,27 @@ impl LocalOAuthRefreshCoordinator {
             distributed_owner,
             true,
             expected_refresh_fingerprint,
+            None,
+        )
+        .await
+    }
+
+    /// Refresh a rejected bearer token under the local credential lock. A
+    /// newer, still-valid cached token is reused rather than refreshed again.
+    pub async fn refresh_rejected_authorization_with_result(
+        &self,
+        executor: &dyn LocalOAuthHttpExecutor,
+        transport: &GatewayProviderTransportSnapshot,
+        rejected_authorization: &str,
+    ) -> Result<Option<LocalOAuthResolution>, LocalOAuthRefreshError> {
+        self.resolve_with_result_mode(
+            executor,
+            transport,
+            None,
+            None,
+            true,
+            None,
+            Some(rejected_authorization),
         )
         .await
     }
@@ -711,6 +733,7 @@ impl LocalOAuthRefreshCoordinator {
         distributed_owner: Option<&str>,
         force_refresh: bool,
         expected_refresh_fingerprint: Option<&str>,
+        rejected_authorization: Option<&str>,
     ) -> Result<Option<LocalOAuthResolution>, LocalOAuthRefreshError> {
         let Some(adapter) = self
             .adapters
@@ -759,22 +782,44 @@ impl LocalOAuthRefreshCoordinator {
                 return Ok(Some(resolution));
             }
         }
-        let refresh_fingerprint = adapter.refresh_fingerprint(transport, cached_entry.as_ref());
-        if let Some(error) = self
-            .backoff_error(
-                key_id,
-                adapter.provider_type(),
-                refresh_fingerprint.as_deref(),
-            )
-            .await
-        {
-            return Err(error);
+        if rejected_authorization.is_none() {
+            let refresh_fingerprint = adapter.refresh_fingerprint(transport, cached_entry.as_ref());
+            if let Some(error) = self
+                .backoff_error(
+                    key_id,
+                    adapter.provider_type(),
+                    refresh_fingerprint.as_deref(),
+                )
+                .await
+            {
+                return Err(error);
+            }
         }
 
         let key_lock = self.lock_for_key(key_id).await;
         let key_guard = key_lock.lock_owned().await;
 
-        let cached_entry = self.cached_entry(key_id).await;
+        let mut cached_entry = self.cached_entry(key_id).await;
+        if let Some(rejected) = rejected_authorization {
+            if let Some(entry) = cached_entry.as_ref() {
+                if entry.auth_header_value.trim() != rejected.trim() {
+                    if let Some(auth) = adapter.resolve_cached(transport, entry) {
+                        let mut resolution = LocalOAuthResolution::reused(auth, entry);
+                        // The caller republishes reused entries as well. Keep
+                        // the lock until publication so a newer refresh cannot
+                        // publish C and then be overwritten by this reused B.
+                        resolution.local_refresh_guard =
+                            Some(LocalOAuthRefreshCommitGuard::new(key_guard));
+                        return Ok(Some(resolution));
+                    }
+                } else {
+                    // Retain refresh backoff while discarding only the token
+                    // that produced this request's 401 response.
+                    self.cache.lock().await.remove(key_id);
+                    cached_entry = None;
+                }
+            }
+        }
         if force_refresh {
             let winner_fingerprint = if shares_refresh_through_transport_persistence {
                 expected_refresh_fingerprint
@@ -1510,6 +1555,129 @@ mod tests {
                 decrypted_auth_config: Some("{\"refresh_token\":\"rt-1\"}".to_string()),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn late_rejected_authorization_reuses_newer_cached_token() {
+        let refresh_hits = Arc::new(AtomicUsize::new(0));
+        let coordinator =
+            LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![Arc::new(TestAdapter {
+                refresh_hits: refresh_hits.clone(),
+                refresh_with_entry_hits: Arc::new(AtomicUsize::new(0)),
+            })]);
+        let transport = sample_transport();
+        coordinator
+            .store_cached_entry(
+                &transport.key.id,
+                CachedOAuthEntry {
+                    provider_type: "test-oauth".into(),
+                    auth_header_name: "authorization".into(),
+                    auth_header_value: "Bearer winner-B".into(),
+                    expires_at_unix_secs: None,
+                    metadata: None,
+                    source_fingerprint: None,
+                },
+            )
+            .await;
+        let executor = ReqwestLocalOAuthHttpExecutor::new(reqwest::Client::new());
+        let result = coordinator
+            .refresh_rejected_authorization_with_result(&executor, &transport, "Bearer old-A")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            result.auth,
+            Some(LocalResolvedOAuthRequestAuth::Header {
+                name: "authorization".into(),
+                value: "Bearer winner-B".into(),
+            })
+        );
+        assert_eq!(refresh_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn late_rejected_authorization_holds_lock_until_reused_token_is_published() {
+        let refresh_hits = Arc::new(AtomicUsize::new(0));
+        let coordinator = Arc::new(LocalOAuthRefreshCoordinator::with_adapters_for_tests(vec![
+            Arc::new(TestAdapter {
+                refresh_hits: refresh_hits.clone(),
+                refresh_with_entry_hits: Arc::new(AtomicUsize::new(0)),
+            }),
+        ]));
+        let transport = sample_transport();
+        coordinator
+            .store_cached_entry(
+                &transport.key.id,
+                CachedOAuthEntry {
+                    provider_type: "test-oauth".into(),
+                    auth_header_name: "authorization".into(),
+                    auth_header_value: "Bearer winner-B".into(),
+                    expires_at_unix_secs: None,
+                    metadata: None,
+                    source_fingerprint: None,
+                },
+            )
+            .await;
+        let executor = ReqwestLocalOAuthHttpExecutor::new(reqwest::Client::new());
+        let reused_b = coordinator
+            .refresh_rejected_authorization_with_result(&executor, &transport, "Bearer old-A")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reused_b.local_refresh_guard.is_some());
+        let key_lock = coordinator.lock_for_key(&transport.key.id).await;
+        assert!(
+            key_lock.try_lock().is_err(),
+            "B publication must retain the credential lock"
+        );
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let worker_coordinator = coordinator.clone();
+        let worker_transport = transport.clone();
+        let mut refresh_c = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let executor = ReqwestLocalOAuthHttpExecutor::new(reqwest::Client::new());
+            let refreshed = worker_coordinator
+                .refresh_rejected_authorization_with_result(
+                    &executor,
+                    &worker_transport,
+                    "Bearer winner-B",
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let entry = refreshed.refreshed_entry.as_ref().unwrap().clone();
+            worker_coordinator
+                .store_cached_entry(&worker_transport.key.id, entry)
+                .await;
+        });
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut refresh_c)
+                .await
+                .is_err()
+        );
+        assert_eq!(refresh_hits.load(Ordering::SeqCst), 0);
+        // Simulate AppState's reused_refresh publication before releasing its guard.
+        coordinator
+            .store_cached_entry(
+                &transport.key.id,
+                reused_b.refreshed_entry.as_ref().unwrap().clone(),
+            )
+            .await;
+        drop(reused_b);
+        tokio::time::timeout(Duration::from_secs(1), refresh_c)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refresh_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            coordinator
+                .cached_entry(&transport.key.id)
+                .await
+                .unwrap()
+                .auth_header_value,
+            "Bearer refreshed-token"
+        );
     }
 
     #[tokio::test]

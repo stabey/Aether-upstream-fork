@@ -27,10 +27,10 @@ pub(crate) use self::attempt::{
 };
 pub(crate) use self::classifier::{
     classify_anthropic_failure_disposition, classify_failure_disposition, classify_local_failover,
-    classify_local_transport_error, failure_disposition_from_local_classification,
-    local_failover_error_message, FailureDisposition, FailureRetryAction, FailureScope,
-    FailureTokenAction, LocalFailoverClassification, LocalFailoverInput,
-    LocalTransportFailoverClassification,
+    classify_local_transport_error, classify_plan_failure_disposition,
+    failure_disposition_from_local_classification, local_failover_error_message,
+    FailureDisposition, FailureRetryAction, FailureScope, FailureTokenAction,
+    LocalFailoverClassification, LocalFailoverInput, LocalTransportFailoverClassification,
 };
 pub(crate) use self::codex_quota_breaker::{
     codex_account_id_from_headers, codex_model_quota_exhaustion_reset_at,
@@ -88,6 +88,20 @@ pub(crate) async fn resolve_local_failover_analysis_for_attempt(
     let policy = resolve_local_failover_policy(state, plan, report_context).await;
     let analysis =
         analyze_local_failover(&policy, LocalFailoverInput::new(status_code, response_text));
+    if aether_provider_transport::vertex::is_vertex_request_url(&plan.url)
+        && matches!(status_code, 401 | 403 | 429)
+    {
+        let disposition =
+            classify_plan_failure_disposition(plan, analysis.classification, status_code);
+        return LocalFailoverAnalysis {
+            classification: analysis.classification,
+            decision: if matches!(disposition.retry_action, FailureRetryAction::Stop) {
+                LocalFailoverDecision::StopLocalFailover
+            } else {
+                LocalFailoverDecision::RetryNextCandidate
+            },
+        };
+    }
     apply_provider_failure_disposition(&plan.provider_api_format, status_code, analysis)
 }
 

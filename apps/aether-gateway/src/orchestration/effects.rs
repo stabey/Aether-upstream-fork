@@ -957,6 +957,13 @@ async fn record_adaptive_rate_limit_effect(
     context: LocalExecutionEffectContext<'_>,
     effect: LocalAdaptiveRateLimitEffect<'_>,
 ) {
+    if crate::provider_transport::vertex::is_vertex_request_url(&context.plan.url)
+        && matches!(effect.status_code, 403 | 429)
+    {
+        // IAM/model access and project/region/model capacity are not evidence
+        // of a key-wide RPM or credential-health problem.
+        return;
+    }
     if !local_candidate_failure_should_apply_key_effects(
         &context.plan.provider_api_format,
         effect.classification,
@@ -1245,6 +1252,13 @@ async fn record_health_failure_effect(
     context: LocalExecutionEffectContext<'_>,
     effect: LocalHealthFailureEffect,
 ) {
+    if crate::provider_transport::vertex::is_vertex_request_url(&context.plan.url)
+        && matches!(effect.status_code, 403 | 429)
+    {
+        // IAM/model access and project/region/model capacity are not evidence
+        // of a key-wide RPM or credential-health problem.
+        return;
+    }
     if !local_candidate_failure_should_apply_key_effects(
         &context.plan.provider_api_format,
         effect.classification,
@@ -1548,13 +1562,37 @@ async fn record_pool_error_effect(
     {
         return;
     }
+    let vertex_transport = state
+        .read_provider_transport_snapshot(
+            &context.plan.provider_id,
+            &context.plan.endpoint_id,
+            &context.plan.key_id,
+        )
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|transport| {
+            transport
+                .provider
+                .provider_type
+                .trim()
+                .eq_ignore_ascii_case("vertex_ai")
+        });
     record_admin_provider_pool_error(
         state.runtime_state.as_ref(),
         &context.plan.provider_id,
         &context.plan.key_id,
         &pool_context.pool_config,
-        effect.status_code,
-        effect.error_body,
+        if vertex_transport && matches!(effect.status_code, 401 | 403) {
+            503
+        } else {
+            effect.status_code
+        },
+        if vertex_transport && matches!(effect.status_code, 401 | 403) {
+            None
+        } else {
+            effect.error_body
+        },
         Some(effect.headers),
     )
     .await;
@@ -1562,7 +1600,11 @@ async fn record_pool_error_effect(
         state,
         context,
         Some(false),
-        pool_score_hard_state_for_status(effect.status_code, effect.error_body),
+        pool_score_hard_state_for_provider_status(
+            vertex_transport,
+            effect.status_code,
+            effect.error_body,
+        ),
         Some(pool_score_delta_for_status(effect.status_code)),
         serde_json::json!({
             "last_request_feedback": {
@@ -2032,6 +2074,23 @@ fn pool_score_feedback_gate_allows(
     }
     POOL_SCORE_FEEDBACK_GATE.insert(key, (), min_interval, POOL_SCORE_FEEDBACK_GATE_MAX_ENTRIES);
     true
+}
+
+fn pool_score_hard_state_for_provider_status(
+    vertex: bool,
+    status_code: u16,
+    error_body: Option<&str>,
+) -> Option<PoolMemberHardState> {
+    if vertex {
+        // Inference 401 is a rejected short-lived access token, and 403 is IAM,
+        // API enablement or model policy. Neither proves the SA key is invalid.
+        // Vertex quota/rate limits have project/region/model scope; do not
+        // permanently quarantine a credential based on a single 429.
+        if matches!(status_code, 401 | 403 | 429) {
+            return Some(PoolMemberHardState::Cooldown);
+        }
+    }
+    pool_score_hard_state_for_status(status_code, error_body)
 }
 
 fn pool_score_hard_state_for_status(
@@ -3659,6 +3718,62 @@ mod tests {
                 "Anthropic status {status_code} must invalidate only retryable target affinity"
             );
         }
+    }
+
+    #[test]
+    fn vertex_query_request_failover_has_scoped_retry_and_preserves_error() {
+        for url in [
+            "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini:generateContent?key=secret",
+            "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/google/models/gemini:streamGenerateContent?alt=sse",
+        ] {
+            let mut plan = sample_plan();
+            plan.url = url.into();
+            plan.provider_api_format = "gemini:generate_content".into();
+            for status in [403, 429] {
+                let disposition = crate::orchestration::classify_plan_failure_disposition(&plan, LocalFailoverClassification::RetryUpstreamFailure, status);
+                assert_eq!(disposition.failure_scope, crate::orchestration::FailureScope::CredentialModel);
+                assert_eq!(disposition.retry_action, crate::orchestration::FailureRetryAction::NextCredential);
+                assert!(disposition.preserve_upstream_error);
+            }
+            let stopped = crate::orchestration::classify_plan_failure_disposition(&plan, LocalFailoverClassification::StopErrorPattern, 429);
+            assert_eq!(stopped.retry_action, crate::orchestration::FailureRetryAction::Stop);
+        }
+    }
+
+    #[test]
+    fn vertex_access_errors_and_scoped_quotas_are_recoverable() {
+        for (status, body) in [
+            (401, r#"{"error":{"status":"UNAUTHENTICATED"}}"#),
+            (
+                403,
+                r#"{"error":{"status":"PERMISSION_DENIED","message":"not authorized"}}"#,
+            ),
+            (
+                429,
+                r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"Resource exhausted. Try again later."}}"#,
+            ),
+            (
+                429,
+                r#"{"error":{"status":"RESOURCE_EXHAUSTED","message":"Quota exceeded for project, region and model"}}"#,
+            ),
+        ] {
+            assert_eq!(
+                super::pool_score_hard_state_for_provider_status(true, status, Some(body)),
+                Some(PoolMemberHardState::Cooldown)
+            );
+        }
+        assert_eq!(
+            super::pool_score_hard_state_for_provider_status(
+                false,
+                429,
+                Some("resource_exhausted")
+            ),
+            Some(PoolMemberHardState::QuotaExhausted)
+        );
+        assert_eq!(
+            super::pool_score_hard_state_for_provider_status(false, 403, None),
+            Some(PoolMemberHardState::AuthInvalid)
+        );
     }
 
     #[test]

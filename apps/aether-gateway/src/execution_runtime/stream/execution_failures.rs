@@ -23,8 +23,7 @@ use crate::execution_runtime::submission::{
 };
 use crate::log_ids::short_request_id;
 use crate::orchestration::{
-    apply_local_execution_effect, classify_failure_disposition,
-    resolve_local_failover_analysis_for_attempt,
+    apply_local_execution_effect, resolve_local_failover_analysis_for_attempt,
     resolve_local_transport_failover_analysis_for_attempt, with_upstream_response_report_context,
     LocalAdaptiveRateLimitEffect, LocalAttemptFailureEffect, LocalExecutionEffect,
     LocalExecutionEffectContext, LocalFailoverAnalysis, LocalFailoverDecision,
@@ -612,8 +611,8 @@ pub(super) async fn handle_prefetch_provider_private_stream_error(
         failure_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate
     ) {
-        let failure_disposition = classify_failure_disposition(
-            &plan.provider_api_format,
+        let failure_disposition = crate::orchestration::classify_plan_failure_disposition(
+            &plan,
             failure_analysis.classification,
             status_code,
         );
@@ -729,8 +728,8 @@ pub(super) async fn handle_prefetch_stream_failure(
             LocalFailoverDecision::RetryNextCandidate
         )
     {
-        let failure_disposition = classify_failure_disposition(
-            &plan.provider_api_format,
+        let failure_disposition = crate::orchestration::classify_plan_failure_disposition(
+            &plan,
             failure_analysis.classification,
             payload.status_code,
         );

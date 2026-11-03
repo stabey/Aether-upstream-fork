@@ -2638,6 +2638,7 @@ async fn execute_execution_runtime_sync_impl(
                 request_order_id: uuid::Uuid::now_v7().to_string(),
             });
     let mut oauth_retry_attempted = false;
+    let mut vertex_capacity_retries = 0;
     let (
         result_error_type,
         result_error_message,
@@ -2731,6 +2732,37 @@ async fn execute_execution_runtime_sync_impl(
             &body_bytes,
             result.error.as_ref().map(|error| error.message.as_str()),
         );
+
+        if result.status_code == 429
+            && aether_provider_transport::vertex::is_vertex_request_url(&plan.url)
+            && !matches!(
+                crate::orchestration::resolve_local_failover_analysis_for_attempt(
+                    state, &plan, report_context.as_ref(), result.status_code,
+                    local_failover_response_text.as_deref(),
+                ).await.decision,
+                LocalFailoverDecision::StopLocalFailover
+            )
+        {
+            if let Some(delay) = aether_provider_transport::vertex::vertex_capacity_retry_delay(
+                result.status_code, &headers, local_failover_response_text.as_deref(), vertex_capacity_retries,
+            ) {
+                vertex_capacity_retries += 1;
+                tokio::time::sleep(delay).await;
+                match crate::execution_runtime::execute_execution_runtime_sync_plan(state, Some(trace_id), &plan).await {
+                    Ok(retry_result) => {
+                        if let Some(observation) = retry_result.response_observation.clone() {
+                            provider_response_observation = observation;
+                        }
+                        candidate_first_byte_elapsed_ms = calibrated_sync_candidate_first_byte_elapsed_ms(candidate_started_at, &retry_result);
+                        result = retry_result;
+                        continue;
+                    }
+                    Err(_) => {
+                        // Keep the original upstream error available as fallback.
+                    }
+                }
+            }
+        }
 
         if result.status_code >= 400
             && !oauth_retry_attempted
@@ -2894,8 +2926,8 @@ async fn execute_execution_runtime_sync_impl(
         local_failover_analysis.decision,
         LocalFailoverDecision::RetryNextCandidate
     ) {
-        let failure_disposition = crate::orchestration::classify_failure_disposition(
-            &plan.provider_api_format,
+        let failure_disposition = crate::orchestration::classify_plan_failure_disposition(
+            &plan,
             local_failover_analysis.classification,
             result.status_code,
         );

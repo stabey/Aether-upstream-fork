@@ -1599,6 +1599,11 @@ fn pool_key_requires_reauth_for_scheduling(
     key: &StoredProviderCatalogKey,
     now_unix_secs: u64,
 ) -> bool {
+    if matches!(key.auth_type.trim(), "service_account" | "vertex_ai") {
+        return key.oauth_invalid_reason.as_deref().is_some_and(|reason| {
+            reason.starts_with("[ACCOUNT_BLOCK] account_disabled: Service account")
+        });
+    }
     if !key.auth_type.trim().eq_ignore_ascii_case("oauth") {
         return false;
     }

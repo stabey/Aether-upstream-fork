@@ -477,6 +477,13 @@ fn key_requires_oauth_reauth(
     provider_type: &str,
     now_unix_secs: u64,
 ) -> bool {
+    if provider_type.trim().eq_ignore_ascii_case("vertex_ai")
+        && matches!(key.auth_type.trim(), "service_account" | "vertex_ai")
+    {
+        return key.oauth_invalid_reason.as_deref().is_some_and(|reason| {
+            reason.starts_with("[ACCOUNT_BLOCK] account_disabled: Service account")
+        });
+    }
     if !key.auth_type.trim().eq_ignore_ascii_case("oauth") {
         return false;
     }
@@ -583,6 +590,31 @@ fn read_provider_key_rpm_reset_at_map(
 mod reserve_minimum_quota_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn vertex_service_account_only_explicit_credential_block_stops_scheduling() {
+        let mut key = StoredProviderCatalogKey::new(
+            "key".into(),
+            "provider".into(),
+            "SA".into(),
+            "service_account".into(),
+            None,
+            true,
+        )
+        .unwrap();
+        for reason in [
+            None,
+            Some("[REFRESH_FAILED] temporary network error"),
+            Some("[OAUTH_EXPIRED] access token expired"),
+        ] {
+            key.oauth_invalid_reason = reason.map(str::to_string);
+            assert!(!key_requires_oauth_reauth(&key, "vertex_ai", 100));
+        }
+        key.oauth_invalid_reason = Some("[ACCOUNT_BLOCK] account_disabled: Service account no longer exists or is disabled; replace the service-account credentials".into());
+        assert!(key_requires_oauth_reauth(&key, "vertex_ai", 100));
+        key.oauth_invalid_reason = None;
+        assert!(!key_requires_oauth_reauth(&key, "vertex_ai", 100));
+    }
 
     #[test]
     fn reserve_minimum_quota_is_independent_of_skip_exhausted_accounts() {
