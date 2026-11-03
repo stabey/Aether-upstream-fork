@@ -467,6 +467,7 @@ mod tests {
         endpoint_id: &str,
     ) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
+            requires_exact_model_permission: false,
             provider_id: "provider-1".to_string(),
             provider_name: "provider".to_string(),
             provider_type: "custom".to_string(),

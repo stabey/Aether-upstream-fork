@@ -334,6 +334,7 @@ mod tests {
         key_id: &str,
     ) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
+            requires_exact_model_permission: false,
             provider_id: "provider-1".to_string(),
             provider_name: "provider-1".to_string(),
             provider_type: "custom".to_string(),
@@ -659,6 +660,7 @@ mod tests {
         provider_priority: i32,
     ) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
+            requires_exact_model_permission: false,
             provider_id: provider_id.to_string(),
             provider_name: provider_id.to_string(),
             provider_type: "custom".to_string(),

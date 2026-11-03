@@ -361,6 +361,7 @@ pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     candidate_api_formats: Vec<String>,
     model_directive_routing_models: BTreeMap<String, String>,
     model_directive_policy_cache_key: String,
+    argon_level: Option<super::argon_routing::ArgonLevel>,
     ordering_config: SchedulerOrderingConfig,
     ranking_seed: u64,
     priority_page_emitted: bool,
@@ -449,6 +450,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             candidate_api_formats,
             model_directive_routing_models,
             model_directive_policy_cache_key: model_directive_policy.cache_key().to_string(),
+            argon_level: None,
             ordering_config,
             ranking_seed: request_distribution_seed(),
             priority_page_emitted: false,
@@ -580,6 +582,20 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
 
     pub(crate) fn resolved_page_cache_model_directive_policy_hash(&self) -> &str {
         &self.model_directive_policy_cache_key
+    }
+
+    pub(crate) fn with_argon_level(
+        mut self,
+        level: Option<super::argon_routing::ArgonLevel>,
+    ) -> Self {
+        self.argon_level = level;
+        if let Some(level) = level {
+            // Both preselection and resolved-page caches use this request key.
+            self.model_directive_policy_cache_key.push_str(":argon:");
+            self.model_directive_policy_cache_key
+                .push_str(level.as_str());
+        }
+        self
     }
 
     pub(crate) fn should_cache_current_priority_resolved_page(&self) -> bool {
@@ -1216,6 +1232,96 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         Ok(reserved_global_model_name)
     }
 
+    async fn resolve_argon_rows(
+        &self,
+        rows: Vec<StoredMinimalCandidateSelectionRow>,
+        routing_model: &str,
+        format: &str,
+        level: super::argon_routing::ArgonLevel,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, GatewayError> {
+        use super::argon_routing::{configured_argon, has_variant, select_variant};
+        let provider_ids = rows
+            .iter()
+            .filter(|row| {
+                configured_argon(
+                    row,
+                    routing_model,
+                    format,
+                    self.request_operation.as_deref(),
+                )
+            })
+            .map(|row| row.provider_id.clone())
+            .collect::<BTreeSet<_>>();
+        if provider_ids.is_empty() {
+            return Ok(rows);
+        }
+        let providers = self
+            .state
+            .app()
+            .read_provider_catalog_providers_by_ids(&provider_ids.into_iter().collect::<Vec<_>>())
+            .await?;
+        let pools = providers.iter().filter(|provider| {
+            crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value(provider.config.as_ref()).is_some()
+        }).map(|provider| provider.id.clone()).collect::<BTreeSet<_>>();
+        let model = level.model();
+        let pool_keys = if pools.is_empty() {
+            Vec::new()
+        } else {
+            self.state
+                .app()
+                // Permission discovery must not decrypt every pool credential:
+                // one broken account is handled when that account is expanded.
+                .data
+                .list_provider_catalog_keys_by_provider_ids(
+                    &pools.iter().cloned().collect::<Vec<_>>(),
+                )
+                .await
+                .map_err(|error| GatewayError::Internal(error.to_string()))?
+        };
+        let available_pools = pool_keys
+            .iter()
+            .filter(|key| {
+                key.is_active
+                    && key
+                        .allowed_models
+                        .as_ref()
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|models| {
+                            models
+                                .iter()
+                                .any(|value| value.as_str() == Some(model.as_str()))
+                        })
+            })
+            .map(|key| key.provider_id.as_str())
+            .collect::<BTreeSet<_>>();
+        Ok(rows
+            .into_iter()
+            .filter_map(|mut row| {
+                if !configured_argon(
+                    &row,
+                    routing_model,
+                    format,
+                    self.request_operation.as_deref(),
+                ) {
+                    return Some(row);
+                }
+                if pools.contains(&row.provider_id) {
+                    if !available_pools.contains(row.provider_id.as_str()) {
+                        return None;
+                    }
+                    // This is a group representative, not the selected credential.
+                    // Every expanded/sticky account is checked again against the
+                    // actual variant before it can become an execution candidate.
+                    row.key_allowed_models = Some(vec![model.clone()]);
+                } else if !has_variant(row.key_allowed_models.as_deref(), &model) {
+                    return None;
+                }
+                select_variant(&mut row, &model);
+                Some(row)
+            })
+            .collect())
+    }
+
     async fn build_page_outcome_from_rows(
         &mut self,
         candidate_api_format: &str,
@@ -1265,6 +1371,11 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 value
             };
         rows.retain(|row| row.global_model_name == resolved_global_model_name);
+        if let Some(level) = self.argon_level {
+            rows = self
+                .resolve_argon_rows(rows, &routing_model, normalized_api_format, level)
+                .await?;
+        }
         if rows.is_empty() {
             return Ok(None);
         }
@@ -1291,7 +1402,10 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         )
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
         let mut candidates = Vec::new();
-        for candidate in enumerated_candidates {
+        for mut candidate in enumerated_candidates {
+            candidate.requires_exact_model_permission = self.argon_level.is_some()
+                && candidate.provider_type.eq_ignore_ascii_case("antigravity")
+                && super::argon_routing::is_argon(&candidate.selected_provider_model_name);
             if !self.candidate_allowed_for_page(&candidate, candidate_api_format) {
                 continue;
             }
@@ -2442,6 +2556,234 @@ mod tests {
             model_is_active: true,
             model_is_available: true,
         }
+    }
+
+    #[tokio::test]
+    async fn argon_mixed_providers_keep_vertex_names_and_isolate_effort_caches() {
+        use super::super::argon_routing::ArgonLevel;
+        let mut rows = Vec::new();
+        for (id, provider_type, allowed) in [
+            (
+                "anti-all",
+                "antigravity",
+                vec![
+                    "gemini-4-argon-low",
+                    "gemini-4-argon-medium",
+                    "gemini-4-argon-high",
+                ],
+            ),
+            ("anti-high", "antigravity", vec!["gemini-4-argon-high"]),
+            // A global alias alone must not grant access to every variant.
+            ("anti-alias", "antigravity", vec!["gemini-4-argon"]),
+            ("vertex", "vertex_ai", vec!["gemini-4-argon"]),
+        ] {
+            let mut row = standard_candidate_row(id, "gemini:generate_content", 0);
+            row.provider_type = provider_type.to_string();
+            if provider_type == "antigravity" {
+                row.key_auth_type = "oauth".to_string();
+            }
+            row.global_model_name = "gemini-4-argon".to_string();
+            row.global_model_id = "global-argon".to_string();
+            row.model_provider_model_name = if provider_type == "antigravity" {
+                "gemini-4-argon-high"
+            } else {
+                "gemini-4-argon"
+            }
+            .to_string();
+            row.key_allowed_models = Some(allowed.into_iter().map(str::to_string).collect());
+            rows.push(row);
+        }
+        let catalog = rows
+            .iter()
+            .map(|row| {
+                let (provider, endpoint, mut key) = provider_catalog_for_standard_row(row, true);
+                key.allowed_models = Some(serde_json::json!(row.key_allowed_models));
+                (provider, endpoint, key)
+            })
+            .collect::<Vec<_>>();
+        let app = AppState::new().unwrap().with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    catalog.iter().map(|(p, _, _)| p.clone()).collect(),
+                    catalog.iter().map(|(_, e, _)| e.clone()).collect(),
+                    catalog.iter().map(|(_, _, k)| k.clone()).collect(),
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+        let auth = unrestricted_auth_snapshot();
+        let policy = crate::system_features::ModelDirectivePolicySnapshot::default();
+        let mut cache_keys = BTreeMap::new();
+        // Alternate levels on the same app/cache, then repeat low and the old
+        // no-effort request to detect cache contamination or catalog mutation.
+        for level in [
+            None,
+            Some(ArgonLevel::Low),
+            Some(ArgonLevel::High),
+            Some(ArgonLevel::Medium),
+            Some(ArgonLevel::Low),
+            None,
+        ] {
+            let mut cursor = LocalCandidatePreselectionPageCursor::new(
+                PlannerAppState::new(&app),
+                &policy,
+                "gemini:generate_content",
+                "gemini-4-argon",
+                None,
+                true,
+                None,
+                &auth,
+                None,
+                None,
+                None,
+                false,
+                LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+                true,
+                None,
+            )
+            .await
+            .with_argon_level(level);
+            let label = level.map(|value| value.as_str()).unwrap_or("off");
+            let key = cursor
+                .resolved_page_cache_model_directive_policy_hash()
+                .to_string();
+            if let Some(previous) = cache_keys.insert(label, key.clone()) {
+                assert_eq!(previous, key);
+            }
+            let mut candidates = Vec::new();
+            while let Some(page) = cursor.next_page().await.unwrap() {
+                candidates.extend(page.candidates);
+            }
+            let models = candidates
+                .into_iter()
+                .map(|c| (c.provider_id, c.selected_provider_model_name))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                models.get("vertex").map(String::as_str),
+                Some("gemini-4-argon")
+            );
+            assert_eq!(
+                models.get("anti-all"),
+                Some(&level.unwrap_or(ArgonLevel::High).model())
+            );
+            if let Some(level) = level {
+                assert!(!models.contains_key("anti-alias"));
+                assert_eq!(models.contains_key("anti-high"), level == ArgonLevel::High);
+            }
+        }
+        assert_eq!(cache_keys.values().collect::<BTreeSet<_>>().len(), 4);
+    }
+
+    #[test]
+    fn argon_variant_selection_respects_mapping_scope_and_other_providers() {
+        use super::super::argon_routing::configured_argon;
+        let mut row = standard_candidate_row("anti", "gemini:generate_content", 0);
+        row.provider_type = "antigravity".to_string();
+        row.model_provider_model_name = "gemini-4-argon-high".to_string();
+        row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: row.model_provider_model_name.clone(),
+            priority: 0,
+            api_formats: None,
+            endpoint_ids: Some(vec!["different-endpoint".to_string()]),
+            operations: None,
+        }]);
+        assert!(!configured_argon(
+            &row,
+            "gpt-5",
+            "gemini:generate_content",
+            None
+        ));
+        row.model_provider_model_mappings = None;
+        assert!(configured_argon(
+            &row,
+            "gpt-5",
+            "gemini:generate_content",
+            None
+        ));
+        row.provider_type = "vertex_ai".to_string();
+        assert!(!configured_argon(
+            &row,
+            "gpt-5",
+            "gemini:generate_content",
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn argon_pool_variant_uses_active_members_not_only_the_representative() {
+        use super::super::argon_routing::ArgonLevel;
+        let mut row = standard_candidate_row("pool", "gemini:generate_content", 0);
+        row.provider_type = "antigravity".to_string();
+        row.key_auth_type = "oauth".to_string();
+        row.global_model_name = "gemini-4-argon".to_string();
+        row.model_provider_model_name = "gemini-4-argon-high".to_string();
+        row.key_allowed_models = Some(vec!["gemini-4-argon-high".to_string()]);
+        let (mut provider, endpoint, mut representative) =
+            provider_catalog_for_standard_row(&row, true);
+        provider.config = Some(serde_json::json!({"pool_advanced":{}}));
+        representative.allowed_models = Some(serde_json::json!(["gemini-4-argon-high"]));
+        let mut low = representative.clone();
+        low.id = "low-account".to_string();
+        low.allowed_models = Some(serde_json::json!(["gemini-4-argon-low"]));
+        let mut inactive = low.clone();
+        inactive.id = "inactive-medium".to_string();
+        inactive.is_active = false;
+        inactive.allowed_models = Some(serde_json::json!(["gemini-4-argon-medium"]));
+        let app = AppState::new().unwrap().with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    vec![provider],
+                    vec![endpoint],
+                    vec![representative, low, inactive],
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed([
+                    row.clone()
+                ])),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+        let auth = unrestricted_auth_snapshot();
+        let policy = crate::system_features::ModelDirectivePolicySnapshot::default();
+        let cursor = LocalCandidatePreselectionPageCursor::new(
+            PlannerAppState::new(&app),
+            &policy,
+            "gemini:generate_content",
+            "gemini-4-argon",
+            None,
+            true,
+            None,
+            &auth,
+            None,
+            None,
+            None,
+            false,
+            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel,
+            false,
+            None,
+        )
+        .await;
+        let selected = cursor
+            .resolve_argon_rows(
+                vec![row.clone()],
+                "gemini-4-argon",
+                "gemini:generate_content",
+                ArgonLevel::Low,
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].model_provider_model_name, "gemini-4-argon-low");
+        assert!(cursor
+            .resolve_argon_rows(
+                vec![row.clone()],
+                "gemini-4-argon",
+                "gemini:generate_content",
+                ArgonLevel::Medium
+            )
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     fn provider_catalog_for_standard_row(

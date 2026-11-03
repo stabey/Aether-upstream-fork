@@ -31,6 +31,7 @@ pub(crate) struct AntigravityV1InternalRequestInput<'a> {
     pub(crate) transport: &'a Arc<GatewayProviderTransportSnapshot>,
     pub(crate) trace_id: &'a str,
     pub(crate) mapped_model: &'a str,
+    pub(crate) requires_exact_model_permission: bool,
     pub(crate) provider_api_format: &'a str,
     pub(crate) auth_header: &'a str,
     pub(crate) auth_value: &'a str,
@@ -51,6 +52,14 @@ pub(crate) struct AntigravityV1InternalRequest {
 pub(crate) async fn build_antigravity_v1internal_provider_request(
     input: AntigravityV1InternalRequestInput<'_>,
 ) -> Result<AntigravityV1InternalRequest, AntigravityV1InternalRequestError> {
+    if input.requires_exact_model_permission
+        && !super::argon_routing::body_matches_variant(
+            input.mapped_model,
+            input.gemini_request_body,
+        )
+    {
+        return Err(AntigravityV1InternalRequestError::EnvelopeUnsupported);
+    }
     let payload = build_antigravity_v1internal_payload(
         input.state,
         input.transport,

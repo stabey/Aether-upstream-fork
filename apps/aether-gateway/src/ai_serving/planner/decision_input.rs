@@ -338,6 +338,26 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
             Some(crate::ai_serving::ApiOperation::OpenAiMemoriesSummarize),
         );
     }
+    // Provider-request rules run after envelope construction. They cannot
+    // silently undo the variant/account decision made during preselection.
+    if provider_type.eq_ignore_ascii_case("antigravity")
+        && decision
+            .mapped_model
+            .as_deref()
+            .is_some_and(super::argon_routing::is_argon)
+    {
+        if let Some(level) = super::argon_routing::request_level(
+            super::argon_routing::enabled(),
+            &input.model_directive_policy,
+            &context.client_api_format,
+            &input.requested_model,
+            &context.effective_body_json,
+        ) {
+            if !super::argon_routing::envelope_matches_level(level, &provider_request_body) {
+                return Err(invalid_routing_provider_contract());
+            }
+        }
+    }
     let provider_model = provider_request_body
         .get("model")
         .and_then(Value::as_str)

@@ -126,6 +126,13 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         if provider_transport_uses_pool(transport) {
             return pool_group_common_transport_skip_reason(candidate, transport);
         }
+        if let Some(reason) = super::argon_routing::transport_skip_reason(
+            transport,
+            &candidate.selected_provider_model_name,
+            candidate.requires_exact_model_permission,
+        ) {
+            return Some(reason);
+        }
         if let Some(skip_reason) =
             candidate_auth_channel_skip_reason(transport, self.request_auth_channel)
         {
@@ -658,6 +665,7 @@ mod tests {
 
     fn sample_candidate() -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
+            requires_exact_model_permission: false,
             provider_id: "provider-1".to_string(),
             provider_name: "provider".to_string(),
             provider_type: "custom".to_string(),

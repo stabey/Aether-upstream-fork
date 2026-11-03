@@ -1358,6 +1358,14 @@ impl<'a> PoolKeyCursor<'a> {
             self.record_skip_reason(skip_reason);
             return None;
         }
+        if let Some(skip_reason) = crate::ai_serving::argon_variant_transport_skip_reason(
+            &transport,
+            &candidate.selected_provider_model_name,
+            candidate.requires_exact_model_permission,
+        ) {
+            self.record_skip_reason(skip_reason);
+            return None;
+        }
         if let Some(skip_reason) = candidate_common_transport_skip_reason(
             &transport,
             pool_candidate_transport_policy_facts(&candidate),
@@ -5476,6 +5484,7 @@ mod tests {
         EligibleLocalExecutionCandidate {
             kind: LocalExecutionCandidateKind::PoolGroup,
             candidate: SchedulerMinimalCandidateSelectionCandidate {
+                requires_exact_model_permission: false,
                 provider_id: provider_id.to_string(),
                 provider_name: provider_id.to_string(),
                 provider_type: "codex".to_string(),
@@ -5594,6 +5603,7 @@ mod tests {
                 LocalExecutionCandidateKind::SingleKey
             },
             candidate: SchedulerMinimalCandidateSelectionCandidate {
+                requires_exact_model_permission: false,
                 provider_id: provider_id.to_string(),
                 provider_name: provider_id.to_string(),
                 provider_type: "codex".to_string(),

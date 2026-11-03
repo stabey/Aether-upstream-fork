@@ -297,6 +297,7 @@ pub(crate) async fn build_lazy_local_openai_chat_candidate_attempt_source<'a>(
         trace_id,
         "openai:chat",
         &input.requested_model,
+        input.effective_body_json(body_json),
         None,
         require_streaming,
         &input.auth_snapshot,

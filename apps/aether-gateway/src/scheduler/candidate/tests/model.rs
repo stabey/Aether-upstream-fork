@@ -128,6 +128,7 @@ fn resolves_requested_global_model_from_global_regex_mapping() {
 #[test]
 fn scheduler_candidate_is_serializable() {
     let candidate = SchedulerMinimalCandidateSelectionCandidate {
+        requires_exact_model_permission: false,
         provider_id: "provider-1".to_string(),
         provider_name: "OpenAI".to_string(),
         provider_type: "custom".to_string(),

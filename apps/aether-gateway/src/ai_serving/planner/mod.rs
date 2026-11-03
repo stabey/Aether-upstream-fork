@@ -2,6 +2,7 @@ use crate::ai_serving::{AiExecutionDecision, AiExecutionPlanPayload, GatewayCont
 use crate::{AppState, GatewayError};
 
 mod antigravity;
+mod argon_routing;
 mod candidate_affinity_cache;
 mod candidate_materialization;
 mod candidate_metadata;
@@ -29,6 +30,7 @@ mod specialized;
 mod standard;
 mod state;
 
+pub(crate) use self::argon_routing::transport_skip_reason as argon_variant_transport_skip_reason;
 pub(crate) use self::candidate_materialization::LocalExecutionAttemptSource;
 pub(crate) use self::candidate_resolution::{
     candidate_auth_channel_skip_reason, read_candidate_transport_snapshot,

@@ -619,6 +619,7 @@ mod reserve_minimum_quota_tests {
     #[test]
     fn reserve_minimum_quota_is_independent_of_skip_exhausted_accounts() {
         let candidate = SchedulerMinimalCandidateSelectionCandidate {
+            requires_exact_model_permission: false,
             provider_id: "provider-codex".to_string(),
             provider_name: "codex".to_string(),
             provider_type: "codex".to_string(),

@@ -83,6 +83,7 @@ mod tests {
         capabilities: Option<serde_json::Value>,
     ) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
+            requires_exact_model_permission: false,
             provider_id: format!("provider-{id}"),
             provider_name: format!("Provider {id}"),
             provider_type: "openai".to_string(),

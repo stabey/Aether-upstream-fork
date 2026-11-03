@@ -214,6 +214,7 @@ mod tests {
 
     fn sample_candidate(id: &str) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
+            requires_exact_model_permission: false,
             provider_id: format!("provider-{id}"),
             provider_name: format!("Provider {id}"),
             provider_type: "custom".to_string(),

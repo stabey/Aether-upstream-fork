@@ -1054,6 +1054,7 @@ async fn build_antigravity_openai_chat_cross_format_payload_parts(
             transport,
             trace_id,
             mapped_model: &mapped_model,
+            requires_exact_model_permission: candidate.requires_exact_model_permission,
             provider_api_format,
             auth_header: &auth_header,
             auth_value: &auth_value,
@@ -2269,6 +2270,7 @@ mod tests {
         EligibleLocalExecutionCandidate {
             kind: crate::ai_serving::planner::candidate_resolution::LocalExecutionCandidateKind::SingleKey,
             candidate: SchedulerMinimalCandidateSelectionCandidate {
+                requires_exact_model_permission: false,
                 provider_id: "provider-1".to_string(),
                 provider_name: "gemini".to_string(),
                 provider_type: "gemini_cli".to_string(),

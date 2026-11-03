@@ -130,6 +130,7 @@ mod tests {
         EligibleLocalExecutionCandidate {
             kind,
             candidate: SchedulerMinimalCandidateSelectionCandidate {
+                requires_exact_model_permission: false,
                 provider_id: "provider-1".to_string(),
                 provider_name: "Provider 1".to_string(),
                 provider_type: "openai".to_string(),

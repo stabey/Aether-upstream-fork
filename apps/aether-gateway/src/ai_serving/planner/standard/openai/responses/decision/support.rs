@@ -319,6 +319,7 @@ pub(crate) async fn build_local_openai_responses_candidate_attempt_source<'a>(
             trace_id,
             spec_metadata.api_format,
             &input.requested_model,
+            input.effective_body_json(body_json),
             request_operation,
             spec_metadata.require_streaming,
             &input.auth_snapshot,

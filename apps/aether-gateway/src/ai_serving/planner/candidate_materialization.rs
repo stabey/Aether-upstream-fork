@@ -808,6 +808,7 @@ pub(crate) async fn build_lazy_requested_model_execution_candidate_attempt_sourc
     trace_id: &str,
     client_api_format: &str,
     requested_model: &str,
+    request_body: &Value,
     request_operation: Option<&str>,
     require_streaming: bool,
     auth_snapshot: &GatewayAuthApiKeySnapshot,
@@ -849,7 +850,14 @@ where
         sticky_session_token.is_none(),
         Some(trace_id),
     )
-    .await;
+    .await
+    .with_argon_level(super::argon_routing::request_level(
+        super::argon_routing::enabled(),
+        model_directive_policy,
+        client_api_format,
+        requested_model,
+        request_body,
+    ));
     let mut cursor = RequestedModelAttemptPageCursor {
         state,
         trace_id: trace_id.to_string(),
@@ -2147,6 +2155,7 @@ mod tests {
 
     fn sample_candidate(key_id: &str) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
+            requires_exact_model_permission: false,
             provider_id: "provider-1".to_string(),
             provider_name: "provider-1".to_string(),
             provider_type: "codex".to_string(),

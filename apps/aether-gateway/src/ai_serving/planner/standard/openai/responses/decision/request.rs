@@ -954,6 +954,7 @@ async fn build_antigravity_openai_responses_payload_parts(
             transport,
             trace_id,
             mapped_model: &mapped_model,
+            requires_exact_model_permission: candidate.requires_exact_model_permission,
             provider_api_format,
             auth_header: &auth_header,
             auth_value: &auth_value,
