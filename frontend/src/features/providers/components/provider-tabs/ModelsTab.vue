@@ -4,54 +4,18 @@
     <div class="p-4 border-b border-border/60">
       <div class="flex items-center justify-between gap-3">
         <div class="flex items-center gap-2 min-w-0">
-          <Checkbox
-            v-if="!isLoading && models.length > 0"
-            data-testid="models-tab-select-all"
-            class="shrink-0"
-            :checked="isAllSelected"
-            :indeterminate="isPartiallySelected"
-            :aria-label="selectAllLabel"
-            :title="selectAllLabel"
-            @update:checked="toggleSelectAll"
-          />
           <h3 class="text-sm font-semibold flex items-center gap-2">
-            模型列表
+            {{ t('ui.modelList') }}
           </h3>
-          <span
-            v-if="selectedCount > 0"
-            class="text-xs text-muted-foreground tabular-nums"
-          >
-            已选 {{ selectedCount }} 个
-          </span>
         </div>
         <div class="flex items-center gap-2 shrink-0">
-          <Button
-            v-if="selectedCount > 0"
-            variant="destructive"
-            size="sm"
-            class="h-8"
-            data-testid="models-tab-delete-selected"
-            :disabled="deletingSelected"
-            @click="confirmDeleteSelected"
-          >
-            <Loader2
-              v-if="deletingSelected"
-              class="w-3.5 h-3.5 mr-1.5 animate-spin"
-            />
-            <Trash2
-              v-else
-              class="w-3.5 h-3.5 mr-1.5"
-            />
-            {{ deletingSelected ? '删除中...' : '删除选中' }}
-          </Button>
           <Button
             variant="outline"
             size="sm"
             class="h-8"
             @click="openBatchAssignDialog"
           >
-            <Layers class="w-3.5 h-3.5 mr-1.5" />
-            关联模型
+            <Layers class="w-3.5 h-3.5 mr-1.5" /> {{ t('guide.nav.concepts.linkModel') }}
           </Button>
         </div>
       </div>
@@ -83,19 +47,10 @@
           <tr
             v-for="model in paginatedModels"
             :key="model.id"
-            class="border-b border-border/40 last:border-b-0 transition-colors"
-            :class="isModelSelected(model.id) ? 'bg-primary/5' : 'hover:bg-muted/30'"
+            class="border-b border-border/40 last:border-b-0 transition-colors hover:bg-muted/30"
           >
             <td class="align-top px-4 py-3">
               <div class="flex items-center gap-2.5">
-                <Checkbox
-                  class="shrink-0"
-                  :data-testid="`models-tab-row-checkbox-${model.id}`"
-                  :checked="isModelSelected(model.id)"
-                  :aria-label="`选择 ${model.global_model_display_name || model.provider_model_name}`"
-                  @click.stop
-                  @update:checked="checked => toggleModelSelection(model.id, checked)"
-                />
                 <!-- 状态指示灯 -->
                 <div
                   class="w-2 h-2 rounded-full shrink-0"
@@ -113,7 +68,7 @@
                     <span class="font-mono truncate">{{ model.provider_model_name }}</span>
                     <button
                       class="p-0.5 hover:bg-muted rounded transition-colors shrink-0"
-                      title="复制模型 ID"
+                      :title="t('ui.copyModelId')"
                       @click.stop="copyModelId(model.provider_model_name)"
                     >
                       <Copy class="w-3 h-3" />
@@ -129,34 +84,33 @@
               >
                 <!-- 按 Token 计费 -->
                 <template v-if="hasTokenPricing(model)">
-                  <span class="text-muted-foreground text-right">入/出:</span>
+                  <span class="text-muted-foreground text-right">{{ t('ui.inOut') }}</span>
                   <span class="font-mono font-semibold">
                     ${{ formatPrice(model.effective_input_price) }}/${{ formatPrice(model.effective_output_price) }}
                   </span>
                 </template>
                 <template v-if="getEffectiveCachePrice(model, 'creation') > 0 || getEffectiveCachePrice(model, 'read') > 0">
-                  <span class="text-muted-foreground text-right">{{ get1hCachePrice(model) > 0 ? '5min 缓存:' : '缓存:' }}</span>
+                  <span class="text-muted-foreground text-right">{{ get1hCachePrice(model) > 0 ? t('ui.5MinuteCache') : t('ui.cache0df2353') }}</span>
                   <span class="font-mono font-semibold">
                     ${{ formatPrice(getEffectiveCachePrice(model, 'creation')) }}/${{ formatPrice(getEffectiveCachePrice(model, 'read')) }}
                   </span>
                 </template>
                 <!-- 1h 缓存价格 -->
                 <template v-if="get1hCachePrice(model) > 0">
-                  <span class="text-muted-foreground text-right">1h 缓存创建:</span>
+                  <span class="text-muted-foreground text-right">{{ t('ui.1HourCacheWrited3ac130') }}</span>
                   <span class="font-mono font-semibold">
                     ${{ formatPrice(get1hCachePrice(model)) }}
                   </span>
                 </template>
                 <!-- 按次计费 -->
                 <template v-if="hasRequestPricing(model)">
-                  <span class="text-muted-foreground text-right">按次:</span>
+                  <span class="text-muted-foreground text-right">{{ t('ui.perRequest5b310fa') }}</span>
                   <span class="font-mono font-semibold">
-                    ${{ formatPrice(model.effective_price_per_request ?? model.price_per_request) }}/次
-                  </span>
+                    ${{ formatPrice(model.effective_price_per_request ?? model.price_per_request) }}{{ t('ui.requestad9c0d7') }} </span>
                 </template>
                 <!-- 视频费用计费 -->
                 <template v-if="hasVideoPricing(model)">
-                  <span class="text-muted-foreground text-right">视频:</span>
+                  <span class="text-muted-foreground text-right">{{ t('ui.video61a56bb') }}</span>
                   <span
                     class="font-mono font-semibold"
                     :title="getVideoPricingTooltip(model)"
@@ -177,7 +131,7 @@
                   variant="ghost"
                   size="icon"
                   class="h-8 w-8"
-                  title="测试模型"
+                  :title="t('ui.testModel')"
                   :disabled="modelTest.testing.value && pendingTestModel?.id === model.id"
                   @click="testModelConnection(model)"
                 >
@@ -194,7 +148,7 @@
                   variant="ghost"
                   size="icon"
                   class="h-8 w-8"
-                  title="编辑"
+                  :title="t('ui.edit0518365')"
                   @click="editModel(model)"
                 >
                   <Edit class="w-3.5 h-3.5" />
@@ -204,7 +158,7 @@
                   size="icon"
                   class="h-8 w-8"
                   :disabled="togglingModelId === model.id"
-                  :title="model.is_active ? '点击停用' : '点击启用'"
+                  :title="model.is_active ? t('ui.clickToDisable') : t('ui.clickToEnable')"
                   @click="toggleModelActive(model)"
                 >
                   <Power class="w-3.5 h-3.5" />
@@ -219,12 +173,7 @@
         v-if="shouldPaginateModels"
         class="px-4 py-2 border-t border-border/40 flex items-center justify-between text-xs text-muted-foreground"
       >
-        <span>
-          共 {{ sortedModels.length }} 个模型
-          <template v-if="selectedCount > 0">
-            · 已选 {{ selectedCount }} 个
-          </template>
-        </span>
+        <span> {{ t('ui.total76e547a') }} {{ sortedModels.length }} {{ t('ui.models') }} </span>
         <div class="flex items-center gap-1.5">
           <Button
             variant="ghost"
@@ -256,10 +205,10 @@
     >
       <Box class="w-12 h-12 mx-auto mb-3 opacity-50" />
       <p class="text-sm">
-        暂无模型
+        {{ t('ui.noModels') }}
       </p>
       <p class="text-xs mt-1">
-        请前往"模型目录"页面添加模型
+        {{ t('ui.addModelsFromTheModelCatalog') }}
       </p>
     </div>
   </Card>
@@ -271,7 +220,7 @@
     :provider-type="provider.provider_type"
     :selecting-model-name="pendingTestModel ? (pendingTestModel.global_model_display_name || pendingTestModel.provider_model_name) : null"
     :requested-model-name="pendingRequestedModelName"
-    :endpoints="activeEndpoints"
+    :endpoints="testableEndpoints"
     :selected-endpoint="selectedTestEndpoint"
     :testing="modelTest.testing.value"
     :trace="modelTest.testTrace.value"
@@ -301,24 +250,23 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import { ref, computed, watch } from 'vue'
 import { useSmartPagination } from '@/composables/useSmartPagination'
 import { useModelTest } from '@/composables/useModelTest'
-import { Box, Edit, Layers, Power, Copy, Loader2, Play, Trash2 } from 'lucide-vue-next'
+import { Box, Edit, Layers, Power, Copy, Loader2, Play } from 'lucide-vue-next'
 import Card from '@/components/ui/card.vue'
 import Button from '@/components/ui/button.vue'
-import Checkbox from '@/components/ui/checkbox.vue'
 import { useToast } from '@/composables/useToast'
-import { useConfirm } from '@/composables/useConfirm'
 import { useClipboard } from '@/composables/useClipboard'
-import { useI18n } from '@/i18n'
 import { sortResolutionEntries } from '@/utils/form'
 import {
   type Model,
   type ProviderEndpoint,
 } from '@/api/endpoints'
 import { getProviderKeys, type EndpointAPIKey } from '@/api/endpoints/keys'
-import { deleteModel, updateModel } from '@/api/endpoints/models'
+import { updateModel } from '@/api/endpoints/models'
 import { parseApiError } from '@/utils/errorParser'
 import { formatApiFormat } from '@/api/endpoints/types/api-format'
 import type { ProviderWithEndpointsSummary } from '@/api/endpoints'
@@ -327,7 +275,6 @@ import {
   buildDefaultModelTestRequestHeaders,
   buildDefaultModelTestRequestBody,
   isModelTestableApiFormat,
-  isModelTestableEndpoint,
   listModelTestMappedModelOptions,
   modelTestKeySupportsEndpoint,
   normalizeModelTestMappedModelSelection,
@@ -351,10 +298,10 @@ const emit = defineEmits<{
   'refresh': []
 }>()
 
+const { t } = useI18n()
+
 const { error: showError, success: showSuccess } = useToast()
-const { confirmDanger } = useConfirm()
 const { copyToClipboard } = useClipboard()
-const { legacyT } = useI18n()
 
 // 模型测试 composable
 const modelTest = useModelTest({ providerId: () => props.provider.id })
@@ -363,8 +310,6 @@ const modelTest = useModelTest({ providerId: () => props.provider.id })
 const localLoading = ref(false)
 const localModels = ref<Model[]>([])
 const togglingModelId = ref<string | null>(null)
-const selectedIds = ref<Set<string>>(new Set())
-const deletingSelected = ref(false)
 const pendingTestModel = ref<Model | null>(null)
 const selectedTestEndpoint = ref<ProviderEndpoint | null>(null)
 const testRequestHeadersDraft = ref('')
@@ -377,16 +322,8 @@ const modelTestProviderKeys = ref<EndpointAPIKey[]>([])
 const modelTestKeysLoadedProviderId = ref<string | null>(null)
 const loadingModelTestKeys = ref(false)
 const isPoolManagedProvider = computed(() => Boolean(props.provider.pool_advanced))
-const activeEndpoints = computed(() => (props.endpoints ?? [])
-  .filter(endpoint => {
-    if (typeof endpoint.active_keys === 'number') {
-      return endpoint.is_active !== false
-        && isModelTestableApiFormat(endpoint.api_format)
-        && (endpoint.active_keys > 0
-          || isModelTestableEndpoint(endpoint, props.providerKeys ?? [], props.provider.provider_type))
-    }
-    return isModelTestableEndpoint(endpoint, props.providerKeys ?? [], props.provider.provider_type)
-  }))
+const testableEndpoints = computed(() => (props.endpoints ?? [])
+  .filter(endpoint => isModelTestableApiFormat(endpoint.api_format)))
 const parsedTestRequestHeaders = computed(() => parseModelTestRequestHeadersDraft(testRequestHeadersDraft.value))
 const testRequestHeadersError = computed(() => parsedTestRequestHeaders.value.error)
 const parsedTestRequestBody = computed(() => parseModelTestRequestBodyDraft(testRequestBodyDraft.value))
@@ -444,16 +381,6 @@ const sortedModels = computed(() => {
     return nameA.localeCompare(nameB)
   })
 })
-
-const selectedCount = computed(() => selectedIds.value.size)
-const isAllSelected = computed(() => (
-  sortedModels.value.length > 0
-  && sortedModels.value.every(model => selectedIds.value.has(model.id))
-))
-const isPartiallySelected = computed(() => (
-  selectedCount.value > 0 && !isAllSelected.value
-))
-const selectAllLabel = computed(() => (isAllSelected.value ? '取消全选' : '全选'))
 
 // ===== 模型列表智能分页 =====
 const modelsListRef = ref<HTMLElement | null>(null)
@@ -538,9 +465,9 @@ function getVideoPricingDisplay(model: Model): string {
   if (entries.length === 0) return ''
   // 获取最低分辨率和价格
   const [firstRes, firstPrice] = entries[0]
-  const priceStr = `${firstRes} $${(firstPrice as number).toFixed(2)}/s`
+  const priceStr = `${firstRes} ${(firstPrice as number).toFixed(2)}/s`
   if (entries.length > 1) {
-    return `${priceStr} [${entries.length}种]`
+    return t('providers.migration.typesd5779c', { value: String(priceStr), value_2: String(entries.length) })
   }
   return priceStr
 }
@@ -551,7 +478,7 @@ function getVideoPricingTooltip(model: Model): string {
     || model.config?.billing?.video?.price_per_second_by_resolution
   if (!priceByResolution || typeof priceByResolution !== 'object') return ''
   const entries = sortResolutionEntries(Object.entries(priceByResolution))
-  return entries.map(([res, price]) => `${res}: $${(price as number).toFixed(4)}/s`).join('\n')
+  return entries.map(([res, price]) => `${res}: ${(price as number).toFixed(4)}/s`).join('\n')
 }
 
 // 获取状态指示灯样式
@@ -571,12 +498,12 @@ function getStatusIndicatorClass(model: Model): string {
 // 获取状态提示文本
 function getStatusTitle(model: Model): string {
   if (!model.is_active) {
-    return '停用'
+    return t('ui.disable4e6fd0e')
   }
   if (model.is_available) {
-    return '活跃且可用'
+    return t('ui.activeAndAvailable')
   }
-  return '活跃但不可用'
+  return t('ui.activeButUnavailable')
 }
 
 // 编辑模型
@@ -589,71 +516,6 @@ function openBatchAssignDialog() {
   emit('batchAssign')
 }
 
-function isModelSelected(modelId: string): boolean {
-  return selectedIds.value.has(modelId)
-}
-
-function toggleModelSelection(modelId: string, checked?: boolean) {
-  const next = new Set(selectedIds.value)
-  const shouldSelect = checked ?? !next.has(modelId)
-  if (shouldSelect) {
-    next.add(modelId)
-  } else {
-    next.delete(modelId)
-  }
-  selectedIds.value = next
-}
-
-function toggleSelectAll(checked: boolean) {
-  selectedIds.value = checked
-    ? new Set(sortedModels.value.map(model => model.id))
-    : new Set()
-}
-
-function pruneMissingSelection(validIds: Set<string>) {
-  if (selectedIds.value.size === 0) return
-  const next = new Set([...selectedIds.value].filter(id => validIds.has(id)))
-  if (next.size !== selectedIds.value.size) {
-    selectedIds.value = next
-  }
-}
-
-async function confirmDeleteSelected() {
-  const ids = Array.from(selectedIds.value)
-  if (ids.length === 0 || deletingSelected.value) return
-
-  const confirmed = await confirmDanger(
-    legacyT(`确定删除选中的 ${ids.length} 个模型吗？\n\n此操作不可撤销。`),
-    legacyT('批量删除模型'),
-  )
-  if (!confirmed) return
-
-  deletingSelected.value = true
-  try {
-    const results = await Promise.allSettled(
-      ids.map(id => deleteModel(props.provider.id, id)),
-    )
-    const successCount = results.filter(result => result.status === 'fulfilled').length
-    const failedCount = results.length - successCount
-
-    if (successCount > 0) {
-      showSuccess(legacyT(`成功删除 ${successCount} 个模型`))
-    }
-    if (failedCount > 0) {
-      showError(legacyT(`${failedCount} 个模型删除失败`), legacyT('部分失败'))
-    }
-
-    selectedIds.value = new Set()
-    if (successCount > 0) {
-      emit('refresh')
-    }
-  } catch (err: unknown) {
-    showError(parseApiError(err, '批量删除失败'), '错误')
-  } finally {
-    deletingSelected.value = false
-  }
-}
-
 // 切换模型启用状态
 async function toggleModelActive(model: Model) {
   if (togglingModelId.value) return
@@ -663,9 +525,9 @@ async function toggleModelActive(model: Model) {
     const newStatus = !model.is_active
     await updateModel(props.provider.id, model.id, { is_active: newStatus })
     model.is_active = newStatus
-    showSuccess(newStatus ? '模型已启用' : '模型已停用')
+    showSuccess(newStatus ? t('ui.modelEnabled') : t('ui.modelDisabledda3c032'))
   } catch (err: unknown) {
-    showError(parseApiError(err, '操作失败'), '错误')
+    showError(parseApiError(err, t('ui.operationFailed')), t('ui.error'))
   } finally {
     togglingModelId.value = null
   }
@@ -690,7 +552,7 @@ function handleTestDialogBack() {
 }
 
 function handleSelectTestEndpoint(endpointId: string) {
-  const endpoint = activeEndpoints.value.find(item => item.id === endpointId)
+  const endpoint = testableEndpoints.value.find(item => item.id === endpointId)
   if (!endpoint) return
   selectedTestEndpoint.value = endpoint
   syncSelectedTestModelMapping()
@@ -714,21 +576,21 @@ async function handleStartPendingTest() {
   if (modelTest.testing.value) return
   if (!pendingTestModel.value) return
 
-  const endpoint = selectedTestEndpoint.value || activeEndpoints.value[0]
+  const endpoint = selectedTestEndpoint.value || testableEndpoints.value[0]
   if (!endpoint) {
-    showError('请选择要测试的端点')
+    showError(t('ui.selectAnEndpointToTest'))
     return
   }
 
   const { value: requestHeaders, error: requestHeadersError } = parsedTestRequestHeaders.value
   if (!requestHeaders || requestHeadersError) {
-    showError(`测试请求头无效: ${requestHeadersError || '无效 JSON'}`)
+    showError(t('providers.migration.invalidTestRequestHeaders73f57d', { value: String(requestHeadersError || t('ui.invalidJson')) }))
     return
   }
 
   const { value: requestBody, error } = parsedTestRequestBody.value
   if (!requestBody || error) {
-    showError(`测试请求体无效: ${error || '无效 JSON'}`)
+    showError(t('providers.migration.invalidTestRequestBody4d0d50', { value: String(error || t('ui.invalidJson')) }))
     return
   }
 
@@ -750,7 +612,7 @@ async function handleStartPendingTest() {
     requestHeaders,
     requestBody,
     onError: () => {
-      if (activeEndpoints.value.length > 1) {
+      if (testableEndpoints.value.length > 1) {
         return true
       }
     },
@@ -760,13 +622,13 @@ async function handleStartPendingTest() {
 async function testModelConnection(model: Model) {
   if (modelTest.testing.value) return
 
-  if (activeEndpoints.value.length === 0) {
-    showError('暂无可用于测试的活跃端点')
+  if (testableEndpoints.value.length === 0) {
+    showError(t('providers.migration.noEndpointsAvailableForTesting9ec423'))
     return
   }
 
   pendingTestModel.value = model
-  selectedTestEndpoint.value = selectPreferredModelTestEndpoint(model, activeEndpoints.value)
+  selectedTestEndpoint.value = selectPreferredModelTestEndpoint(model, testableEndpoints.value)
   const requestedModelName = getModelTestRequestedModelName(model)
   selectedTestMappedModelName.value = null
   selectedTestKeyIds.value = []
@@ -807,7 +669,7 @@ async function ensureModelTestKeysLoaded() {
     modelTestKeysLoadedProviderId.value = props.provider.id
     pruneSelectedTestKeyIds()
   } catch (err: unknown) {
-    showError(parseApiError(err, '加载测试 Key 失败'), '错误')
+    showError(parseApiError(err, t('ui.failedToLoadTestKeys')), t('ui.error'))
   } finally {
     loadingModelTestKeys.value = false
   }
@@ -891,14 +753,6 @@ watch(
     modelTestProviderKeys.value = []
     modelTestKeysLoadedProviderId.value = null
     selectedTestKeyIds.value = []
-    selectedIds.value = new Set()
-  },
-)
-
-watch(
-  () => models.value.map(model => model.id),
-  (ids) => {
-    pruneMissingSelection(new Set(ids))
   },
 )
 
@@ -906,4 +760,5 @@ watch(
 defineExpose({
   reload: refresh
 })
+
 </script>

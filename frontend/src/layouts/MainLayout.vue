@@ -3,6 +3,7 @@
     :show-notice="showAuthError"
     :main-class="mainClasses"
     :sidebar-class="sidebarClasses"
+    :sidebar-style="{ width: `${sidebarCollapsed ? 64 : sidebarWidth}px` }"
     :content-class="contentClasses"
   >
     <template #notice>
@@ -23,6 +24,20 @@
     </template>
 
     <template #sidebar>
+      <div
+        v-if="!sidebarCollapsed"
+        role="separator"
+        aria-orientation="vertical"
+        :aria-label="locale === 'zh-CN' ? t('ui.resizeNavigationSidebar') : 'Resize navigation sidebar'"
+        :aria-valuenow="sidebarWidth"
+        :aria-valuemin="sidebarMinWidth"
+        :aria-valuemax="sidebarMaxWidth"
+        tabindex="0"
+        class="absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize touch-none hover:bg-primary/20 focus-visible:bg-primary/20 focus-visible:outline-none"
+        :class="{ 'bg-primary/20': sidebarResizing }"
+        @pointerdown="startSidebarResize"
+        @keydown="handleSidebarResizeKey"
+      />
       <div class="flex h-full w-full min-w-0 flex-col overflow-hidden">
         <!-- HEADER (Brand) -->
         <div
@@ -500,8 +515,10 @@ import { useLocalStorage } from '@vueuse/core'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import { useModuleStore } from '@/stores/modules'
+import { useNavigationModules } from '@/layouts/main-layout/modules'
 import { useSiteInfo } from '@/composables/useSiteInfo'
 import { useToast } from '@/composables/useToast'
+import { useSidebarResize } from '@/composables/useSidebarResize'
 import { isDemoMode } from '@/config/demo'
 import { adminApi, type CheckUpdateResponse, type ReleaseEntry, type SystemUpdateCapabilityResponse, type UpdateTaskStatusResponse } from '@/api/admin'
 import type { Announcement } from '@/api/announcements'
@@ -510,7 +527,7 @@ import { parseApiError } from '@/utils/errorParser'
 import Button from '@/components/ui/button.vue'
 import AppShell from '@/components/layout/AppShell.vue'
 import SidebarNav from '@/components/layout/SidebarNav.vue'
-import HeaderLogo from '@/components/HeaderLogo.vue'
+import HeaderLogo from '@/components/brand/HeaderLogo.vue'
 import LanguageSwitcher from '@/components/common/LanguageSwitcher.vue'
 import ThemeModeButton from '@/components/common/ThemeModeButton.vue'
 import UpdateDialog from '@/components/common/UpdateDialog.vue'
@@ -531,7 +548,7 @@ import {
   PanelLeftOpen,
 } from 'lucide-vue-next'
 
-import GithubIcon from '@/components/icons/GithubIcon.vue'
+import GithubIcon from '@/components/brand/GithubIcon.vue'
 import { prefetchNavigationTarget } from '@/utils/adminNavigationPrefetch'
 import { useI18n, type MessageKey } from '@/i18n'
 import { buildBreadcrumbs, buildNavigation } from './main-layout/navigation'
@@ -542,6 +559,7 @@ const router = useRouter()
 const route = useRoute()
 const authStore = useAuthStore()
 const moduleStore = useModuleStore()
+useNavigationModules(() => authStore.canAccessAdmin)
 const announcementStore = useAnnouncementStore()
 const { siteName, siteSubtitle } = useSiteInfo()
 const { success, error: showError } = useToast()
@@ -552,6 +570,10 @@ const isAdmin = computed(() => authStore.user?.role === 'admin')
 const showAuthError = ref(false)
 const mobileMenuOpen = ref(false)
 const sidebarCollapsed = useLocalStorage('aether-sidebar-collapsed', false)
+const {
+  sidebarWidth, sidebarMinWidth, sidebarMaxWidth, sidebarResizing,
+  startSidebarResize, handleSidebarResizeKey,
+} = useSidebarResize()
 const announcementText = (zh: string, en: string) => locale.value === 'zh-CN' ? zh : en
 const announcementPanel = ref<'desktop' | 'mobile' | null>(null)
 const manualAnnouncement = ref<Announcement | null>(null)
@@ -1197,12 +1219,6 @@ onMounted(() => {
   syncAuthNotice()
   applyCachedVersionStatus()
 
-  // 管理员预加载模块状态（路由守卫会按需加载，这里提前加载以避免菜单闪烁）
-  if (authStore.canAccessAdmin && !moduleStore.loaded && !moduleStore.loading) {
-    void moduleStore.fetchModules().catch(() => {
-      // 路由守卫会在需要模块状态时按需处理失败场景。
-    })
-  }
   announcementPollTimer = window.setInterval(() => {
     if (!document.hidden) void announcementStore.refreshStatus()
   }, 60_000)
@@ -1264,7 +1280,7 @@ const navigation = computed(() => {
   return buildNavigation({
     canAccessAdmin: authStore.canAccessAdmin,
     modules: moduleStore.modules,
-    isModuleActive: moduleStore.isActive,
+    isModuleActive: authStore.canAccessAdmin ? moduleStore.isActive : moduleStore.isUserActive,
     t,
   })
 })
@@ -1285,8 +1301,8 @@ const breadcrumbs = computed(() => buildBreadcrumbs({
 
 // Styling Classes (Editorial)
 const sidebarClasses = computed(() => {
-    const widthClass = sidebarCollapsed.value ? 'w-16' : 'w-[260px]'
-    return `${widthClass} flex-col hidden lg:flex border-r border-[#3d3929]/5 dark:border-white/5 bg-[#faf9f5] dark:bg-[#1e1c19] h-screen sticky top-0 transition-[width] [transition-duration:240ms] [transition-timing-function:cubic-bezier(0.4,0,0.2,1)] motion-reduce:transition-none`
+    const transitionClass = sidebarResizing.value ? '' : 'transition-[width] [transition-duration:240ms] [transition-timing-function:cubic-bezier(0.4,0,0.2,1)] motion-reduce:transition-none'
+    return `${transitionClass} flex-col hidden lg:flex border-r border-[#3d3929]/5 dark:border-white/5 bg-[#faf9f5] dark:bg-[#1e1c19] h-screen sticky top-0`
 })
 
 const contentClasses = computed(() => {

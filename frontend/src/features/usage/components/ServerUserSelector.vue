@@ -6,7 +6,10 @@
     <button
       v-if="dropdown"
       type="button"
-      class="flex h-8 w-full min-w-0 cursor-pointer items-center justify-between gap-2 rounded-2xl border border-border/60 bg-card/80 px-4 py-2 text-left text-xs text-foreground shadow-sm backdrop-blur transition-all focus:border-primary/60 focus:outline-none focus:ring-2 focus:ring-primary/40"
+      :class="cn('flex h-8 w-full min-w-0 cursor-pointer items-center justify-between gap-2 rounded-2xl border border-border/60 bg-card/80 px-4 py-2 text-left text-xs text-foreground shadow-sm backdrop-blur transition-all focus:border-primary/60 focus:outline-none focus:ring-2 focus:ring-primary/40', triggerClass)"
+      :aria-label="label || selectedLabel"
+      :aria-expanded="open"
+      @keydown.esc="open = false"
       @click="toggleOpen"
     >
       <span class="truncate">{{ selectedLabel }}</span>
@@ -15,14 +18,14 @@
 
     <div
       v-if="!dropdown || open"
-      :class="dropdown ? 'absolute left-0 top-full z-50 mt-1 w-64 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-lg' : ''"
+      :class="dropdown ? 'absolute left-0 top-full z-50 mt-1 w-64 rounded-2xl border border-border bg-card p-1 text-foreground shadow-2xl backdrop-blur-xl' : ''"
     >
       <div class="relative mb-1">
         <Search class="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
         <Input
           v-model="searchText"
           class="h-8 pl-8 text-xs"
-          placeholder="搜索用户"
+          :placeholder="t('userStats.search.user')"
           @keydown.stop
         />
       </div>
@@ -37,7 +40,7 @@
             class="absolute left-2 h-4 w-4"
             :class="modelValue === '__all__' ? 'opacity-100' : 'opacity-0'"
           />
-          <span>全部用户</span>
+          <span>{{ t('ui.allUsers') }}</span>
         </button>
 
         <div
@@ -64,13 +67,26 @@
           v-if="loading"
           class="px-3 py-6 text-center text-xs text-muted-foreground"
         >
-          加载中...
+          {{ t('common.loading') }}
+        </div>
+        <div
+          v-else-if="loadError"
+          role="alert"
+          class="px-3 py-4 text-center text-xs text-destructive"
+        >
+          {{ t('ui.failedToLoadUsers') }} <button
+            type="button"
+            class="ml-2 underline"
+            @click="loadUsers(searchText)"
+          >
+            {{ t('vscodex.connection.retry') }}
+          </button>
         </div>
         <div
           v-else-if="visibleUsers.length === 0"
           class="px-3 py-6 text-center text-xs text-muted-foreground"
         >
-          未找到用户
+          {{ t('ui.noUsersFound') }}
         </div>
         <button
           v-for="user in visibleUsers"
@@ -98,11 +114,14 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from '@/i18n'
+
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useDebounceFn } from '@vueuse/core'
 import { Check, ChevronDown, Search } from 'lucide-vue-next'
 
 import { Input } from '@/components/ui'
+import { cn } from '@/lib/utils'
 import { usersApi } from '@/api/users'
 import type { UserOption } from './UsageRecordsTable.vue'
 
@@ -110,9 +129,15 @@ const props = withDefaults(defineProps<{
   modelValue: string
   initialUsers?: UserOption[]
   dropdown?: boolean
+  placeholder?: string
+  label?: string
+  triggerClass?: string
 }>(), {
   initialUsers: () => [],
   dropdown: false,
+  placeholder: undefined,
+  label: '',
+  triggerClass: '',
 })
 
 const emit = defineEmits<{
@@ -120,9 +145,12 @@ const emit = defineEmits<{
   select: [value: string]
 }>()
 
+const { t } = useI18n()
+
 const rootRef = ref<HTMLElement | null>(null)
 const open = ref(false)
 const loading = ref(false)
+const loadError = ref(false)
 const users = ref<UserOption[]>([])
 const knownUsers = ref(new Map<string, UserOption>())
 const searchText = ref('')
@@ -131,7 +159,7 @@ let loadedInitialBatch = false
 
 const selectedUser = computed(() => knownUsers.value.get(props.modelValue))
 const selectedLabel = computed(() => {
-  if (props.modelValue === '__all__') return '全部用户'
+  if (props.modelValue === '__all__') return placeholder.value
   const user = selectedUser.value
   return user ? getUserLabel(user) : `User ${props.modelValue}`
 })
@@ -178,6 +206,7 @@ function rememberUsers(nextUsers: UserOption[]) {
 async function loadUsers(search: string) {
   const currentRequest = ++requestId
   loading.value = true
+  loadError.value = false
   try {
     const result = await usersApi.getAllUsers({
       search,
@@ -195,7 +224,10 @@ async function loadUsers(search: string) {
     users.value = options
     rememberUsers(options)
   } catch {
-    if (currentRequest === requestId) users.value = []
+    if (currentRequest === requestId) {
+      users.value = []
+      loadError.value = true
+    }
   } finally {
     if (currentRequest === requestId) loading.value = false
   }
@@ -226,6 +258,9 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  requestId += 1
   document.removeEventListener('pointerdown', handleDocumentPointerDown)
 })
+
+const placeholder = computed(() => props.placeholder ?? t('ui.allUsers'))
 </script>
