@@ -574,7 +574,7 @@ fn validate_gemini_mixed_tool_model(
         format: target.as_str().to_string(),
         field: "tools".to_string(),
         reason: format!(
-            "model {target_model:?} does not support combining built-in tools with custom function declarations; use a Gemini 3 model"
+            "model {target_model:?} does not support combining built-in tools with custom function declarations; use a Gemini 3 or Gemini 4 Argon model"
         ),
     })
 }
@@ -3693,6 +3693,118 @@ mod tests {
                 items.iter().find_map(|item| find_first_array(item, key))
             }
             _ => None,
+        }
+    }
+
+    #[test]
+    fn runtime_argon_reasoning_preserves_medium_across_client_formats() {
+        for (format, body) in [
+            (
+                "openai:chat",
+                json!({"model":"client", "messages":[{"role":"user","content":"hello"}], "reasoning_effort":"medium"}),
+            ),
+            (
+                "openai:responses",
+                json!({"model":"client", "input":"hello", "reasoning":{"effort":"medium"}}),
+            ),
+            (
+                "claude:messages",
+                json!({"model":"client", "messages":[{"role":"user","content":"hello"}], "max_tokens":1000, "thinking":{"type":"enabled","budget_tokens":2048}}),
+            ),
+        ] {
+            let context = FormatContext::default().with_mapped_model("gemini-4-argon");
+            let output =
+                convert_request(format, "gemini:generate_content", &body, &context).unwrap();
+            assert_eq!(
+                output["generationConfig"]["thinkingConfig"]["thinkingLevel"], "medium",
+                "{format}: {output}"
+            );
+            assert!(output["generationConfig"]["thinkingConfig"]
+                .get("thinkingBudget")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_argon_native_budget_and_unspecified_effort_are_preserved() {
+        let context = FormatContext::default().with_mapped_model("gemini-4-argon");
+        let body = json!({"contents":[{"role":"user","parts":[{"text":"hello"}]}], "generationConfig":{"thinkingConfig":{"thinkingBudget":2048}}});
+        let output = convert_request(
+            "gemini:generate_content",
+            "gemini:generate_content",
+            &body,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            output["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            2048
+        );
+        assert!(output["generationConfig"]["thinkingConfig"]
+            .get("thinkingLevel")
+            .is_none());
+        let body = json!({"model":"client", "messages":[{"role":"user","content":"hello"}]});
+        let output =
+            convert_request("openai:chat", "gemini:generate_content", &body, &context).unwrap();
+        assert!(output["generationConfig"].get("thinkingConfig").is_none());
+    }
+
+    #[test]
+    fn runtime_responses_to_argon_supports_mixed_tools() {
+        let body = json!({"model":"client", "input":"Search and save", "tools":[
+            {"type":"web_search_preview"},
+            {"type":"function","name":"save_result","parameters":{"type":"object"}}
+        ]});
+        for model in [
+            "gemini-4-argon",
+            "gemini-4-argon-medium",
+            "models/gemini-4-argon",
+            "google/gemini-4-argon-high",
+        ] {
+            let context = FormatContext::default().with_mapped_model(model);
+            let output = convert_request(
+                "openai:responses",
+                "gemini:generate_content",
+                &body,
+                &context,
+            )
+            .unwrap();
+            assert_eq!(
+                output["toolConfig"]["includeServerSideToolInvocations"],
+                true
+            );
+            assert!(output["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool.get("googleSearch").is_some()));
+            assert!(output["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool.get("functionDeclarations").is_some()));
+        }
+    }
+
+    #[test]
+    fn runtime_chat_and_claude_to_argon_support_mixed_tools() {
+        for (format, body) in [
+            (
+                "openai:chat",
+                json!({"model":"client", "messages":[{"role":"user","content":"Search and save"}], "tools":[{"type":"function","function":{"name":"google_search"}},{"type":"function","function":{"name":"save_result","parameters":{"type":"object"}}}]}),
+            ),
+            (
+                "claude:messages",
+                json!({"model":"client", "messages":[{"role":"user","content":"Search and save"}], "max_tokens":1000, "tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"save_result","input_schema":{"type":"object"}}]}),
+            ),
+        ] {
+            let context = FormatContext::default().with_mapped_model("gemini-4-argon");
+            let output =
+                convert_request(format, "gemini:generate_content", &body, &context).unwrap();
+            assert_eq!(
+                output["toolConfig"]["includeServerSideToolInvocations"], true,
+                "{format}: {output}"
+            );
         }
     }
 

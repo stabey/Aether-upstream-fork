@@ -581,6 +581,20 @@ fn set_gemini_reasoning_effort(
     } else {
         "generationConfig"
     };
+    // A directive replaces thinking settings; do not leave an alternate spelling
+    // carrying a conflicting budget or level alongside the selected generation config.
+    let alternate_generation_key = if generation_key == "generationConfig" {
+        "generation_config"
+    } else {
+        "generationConfig"
+    };
+    if let Some(alternate) = body_object
+        .get_mut(alternate_generation_key)
+        .and_then(Value::as_object_mut)
+    {
+        alternate.remove("thinkingConfig");
+        alternate.remove("thinking_config");
+    }
     let generation_config = body_object
         .entry(generation_key.to_string())
         .or_insert_with(|| json!({}));
@@ -595,6 +609,11 @@ fn set_gemini_reasoning_effort(
     } else {
         "thinkingConfig"
     };
+    generation_config.remove(if thinking_key == "thinkingConfig" {
+        "thinking_config"
+    } else {
+        "thinkingConfig"
+    });
     generation_config.insert(
         thinking_key.to_string(),
         gemini_reasoning_effort_config(effort, provider_model, thinking_key),
@@ -640,16 +659,44 @@ pub fn claude_model_uses_adaptive_effort(model: &str) -> bool {
         || model.contains("sonnet-4-6")
 }
 
+// Inspect the model identity, never a parent path segment (e.g. gemini-3-pro/custom).
+fn gemini_capability_model_id(model: &str) -> String {
+    model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn is_gemini_three_model(model: &str) -> bool {
+    model
+        .strip_prefix("gemini-3-")
+        .is_some_and(|suffix| !suffix.is_empty())
+        || model.strip_prefix("gemini-3.").is_some_and(|rest| {
+            rest.split_once('-').is_some_and(|(minor, suffix)| {
+                !minor.is_empty()
+                    && minor.bytes().all(|byte| byte.is_ascii_digit())
+                    && !suffix.is_empty()
+            })
+        })
+}
+
+fn is_gemini_four_argon_model(model: &str) -> bool {
+    matches!(
+        model,
+        "gemini-4-argon" | "gemini-4-argon-low" | "gemini-4-argon-medium" | "gemini-4-argon-high"
+    )
+}
+
 pub fn gemini_model_uses_thinking_level(model: &str) -> bool {
-    gemini_model_supports_mixed_tools(model)
+    let model = gemini_capability_model_id(model);
+    is_gemini_three_model(&model) || is_gemini_four_argon_model(&model)
 }
 
 pub(crate) fn gemini_model_supports_mixed_tools(model: &str) -> bool {
-    model
-        .trim()
-        .to_ascii_lowercase()
-        .split('/')
-        .any(|part| part.starts_with("gemini-3"))
+    let model = gemini_capability_model_id(model);
+    is_gemini_three_model(&model) || is_gemini_four_argon_model(&model)
 }
 
 pub fn openai_model_supports_max_reasoning_effort(model: &str) -> bool {
@@ -819,7 +866,8 @@ mod tests {
 
     use super::{
         apply_model_directive_overrides_from_model, default_model_directive_suffixes,
-        default_model_directives_config, parse_model_directive,
+        default_model_directives_config, gemini_model_supports_mixed_tools,
+        gemini_model_uses_thinking_level, parse_model_directive,
         parse_model_directive_with_suffixes, ModelDirective, ModelDirectiveSuffixResolution,
         ModelOverride, ReasoningEffort, ServiceTier, MODEL_DIRECTIVE_API_FORMATS,
     };
@@ -975,6 +1023,76 @@ mod tests {
         ] {
             assert_eq!(parse_model_directive(model), None);
         }
+    }
+
+    #[test]
+    fn gemini_capabilities_use_explicit_model_identity() {
+        for model in [
+            "gemini-3-pro",
+            "gemini-3.1-pro-preview",
+            "gemini-3.2-flash",
+            "gemini-3.5-flash",
+            "gemini-3.7-flash-tiered",
+            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-4-argon-low",
+            "gemini-4-argon-medium",
+            "models/gemini-4-argon-high",
+            "google/gemini-4-argon",
+        ] {
+            assert!(gemini_model_uses_thinking_level(model), "{model}");
+            assert!(gemini_model_supports_mixed_tools(model), "{model}");
+        }
+        for model in [
+            "gemini-2.5-pro",
+            "gemini-30-pro",
+            "gemini-3.foo-pro",
+            "gemini-3.1foo-pro",
+            "gemini-4-pro",
+            "gemini-5-argon",
+            "gemini-4-argonium",
+            "gemini-4-argon-preview",
+            "gemini-3-pro/custom",
+            "gemini-4-argon/custom",
+        ] {
+            assert!(!gemini_model_uses_thinking_level(model), "{model}");
+            assert!(!gemini_model_supports_mixed_tools(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn argon_directives_replace_conflicting_thinking_fields_and_preserve_generation() {
+        for (generation, thinking, level) in [
+            ("generationConfig", "thinkingConfig", "thinkingLevel"),
+            ("generation_config", "thinking_config", "thinking_level"),
+        ] {
+            let mut body = json!({generation: {"temperature": 0.2, thinking: {"thinkingBudget":2048, "thinkingLevel":"high"}}});
+            apply_model_directive_overrides_from_model(
+                &mut body,
+                "gemini:generate_content",
+                "models/gemini-4-argon",
+                "alias-medium",
+            )
+            .unwrap();
+            assert_eq!(body[generation][thinking][level], "medium");
+            assert_eq!(body[generation]["temperature"], 0.2);
+            assert!(body[generation][thinking].get("thinkingBudget").is_none());
+        }
+        let mut body = json!({"generationConfig":{"temperature":0.2,"thinkingConfig":{"thinkingBudget":4096},"thinking_config":{"thinking_budget":8192}},"generation_config":{"top_p":0.9,"thinking_config":{"thinking_budget":2048}}});
+        apply_model_directive_overrides_from_model(
+            &mut body,
+            "gemini:generate_content",
+            "gemini-4-argon",
+            "gemini-4-argon-medium",
+        )
+        .unwrap();
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "medium"
+        );
+        assert!(body["generationConfig"].get("thinking_config").is_none());
+        assert!(body["generation_config"].get("thinking_config").is_none());
+        assert_eq!(body["generation_config"]["top_p"], 0.9);
     }
 
     #[test]

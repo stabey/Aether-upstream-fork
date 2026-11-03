@@ -1351,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_builtin_and_function_tools_require_gemini_three() {
+    fn mixed_builtin_and_function_tools_require_supported_gemini_models() {
         let canonical = CanonicalRequest {
             model: "gemini-2.5-pro".to_string(),
             tools: vec![CanonicalToolDefinition {
@@ -1369,7 +1369,18 @@ mod tests {
         };
 
         assert!(to_raw(&canonical, "gemini-2.5-pro", false).is_none());
-        assert!(to_raw(&canonical, "gemini-3-flash-preview", false).is_some());
+        for model in [
+            "gemini-3-flash-preview",
+            "gemini-4-argon",
+            "models/gemini-4-argon-medium",
+        ] {
+            let output = to_raw(&canonical, model, false).unwrap();
+            assert_eq!(
+                output["toolConfig"]["includeServerSideToolInvocations"],
+                true
+            );
+        }
+        assert!(to_raw(&canonical, "gemini-30-pro", false).is_none());
     }
 
     #[test]

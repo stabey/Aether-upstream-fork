@@ -1399,6 +1399,9 @@ fn parse_antigravity_models_response(body: &Value) -> Result<(Vec<Value>, Option
             continue;
         }
         let model_object = model_data.as_object().cloned().unwrap_or_default();
+        if model_object.get("disabled").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
         let display_name = model_object
             .get("displayName")
             .and_then(Value::as_str)
@@ -3335,6 +3338,29 @@ mod tests {
                     .pointer("/antigravity/quota_by_model/chat_12345/remaining_fraction")),
             Some(&json!(0.75))
         );
+    }
+
+    #[test]
+    fn antigravity_disabled_models_are_excluded_with_their_quotas() {
+        let (models, metadata) = parse_antigravity_models_response(&json!({"models": {
+            "gemini-4-argon": {"displayName":"Argon", "disabled":false, "quotaInfo":{"remainingFraction":0.75}},
+            "gemini-4-argon-high": {"disabled":true,"quotaInfo":{"remainingFraction":1.0}},
+            "gemini-4-argon-low": {"disabled":true},
+            "gemini-4-argon-medium": {}
+        }})).unwrap();
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["gemini-4-argon", "gemini-4-argon-medium"]
+        );
+        let quotas = &metadata.unwrap()["antigravity"]["quota_by_model"];
+        assert_eq!(quotas.as_object().unwrap().len(), 1);
+        assert_eq!(quotas["gemini-4-argon"]["remaining_fraction"], 0.75);
+        let (models, metadata) = parse_antigravity_models_response(&json!({"models":{"gemini-4-argon":{"disabled":true,"quotaInfo":{"remainingFraction":1.0}}}})).unwrap();
+        assert!(models.is_empty());
+        assert!(metadata.is_none());
     }
 
     #[test]
