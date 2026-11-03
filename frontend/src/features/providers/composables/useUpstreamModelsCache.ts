@@ -13,7 +13,7 @@ import type { UpstreamModel } from '@/api/endpoints/types'
 
 export type { UpstreamModel }
 
-type FetchResult = { models: UpstreamModel[]; error?: string; warning?: string; fromCache?: boolean }
+type FetchResult = { models: UpstreamModel[]; error?: string; warning?: string; fromCache?: boolean; syncedAllowedModels?: string[] | null }
 
 // 进行中的请求（用于去重并发请求）
 const pendingRequests = new Map<string, Promise<FetchResult>>()
@@ -44,6 +44,7 @@ function providerModelsFetchResult(response: ProviderModelsQueryResponse): Fetch
       })),
       warning: partialWarning ? parseUpstreamModelError(partialWarning) : undefined,
       fromCache: response.data.from_cache,
+      syncedAllowedModels: response.data.synced_allowed_models,
     }
   }
   const rawError = response.data?.error || response.data?.warning || t('ui.failedToFetchUpstreamModels')
@@ -95,13 +96,14 @@ export function useUpstreamModelsCache() {
   async function fetchModels(
     providerId: string,
     apiKeyId?: string,
-    forceRefresh = false
+    forceRefresh = false,
+    syncAllowedModels = false
   ): Promise<FetchResult> {
-    const requestKey = getRequestKey(providerId, apiKeyId)
+    const requestKey = `${getRequestKey(providerId, apiKeyId)}${syncAllowedModels ? ":sync" : ""}`
     return fetchProviderModels(
       requestKey,
       forceRefresh,
-      () => adminApi.queryProviderModels(providerId, apiKeyId, forceRefresh),
+      () => adminApi.queryProviderModels(providerId, apiKeyId, forceRefresh, syncAllowedModels),
     )
   }
 

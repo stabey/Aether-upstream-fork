@@ -94,7 +94,6 @@ const ADMIN_PROVIDER_QUERY_NO_ACTIVE_TEST_CANDIDATE_DETAIL: &str =
     "No active endpoint or API key found";
 const ADMIN_PROVIDER_QUERY_INVALID_MAPPED_MODEL_DETAIL: &str =
     "mapped_model_name is not valid for the selected model and endpoint";
-const ANTIGRAVITY_PROVIDER_CACHE_KEY_PREFIX: &str = "upstream_models_provider:";
 const DEFAULT_PROVIDER_QUERY_TEST_MESSAGE: &str = "Hello! This is a test message.";
 static PROVIDER_QUERY_POOL_LOAD_BALANCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -104,7 +103,6 @@ struct ProviderQueryKeyFetchResult {
     error: Option<String>,
     warning: Option<String>,
     from_cache: bool,
-    has_success: bool,
 }
 
 fn provider_query_select_model_keys(
@@ -317,7 +315,6 @@ fn provider_query_codex_preset_fallback(
             "Codex 动态模型目录不可用，已使用内置模型卡：{fetch_error}"
         )),
         from_cache: false,
-        has_success: true,
     })
 }
 
@@ -414,92 +411,6 @@ async fn provider_query_read_cached_models(
     (!models.is_empty()).then_some(models)
 }
 
-async fn provider_query_read_provider_cached_models(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-) -> Option<Vec<Value>> {
-    let cache_key = format!("{ANTIGRAVITY_PROVIDER_CACHE_KEY_PREFIX}{provider_id}");
-    let raw = state.runtime_state().kv_get(&cache_key).await.ok()??;
-    let parsed = serde_json::from_str::<Vec<Value>>(&raw).ok()?;
-    let models = aggregate_models_for_cache(&parsed);
-    (!models.is_empty()).then_some(models)
-}
-
-async fn provider_query_write_provider_cached_models(
-    state: &AdminAppState<'_>,
-    provider_id: &str,
-    models: &[Value],
-) {
-    let models = aggregate_models_for_cache(models);
-    if models.is_empty() {
-        return;
-    }
-    let Ok(serialized) = serde_json::to_string(&models) else {
-        return;
-    };
-    let cache_key = format!("{ANTIGRAVITY_PROVIDER_CACHE_KEY_PREFIX}{provider_id}");
-    let _ = state
-        .runtime_state()
-        .kv_set(
-            &cache_key,
-            serialized,
-            Some(std::time::Duration::from_secs(
-                aether_model_fetch::model_fetch_interval_minutes().saturating_mul(60),
-            )),
-        )
-        .await;
-}
-
-fn provider_query_antigravity_tier_weight(raw_auth_config: Option<&str>) -> i32 {
-    raw_auth_config
-        .and_then(|value| serde_json::from_str::<Value>(value).ok())
-        .and_then(|value| value.get("tier").cloned())
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .map(|tier| match tier.trim().to_ascii_lowercase().as_str() {
-            "ultra" => 3,
-            "pro" => 2,
-            "free" => 1,
-            _ => 0,
-        })
-        .unwrap_or(0)
-}
-
-async fn provider_query_sort_antigravity_keys(
-    state: &AdminAppState<'_>,
-    provider: &StoredProviderCatalogProvider,
-    endpoints: &[StoredProviderCatalogEndpoint],
-    keys: Vec<StoredProviderCatalogKey>,
-) -> Result<Vec<StoredProviderCatalogKey>, GatewayError> {
-    let mut ranked = Vec::new();
-    for key in keys {
-        let availability = if key.oauth_invalid_at_unix_secs.is_some() {
-            0
-        } else {
-            1
-        };
-        let tier_weight = if let Some(endpoint) = selected_models_fetch_endpoints(endpoints, &key)
-            .into_iter()
-            .next()
-        {
-            state
-                .app()
-                .read_provider_transport_snapshot(&provider.id, &endpoint.id, &key.id)
-                .await?
-                .map(|transport| {
-                    provider_query_antigravity_tier_weight(
-                        transport.key.decrypted_auth_config.as_deref(),
-                    )
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        ranked.push(((availability, tier_weight), key));
-    }
-    ranked.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    Ok(ranked.into_iter().map(|(_, key)| key).collect())
-}
-
 async fn provider_query_fetch_models_for_key(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
@@ -542,7 +453,6 @@ async fn provider_query_fetch_models_for_key(
                 error: None,
                 warning: None,
                 from_cache: true,
-                has_success: true,
             });
         }
     }
@@ -565,7 +475,6 @@ async fn provider_query_fetch_models_for_key(
                 warning: is_xai
                     .then(|| "xAI 没有可用的模型发现端点，已使用静态兜底目录".to_string()),
                 from_cache: false,
-                has_success: !is_xai,
             });
         }
         return Ok(ProviderQueryKeyFetchResult {
@@ -573,7 +482,6 @@ async fn provider_query_fetch_models_for_key(
             error: Some(ADMIN_PROVIDER_QUERY_NO_ACTIVE_ENDPOINT_DETAIL.to_string()),
             warning: None,
             from_cache: false,
-            has_success: false,
         });
     }
 
@@ -600,7 +508,6 @@ async fn provider_query_fetch_models_for_key(
             error: Some(all_errors.join("; ")),
             warning: None,
             from_cache: false,
-            has_success: false,
         });
     }
 
@@ -632,7 +539,6 @@ async fn provider_query_fetch_models_for_key(
                 error: Some(all_errors.join("; ")),
                 warning: None,
                 from_cache: false,
-                has_success: false,
             });
         }
     };
@@ -710,8 +616,61 @@ async fn provider_query_fetch_models_for_key(
         error,
         warning,
         from_cache: outcome.xai_source == Some(XaiModelCatalogSource::LastSuccessCache),
-        has_success: outcome.has_success,
     })
+}
+
+#[derive(Debug, Default)]
+struct ProviderQueryModelsCollection {
+    models: Vec<Value>,
+    errors: Vec<String>,
+    warnings: Vec<String>,
+    cache_hit_count: usize,
+    fetch_count: usize,
+}
+
+// A provider catalog is the union of every selected credential's directory.
+// Keep failures local to their credential, including malformed legacy credentials.
+async fn provider_query_collect_models<F, Fut>(
+    keys: Vec<StoredProviderCatalogKey>,
+    mut fetch: F,
+) -> ProviderQueryModelsCollection
+where
+    F: FnMut(StoredProviderCatalogKey) -> Fut,
+    Fut: std::future::Future<Output = Result<ProviderQueryKeyFetchResult, GatewayError>>,
+{
+    let mut collection = ProviderQueryModelsCollection::default();
+    let mut models = Vec::new();
+    for key in keys {
+        let name = provider_query_key_display_name(&key);
+        let result = match fetch(key).await {
+            Ok(result) => result,
+            Err(error) => {
+                collection.errors.push(format!(
+                    "Key {name}: {}",
+                    safe_model_fetch_error(&error.into_message())
+                ));
+                collection.fetch_count += 1;
+                continue;
+            }
+        };
+        models.extend(result.models.into_iter().filter(|model| {
+            provider_query_model_id(model).is_some()
+                && model.get("disabled").and_then(Value::as_bool) != Some(true)
+        }));
+        if let Some(error) = result.error {
+            collection.errors.push(format!("Key {name}: {error}"));
+        }
+        if let Some(warning) = result.warning {
+            collection.warnings.push(format!("Key {name}: {warning}"));
+        }
+        if result.from_cache {
+            collection.cache_hit_count += 1;
+        } else {
+            collection.fetch_count += 1;
+        }
+    }
+    collection.models = aggregate_models_for_cache(&models);
+    collection
 }
 
 pub(crate) async fn build_admin_provider_query_models_response(
@@ -754,14 +713,66 @@ pub(crate) async fn build_admin_provider_query_models_response(
             ));
         };
 
-        let result = provider_query_fetch_models_for_key(
-            state,
-            &provider,
-            &endpoints,
-            selected_key,
-            force_refresh,
-        )
-        .await?;
+        // Permission updates are explicit: ordinary catalog reads (even forced
+        // reads) must never rewrite a key's whitelist.
+        let sync_permissions =
+            payload.get("sync_allowed_models").and_then(Value::as_bool) == Some(true);
+        let mut synced_allowed_models = None;
+        let mut synced_models = Vec::new();
+        if sync_permissions {
+            if !selected_key.auto_fetch_models || !selected_key.is_active || !force_refresh {
+                return Ok(build_admin_provider_query_bad_request_response(
+                    "Model permission sync requires an active automatic key and force_refresh",
+                ));
+            }
+            let (summary, models) = crate::model_fetch::refresh_model_permissions_for_key(
+                state.app(),
+                &provider.id,
+                &selected_key.id,
+            )
+            .await?;
+            let updated = state
+                .app()
+                .read_provider_catalog_keys_by_ids(std::slice::from_ref(&selected_key.id))
+                .await?
+                .into_iter()
+                .next();
+            if summary.succeeded == 0 {
+                let error = updated
+                    .and_then(|key| key.last_models_fetch_error)
+                    .unwrap_or_else(|| "Upstream model permission sync failed".to_string());
+                return Ok(Json(json!({
+                    "success": false,
+                    "data": { "models": [], "error": error },
+                    "provider": provider_query_provider_payload(&provider),
+                }))
+                .into_response());
+            }
+            synced_allowed_models = Some(updated.and_then(|key| key.allowed_models));
+            synced_models = models;
+        }
+
+        let result = if sync_permissions {
+            ProviderQueryKeyFetchResult {
+                models: provider_query_filter_models_for_key(
+                    &provider,
+                    selected_key,
+                    synced_models,
+                ),
+                error: None,
+                warning: None,
+                from_cache: false,
+            }
+        } else {
+            provider_query_fetch_models_for_key(
+                state,
+                &provider,
+                &endpoints,
+                selected_key,
+                force_refresh,
+            )
+            .await?
+        };
         let models = provider_query_attach_model_test_capabilities(&provider, result.models);
         let success = !models.is_empty();
         return Ok(Json(json!({
@@ -771,12 +782,18 @@ pub(crate) async fn build_admin_provider_query_models_response(
                 "error": result.error,
                 "warning": result.warning,
                 "from_cache": result.from_cache,
+                "synced_allowed_models": synced_allowed_models,
             },
             "provider": provider_query_provider_payload(&provider),
         }))
         .into_response());
     }
 
+    if payload.get("sync_allowed_models").and_then(Value::as_bool) == Some(true) {
+        return Ok(build_admin_provider_query_bad_request_response(
+            "Model permission sync requires a single api_key_id",
+        ));
+    }
     let selected_key_ids = provider_query_extract_api_key_ids(payload);
     let query_keys = match provider_query_select_model_keys(keys, selected_key_ids.as_ref()) {
         Ok(keys) => keys,
@@ -793,92 +810,20 @@ pub(crate) async fn build_admin_provider_query_models_response(
     }
     let query_key_count = query_keys.len();
 
-    if selected_key_ids.is_none()
-        && provider
-            .provider_type
-            .trim()
-            .eq_ignore_ascii_case("antigravity")
-        && !force_refresh
-    {
-        if let Some(models) = provider_query_read_provider_cached_models(state, &provider.id).await
-        {
-            let models = provider_query_attach_model_test_capabilities(&provider, models);
-            return Ok(Json(json!({
-                "success": !models.is_empty(),
-                "data": {
-                    "models": models,
-                    "error": serde_json::Value::Null,
-                    "warning": serde_json::Value::Null,
-                    "from_cache": true,
-                    "keys_total": query_key_count,
-                    "keys_cached": query_key_count,
-                    "keys_fetched": 0,
-                },
-                "provider": provider_query_provider_payload(&provider),
-            }))
-            .into_response());
-        }
-    }
-
-    let ordered_keys = if provider
-        .provider_type
-        .trim()
-        .eq_ignore_ascii_case("antigravity")
-    {
-        provider_query_sort_antigravity_keys(state, &provider, &endpoints, query_keys).await?
-    } else {
-        query_keys
-    };
-
-    let mut all_models = Vec::new();
-    let mut all_errors = Vec::new();
-    let mut all_warnings = Vec::new();
-    let mut cache_hit_count = 0usize;
-    let mut fetch_count = 0usize;
-    for key in &ordered_keys {
-        let result =
-            provider_query_fetch_models_for_key(state, &provider, &endpoints, key, force_refresh)
-                .await?;
-        all_models.extend(result.models);
-        if let Some(error) = result.error {
-            all_errors.push(format!(
-                "Key {}: {}",
-                provider_query_key_display_name(key),
-                error
-            ));
-        }
-        if let Some(warning) = result.warning {
-            all_warnings.push(format!(
-                "Key {}: {}",
-                provider_query_key_display_name(key),
-                warning
-            ));
-        }
-        if result.from_cache {
-            cache_hit_count += 1;
-        } else {
-            fetch_count += 1;
-        }
-        if provider
-            .provider_type
-            .trim()
-            .eq_ignore_ascii_case("antigravity")
-            && result.has_success
-        {
-            break;
-        }
-    }
-
-    let models = aggregate_models_for_cache(&all_models);
-    if selected_key_ids.is_none()
-        && provider
-            .provider_type
-            .trim()
-            .eq_ignore_ascii_case("antigravity")
-        && !models.is_empty()
-    {
-        provider_query_write_provider_cached_models(state, &provider.id, &models).await;
-    }
+    let provider_ref = &provider;
+    let endpoints_ref = &endpoints;
+    let collection = provider_query_collect_models(query_keys, |key| async move {
+        provider_query_fetch_models_for_key(state, provider_ref, endpoints_ref, &key, force_refresh)
+            .await
+    })
+    .await;
+    let ProviderQueryModelsCollection {
+        models,
+        errors: all_errors,
+        warnings: all_warnings,
+        cache_hit_count,
+        fetch_count,
+    } = collection;
     let success = !models.is_empty();
     let mut all_issues = all_errors;
     all_issues.extend(all_warnings);
@@ -930,6 +875,75 @@ mod tests {
         .expect("provider should build");
         provider.provider_type = "grok".to_string();
         provider
+    }
+
+    #[tokio::test]
+    async fn provider_directory_unions_all_account_caches_and_isolates_failures() {
+        let make_key = |id: &str| {
+            StoredProviderCatalogKey::new(
+                id.to_string(),
+                "provider-1".to_string(),
+                id.to_string(),
+                "api_key".to_string(),
+                None,
+                true,
+            )
+            .unwrap()
+        };
+        let keys = vec![make_key("free"), make_key("broken"), make_key("ultra")];
+        let mut visited = Vec::new();
+        let collection = provider_query_collect_models(keys.clone(), |key| {
+            visited.push(key.id.clone());
+            std::future::ready(match key.id.as_str() {
+                "broken" => Err(GatewayError::Internal(
+                    "credential-secret-detail".to_string(),
+                )),
+                "free" => Ok(ProviderQueryKeyFetchResult {
+                    models: vec![json!({"id":"shared"})],
+                    error: None,
+                    warning: None,
+                    from_cache: true,
+                }),
+                _ => Ok(ProviderQueryKeyFetchResult {
+                    models: vec![
+                        json!({"id":"shared"}),
+                        json!({"id":"ultra-only"}),
+                        json!({"id":"disabled", "disabled":true}),
+                        json!({"id":""}),
+                    ],
+                    error: None,
+                    warning: None,
+                    from_cache: true,
+                }),
+            })
+        })
+        .await;
+        assert_eq!(visited, vec!["free", "broken", "ultra"]);
+        let ids = collection
+            .models
+            .iter()
+            .filter_map(provider_query_model_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids, BTreeSet::from(["shared", "ultra-only"]));
+        assert_eq!(collection.cache_hit_count, 2);
+        assert_eq!(collection.fetch_count, 1);
+        assert_eq!(collection.errors.len(), 1);
+        assert!(!collection.errors[0].contains("credential-secret-detail"));
+
+        let selected = BTreeSet::from(["free".to_string()]);
+        let keys = provider_query_select_model_keys(keys, Some(&selected)).unwrap();
+        let isolated = provider_query_collect_models(keys, |key| {
+            assert_eq!(key.id, "free");
+            std::future::ready(Ok(ProviderQueryKeyFetchResult {
+                models: vec![json!({"id":"shared"})],
+                error: None,
+                warning: None,
+                from_cache: true,
+            }))
+        })
+        .await;
+        assert_eq!(isolated.models.len(), 1);
+        assert_eq!(provider_query_model_id(&isolated.models[0]), Some("shared"));
     }
 
     #[test]

@@ -391,6 +391,7 @@
     :provider-id="providerId || ''"
     @close="keyPermissionsDialogOpen = false"
     @saved="handleKeyChanged"
+    @synced="handleKeyPermissionsSynced"
   />
 
   <!-- 删除密钥确认对话框 -->
@@ -1787,6 +1788,11 @@ function applyUpdatedKeySnapshot(updatedKey: EndpointAPIKey) {
     editingKey.value = updatedKey
   }
   syncCurrentSelections(endpoints.value, providerKeys.value)
+}
+
+async function handleKeyPermissionsSynced(allowedModels: string[] | null) {
+  if (editingKey.value) editingKey.value = { ...editingKey.value, allowed_models: allowedModels }
+  await handleKeyChanged()
 }
 
 async function handleKeyChanged(updatedKey?: EndpointAPIKey) {

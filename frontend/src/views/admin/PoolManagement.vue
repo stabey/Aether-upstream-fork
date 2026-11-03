@@ -705,6 +705,7 @@
       :provider-id="selectedProviderId || ''"
       @close="closeKeyPermissionsDialog"
       @saved="handleDialogSaved"
+      @synced="handleKeyPermissionsSynced"
     />
   </div>
 </template>
@@ -2415,6 +2416,11 @@ function closeKeyBatchEditDialog(): void {
 async function handleKeyBatchEditSaved(): Promise<void> {
   resetPoolKeySelection(true)
   await Promise.all([loadKeys({ silent: true }), loadOverview({ silent: true })])
+}
+
+async function handleKeyPermissionsSynced(allowedModels: string[] | null) {
+  if (editingKeyDetail.value) editingKeyDetail.value = { ...editingKeyDetail.value, allowed_models: allowedModels }
+  await loadKeys({ silent: true })
 }
 
 async function handleDialogSaved() {

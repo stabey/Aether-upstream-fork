@@ -7,24 +7,28 @@ import type { EndpointAPIKey } from '@/api/endpoints'
 const endpointMocks = vi.hoisted(() => ({
   getProviderModels: vi.fn(),
   updateProviderKey: vi.fn(),
+  fetchModels: vi.fn(),
+  success: vi.fn(),
+  error: vi.fn(),
+  confirmWarning: vi.fn(),
 }))
 
 vi.mock('@/api/endpoints', () => endpointMocks)
 vi.mock('@/composables/useToast', () => ({
   useToast: () => ({
-    error: vi.fn(),
-    success: vi.fn(),
+    error: endpointMocks.error,
+    success: endpointMocks.success,
     warning: vi.fn(),
   }),
 }))
 vi.mock('@/composables/useConfirm', () => ({
   useConfirm: () => ({
-    confirmWarning: vi.fn().mockResolvedValue(true),
+    confirmWarning: endpointMocks.confirmWarning,
   }),
 }))
 vi.mock('@/features/providers/composables/useUpstreamModelsCache', () => ({
   useUpstreamModelsCache: () => ({
-    fetchModels: vi.fn(),
+    fetchModels: endpointMocks.fetchModels,
   }),
 }))
 vi.mock('@/components/ui', async () => {
@@ -85,6 +89,12 @@ beforeEach(() => {
     global_model_display_name: 'GPT-5',
   }])
   endpointMocks.updateProviderKey.mockReset()
+  endpointMocks.fetchModels.mockReset()
+  endpointMocks.fetchModels.mockResolvedValue({ models: [{ id: 'gpt-5' }] })
+  endpointMocks.success.mockReset()
+  endpointMocks.error.mockReset()
+  endpointMocks.confirmWarning.mockReset()
+  endpointMocks.confirmWarning.mockResolvedValue(true)
 })
 
 afterEach(() => {
@@ -113,5 +123,82 @@ describe('KeyAllowedModelsEditDialog loading', () => {
     expect(root.textContent).toContain('提供商模型')
     expect(root.textContent).toContain('已选 1 个')
     expect(root.querySelector('.bg-primary.border-primary')).toBeTruthy()
+  })
+})
+describe('model permission refresh', () => {
+  async function mountDialog(auto: boolean, onSynced = vi.fn()) {
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(KeyAllowedModelsEditDialog, {
+      open: true, apiKey: { ...apiKey, auto_fetch_models: auto },
+      providerId: 'provider-1', onSynced,
+    })
+    app.mount(root)
+    mountedApps.push({ app, root })
+    await settle()
+    return root
+  }
+
+  it('explicitly syncs automatic permissions and reports the persisted whitelist', async () => {
+    const synced = vi.fn()
+    const root = await mountDialog(true, synced)
+    expect(endpointMocks.fetchModels).toHaveBeenCalledWith('provider-1', 'key-1', false, false)
+    endpointMocks.fetchModels.mockResolvedValueOnce({
+      models: [{ id: 'gpt-5' }, { id: 'new-model' }],
+      syncedAllowedModels: ['gpt-5', 'new-model'],
+    })
+    root.querySelector<HTMLButtonElement>('button[title]')!.click()
+    await settle()
+    expect(endpointMocks.fetchModels).toHaveBeenLastCalledWith('provider-1', 'key-1', true, true)
+    expect(root.textContent).toContain('已选 2 个')
+    expect(synced).toHaveBeenCalledWith(['gpt-5', 'new-model'])
+    expect(endpointMocks.updateProviderKey).not.toHaveBeenCalled()
+  })
+
+  it('retains previous permissions and shows no success after a failed sync', async () => {
+    const synced = vi.fn()
+    const root = await mountDialog(true, synced)
+    endpointMocks.fetchModels.mockResolvedValueOnce({ models: [], error: 'upstream failed' })
+    root.querySelector<HTMLButtonElement>('button[title]')!.click()
+    await settle()
+    expect(root.textContent).toContain('已选 1 个')
+    expect(synced).not.toHaveBeenCalled()
+    expect(endpointMocks.error).toHaveBeenCalled()
+    expect(endpointMocks.success).not.toHaveBeenCalled()
+  })
+
+  it('does not discard local automatic locks when discard is cancelled', async () => {
+    const root = await mountDialog(true)
+    const lock = root.querySelector<HTMLButtonElement>('button.p-1')!
+    lock.click()
+    await settle()
+    endpointMocks.confirmWarning.mockResolvedValueOnce(false)
+    root.querySelector<HTMLButtonElement>('button[title]')!.click()
+    await settle()
+    expect(endpointMocks.confirmWarning).toHaveBeenCalledOnce()
+    expect(endpointMocks.fetchModels).toHaveBeenCalledTimes(1)
+    expect(root.textContent).toContain('未保存')
+  })
+
+  it('preserves unsaved manual selections during a catalog refresh', async () => {
+    const root = await mountDialog(false)
+    const selected = root.querySelector<HTMLElement>('.bg-primary.border-primary')!
+    selected.parentElement!.click()
+    await settle()
+    expect(root.textContent).toContain('全部模型')
+    root.querySelector<HTMLButtonElement>('button[title]')!.click()
+    await settle()
+    expect(root.textContent).toContain('全部模型')
+    expect(endpointMocks.confirmWarning).not.toHaveBeenCalled()
+  })
+
+  it('manual refresh reads the catalog without changing saved selections', async () => {
+    const root = await mountDialog(false)
+    endpointMocks.fetchModels.mockResolvedValueOnce({ models: [{ id: 'other-model' }] })
+    root.querySelector<HTMLButtonElement>('button[title]')!.click()
+    await settle()
+    expect(endpointMocks.fetchModels).toHaveBeenCalledWith('provider-1', 'key-1', true, false)
+    expect(root.textContent).toContain('已选 1 个')
+    expect(endpointMocks.updateProviderKey).not.toHaveBeenCalled()
   })
 })

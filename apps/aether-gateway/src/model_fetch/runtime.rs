@@ -87,6 +87,34 @@ pub(crate) async fn perform_model_fetch_for_key(
     perform_model_fetch_for_keys_with_state(state, provider_id, &key_ids).await
 }
 
+/// Explicit permission refresh fails closed on incomplete or empty discovery.
+pub(crate) async fn refresh_model_permissions_for_key(
+    state: &AppState,
+    provider_id: &str,
+    key_id: &str,
+) -> Result<(ModelFetchRunSummary, Vec<Value>), GatewayError> {
+    let key_ids = BTreeSet::from([key_id.to_string()]);
+    let targets = collect_fetch_targets(state, Some(provider_id), Some(&key_ids)).await?;
+    let mut summary = ModelFetchRunSummary {
+        attempted: targets.len(),
+        succeeded: 0,
+        failed: 0,
+        skipped: 0,
+    };
+    let mut models = Vec::new();
+    for target in targets {
+        match fetch_and_persist_key_models(state, &target, true).await? {
+            KeyFetchDisposition::Succeeded(fetched) => {
+                summary.succeeded += 1;
+                models.extend(fetched);
+            }
+            KeyFetchDisposition::Failed => summary.failed += 1,
+            KeyFetchDisposition::Skipped => summary.skipped += 1,
+        }
+    }
+    Ok((summary, models))
+}
+
 pub(crate) async fn perform_model_fetch_for_keys(
     state: &AppState,
     provider_id: &str,
@@ -102,7 +130,7 @@ where
     S: ModelFetchRuntimeState + ?Sized,
 {
     let targets = collect_fetch_targets(state, None, None).await?;
-    execute_fetch_targets(state, targets).await
+    execute_fetch_targets(state, targets, false).await
 }
 
 async fn perform_model_fetch_for_keys_with_state<S>(
@@ -114,7 +142,7 @@ where
     S: ModelFetchRuntimeState + ?Sized,
 {
     let targets = collect_fetch_targets(state, Some(provider_id), Some(key_ids)).await?;
-    execute_fetch_targets(state, targets).await
+    execute_fetch_targets(state, targets, false).await
 }
 
 async fn collect_fetch_targets<S>(
@@ -277,6 +305,7 @@ fn sanitize_model_fetch_endpoint(
 async fn execute_fetch_targets<S>(
     state: &S,
     targets: Vec<SelectedFetchTarget>,
+    require_complete_catalog: bool,
 ) -> Result<ModelFetchRunSummary, GatewayError>
 where
     S: ModelFetchRuntimeState + ?Sized,
@@ -288,8 +317,8 @@ where
         skipped: 0,
     };
     for target in targets {
-        match fetch_and_persist_key_models(state, &target).await? {
-            KeyFetchDisposition::Succeeded => summary.succeeded += 1,
+        match fetch_and_persist_key_models(state, &target, require_complete_catalog).await? {
+            KeyFetchDisposition::Succeeded(_) => summary.succeeded += 1,
             KeyFetchDisposition::Failed => summary.failed += 1,
             KeyFetchDisposition::Skipped => summary.skipped += 1,
         }
@@ -318,9 +347,9 @@ where
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum KeyFetchDisposition {
-    Succeeded,
+    Succeeded(Vec<Value>),
     Failed,
     Skipped,
 }
@@ -328,9 +357,20 @@ enum KeyFetchDisposition {
 async fn fetch_and_persist_key_models(
     state: &(impl ModelFetchRuntimeState + ?Sized),
     target: &SelectedFetchTarget,
+    require_complete_catalog: bool,
 ) -> Result<KeyFetchDisposition, GatewayError> {
     let now_unix_secs = now_unix_secs();
     if target.endpoints.is_empty() {
+        if require_complete_catalog {
+            persist_key_fetch_failure(
+                state,
+                &target.key,
+                now_unix_secs,
+                "No supported endpoint for Rust models fetch".to_string(),
+            )
+            .await?;
+            return Ok(KeyFetchDisposition::Failed);
+        }
         if target
             .provider
             .provider_type
@@ -379,7 +419,7 @@ async fn fetch_and_persist_key_models(
             )
             .await
             .map_err(GatewayError::Internal)?;
-            return Ok(KeyFetchDisposition::Succeeded);
+            return Ok(KeyFetchDisposition::Succeeded(models));
         }
         persist_key_fetch_failure(
             state,
@@ -421,6 +461,17 @@ async fn fetch_and_persist_key_models(
             }
             Err(error) => return Err(error),
         }
+    }
+
+    if require_complete_catalog && transports.len() != target.endpoints.len() {
+        persist_key_fetch_failure(
+            state,
+            &target.key,
+            now_unix_secs,
+            "Incomplete or empty upstream catalog; previous model permissions retained".to_string(),
+        )
+        .await?;
+        return Ok(KeyFetchDisposition::Failed);
     }
 
     // A malformed legacy credential is isolated to its key. Do not turn it
@@ -498,6 +549,20 @@ async fn fetch_and_persist_key_models(
         json_string_list(target.key.model_include_patterns.as_ref()),
         json_string_list(target.key.model_exclude_patterns.as_ref()),
     );
+    if require_complete_catalog
+        && (!result.errors.is_empty()
+            || result.fetched_model_ids.is_empty()
+            || filtered_models.is_empty())
+    {
+        persist_key_fetch_failure(
+            state,
+            &target.key,
+            now_unix_secs,
+            "Incomplete or empty upstream catalog; previous model permissions retained".to_string(),
+        )
+        .await?;
+        return Ok(KeyFetchDisposition::Failed);
+    }
     persist_key_fetch_success(
         state,
         &target.key,
@@ -512,7 +577,7 @@ async fn fetch_and_persist_key_models(
     sync_provider_model_whitelist_associations(state, &target.provider.id, &filtered_models)
         .await
         .map_err(GatewayError::Internal)?;
-    Ok(KeyFetchDisposition::Succeeded)
+    Ok(KeyFetchDisposition::Succeeded(result.legacy_models))
 }
 
 async fn persist_key_fetch_failure(
@@ -538,6 +603,7 @@ pub(crate) fn safe_model_fetch_error(error: &str) -> String {
     let trimmed = error.trim();
     match trimmed {
         "No supported endpoint for Rust models fetch"
+        | "Incomplete or empty upstream catalog; previous model permissions retained"
         | "Provider transport snapshot unavailable" => return trimmed.to_string(),
         _ => {}
     }
@@ -1267,6 +1333,106 @@ mod tests {
         assert_eq!(plan.endpoint_id, "endpoint-openai-chat");
         assert_eq!(plan.key_id, "key-openai-chat");
         assert_eq!(plan.model_name.as_deref(), Some("models"));
+    }
+
+    #[tokio::test]
+    async fn explicit_permission_refresh_rejects_missing_transport_snapshot() {
+        let mut key = sample_key("k", "p", "api_key", &["openai:chat", "claude:messages"]);
+        key.allowed_models = Some(json!(["old-model"]));
+        let state = TestState::new(
+            vec![sample_provider("p", "openai")],
+            vec![
+                sample_endpoint("e", "p", "openai:chat"),
+                sample_endpoint("missing", "p", "claude:messages"),
+            ],
+            vec![key],
+            HashMap::from([(
+                ("p".into(), "e".into(), "k".into()),
+                sample_transport("openai", "p", "e", "k", "openai:chat", "api_key", None),
+            )]),
+            vec![],
+        );
+        let targets = super::collect_fetch_targets(&state, Some("p"), None)
+            .await
+            .unwrap();
+        let summary = super::execute_fetch_targets(&state, targets, true)
+            .await
+            .unwrap();
+        assert_eq!(summary.failed, 1);
+        assert_eq!(state.key("k").allowed_models, Some(json!(["old-model"])));
+    }
+
+    #[tokio::test]
+    async fn explicit_permission_refresh_filters_one_key_and_preserves_on_empty_or_partial_catalog()
+    {
+        for (body, fail_second_endpoint, no_endpoint) in [
+            (
+                json!({"data": [{"id": "new-model"}, {"id": "blocked-model"}]}),
+                false,
+                false,
+            ),
+            (json!({"data": []}), false, false),
+            (json!({"data": [{"id": "new-model"}]}), true, false),
+            (json!({"data": [{"id": "new-model"}]}), false, true),
+        ] {
+            let provider = sample_provider("p", "openai");
+            let endpoint = sample_endpoint("e", "p", "openai:chat");
+            let mut key = sample_key("k", "p", "api_key", &["openai:chat", "claude:messages"]);
+            key.allowed_models = Some(json!(["old-model"]));
+            key.locked_models = Some(json!(["locked-model"]));
+            key.model_include_patterns = Some(json!(["new-*"]));
+            key.model_exclude_patterns = Some(json!(["blocked-*"]));
+            let other = sample_key("other", "p", "api_key", &["openai:chat"]);
+            let mut endpoints = if no_endpoint { vec![] } else { vec![endpoint] };
+            let mut transports = HashMap::from([(
+                ("p".into(), "e".into(), "k".into()),
+                sample_transport("openai", "p", "e", "k", "openai:chat", "api_key", None),
+            )]);
+            let empty = body["data"].as_array().unwrap().is_empty();
+            let mut results = vec![execution_result(body)];
+            if fail_second_endpoint {
+                endpoints.push(sample_endpoint("e2", "p", "claude:messages"));
+                transports.insert(
+                    ("p".into(), "e2".into(), "k".into()),
+                    sample_transport("openai", "p", "e2", "k", "claude:messages", "api_key", None),
+                );
+                results.push(execution_result_with_status(
+                    503,
+                    json!({"error": "unavailable"}),
+                ));
+            }
+            let state = TestState::new(
+                vec![provider],
+                endpoints,
+                vec![key, other],
+                transports,
+                results,
+            );
+            let targets = super::collect_fetch_targets(
+                &state,
+                Some("p"),
+                Some(&std::collections::BTreeSet::from(["k".to_string()])),
+            )
+            .await
+            .unwrap();
+            let summary = super::execute_fetch_targets(&state, targets, true)
+                .await
+                .unwrap();
+            assert_eq!(summary.attempted, 1);
+            // An empty upstream directory is never allowed to turn a whitelist into unrestricted access,
+            // even when a locked model would make the filtered list nonempty.
+            if empty || fail_second_endpoint || no_endpoint {
+                assert_eq!(summary.failed, 1);
+                assert_eq!(state.key("k").allowed_models, Some(json!(["old-model"])));
+            } else {
+                assert_eq!(summary.succeeded, 1);
+                assert_eq!(
+                    state.key("k").allowed_models,
+                    Some(json!(["locked-model", "new-model"]))
+                );
+            }
+            assert_eq!(state.key("other").allowed_models, None);
+        }
     }
 
     #[tokio::test]

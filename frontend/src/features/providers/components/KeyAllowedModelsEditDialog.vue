@@ -387,6 +387,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   close: []
   saved: []
+  synced: [allowedModels: string[] | null]
 }>()
 
 const { t } = useI18n()
@@ -679,8 +680,15 @@ async function fetchUpstreamModels(forceRefresh = false) {
   if (!props.providerId || !props.apiKey) return
   try {
     fetchingUpstreamModels.value = true
-    const result = await fetchCachedModels(props.providerId, props.apiKey.id, forceRefresh)
-    if (loadingCancelled) return
+    const keyId = props.apiKey.id
+    const syncPermissions = forceRefresh && isAutoFetchMode.value
+    const result = await fetchCachedModels(props.providerId, keyId, forceRefresh, syncPermissions)
+    if (loadingCancelled || props.apiKey?.id !== keyId) return
+    if (syncPermissions && !result.error && result.syncedAllowedModels !== undefined) {
+      selectedModels.value = [...(result.syncedAllowedModels ?? [])]
+      initialSelectedModels.value = [...selectedModels.value]
+      emit('synced', result.syncedAllowedModels)
+    }
     if (result.models.length > 0) {
       upstreamModels.value = result.models
       upstreamModelsLoaded.value = true
@@ -693,6 +701,7 @@ async function fetchUpstreamModels(forceRefresh = false) {
     } else if (result.error) {
       showError(result.error, t('ui.failedToFetchUpstreamModels'))
     }
+    return !result.error && result.models.length > 0
   } finally {
     fetchingUpstreamModels.value = false
   }
@@ -700,8 +709,14 @@ async function fetchUpstreamModels(forceRefresh = false) {
 
 // 手动刷新上游模型（强制跳过缓存）
 async function refreshUpstreamModels() {
-  await fetchUpstreamModels(true)
-  if (upstreamModels.value.length > 0) {
+  // Refresh uses persisted filter/lock rules. Ask before discarding local edits.
+  if (isAutoFetchMode.value) {
+    if (!(await confirmDiscard())) return
+    lockedModels.value = [...initialLockedModels.value]
+    selectedModels.value = [...initialSelectedModels.value]
+  }
+  const refreshed = await fetchUpstreamModels(true)
+  if (refreshed) {
     success(t('ui.upstreamModelsRefreshed'))
     // 获取成功后收缩所有分组
     collapsedGroups.value = new Set(['global', 'upstream', 'custom'])
