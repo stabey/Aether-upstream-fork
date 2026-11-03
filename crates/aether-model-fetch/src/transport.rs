@@ -804,7 +804,7 @@ mod tests {
         build_kiro_list_available_models_plan, build_models_fetch_execution_plan,
         build_models_fetch_execution_plan_for_client_version,
         build_standard_models_fetch_execution_plan, build_vertex_models_fetch_execution_plan,
-        ModelFetchTransportRuntime, ANTIGRAVITY_REQUEST_USER_AGENT,
+        ModelFetchTransportRuntime,
     };
 
     struct TestRuntime {
@@ -1208,7 +1208,11 @@ mod tests {
         );
         assert_eq!(
             plan.headers.get("user-agent").map(String::as_str),
-            Some(ANTIGRAVITY_REQUEST_USER_AGENT)
+            Some(
+                aether_provider_transport::antigravity::antigravity_client_profile()
+                    .user_agent
+                    .as_str()
+            )
         );
         assert_eq!(
             plan.headers.get("x-client-name").map(String::as_str),
@@ -1216,11 +1220,19 @@ mod tests {
         );
         assert_eq!(
             plan.headers.get("x-goog-api-client").map(String::as_str),
-            Some("gl-node/18.18.2 fire/0.8.6 grpc/1.10.x")
+            Some(
+                aether_provider_transport::antigravity::antigravity_client_profile()
+                    .goog_api_client
+                    .as_str()
+            )
         );
         assert_eq!(
             plan.headers.get("x-client-version").map(String::as_str),
-            Some("4.3.0")
+            Some(
+                aether_provider_transport::antigravity::antigravity_client_profile()
+                    .version
+                    .as_str()
+            )
         );
         assert_eq!(
             plan.headers.get("x-vscode-sessionid").map(String::as_str),
@@ -1255,7 +1267,11 @@ mod tests {
         );
         assert_eq!(
             plan.headers.get("user-agent").map(String::as_str),
-            Some(ANTIGRAVITY_REQUEST_USER_AGENT)
+            Some(
+                aether_provider_transport::antigravity::antigravity_client_profile()
+                    .user_agent
+                    .as_str()
+            )
         );
         assert_eq!(
             plan.headers.get("x-client-name").map(String::as_str),
@@ -1263,7 +1279,11 @@ mod tests {
         );
         assert_eq!(
             plan.headers.get("x-goog-api-client").map(String::as_str),
-            Some("gl-node/18.18.2 fire/0.8.6 grpc/1.10.x")
+            Some(
+                aether_provider_transport::antigravity::antigravity_client_profile()
+                    .goog_api_client
+                    .as_str()
+            )
         );
     }
 

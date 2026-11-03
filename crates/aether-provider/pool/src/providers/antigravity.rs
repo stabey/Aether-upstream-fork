@@ -144,6 +144,37 @@ mod tests {
     };
 
     #[test]
+    fn quota_requests_keep_the_active_antigravity_profile() {
+        let profile = aether_provider_transport::antigravity::antigravity_client_profile();
+        let identity =
+            aether_provider_transport::antigravity::build_antigravity_static_client_headers(
+                None, None,
+            );
+        let quota = super::build_antigravity_pool_quota_request(
+            "key",
+            "https://example.invalid",
+            ("authorization".into(), "Bearer test".into()),
+            "project",
+            identity.clone(),
+        );
+        let summary = super::build_antigravity_pool_quota_summary_request(
+            "key",
+            "https://example.invalid",
+            ("authorization".into(), "Bearer test".into()),
+            Some("project"),
+            identity,
+        );
+        for request in [quota, summary] {
+            assert_eq!(request.headers["user-agent"], profile.user_agent);
+            assert_eq!(request.headers["x-client-version"], profile.version);
+            assert_eq!(
+                request.headers["x-goog-api-client"],
+                profile.goog_api_client
+            );
+        }
+    }
+
+    #[test]
     fn grouped_quota_request_can_retry_without_project_on_the_same_endpoint() {
         let with_project = build_antigravity_pool_quota_summary_request(
             "key-1",

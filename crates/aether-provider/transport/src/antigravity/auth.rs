@@ -8,11 +8,11 @@ pub const ANTIGRAVITY_PROVIDER_TYPE: &str = "antigravity";
 pub const ANTIGRAVITY_CLIENT_VERSION: &str = crate::client_identity::ANTIGRAVITY.version;
 pub const ANTIGRAVITY_REQUEST_USER_AGENT: &str = crate::client_identity::ANTIGRAVITY.user_agent;
 const ANTIGRAVITY_CLIENT_NAME: &str = "antigravity";
-const ANTIGRAVITY_GOOG_API_CLIENT: &str = "gl-node/18.18.2 fire/0.8.6 grpc/1.10.x";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityRequestAuth {
     pub project_id: String,
+    pub client_profile: std::sync::Arc<super::profile::AntigravityClientProfile>,
     pub client_version: Option<String>,
     pub session_id: Option<String>,
 }
@@ -94,6 +94,7 @@ pub fn resolve_local_antigravity_request_auth(
 
     AntigravityRequestAuthSupport::Supported(AntigravityRequestAuth {
         project_id,
+        client_profile: super::profile::antigravity_client_profile(),
         client_version,
         session_id,
     })
@@ -102,14 +103,18 @@ pub fn resolve_local_antigravity_request_auth(
 pub fn build_antigravity_static_identity_headers(
     auth: &AntigravityRequestAuth,
 ) -> BTreeMap<String, String> {
-    build_antigravity_static_client_headers(
-        auth.client_version.as_deref(),
-        auth.session_id.as_deref(),
-    )
+    build_profile_headers(&auth.client_profile, auth.session_id.as_deref())
 }
 
 pub fn build_antigravity_static_client_headers(
     _client_version: Option<&str>,
+    session_id: Option<&str>,
+) -> BTreeMap<String, String> {
+    build_profile_headers(&super::profile::antigravity_client_profile(), session_id)
+}
+
+fn build_profile_headers(
+    profile: &super::profile::AntigravityClientProfile,
     session_id: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut headers = BTreeMap::from([
@@ -119,16 +124,10 @@ pub fn build_antigravity_static_client_headers(
         ),
         (
             String::from("x-goog-api-client"),
-            String::from(ANTIGRAVITY_GOOG_API_CLIENT),
+            profile.goog_api_client.clone(),
         ),
-        (
-            String::from("user-agent"),
-            String::from(ANTIGRAVITY_REQUEST_USER_AGENT),
-        ),
-        (
-            String::from("x-client-version"),
-            String::from(ANTIGRAVITY_CLIENT_VERSION),
-        ),
+        (String::from("user-agent"), profile.user_agent.clone()),
+        (String::from("x-client-version"), profile.version.clone()),
     ]);
 
     if let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) {
@@ -349,6 +348,7 @@ mod tests {
             resolve_local_antigravity_request_auth(&transport),
             AntigravityRequestAuthSupport::Supported(AntigravityRequestAuth {
                 project_id: "project-from-auth-config".to_string(),
+                client_profile: super::super::profile::antigravity_client_profile(),
                 client_version: None,
                 session_id: None,
             })
@@ -375,6 +375,7 @@ mod tests {
             resolve_local_antigravity_request_auth(&transport),
             AntigravityRequestAuthSupport::Supported(AntigravityRequestAuth {
                 project_id: "project-from-metadata".to_string(),
+                client_profile: super::super::profile::antigravity_client_profile(),
                 client_version: Some("1.99.0".to_string()),
                 session_id: Some("session-from-metadata".to_string()),
             })

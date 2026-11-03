@@ -1,3 +1,8 @@
+mod profile;
+pub use profile::{
+    antigravity_client_profile, antigravity_hub_client_version, antigravity_hub_enabled,
+    set_antigravity_hub_client_version, AntigravityClientProfile,
+};
 mod auth;
 mod policy;
 mod request;

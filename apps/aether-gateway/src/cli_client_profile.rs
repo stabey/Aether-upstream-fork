@@ -1,6 +1,6 @@
 //! CLI 客户端画像的统一发布、官方版本刷新与每节点缓存同步。
 //!
-//! 每个客户端由一份 [`CliClientProfileSpec`] 描述：官方 npm 发布源、平台包校验规则、
+//! 每个客户端由一份 [`CliClientProfileSpec`] 描述：官方 npm 或 Hub 清单发布源、校验规则、
 //! 运行时缓存键、环境变量开关与画像发布函数。刷新逻辑本身与客户端无关。
 
 use std::collections::BTreeMap;
@@ -33,7 +33,9 @@ const MAX_RELEASE_BYTES: usize = 256 * 1024;
 pub(crate) struct CliClientProfileSpec {
     /// 日志中的客户端标识。
     client: &'static str,
-    /// 官方 npm stable 标签的发布元数据地址。
+    enabled: fn() -> bool,
+    release_parser: fn(&CliClientProfileSpec, &[u8]) -> Result<String, ProfileRefreshError>,
+    /// 官方 stable 发布元数据地址（npm 标签或 Hub updater 清单）。
     release_endpoint: &'static str,
     stable_channel: Option<&'static str>,
     refresh_interval: Duration,
@@ -71,6 +73,8 @@ fn publish_claude_code_version(version: &str) -> Result<(), &'static str> {
 
 pub(crate) static CODEX_CLI_PROFILE: CliClientProfileSpec = CliClientProfileSpec {
     client: "codex",
+    enabled: || true,
+    release_parser: parse_cli_release,
     stable_channel: None,
     refresh_interval: PROFILE_REFRESH_INTERVAL,
     release_endpoint: "https://registry.npmjs.org/@openai%2Fcodex/latest",
@@ -97,6 +101,8 @@ pub(crate) static CODEX_CLI_PROFILE: CliClientProfileSpec = CliClientProfileSpec
 /// 指纹仍由 transport crate 中带版本号的身份模板统一维护。
 pub(crate) static CLAUDE_CODE_CLI_PROFILE: CliClientProfileSpec = CliClientProfileSpec {
     client: "claude_code",
+    enabled: || true,
+    release_parser: parse_cli_release,
     stable_channel: None,
     refresh_interval: PROFILE_REFRESH_INTERVAL,
     release_endpoint: "https://registry.npmjs.org/@anthropic-ai%2Fclaude-code/latest",
@@ -129,6 +135,8 @@ fn publish_gemini_version(version: &str) -> Result<(), &'static str> {
 
 pub(crate) static XAI_CLI_PROFILE: CliClientProfileSpec = CliClientProfileSpec {
     client: "xai",
+    enabled: || true,
+    release_parser: parse_cli_release,
     release_endpoint: "https://registry.npmjs.org/@xai-official%2Fgrok/latest",
     stable_channel: Some("https://x.ai/cli/stable"),
     refresh_interval: Duration::from_secs(3 * 60 * 60),
@@ -151,6 +159,8 @@ pub(crate) static XAI_CLI_PROFILE: CliClientProfileSpec = CliClientProfileSpec {
 };
 pub(crate) static GEMINI_CLI_PROFILE: CliClientProfileSpec = CliClientProfileSpec {
     client: "gemini_cli",
+    enabled: || true,
+    release_parser: parse_cli_release,
     release_endpoint: "https://registry.npmjs.org/@google%2Fgemini-cli/latest",
     stable_channel: None,
     refresh_interval: PROFILE_REFRESH_INTERVAL,
@@ -165,13 +175,35 @@ pub(crate) static GEMINI_CLI_PROFILE: CliClientProfileSpec = CliClientProfileSpe
     active_version: aether_provider_transport::gemini_cli::gemini_cli_client_version,
     publish_version: publish_gemini_version,
 };
+pub(crate) static ANTIGRAVITY_HUB_PROFILE: CliClientProfileSpec = CliClientProfileSpec {
+    client: "antigravity_hub",
+    enabled: aether_provider_transport::antigravity::antigravity_hub_enabled,
+    release_parser: parse_antigravity_hub_manifest,
+    release_endpoint: "https://antigravity-hub-auto-updater-974169037036.us-central1.run.app/manifest/latest-arm64-mac.yml",
+    stable_channel: None,
+    refresh_interval: Duration::from_secs(3 * 60 * 60),
+    package_name: "antigravity-hub",
+    platform_targets: &[],
+    platform_dependency: claude_code_platform_dependency,
+    cache_key: "aether:antigravity:hub:client-profile:v1",
+    refresh_env: "AETHER_ANTIGRAVITY_CLIENT_PROFILE_REFRESH",
+    fixed_version_env: "AETHER_ANTIGRAVITY_CLIENT_VERSION",
+    task_key: crate::task_runtime::TASK_KEY_ANTIGRAVITY_HUB_CLIENT_PROFILE,
+    active_version: aether_provider_transport::antigravity::antigravity_hub_client_version,
+    publish_version: aether_provider_transport::antigravity::set_antigravity_hub_client_version,
+};
+
 pub(crate) static CLI_PROFILES: &[&CliClientProfileSpec] = &[
     &CODEX_CLI_PROFILE,
     &CLAUDE_CODE_CLI_PROFILE,
     &XAI_CLI_PROFILE,
     &GEMINI_CLI_PROFILE,
+    &ANTIGRAVITY_HUB_PROFILE,
 ];
 impl CliClientProfileSpec {
+    pub(crate) fn enabled(&self) -> bool {
+        (self.enabled)()
+    }
     pub(crate) fn task_key(&self) -> &'static str {
         self.task_key
     }
@@ -248,6 +280,87 @@ fn parse_cli_release(
         return Err(ProfileRefreshError::InvalidMetadata);
     }
     Ok(release.version)
+}
+
+/// Deliberately narrow electron-updater schema, not a general YAML parser.
+/// Accept only observed scalar fields and the files list. Quoted releaseDate
+/// is harmless; tags, aliases, multiline/flow syntax and quoted keys fail closed.
+fn parse_antigravity_hub_manifest(
+    _spec: &CliClientProfileSpec,
+    bytes: &[u8],
+) -> Result<String, ProfileRefreshError> {
+    if bytes.len() > MAX_RELEASE_BYTES {
+        return Err(ProfileRefreshError::ResponseTooLarge);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| ProfileRefreshError::InvalidMetadata)?;
+    let mut version = None;
+    let mut top_keys = std::collections::HashSet::new();
+    let mut in_files = false;
+    let mut in_file = false;
+    let mut file_keys = std::collections::HashSet::new();
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let mut entry = &line[indent..];
+        if entry.starts_with('#') {
+            continue;
+        }
+        if line.contains('\t') {
+            return Err(ProfileRefreshError::InvalidMetadata);
+        }
+        if indent == 2 && entry.starts_with("- ") && in_files {
+            in_file = true;
+            file_keys.clear();
+            entry = &entry[2..];
+        } else if indent != 0 && !(indent == 4 && in_files && in_file) {
+            return Err(ProfileRefreshError::InvalidMetadata);
+        }
+        let (key, value) = entry
+            .split_once(':')
+            .ok_or(ProfileRefreshError::InvalidMetadata)?;
+        let value = value.trim();
+        if indent == 0 {
+            if !top_keys.insert(key) {
+                return Err(ProfileRefreshError::InvalidMetadata);
+            }
+            in_files = key == "files";
+            in_file = false;
+            match key {
+                "version" => {
+                    version_sequence(value)?;
+                    version = Some(value.to_owned());
+                }
+                "files" if value.is_empty() => continue,
+                "path" | "sha512" => {}
+                "releaseDate" => {
+                    // Single-line timestamp only; no general quoted scalar decoding.
+                    let value = value
+                        .strip_prefix('\'')
+                        .and_then(|v| v.strip_suffix('\''))
+                        .or_else(|| value.strip_prefix('"').and_then(|v| v.strip_suffix('"')))
+                        .unwrap_or(value);
+                    if value.is_empty()
+                        || !value
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || b"-:TZ.+".contains(&b))
+                    {
+                        return Err(ProfileRefreshError::InvalidMetadata);
+                    }
+                    continue;
+                }
+                _ => return Err(ProfileRefreshError::InvalidMetadata),
+            }
+        } else if !matches!(key, "url" | "sha512" | "size") || !file_keys.insert(key) {
+            return Err(ProfileRefreshError::InvalidMetadata);
+        }
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:/+=%-".contains(&b))
+        {
+            return Err(ProfileRefreshError::InvalidMetadata);
+        }
+    }
+    version.ok_or(ProfileRefreshError::InvalidMetadata)
 }
 
 fn refresh_enabled_from(value: Option<&str>) -> bool {
@@ -361,16 +474,17 @@ async fn fetch_latest_cli_version(
     spec: &CliClientProfileSpec,
     client: &Client,
 ) -> Result<String, ProfileRefreshError> {
-    let npm =
-        || async { parse_cli_release(spec, &fetch_bounded(client, spec.release_endpoint).await?) };
+    let release = || async {
+        (spec.release_parser)(spec, &fetch_bounded(client, spec.release_endpoint).await?)
+    };
     if let Some(url) = spec.stable_channel {
         fetch_latest_with_fallback(
             || async { parse_stable_channel(&fetch_bounded(client, url).await?) },
-            npm,
+            release,
         )
         .await
     } else {
-        npm().await
+        release().await
     }
 }
 
@@ -476,6 +590,9 @@ async fn refresh_once(
     spec: &CliClientProfileSpec,
     runtime: &RuntimeState,
 ) -> Result<String, ProfileRefreshError> {
+    if !spec.enabled() {
+        return Ok((spec.active_version)());
+    }
     let fixed_version = fixed_version_override(spec);
     if fixed_version.is_some() || !refresh_enabled(spec) {
         return refresh_once_with_fetch(spec, runtime, fixed_version.as_deref(), false, || async {
@@ -574,6 +691,9 @@ async fn sync_cached_profile(
     runtime: &RuntimeState,
     fixed: Option<&str>,
 ) -> Result<(), ProfileRefreshError> {
+    if !spec.enabled() {
+        return Ok(());
+    }
     if let Some(version) = fixed {
         publish(spec, version)
     } else {
@@ -589,7 +709,7 @@ pub(crate) fn spawn_cache_sync(app: AppState) -> ClientProfileSyncGuard {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                for spec in CLI_PROFILES {
+                for spec in CLI_PROFILES.iter().filter(|spec| spec.enabled()) {
                     let fixed = fixed_version_override(spec);
                     if let Err(error) =
                         sync_cached_profile(spec, app.runtime_state(), fixed.as_deref()).await
@@ -642,6 +762,8 @@ mod tests {
 
     static TEST_PROFILE: CliClientProfileSpec = CliClientProfileSpec {
         client: "test",
+        enabled: || true,
+        release_parser: parse_cli_release,
         stable_channel: None,
         refresh_interval: super::PROFILE_REFRESH_INTERVAL,
         release_endpoint: "https://registry.invalid/test/latest",
@@ -663,17 +785,74 @@ mod tests {
     }
 
     #[test]
+    fn hub_manifest_accepts_only_one_top_level_stable_version() {
+        let spec = &super::ANTIGRAVITY_HUB_PROFILE;
+        assert_eq!(super::parse_antigravity_hub_manifest(spec, b"version: 2.28.2\nfiles:\n  - url: https://storage.googleapis.com/antigravity-public/antigravity-hub/2.28.2-5937220255875072/darwin-arm/Antigravity.zip\n    sha512: abcdef0123456789+/==\n    size: 42\npath: Antigravity.zip\nsha512: abcdef0123456789+/==\nreleaseDate: '2026-11-03T01:02:03.000Z'\n").unwrap(), "2.28.2");
+        for body in [
+            "",
+            "version: 2.29.0-beta.1",
+            "version: 2.28.2+build",
+            "  version: 2.28.2",
+            "version: 2.28.2\nversion: 2.29.0",
+            "other:\n  version: 2.28.2",
+            "version: '2.28.2'",
+            "version: 2.28.2\n---\nversion: 2.29.0",
+            "version: 2.28.2\n\"version\": 2.29.0",
+            "version: 2.28.2\nother: |\n  version: 9.0.0",
+        ] {
+            assert!(
+                super::parse_antigravity_hub_manifest(spec, body.as_bytes()).is_err(),
+                "{body}"
+            );
+        }
+        assert!(super::parse_antigravity_hub_manifest(
+            spec,
+            &vec![b'a'; super::MAX_RELEASE_BYTES + 1]
+        )
+        .is_err());
+        assert_ne!(spec.cache_key, super::GEMINI_CLI_PROFILE.cache_key);
+    }
+
+    #[tokio::test]
+    async fn inactive_family_does_not_read_cache_publish_or_fetch() {
+        let _guard = test_profile_guard().await;
+        let disabled = CliClientProfileSpec {
+            enabled: || false,
+            ..TEST_PROFILE
+        };
+        let runtime = RuntimeState::memory(MemoryRuntimeStateConfig::default());
+        runtime
+            .kv_set(
+                disabled.cache_key,
+                serde_json::to_string(&CachedProfile {
+                    version: "9.0.0".into(),
+                    verified_at_unix_secs: 1,
+                })
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            super::refresh_once(&disabled, &runtime).await.unwrap(),
+            TEST_BUILTIN_VERSION
+        );
+        super::sync_cached_profile(&disabled, &runtime, Some("8.0.0"))
+            .await
+            .unwrap();
+        assert_eq!(test_active_version(), TEST_BUILTIN_VERSION);
+    }
+
+    #[test]
     fn all_release_adapters_keep_distinct_cache_keys_and_registered_tasks() {
         let mut keys = std::collections::HashSet::new();
         let mut tasks = std::collections::HashSet::new();
         for spec in super::CLI_PROFILES {
             assert!(keys.insert(spec.cache_key));
             assert!(tasks.insert(spec.task_key()));
-            assert!(spec
-                .release_endpoint
-                .starts_with("https://registry.npmjs.org/"));
+            assert!(spec.release_endpoint.starts_with("https://"));
         }
-        assert_eq!(keys.len(), 4);
+        assert_eq!(keys.len(), 5);
         assert_eq!(
             super::XAI_CLI_PROFILE.refresh_interval,
             Duration::from_secs(3 * 60 * 60)

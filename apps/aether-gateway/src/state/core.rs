@@ -166,12 +166,14 @@ impl AppState {
     }
 
     pub async fn prewarm_client_profiles(&self) -> Vec<(&'static str, Result<String, String>)> {
-        futures_util::future::join_all(CLI_PROFILES.iter().map(|spec| async move {
-            (
-                spec.client_name(),
-                crate::cli_client_profile::prewarm(spec, self.runtime_state()).await,
-            )
-        }))
+        futures_util::future::join_all(CLI_PROFILES.iter().filter(|spec| spec.enabled()).map(
+            |spec| async move {
+                (
+                    spec.client_name(),
+                    crate::cli_client_profile::prewarm(spec, self.runtime_state()).await,
+                )
+            },
+        ))
         .await
     }
 
@@ -2377,7 +2379,7 @@ impl AppState {
             crate::task_runtime::TASK_KEY_MODEL_FETCH_WORKER,
             spawn_model_fetch_worker(background_state.clone()),
         );
-        for spec in CLI_PROFILES {
+        for spec in CLI_PROFILES.iter().filter(|spec| spec.enabled()) {
             supervise_worker(
                 spec.task_key(),
                 Some(spawn_cli_client_profile_worker(

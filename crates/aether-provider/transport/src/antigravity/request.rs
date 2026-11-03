@@ -1,6 +1,6 @@
 use serde_json::{Map, Value};
 
-use super::auth::{AntigravityRequestAuth, ANTIGRAVITY_REQUEST_USER_AGENT};
+use super::auth::AntigravityRequestAuth;
 use super::schema::{normalize_claude_unions, normalize_tool_parameters, SchemaBudget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,8 +89,8 @@ pub fn build_antigravity_safe_v1internal_request(
             );
         }
         let request_id = non_empty_string_field(source, "requestId").unwrap_or(request_id);
-        let user_agent =
-            non_empty_string_field(source, "userAgent").unwrap_or(ANTIGRAVITY_REQUEST_USER_AGENT);
+        let user_agent = non_empty_string_field(source, "userAgent")
+            .unwrap_or(&auth.client_profile.envelope_user_agent);
         let existing_request_type = existing_v1internal_request_type(source);
 
         let mut envelope = serde_json::json!({
@@ -125,7 +125,7 @@ pub fn build_antigravity_safe_v1internal_request(
         "requestId": request_id,
         "request": Value::Object(inner_request),
         "model": model,
-        "userAgent": ANTIGRAVITY_REQUEST_USER_AGENT,
+        "userAgent": auth.client_profile.envelope_user_agent,
     });
     if request_type != AntigravityEnvelopeRequestType::Agent {
         envelope["requestType"] = Value::String(request_type.as_str().to_string());
@@ -552,9 +552,35 @@ mod tests {
     fn sample_auth() -> AntigravityRequestAuth {
         AntigravityRequestAuth {
             project_id: "project-ant-123".to_string(),
+            client_profile: super::super::profile::antigravity_client_profile(),
             client_version: None,
             session_id: None,
         }
+    }
+
+    #[test]
+    fn hub_request_uses_the_auth_snapshot_for_headers_and_body() {
+        let store = aether_ai_formats::client_profile::ClientProfileStore::new(
+            super::super::profile::AntigravityClientProfile::hub("2.28.2").unwrap(),
+        );
+        let mut auth = sample_auth();
+        auth.client_profile = store.snapshot();
+        store.publish(super::super::profile::AntigravityClientProfile::hub("2.29.0").unwrap());
+        let headers = crate::antigravity::build_antigravity_static_identity_headers(&auth);
+        assert_eq!(headers["x-client-version"], "2.28.2");
+        assert_eq!(headers["user-agent"], auth.client_profile.user_agent);
+        let envelope = build_antigravity_safe_v1internal_request(
+            &auth,
+            "req-1",
+            "gemini-3-pro",
+            &json!({"contents": []}),
+            AntigravityEnvelopeRequestType::Agent,
+        );
+        let AntigravityRequestEnvelopeSupport::Supported(body) = envelope else {
+            panic!("supported");
+        };
+        assert_eq!(body["userAgent"], "antigravity");
+        assert!(headers["user-agent"].contains("2.28.2"));
     }
 
     #[test]

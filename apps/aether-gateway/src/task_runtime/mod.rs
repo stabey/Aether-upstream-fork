@@ -28,6 +28,8 @@ pub(crate) const TASK_KEY_CODEX_CLIENT_PROFILE: &str = "maintenance.codex.client
 pub(crate) const TASK_KEY_CLAUDE_CODE_CLIENT_PROFILE: &str =
     "maintenance.claude_code.client.profile";
 pub(crate) const TASK_KEY_XAI_CLIENT_PROFILE: &str = "maintenance.xai.client.profile";
+pub(crate) const TASK_KEY_ANTIGRAVITY_HUB_CLIENT_PROFILE: &str =
+    "maintenance.antigravity_hub.client.profile";
 pub(crate) const TASK_KEY_GEMINI_CLI_CLIENT_PROFILE: &str = "maintenance.gemini_cli.client.profile";
 pub(crate) const TASK_KEY_PROVIDER_QUOTA_RESET: &str = "provider.quota.reset.worker";
 pub(crate) const TASK_KEY_ACCOUNT_SELF_CHECK: &str = "account.self_check.worker";
@@ -219,6 +221,14 @@ const TASK_DEFINITIONS: &[TaskDefinition] = &[
         TASK_KEY_CLAUDE_CODE_CLIENT_PROFILE,
         TaskKind::Scheduled,
         "daily",
+        true,
+        true,
+        RETRY_ONCE,
+    ),
+    TaskDefinition::new(
+        TASK_KEY_ANTIGRAVITY_HUB_CLIENT_PROFILE,
+        TaskKind::Scheduled,
+        "interval",
         true,
         true,
         RETRY_ONCE,
@@ -988,6 +998,7 @@ mod client_profile_task_tests {
             (TASK_KEY_CLAUDE_CODE_CLIENT_PROFILE, "daily"),
             (TASK_KEY_XAI_CLIENT_PROFILE, "interval"),
             (TASK_KEY_GEMINI_CLI_CLIENT_PROFILE, "daily"),
+            (TASK_KEY_ANTIGRAVITY_HUB_CLIENT_PROFILE, "interval"),
         ] {
             let definitions: Vec<_> = task_definitions()
                 .iter()
