@@ -63,9 +63,11 @@ use aether_data_contracts::repository::provider_catalog::{
     StoredProviderCatalogEndpoint, StoredProviderCatalogKey, StoredProviderCatalogProvider,
 };
 use aether_model_fetch::{
-    aggregate_models_for_cache, fetch_models_from_transports_for_management, json_string_list,
-    model_catalog_upstream_metadata, preset_models_for_provider, selected_models_fetch_endpoints,
-    upstream_metadata_namespace_updates,
+    aggregate_models_for_cache, fetch_models_from_transports_for_management,
+    fetch_xai_models_from_transports, json_string_list, model_catalog_upstream_metadata,
+    preset_models_for_provider, selected_models_fetch_endpoints,
+    selected_xai_models_fetch_endpoints, upstream_metadata_namespace_updates,
+    XaiModelCatalogSource,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -506,12 +508,13 @@ async fn provider_query_fetch_models_for_key(
     force_refresh: bool,
 ) -> Result<ProviderQueryKeyFetchResult, GatewayError> {
     let is_codex = provider.provider_type.trim().eq_ignore_ascii_case("codex");
+    let is_xai = provider.provider_type.trim().eq_ignore_ascii_case("xai");
     let codex_catalog = if is_codex {
         crate::model_fetch::read_codex_management_catalog(state.app(), &provider.id, &key.id).await
     } else {
         None
     };
-    if !force_refresh {
+    if !force_refresh && !is_xai {
         // Read through the live, credential-scoped directory before the admin cache.
         // Never reuse the old versionless cache for Codex (including cached presets).
         let cached_models = if is_codex {
@@ -544,18 +547,25 @@ async fn provider_query_fetch_models_for_key(
         }
     }
 
-    let selected_endpoints = selected_models_fetch_endpoints(endpoints, key);
+    let selected_endpoints = if is_xai {
+        selected_xai_models_fetch_endpoints(endpoints, key)
+    } else {
+        selected_models_fetch_endpoints(endpoints, key)
+    };
     if selected_endpoints.is_empty() {
         if let Some(models) = preset_models_for_provider(&provider.provider_type) {
             let models = aggregate_models_for_cache(&models);
-            provider_query_persist_preset_models(state, provider, key, &models).await?;
+            if !is_xai {
+                provider_query_persist_preset_models(state, provider, key, &models).await?;
+            }
             let models = provider_query_filter_models_for_key(provider, key, models);
             return Ok(ProviderQueryKeyFetchResult {
                 models,
                 error: None,
-                warning: None,
+                warning: is_xai
+                    .then(|| "xAI 没有可用的模型发现端点，已使用静态兜底目录".to_string()),
                 from_cache: false,
-                has_success: true,
+                has_success: !is_xai,
             });
         }
         return Ok(ProviderQueryKeyFetchResult {
@@ -601,29 +611,31 @@ async fn provider_query_fetch_models_for_key(
             .map(|catalog| catalog.client_version.as_str())
             .unwrap_or(dynamic_client_version.as_str())
     });
-    let outcome =
-        match fetch_models_from_transports_for_management(state.app(), &transports, client_version)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                all_errors.extend(provider_query_project_model_fetch_errors([err]));
-                if let Some(fallback) =
-                    provider_query_codex_preset_fallback(provider, &all_errors.join("; "))
-                {
-                    provider_query_persist_preset_models(state, provider, key, &fallback.models)
-                        .await?;
-                    return Ok(fallback);
-                }
-                return Ok(ProviderQueryKeyFetchResult {
-                    models: Vec::new(),
-                    error: Some(all_errors.join("; ")),
-                    warning: None,
-                    from_cache: false,
-                    has_success: false,
-                });
+    let fetched = if is_xai {
+        fetch_xai_models_from_transports(state.app(), &transports, force_refresh).await
+    } else {
+        fetch_models_from_transports_for_management(state.app(), &transports, client_version).await
+    };
+    let outcome = match fetched {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            all_errors.extend(provider_query_project_model_fetch_errors([err]));
+            if let Some(fallback) =
+                provider_query_codex_preset_fallback(provider, &all_errors.join("; "))
+            {
+                provider_query_persist_preset_models(state, provider, key, &fallback.models)
+                    .await?;
+                return Ok(fallback);
             }
-        };
+            return Ok(ProviderQueryKeyFetchResult {
+                models: Vec::new(),
+                error: Some(all_errors.join("; ")),
+                warning: None,
+                from_cache: false,
+                has_success: false,
+            });
+        }
+    };
 
     all_errors.extend(provider_query_project_model_fetch_errors(outcome.errors));
     let unique_models = outcome.legacy_models;
@@ -667,11 +679,28 @@ async fn provider_query_fetch_models_for_key(
     } else {
         None
     };
-    let warning = if has_models && !all_errors.is_empty() {
+    let mut warning = if has_models && !all_errors.is_empty() {
         Some(all_errors.join("; "))
     } else {
         None
     };
+    if has_models {
+        let fallback = match outcome.xai_source {
+            Some(XaiModelCatalogSource::LastSuccessCache) if warning.is_some() => {
+                Some("xAI 动态模型目录刷新失败，已保留该账号最近成功的目录")
+            }
+            Some(XaiModelCatalogSource::StaticFallback) => {
+                Some("xAI 动态模型目录不可用，已使用静态兜底目录")
+            }
+            _ => None,
+        };
+        if let Some(fallback) = fallback {
+            warning = Some(match warning {
+                Some(detail) => format!("{fallback}: {detail}"),
+                None => fallback.to_string(),
+            });
+        }
+    }
     if !has_models && error.is_none() {
         error = Some(ADMIN_PROVIDER_QUERY_NO_MODELS_FROM_ENDPOINT_DETAIL.to_string());
     }
@@ -680,7 +709,7 @@ async fn provider_query_fetch_models_for_key(
         models: provider_query_filter_models_for_key(provider, key, unique_models),
         error,
         warning,
-        from_cache: false,
+        from_cache: outcome.xai_source == Some(XaiModelCatalogSource::LastSuccessCache),
         has_success: outcome.has_success,
     })
 }

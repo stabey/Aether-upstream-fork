@@ -137,6 +137,202 @@ async fn assert_admin_provider_query_route(
 }
 
 #[test]
+fn gateway_xai_model_discovery_is_account_scoped_and_keeps_last_success() {
+    run_provider_query_test(
+        "gateway_xai_model_discovery_is_account_scoped_and_keeps_last_success",
+        gateway_xai_model_discovery_is_account_scoped_and_keeps_last_success_impl,
+    );
+}
+
+async fn gateway_xai_model_discovery_is_account_scoped_and_keeps_last_success_impl() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let failing = Arc::new(AtomicBool::new(false));
+    let hits = Arc::new(Mutex::new(Vec::<String>::new()));
+    let upstream_failing = failing.clone();
+    let upstream_hits = hits.clone();
+    let execution_runtime = Router::new().route(
+        "/v1/execute/sync",
+        any(move |Json(plan): Json<ExecutionPlan>| {
+            let failing = upstream_failing.clone();
+            let hits = upstream_hits.clone();
+            async move {
+                hits.lock().unwrap().push(plan.key_id.clone());
+                assert_eq!(plan.url, "https://api.x.ai/v1/models");
+                assert_eq!(
+                    plan.headers["authorization"],
+                    format!("Bearer secret-{}", plan.key_id)
+                );
+                assert!(!plan.headers.contains_key("x-xai-token-auth"));
+                let body = if failing.load(Ordering::SeqCst) {
+                    json!({"error":{"message":"upstream-unavailable-secret"}})
+                } else {
+                    json!({"data":[{
+                        "id":format!("grok-{}",plan.key_id), "context_window":256000,
+                        "context_windows":[256000,500000],
+                        "reasoning_efforts":[{"value":"high"},{"value":"low"}],
+                        "authorization":"must-not-be-saved"
+                    }]})
+                };
+                Json(json!({
+                    "request_id":plan.request_id,
+                    "status_code":if failing.load(Ordering::SeqCst) {503} else {200},
+                    "headers":{"content-type":"application/json"},
+                    "body":{"json_body":body}
+                }))
+            }
+        }),
+    );
+    let (runtime_url, runtime_handle) = start_server(execution_runtime).await;
+    let mut provider = sample_provider("p-xai-directory", "xAI", 10);
+    provider.provider_type = "xai".into();
+    let endpoint = StoredProviderCatalogEndpoint::new(
+        "e-xai-directory".into(),
+        provider.id.clone(),
+        "openai:responses".into(),
+        Some("openai".into()),
+        Some("responses".into()),
+        true,
+    )
+    .unwrap()
+    .with_transport_fields(
+        "https://api.x.ai/v1".into(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
+    let keys = ["a", "b", "c"]
+        .into_iter()
+        .map(|id| {
+            let mut key = sample_bound_key(
+                id,
+                &provider.id,
+                "openai:responses",
+                &format!("secret-{id}"),
+            );
+            key.auto_fetch_models = false;
+            key.allowed_models = Some(json!(["grok-manual"]));
+            key.upstream_metadata = Some(json!({"xai":{"prepaid_balance":7}}));
+            key
+        })
+        .collect();
+    let repository = Arc::new(InMemoryProviderCatalogReadRepository::seed(
+        vec![provider],
+        vec![endpoint],
+        keys,
+    ));
+    let state = build_state_with_execution_runtime_override(runtime_url.clone())
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(repository.clone())
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    // Historical versionless caches must not bypass xAI's account/entry-point scope.
+    state
+        .runtime_state
+        .kv_set(
+            "upstream_models:p-xai-directory:a",
+            json!([{"id":"grok-unscoped-cache"}]).to_string(),
+            None,
+        )
+        .await
+        .unwrap();
+    let (gateway_url, gateway_handle) = start_server(build_router_with_state(state.clone())).await;
+    async fn query(base: &str, key: &str, force: bool) -> serde_json::Value {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/api/admin/provider-query/models"))
+            .header(GATEWAY_HEADER, "rust-phase3b")
+            .header(TRUSTED_ADMIN_USER_ID_HEADER, "admin-user-123")
+            .header(TRUSTED_ADMIN_USER_ROLE_HEADER, "admin")
+            .header(TRUSTED_ADMIN_SESSION_ID_HEADER, "session-123")
+            .json(&json!({"provider_id":"p-xai-directory","api_key_id":key,"force_refresh":force}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        response.json().await.unwrap()
+    }
+    let first = query(&gateway_url, "a", false).await;
+    assert_eq!(first["data"]["models"][0]["id"], "grok-a");
+    assert_eq!(
+        first["data"]["models"][0]["context_windows"],
+        json!([256000, 500000])
+    );
+    assert_eq!(
+        first["data"]["models"][0]["supported_reasoning_levels"][0]["effort"],
+        "low"
+    );
+    assert!(!first.to_string().contains("must-not-be-saved"));
+    assert_eq!(first["data"]["from_cache"], false);
+    let again = query(&gateway_url, "a", false).await;
+    assert_eq!(again["data"]["from_cache"], true);
+    let other = query(&gateway_url, "b", false).await;
+    assert_eq!(other["data"]["models"][0]["id"], "grok-b");
+    assert_eq!(hits.lock().unwrap().as_slice(), ["a", "b"]);
+    let saved = state
+        .list_provider_catalog_keys_by_provider_ids(&["p-xai-directory".into()])
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|k| k.id == "a")
+        .unwrap();
+    assert_eq!(saved.allowed_models, Some(json!(["grok-manual"])));
+    assert_eq!(
+        saved.upstream_metadata.as_ref().unwrap()["xai"]["prepaid_balance"],
+        7
+    );
+    assert!(saved
+        .upstream_metadata
+        .as_ref()
+        .unwrap()
+        .get("xai_model_catalog")
+        .is_some());
+    failing.store(true, Ordering::SeqCst);
+    let stale = query(&gateway_url, "a", true).await;
+    assert_eq!(stale["data"]["models"][0]["id"], "grok-a");
+    assert_eq!(stale["data"]["from_cache"], true);
+    assert!(stale["data"]["warning"]
+        .as_str()
+        .unwrap()
+        .contains("最近成功"));
+    assert!(!stale.to_string().contains("upstream-unavailable-secret"));
+    let fallback = query(&gateway_url, "c", true).await;
+    assert_eq!(fallback["success"], true);
+    assert_eq!(fallback["data"]["from_cache"], false);
+    assert!(fallback["data"]["warning"]
+        .as_str()
+        .unwrap()
+        .contains("静态兜底"));
+    let after = state
+        .list_provider_catalog_keys_by_provider_ids(&["p-xai-directory".into()])
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|k| k.id == "a")
+        .unwrap();
+    assert_eq!(after.allowed_models, saved.allowed_models);
+    assert_eq!(after.upstream_metadata, saved.upstream_metadata);
+    gateway_handle.abort();
+    // A new gateway with an empty runtime cache recovers the last success from the account.
+    let restarted = build_state_with_execution_runtime_override(runtime_url)
+        .with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_repository_for_tests(repository)
+                .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+    let (new_url, new_handle) = start_server(build_router_with_state(restarted)).await;
+    let recovered = query(&new_url, "a", false).await;
+    assert_eq!(recovered["data"]["models"][0]["id"], "grok-a");
+    assert_eq!(recovered["data"]["from_cache"], true);
+    assert_eq!(hits.lock().unwrap().len(), 4);
+    new_handle.abort();
+    runtime_handle.abort();
+}
+
+#[test]
 fn gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key() {
     run_provider_query_test(
         "gateway_handles_admin_provider_query_models_fetches_upstream_for_selected_key",

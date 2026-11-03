@@ -10,8 +10,9 @@ use aether_model_fetch::{
     apply_model_filters, fetch_models_from_transports_for_management, json_string_list,
     model_catalog_upstream_metadata, model_fetch_interval_minutes,
     model_fetch_startup_delay_seconds, model_fetch_startup_enabled, preset_models_for_provider,
-    selected_models_fetch_endpoints, sync_provider_model_whitelist_associations,
-    upstream_metadata_namespace_updates, ModelFetchAssociationStore, ModelFetchRunSummary,
+    selected_models_fetch_endpoints, selected_xai_models_fetch_endpoints,
+    sync_provider_model_whitelist_associations, upstream_metadata_namespace_updates,
+    ModelFetchAssociationStore, ModelFetchRunSummary,
 };
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -181,7 +182,11 @@ where
             if !key.is_active || !key.auto_fetch_models {
                 continue;
             }
-            let selected_endpoints = selected_models_fetch_endpoints(&endpoints, &key);
+            let selected_endpoints = if provider.provider_type.trim().eq_ignore_ascii_case("xai") {
+                selected_xai_models_fetch_endpoints(&endpoints, &key)
+            } else {
+                selected_models_fetch_endpoints(&endpoints, &key)
+            };
             let key = sanitize_model_fetch_key(key);
             targets.push(SelectedFetchTarget {
                 provider: provider.clone(),
@@ -326,6 +331,21 @@ async fn fetch_and_persist_key_models(
 ) -> Result<KeyFetchDisposition, GatewayError> {
     let now_unix_secs = now_unix_secs();
     if target.endpoints.is_empty() {
+        if target
+            .provider
+            .provider_type
+            .trim()
+            .eq_ignore_ascii_case("xai")
+        {
+            persist_key_fetch_failure(
+                state,
+                &target.key,
+                now_unix_secs,
+                "No supported endpoint for Rust models fetch".to_string(),
+            )
+            .await?;
+            return Ok(KeyFetchDisposition::Skipped);
+        }
         if let Some(models) = preset_models_for_provider(&target.provider.provider_type) {
             let fetched_model_ids = models
                 .iter()
@@ -1247,6 +1267,133 @@ mod tests {
         assert_eq!(plan.endpoint_id, "endpoint-openai-chat");
         assert_eq!(plan.key_id, "key-openai-chat");
         assert_eq!(plan.model_name.as_deref(), Some("models"));
+    }
+
+    #[tokio::test]
+    async fn xai_model_fetch_preserves_manual_controls_and_last_success_on_failure() {
+        let provider = sample_provider("p-xai", "xai");
+        let mut endpoint = sample_endpoint("e-xai", "p-xai", "openai:responses");
+        endpoint.base_url = "https://api.x.ai/v1".to_string();
+        let mut key = sample_key("k-xai", "p-xai", "api_key", &["openai:responses"]);
+        key.locked_models = Some(json!(["grok-manual"]));
+        key.model_exclude_patterns = Some(json!(["grok-blocked"]));
+        key.upstream_metadata = Some(json!({"xai":{"prepaid_balance":7}}));
+        let mut transport = sample_transport(
+            "xai",
+            "p-xai",
+            "e-xai",
+            "k-xai",
+            "openai:responses",
+            "api_key",
+            None,
+        );
+        transport.endpoint.base_url = endpoint.base_url.clone();
+        transport.key.upstream_metadata = key.upstream_metadata.clone();
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+            HashMap::from([(("p-xai".into(), "e-xai".into(), "k-xai".into()), transport)]),
+            vec![
+                execution_result(json!({"data":[
+                    {"id":"grok-live","context_window":500000,"reasoning_efforts":[{"value":"xhigh"}]},
+                    {"id":"grok-blocked"}
+                ]})),
+                execution_result_with_status(503, json!({"error":{"message":"unavailable"}})),
+            ],
+        );
+        let success = perform_model_fetch_once_with_state(&state).await.unwrap();
+        assert_eq!(success.succeeded, 1);
+        let key = state.key("k-xai");
+        assert_eq!(
+            key.allowed_models,
+            Some(json!(["grok-live", "grok-manual"]))
+        );
+        assert_eq!(
+            key.upstream_metadata.as_ref().unwrap()["xai"]["prepaid_balance"],
+            7
+        );
+        assert!(key
+            .upstream_metadata
+            .as_ref()
+            .unwrap()
+            .get("xai_model_catalog")
+            .is_some());
+        let saved = key.upstream_metadata.clone();
+        let failed = perform_model_fetch_once_with_state(&state).await.unwrap();
+        assert_eq!(failed.failed, 1);
+        let key = state.key("k-xai");
+        assert_eq!(
+            key.allowed_models,
+            Some(json!(["grok-live", "grok-manual"]))
+        );
+        assert_eq!(key.upstream_metadata, saved);
+        assert!(key.last_models_fetch_error.is_some());
+        state.keys.lock().unwrap()[0].auto_fetch_models = false;
+        let disabled = perform_model_fetch_once_with_state(&state).await.unwrap();
+        assert_eq!(disabled.attempted, 0);
+        assert_eq!(state.executed_plans.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn xai_model_discovery_missing_endpoint_preserves_manual_models() {
+        let mut key = sample_key("k-xai", "p-xai", "api_key", &["openai:responses"]);
+        key.allowed_models = Some(json!(["grok-manual"]));
+        key.upstream_metadata = Some(json!({"xai_model_catalog":{"version":1,"catalogs":{}}}));
+        let saved = key.upstream_metadata.clone();
+        let state = TestState::new(
+            vec![sample_provider("p-xai", "xai")],
+            Vec::new(),
+            vec![key],
+            HashMap::new(),
+            Vec::new(),
+        );
+        let summary = perform_model_fetch_once_with_state(&state).await.unwrap();
+        assert_eq!(summary.skipped, 1);
+        assert_eq!(summary.succeeded, 0);
+        assert_eq!(
+            state.key("k-xai").allowed_models,
+            Some(json!(["grok-manual"]))
+        );
+        assert_eq!(state.key("k-xai").upstream_metadata, saved);
+        assert!(state.cached_models.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn xai_model_discovery_media_only_account_fetches_dynamic_directory() {
+        let provider = sample_provider("p-xai", "xai");
+        let mut endpoint = sample_endpoint("e-xai", "p-xai", "openai:image");
+        endpoint.base_url = "https://api.x.ai/v1".into();
+        let key = sample_key("k-xai", "p-xai", "api_key", &["openai:image"]);
+        let mut transport = sample_transport(
+            "xai",
+            "p-xai",
+            "e-xai",
+            "k-xai",
+            "openai:image",
+            "api_key",
+            None,
+        );
+        transport.endpoint.base_url = endpoint.base_url.clone();
+        let state = TestState::new(
+            vec![provider],
+            vec![endpoint],
+            vec![key],
+            HashMap::from([(("p-xai".into(), "e-xai".into(), "k-xai".into()), transport)]),
+            vec![execution_result(
+                json!({"data":[{"id":"grok-imagine-image-2.0"}]}),
+            )],
+        );
+        let summary = perform_model_fetch_once_with_state(&state).await.unwrap();
+        assert_eq!(summary.succeeded, 1);
+        assert_eq!(
+            state.key("k-xai").allowed_models,
+            Some(json!(["grok-imagine-image-2.0"]))
+        );
+        assert_eq!(
+            state.executed_plans.lock().unwrap()[0].url,
+            "https://api.x.ai/v1/models"
+        );
     }
 
     #[tokio::test]

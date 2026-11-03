@@ -29,6 +29,45 @@ channel with npm fallback and the existing three-hour refresh interval.
 - OpenAI-style image reference aliases in a request body are rewritten to xAI's
   shape without touching chat message parts.
 
+## Account model discovery
+
+The xAI provider fetches the selected account's directory with `GET /models`.
+OAuth defaults to `https://cli-chat-proxy.grok.com/v1/models`, with the current
+Grok CLI identity and the account's refreshed bearer token. API-key and
+`using_api=true` accounts default to `https://api.x.ai/v1/models`; explicitly
+configured gateways, proxy routes, header rules, and timeouts retain precedence.
+Compact inference endpoints still use this account directory. Media-only xAI
+accounts can discover models through the same directory.
+
+Each normalized card retains the default `context_window`, the distinct positive
+`context_windows`, `max_context_window`, and any reported `max_output_tokens`.
+Reported reasoning efforts become `reasoning_efforts` and ordered
+`supported_reasoning_levels`; an explicit supported default is retained as
+`default_reasoning_level`. These are model-directory metadata, with the original
+model IDs kept for routing. Image and video entries retain their media formats.
+
+Successful directories are persisted in the account key's separate
+`upstream_metadata.xai_model_catalog` namespace, scoped to the provider/key,
+resolved directory URL, authentication mode, and credential identity. OAuth
+account IDs allow normal token rotation to reuse the directory; credentials
+without an account ID use a credential digest. Secrets and arbitrary upstream
+fields are excluded from persisted cards.
+
+Management reads use a matching successful directory for up to six hours unless
+`force_refresh=true`. Background auto-fetch uses the existing model-fetch worker
+cadence and always attempts a live refresh. A refresh failure, malformed/empty
+directory, or incomplete paginated response preserves the last successful
+directory, even after the freshness window or a gateway restart. Without a
+matching success, management returns the existing static xAI presets with a
+warning. Cached/static fallback is never recorded as a successful live fetch and
+never replaces the last success.
+
+Management discovery does not rewrite manual model restrictions. Background
+updates still require `auto_fetch_models=true` and retain locked models and the
+existing include/exclude rules. Failed background discovery preserves the current
+whitelist and records the fetch error. Other provider types keep their existing
+discovery behavior.
+
 ## Routing and credentials
 
 OAuth requests default to `https://cli-chat-proxy.grok.com/v1`; API-key or

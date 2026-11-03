@@ -483,6 +483,7 @@ dependencies = [
  "base64 0.22.1",
  "regex",
  "serde_json",
+ "sha2",
  "tokio",
  "url",
  "uuid",

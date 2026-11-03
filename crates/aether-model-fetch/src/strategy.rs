@@ -57,6 +57,8 @@ pub struct ModelsFetchOutcome {
     pub upstream_metadata: Option<Value>,
     pub etag: Option<String>,
     pub upstream_status: Option<u16>,
+    /// xAI discovery distinguishes a live response from cached or built-in fallback data.
+    pub xai_source: Option<crate::XaiModelCatalogSource>,
 }
 
 #[derive(Debug)]
@@ -106,6 +108,7 @@ pub enum ModelFetchStrategyKind {
     GeminiCliPreset,
     Kiro,
     Windsurf,
+    Xai,
 }
 
 pub trait ModelFetchStrategy {
@@ -182,6 +185,13 @@ fn select_model_fetch_strategy(
         .provider_type
         .trim()
         .to_ascii_lowercase();
+    if provider_type == "xai" {
+        return Ok(SelectedModelFetchStrategy {
+            provider_type,
+            kind: ModelFetchStrategyKind::Xai,
+            preset_models: None,
+        });
+    }
     if let Some(models) = preset_models_for_provider(&provider_type) {
         if provider_type == "kiro" {
             return Ok(SelectedModelFetchStrategy {
@@ -273,6 +283,9 @@ async fn execute_model_fetch_strategy(
         }
         ModelFetchStrategyKind::Kiro => fetch_kiro_models(runtime, first_transport).await,
         ModelFetchStrategyKind::Windsurf => fetch_windsurf_models(runtime, first_transport).await,
+        ModelFetchStrategyKind::Xai => {
+            crate::fetch_xai_models_from_transports(runtime, transports, true).await
+        }
     }
 }
 
@@ -516,6 +529,7 @@ async fn fetch_antigravity_models(
         upstream_metadata: None,
         etag: None,
         upstream_status: None,
+        xai_source: None,
     })
 }
 
@@ -715,6 +729,7 @@ async fn fetch_vertex_api_key_models(
             upstream_metadata: None,
             etag: None,
             upstream_status: None,
+            xai_source: None,
         });
     }
 
@@ -784,6 +799,7 @@ async fn fetch_vertex_api_key_models(
         upstream_metadata: None,
         etag: None,
         upstream_status: None,
+        xai_source: None,
     })
 }
 
@@ -803,6 +819,7 @@ async fn fetch_vertex_service_account_models(
             upstream_metadata: None,
             etag: None,
             upstream_status: None,
+            xai_source: None,
         });
     };
     let token = exchange_vertex_service_account_token(runtime, &transports[0], auth_config)
@@ -884,6 +901,7 @@ async fn fetch_vertex_service_account_models(
         upstream_metadata: None,
         etag: None,
         upstream_status: None,
+        xai_source: None,
     })
 }
 
@@ -1801,7 +1819,7 @@ fn dedupe_models_by_id_and_format(models: Vec<Value>) -> Vec<Value> {
     deduped
 }
 
-fn build_success_outcome(
+pub(crate) fn build_success_outcome(
     cached_models: Vec<Value>,
     upstream_metadata: Option<Value>,
     has_success: bool,
@@ -1817,6 +1835,7 @@ fn build_success_outcome(
         upstream_metadata,
         etag: None,
         upstream_status: None,
+        xai_source: None,
     }
 }
 

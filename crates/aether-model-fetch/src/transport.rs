@@ -120,9 +120,15 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     after_id: Option<&str>,
     codex_client_version: Option<&str>,
 ) -> Result<ExecutionPlan, String> {
-    let api_format = transport.endpoint.api_format.trim().to_ascii_lowercase();
-    let provider_api_format = api_format.clone();
     let provider_type = transport.provider.provider_type.trim().to_ascii_lowercase();
+    let is_xai = provider_type == "xai";
+    // xAI has one OpenAI-shaped directory regardless of the inference endpoint format.
+    let api_format = if is_xai {
+        "openai:responses".to_string()
+    } else {
+        transport.endpoint.api_format.trim().to_ascii_lowercase()
+    };
+    let provider_api_format = api_format.clone();
     let is_codex_openai_models_fetch =
         provider_type == "codex" && api_format.starts_with("openai:");
     let is_deepseek_anthropic_models_fetch = api_format.starts_with("claude:")
@@ -133,8 +139,29 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
                 .map_err(|error| error.to_string())?;
         }
     }
-    let mut headers =
-        standard_models_fetch_headers(&api_format, &provider_type, codex_client_version);
+    let mut headers = if is_xai {
+        let mut headers = BTreeMap::from([("accept".to_string(), "application/json".to_string())]);
+        aether_provider_transport::xai::insert_cli_identity_headers_if_needed(
+            transport,
+            "openai:responses",
+            &mut headers,
+        );
+        if aether_provider_transport::xai::should_attach_cli_identity_headers(
+            transport,
+            "openai:responses",
+        ) {
+            if let Some(user_id) =
+                aether_provider_transport::xai::extract_xai_user_id_from_auth_config(
+                    transport.key.decrypted_auth_config.as_deref(),
+                )
+            {
+                headers.insert("x-userid".to_string(), user_id);
+            }
+        }
+        headers
+    } else {
+        standard_models_fetch_headers(&api_format, &provider_type, codex_client_version)
+    };
     if is_codex_openai_models_fetch {
         headers.insert("accept".to_string(), "application/json".to_string());
     }
@@ -149,7 +176,9 @@ pub async fn build_standard_models_fetch_execution_plan_for_client_version(
     }
 
     if api_format.starts_with("openai:") || api_format.starts_with("claude:") {
-        let resolved_auth = if is_deepseek_anthropic_models_fetch {
+        let resolved_auth = if is_xai {
+            resolve_bearer_or_oauth_header_auth(runtime, transport).await?
+        } else if is_deepseek_anthropic_models_fetch {
             resolve_oauth_header_auth(runtime, transport)
                 .await?
                 .or_else(|| resolve_local_openai_bearer_auth(transport))
@@ -701,6 +730,14 @@ fn build_standard_models_fetch_url(
     after_id: Option<&str>,
     codex_client_version: Option<&str>,
 ) -> Result<String, String> {
+    if transport
+        .provider
+        .provider_type
+        .trim()
+        .eq_ignore_ascii_case("xai")
+    {
+        return xai_models_fetch_url(transport);
+    }
     let api_format = transport.endpoint.api_format.trim().to_ascii_lowercase();
     if api_format.starts_with("gemini:") {
         let secret = resolve_local_vertex_api_key_query_auth(transport)
@@ -744,6 +781,18 @@ fn build_standard_models_fetch_url(
     }
 
     Ok(url)
+}
+
+pub(crate) fn xai_models_fetch_url(
+    transport: &GatewayProviderTransportSnapshot,
+) -> Result<String, String> {
+    let base_url = aether_provider_transport::xai::resolved_xai_request_base_url(
+        transport,
+        "openai:responses",
+    );
+    build_models_fetch_url_for_client_version("xai", "openai:responses", &base_url, None)
+        .map(|(url, _)| url)
+        .ok_or_else(|| "xAI models fetch URL configuration is invalid".to_string())
 }
 
 fn append_query_param(mut url: String, key: &str, value: &str) -> String {

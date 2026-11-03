@@ -3,6 +3,11 @@ mod config;
 mod logic;
 mod strategy;
 mod transport;
+mod xai;
+
+pub use xai::{
+    fetch_xai_models_from_transports, selected_xai_models_fetch_endpoints, XaiModelCatalogSource,
+};
 
 pub use association_sync::{
     sync_provider_model_whitelist_associations, ModelFetchAssociationStore,
