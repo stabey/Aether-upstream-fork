@@ -1,6 +1,9 @@
 //! Request-scoped Argon variant selection. Never rewrite the client's model or
 //! the shared catalog: Vertex and Antigravity can serve the same global model.
-use aether_data_contracts::repository::candidate_selection::StoredMinimalCandidateSelectionRow;
+use aether_data_contracts::repository::candidate_selection::{
+    provider_model_mapping_api_format_covers, StoredMinimalCandidateSelectionRow,
+    StoredProviderModelMapping,
+};
 use serde_json::Value;
 
 use crate::system_features::ModelDirectivePolicySnapshot;
@@ -44,7 +47,44 @@ impl ArgonLevel {
     }
 }
 
-fn gemini_level(body: &Value) -> Option<ArgonLevel> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RequestThinkingEffort {
+    Unspecified,
+    Explicit(String),
+}
+
+impl RequestThinkingEffort {
+    pub(crate) fn parse_explicit(value: &str) -> Option<Self> {
+        let normalized = value.trim().to_ascii_lowercase();
+        if normalized.is_empty() || matches!(normalized.as_str(), "none" | "disabled" | "off") {
+            return None;
+        }
+        if matches!(normalized.as_str(), "unspecified" | "default" | "unset") {
+            return Some(Self::Unspecified);
+        }
+        Some(Self::Explicit(normalized))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::Explicit(value) => value.as_str(),
+        }
+    }
+
+    pub(crate) fn is_unspecified(&self) -> bool {
+        matches!(self, Self::Unspecified)
+    }
+
+    pub(crate) fn argon_level(&self, allow_unspecified_default_low: bool) -> Option<ArgonLevel> {
+        match self {
+            Self::Unspecified => allow_unspecified_default_low.then_some(ArgonLevel::Low),
+            Self::Explicit(value) => ArgonLevel::parse(value),
+        }
+    }
+}
+
+fn gemini_thinking_effort_str(body: &Value) -> Option<String> {
     let generation = body
         .get("generationConfig")
         .or_else(|| body.get("generation_config"))?;
@@ -63,7 +103,84 @@ fn gemini_level(body: &Value) -> Option<ArgonLevel> {
         .get("thinkingLevel")
         .or_else(|| thinking.get("thinking_level"))?
         .as_str()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+}
+
+fn gemini_level(body: &Value) -> Option<ArgonLevel> {
+    gemini_thinking_effort_str(body)
+        .as_deref()
         .and_then(ArgonLevel::parse)
+}
+
+fn extract_body_thinking_effort(
+    normalized_format: &str,
+    body: &Value,
+) -> Option<RequestThinkingEffort> {
+    let value = match normalized_format {
+        "gemini:generate_content" => {
+            return if gemini_effort_unspecified(body) {
+                Some(RequestThinkingEffort::Unspecified)
+            } else {
+                gemini_thinking_effort_str(body)
+                    .as_deref()
+                    .and_then(RequestThinkingEffort::parse_explicit)
+            };
+        }
+        "openai:chat" => body.get("reasoning_effort"),
+        "openai:responses" => body.get("reasoning").and_then(|v| v.get("effort")),
+        "claude:messages" => {
+            if body.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
+                return None;
+            }
+            if body.get("thinking").is_some() && body.pointer("/output_config/effort").is_none() {
+                return None;
+            }
+            body.pointer("/output_config/effort")
+        }
+        _ => return None,
+    };
+    match value {
+        None => Some(RequestThinkingEffort::Unspecified),
+        Some(value) => value.as_str().and_then(RequestThinkingEffort::parse_explicit),
+    }
+}
+
+pub(crate) fn request_thinking_effort(
+    policy: &ModelDirectivePolicySnapshot,
+    client_format: &str,
+    requested_model: &str,
+    body: &Value,
+) -> Option<RequestThinkingEffort> {
+    let normalized_format = aether_ai_formats::normalize_api_format_alias(client_format);
+    // Preserve format-native directive effort (including xhigh/max/minimal) before
+    // falling back to Gemini/Argon directive resolution.
+    let client_directive = policy.resolve_reasoning(&normalized_format, Some(requested_model));
+    if client_directive.enabled() {
+        let probe_model = match normalized_format.as_str() {
+            "gemini:generate_content" => "gemini-4-argon",
+            "claude:messages" => "claude-opus-4-6",
+            _ => client_directive.base_model().unwrap_or(requested_model),
+        };
+        if let Ok(Some(patch)) = client_directive.mapping_patch_for_mapped_model(probe_model) {
+            let effort = extract_body_thinking_effort(&normalized_format, &patch);
+            if effort.as_ref().is_some_and(|e| !e.is_unspecified()) {
+                return effort;
+            }
+        }
+    }
+    let gemini_directive =
+        policy.resolve_reasoning("gemini:generate_content", Some(requested_model));
+    match gemini_directive.mapping_patch_for_mapped_model("gemini-4-argon") {
+        Ok(Some(patch)) => {
+            return gemini_thinking_effort_str(&patch)
+                .as_deref()
+                .and_then(RequestThinkingEffort::parse_explicit);
+        }
+        Err(_) => return None,
+        Ok(None) => {}
+    }
+    extract_body_thinking_effort(&normalized_format, body)
 }
 
 /// Missing effort defaults to low for eligible Antigravity Argon mappings.
@@ -85,31 +202,8 @@ pub(crate) fn request_level(
         Err(_) => return None,
         Ok(None) => {}
     }
-    let value = match aether_ai_formats::normalize_api_format_alias(client_format).as_str() {
-        "gemini:generate_content" => {
-            return if gemini_effort_unspecified(body) {
-                Some(ArgonLevel::Low)
-            } else {
-                gemini_level(body)
-            };
-        }
-        "openai:chat" => body.get("reasoning_effort"),
-        "openai:responses" => body.get("reasoning").and_then(|v| v.get("effort")),
-        "claude:messages" => {
-            if body.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
-                return None;
-            }
-            if body.get("thinking").is_some() && body.pointer("/output_config/effort").is_none() {
-                return None;
-            }
-            body.pointer("/output_config/effort")
-        }
-        _ => return None,
-    };
-    match value {
-        None => Some(ArgonLevel::Low),
-        Some(value) => value.as_str().and_then(ArgonLevel::parse),
-    }
+    let normalized_format = aether_ai_formats::normalize_api_format_alias(client_format);
+    extract_body_thinking_effort(&normalized_format, body)?.argon_level(true)
 }
 
 fn gemini_effort_unspecified(body: &Value) -> bool {
@@ -130,9 +224,26 @@ fn gemini_effort_unspecified(body: &Value) -> bool {
     })
 }
 
-/// Modify only an owned Antigravity body after exact-account routing selected low.
-pub(crate) fn with_default_low(model: &str, body: &Value) -> Option<Value> {
-    if model != "gemini-4-argon-low" || !gemini_effort_unspecified(body) {
+pub(crate) fn variant_level(model: &str) -> Option<ArgonLevel> {
+    if !aether_ai_formats::gemini_model_uses_thinking_level(model) {
+        return None;
+    }
+    let normalized = model.trim().to_ascii_lowercase();
+    if normalized.ends_with("-low") {
+        Some(ArgonLevel::Low)
+    } else if normalized.ends_with("-medium") {
+        Some(ArgonLevel::Medium)
+    } else if normalized.ends_with("-high") {
+        Some(ArgonLevel::High)
+    } else {
+        None
+    }
+}
+
+/// Modify only an owned Antigravity body after exact-account routing selected a variant.
+pub(crate) fn with_default_variant_level(model: &str, body: &Value) -> Option<Value> {
+    let level = variant_level(model)?;
+    if !gemini_effort_unspecified(body) {
         return None;
     }
     let mut result = body.clone();
@@ -159,8 +270,19 @@ pub(crate) fn with_default_low(model: &str, body: &Value) -> Option<Value> {
         .entry(thinking_key)
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()?;
-    thinking.insert("thinkingLevel".into(), serde_json::json!("LOW"));
+    thinking.insert(
+        "thinkingLevel".into(),
+        serde_json::json!(level.as_str().to_ascii_uppercase()),
+    );
     Some(result)
+}
+
+/// Modify only an owned Antigravity body after exact-account routing selected low.
+pub(crate) fn with_default_low(model: &str, body: &Value) -> Option<Value> {
+    if variant_level(model) != Some(ArgonLevel::Low) {
+        return None;
+    }
+    with_default_variant_level(model, body)
 }
 
 pub(crate) fn is_argon(model: &str) -> bool {
@@ -195,20 +317,177 @@ pub(crate) fn configured_argon(
     .is_some_and(|(model, _)| is_argon(&model))
 }
 
+fn mapping_scope_matches(
+    mapping: &StoredProviderModelMapping,
+    row: &StoredMinimalCandidateSelectionRow,
+    normalized_api_format: &str,
+    request_operation: Option<&str>,
+) -> bool {
+    let api_format_matches = mapping.api_formats.as_ref().is_none_or(|api_formats| {
+        api_formats.iter().any(|value| {
+            provider_model_mapping_api_format_covers(
+                &row.provider_type,
+                value,
+                normalized_api_format,
+            )
+        })
+    });
+    if !api_format_matches {
+        return false;
+    }
+    let endpoint_matches = mapping.endpoint_ids.as_ref().is_none_or(|endpoint_ids| {
+        endpoint_ids
+            .iter()
+            .any(|endpoint_id| endpoint_id == &row.endpoint_id)
+    });
+    if !endpoint_matches {
+        return false;
+    }
+    mapping.operations.as_ref().is_none_or(|operations| {
+        request_operation.is_some_and(|request_operation| {
+            operations
+                .iter()
+                .any(|operation| operation.eq_ignore_ascii_case(request_operation))
+        })
+    })
+}
+
+fn mapping_operation_scope_rank(mapping: &StoredProviderModelMapping) -> u8 {
+    u8::from(
+        mapping
+            .operations
+            .as_ref()
+            .is_some_and(|operations| !operations.is_empty()),
+    )
+}
+
+fn mapping_effort_matches(mapping: &StoredProviderModelMapping, target_effort: &str) -> bool {
+    mapping
+        .thinking_efforts
+        .as_ref()
+        .is_some_and(|efforts| {
+            efforts.iter().any(|item| {
+                let normalized = match item.trim().to_ascii_lowercase().as_str() {
+                    "default" | "unset" => "unspecified".to_string(),
+                    other => other.to_string(),
+                };
+                normalized == target_effort
+            })
+        })
+}
+
+pub(crate) fn row_has_thinking_effort_mappings(
+    row: &StoredMinimalCandidateSelectionRow,
+    format: &str,
+    operation: Option<&str>,
+) -> bool {
+    let normalized_format = aether_scheduler_core::normalize_api_format(format);
+    row.model_provider_model_mappings
+        .as_ref()
+        .is_some_and(|mappings| {
+            mappings.iter().any(|mapping| {
+                mapping_scope_matches(mapping, row, &normalized_format, operation)
+                    && mapping
+                        .thinking_efforts
+                        .as_ref()
+                        .is_some_and(|efforts| !efforts.is_empty())
+            })
+        })
+}
+
+pub(crate) fn resolve_row_thinking_effort_model(
+    row: &StoredMinimalCandidateSelectionRow,
+    requested_model: &str,
+    format: &str,
+    operation: Option<&str>,
+    effort: Option<&RequestThinkingEffort>,
+) -> Option<String> {
+    let normalized_format = aether_scheduler_core::normalize_api_format(format);
+    let mut unrestricted = row.clone();
+    unrestricted.key_allowed_models = None;
+    if !aether_scheduler_core::row_supports_requested_model_with_model_directives_and_request_operation(
+        &unrestricted,
+        requested_model,
+        &normalized_format,
+        false,
+        operation,
+    ) {
+        return None;
+    }
+    let mappings = row.model_provider_model_mappings.as_ref()?;
+    let in_scope = mappings
+        .iter()
+        .filter(|mapping| mapping_scope_matches(mapping, row, &normalized_format, operation))
+        .collect::<Vec<_>>();
+    if in_scope.is_empty() {
+        return None;
+    }
+    let pick_best = |candidates: Vec<&StoredProviderModelMapping>| -> Option<String> {
+        candidates
+            .into_iter()
+            .min_by(|left, right| {
+                left.priority
+                    .cmp(&right.priority)
+                    .then_with(|| {
+                        mapping_operation_scope_rank(right)
+                            .cmp(&mapping_operation_scope_rank(left))
+                    })
+                    .then(left.name.cmp(&right.name))
+            })
+            .map(|mapping| mapping.name.clone())
+    };
+    if let Some(effort) = effort {
+        let exact_matches = in_scope
+            .iter()
+            .copied()
+            .filter(|mapping| mapping_effort_matches(mapping, effort.as_str()))
+            .collect::<Vec<_>>();
+        if let Some(selected) = pick_best(exact_matches) {
+            return Some(selected);
+        }
+        if effort.is_unspecified() {
+            let low_matches = in_scope
+                .iter()
+                .copied()
+                .filter(|mapping| mapping_effort_matches(mapping, "low"))
+                .collect::<Vec<_>>();
+            if let Some(selected) = pick_best(low_matches) {
+                return Some(selected);
+            }
+        }
+    }
+    let unscoped_matches = in_scope
+        .into_iter()
+        .filter(|mapping| {
+            mapping
+                .thinking_efforts
+                .as_ref()
+                .is_none_or(|efforts| efforts.is_empty())
+        })
+        .collect::<Vec<_>>();
+    pick_best(unscoped_matches)
+}
+
 pub(crate) fn has_variant(allowed: Option<&[String]>, model: &str) -> bool {
     allowed.is_some_and(|models| models.iter().any(|name| name.trim() == model))
 }
 
 pub(crate) fn body_matches_variant(model: &str, body: &Value) -> bool {
-    gemini_level(body).is_some_and(|level| level.model() == model)
+    match variant_level(model) {
+        Some(expected) => gemini_level(body) == Some(expected),
+        None => true,
+    }
+}
+
+pub(crate) fn envelope_matches_variant(model: &str, envelope: &Value) -> bool {
+    envelope.get("model").and_then(Value::as_str) == Some(model)
+        && envelope
+            .get("request")
+            .is_some_and(|body| body_matches_variant(model, body))
 }
 
 pub(crate) fn envelope_matches_level(level: ArgonLevel, envelope: &Value) -> bool {
-    let model = level.model();
-    envelope.get("model").and_then(Value::as_str) == Some(model.as_str())
-        && envelope
-            .get("request")
-            .is_some_and(|body| body_matches_variant(&model, body))
+    envelope_matches_variant(&level.model(), envelope)
 }
 
 pub(crate) fn select_variant(row: &mut StoredMinimalCandidateSelectionRow, model: &str) {
@@ -242,7 +521,6 @@ fn exact_permission_skip_reason(
 ) -> Option<&'static str> {
     (requires_exact_model_permission
         && provider_type.eq_ignore_ascii_case("antigravity")
-        && is_argon(model)
         && !has_variant(allowed, model))
     .then_some("argon_variant_not_allowed")
 }
@@ -454,5 +732,108 @@ mod tests {
             exact_permission_skip_reason("vertex_ai", None, "gemini-4-argon", false),
             None
         );
+    }
+
+    #[test]
+    fn generic_thinking_effort_mappings_resolve_variants_and_default_unspecified_to_low() {
+        let row = StoredMinimalCandidateSelectionRow {
+            provider_id: "anti".to_string(),
+            provider_name: "anti".to_string(),
+            provider_type: "antigravity".to_string(),
+            provider_priority: 1,
+            provider_is_active: true,
+            endpoint_id: "ep-anti".to_string(),
+            endpoint_api_format: "gemini:generate_content".to_string(),
+            endpoint_api_family: Some("gemini".to_string()),
+            endpoint_kind: Some("generate_content".to_string()),
+            endpoint_is_active: true,
+            key_id: "key-anti".to_string(),
+            key_name: "key-anti".to_string(),
+            key_auth_type: "api_key".to_string(),
+            key_is_active: true,
+            key_api_formats: Some(vec!["gemini:generate_content".to_string()]),
+            key_allowed_models: Some(vec![
+                "gemini-3.8-flash-low".to_string(),
+                "gemini-3.8-flash-medium".to_string(),
+            ]),
+            key_capabilities: None,
+            key_internal_priority: 1,
+            key_global_priority_by_format: None,
+            model_id: "model-anti".to_string(),
+            global_model_id: "gm-flash".to_string(),
+            global_model_name: "gemini-3.8-flash".to_string(),
+            global_model_mappings: None,
+            global_model_supports_streaming: Some(true),
+            model_provider_model_name: "gemini-3.8-flash".to_string(),
+            model_provider_model_mappings: Some(vec![
+                StoredProviderModelMapping {
+                    name: "gemini-3.8-flash-low".to_string(),
+                    priority: 1,
+                    api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                    endpoint_ids: None,
+                    operations: None,
+                    thinking_efforts: Some(vec!["low".to_string()]),
+                },
+                StoredProviderModelMapping {
+                    name: "gemini-3.8-flash-medium".to_string(),
+                    priority: 2,
+                    api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                    endpoint_ids: None,
+                    operations: None,
+                    thinking_efforts: Some(vec!["medium".to_string()]),
+                },
+                StoredProviderModelMapping {
+                    name: "gemini-3.8-flash-high".to_string(),
+                    priority: 3,
+                    api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                    endpoint_ids: None,
+                    operations: None,
+                    thinking_efforts: Some(vec!["high".to_string()]),
+                },
+            ]),
+            model_supports_streaming: Some(true),
+            model_is_active: true,
+            model_is_available: true,
+        };
+        assert!(row_has_thinking_effort_mappings(
+            &row,
+            "gemini:generate_content",
+            None
+        ));
+        assert_eq!(
+            resolve_row_thinking_effort_model(
+                &row,
+                "gemini-3.8-flash",
+                "gemini:generate_content",
+                None,
+                Some(&RequestThinkingEffort::Explicit("medium".to_string())),
+            )
+            .as_deref(),
+            Some("gemini-3.8-flash-medium")
+        );
+        assert_eq!(
+            resolve_row_thinking_effort_model(
+                &row,
+                "gemini-3.8-flash",
+                "gemini:generate_content",
+                None,
+                Some(&RequestThinkingEffort::Unspecified),
+            )
+            .as_deref(),
+            Some("gemini-3.8-flash-low")
+        );
+        assert_eq!(
+            resolve_row_thinking_effort_model(
+                &row,
+                "gemini-3.8-flash",
+                "gemini:generate_content",
+                None,
+                Some(&RequestThinkingEffort::Explicit("xhigh".to_string())),
+            ),
+            None
+        );
+        let patched = with_default_variant_level("gemini-3.8-flash-medium", &json!({})).unwrap();
+        assert!(body_matches_variant("gemini-3.8-flash-medium", &patched));
+        assert!(!body_matches_variant("gemini-3.8-flash-low", &patched));
     }
 }

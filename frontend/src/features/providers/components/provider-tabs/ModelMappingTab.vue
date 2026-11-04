@@ -86,6 +86,14 @@
               >
                 <span class="truncate">{{ getGroupOperationScopeLabel(item.group) }}</span>
               </Badge>
+              <Badge
+                v-if="item.group && item.group.thinkingEfforts && item.group.thinkingEfforts.length > 0"
+                variant="outline"
+                class="min-w-0 max-w-full text-xs"
+                :title="getGroupThinkingEffortScopeLabel(item.group)"
+              >
+                <span class="truncate">{{ getGroupThinkingEffortScopeLabel(item.group) }}</span>
+              </Badge>
             </template>
             <!-- 正则映射 -->
             <template v-else>
@@ -385,6 +393,9 @@ import {
   formatModelMappingRequestScope,
   modelMappingOperationsKey,
   normalizeModelMappingOperations,
+  formatModelMappingThinkingEffortScope,
+  modelMappingThinkingEffortsKey,
+  normalizeModelMappingThinkingEfforts,
 } from '../../utils/modelMappingScope'
 import {
   buildDefaultModelTestRequestHeaders,
@@ -560,6 +571,10 @@ function getOperationsKey(operations: string[] | undefined): string {
   return modelMappingOperationsKey(operations)
 }
 
+function getThinkingEffortsKey(thinkingEfforts: string[] | undefined): string {
+  return modelMappingThinkingEffortsKey(thinkingEfforts)
+}
+
 const requestScopeLabels = computed(() => ({
   allRequests: t('providers.modelMapping.scope.allRequests'),
   sessionCompactionOnly: t('providers.modelMapping.scope.sessionCompactionOnly'),
@@ -599,6 +614,10 @@ function getGroupOperationScopeLabel(group: AliasGroup): string {
   return formatModelMappingRequestScope(group.operations, requestScopeLabels.value)
 }
 
+function getGroupThinkingEffortScopeLabel(group: AliasGroup): string {
+  return formatModelMappingThinkingEffortScope(group.thinkingEfforts)
+}
+
 // 精确映射分组（来自 provider_model_mappings）
 const exactMappingGroups = computed<AliasGroup[]>(() => {
   const groups: AliasGroup[] = []
@@ -611,7 +630,8 @@ const exactMappingGroups = computed<AliasGroup[]>(() => {
       const apiFormatsKey = getApiFormatsKey(alias.api_formats)
       const endpointIdsKey = getEndpointIdsKey(alias.endpoint_ids)
       const operationsKey = getOperationsKey(alias.operations)
-      const groupKey = `${model.id}|${apiFormatsKey}|${endpointIdsKey}|${operationsKey}`
+      const thinkingEffortsKey = getThinkingEffortsKey(alias.thinking_efforts)
+      const groupKey = `${model.id}|${apiFormatsKey}|${endpointIdsKey}|${operationsKey}|${thinkingEffortsKey}`
 
       if (!groupMap.has(groupKey)) {
         const group: AliasGroup = {
@@ -622,6 +642,8 @@ const exactMappingGroups = computed<AliasGroup[]>(() => {
           endpointIds: normalizeStringList(alias.endpoint_ids),
           operationsKey,
           operations: normalizeModelMappingOperations(alias.operations),
+          thinkingEffortsKey,
+          thinkingEfforts: normalizeModelMappingThinkingEfforts(alias.thinking_efforts),
           aliases: []
         }
         groupMap.set(groupKey, group)
@@ -705,7 +727,7 @@ const combinedMappings = computed<CombinedMapping[]>(() => {
   // 添加精确映射
   for (const group of exactMappingGroups.value) {
     result.push({
-      key: `exact-${group.model.id}-${group.apiFormatsKey}-${group.endpointIdsKey}-${group.operationsKey}`,
+      key: `exact-${group.model.id}-${group.apiFormatsKey}-${group.endpointIdsKey}-${group.operationsKey}-${group.thinkingEffortsKey || ''}`,
       type: 'exact',
       targetModelName: group.model.global_model_display_name || group.model.provider_model_name,
       targetModelId: group.model.id,
@@ -798,7 +820,8 @@ function deleteGroup(group: AliasGroup) {
 async function confirmDelete() {
   if (!deletingGroup.value) return
 
-  const { model, aliases, apiFormatsKey, endpointIdsKey, operationsKey } = deletingGroup.value
+  const { model, aliases, apiFormatsKey, endpointIdsKey, operationsKey, thinkingEffortsKey } = deletingGroup.value
+  const expectedThinkingEffortsKey = thinkingEffortsKey ?? getThinkingEffortsKey(deletingGroup.value.thinkingEfforts)
 
   try {
     const currentAliases = model.provider_model_mappings || []
@@ -807,9 +830,11 @@ async function confirmDelete() {
       const currentKey = getApiFormatsKey(a.api_formats)
       const currentEndpointIdsKey = getEndpointIdsKey(a.endpoint_ids)
       const currentOperationsKey = getOperationsKey(a.operations)
+      const currentThinkingEffortsKey = getThinkingEffortsKey(a.thinking_efforts)
       return !(currentKey === apiFormatsKey
         && currentEndpointIdsKey === endpointIdsKey
         && currentOperationsKey === operationsKey
+        && currentThinkingEffortsKey === expectedThinkingEffortsKey
         && aliasNamesToRemove.has(a.name))
     })
 

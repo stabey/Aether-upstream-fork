@@ -11,6 +11,15 @@ pub struct StoredProviderModelMapping {
     /// operation supported by the selected API format.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operations: Option<Vec<String>>,
+    /// Optional thinking/reasoning effort scope (e.g. `low`, `medium`, `high`,
+    /// `xhigh`, `max`, `unspecified`). An omitted scope applies to any effort
+    /// or acts as a fallback when no effort-specific rule matches.
+    #[serde(
+        default,
+        alias = "reasoning_efforts",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub thinking_efforts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

@@ -7,11 +7,13 @@ import ProviderFormDialog from '../ProviderFormDialog.vue'
 const endpointMocks = vi.hoisted(() => ({
   createProvider: vi.fn(),
   updateProvider: vi.fn(),
+  resetProviderQuota: vi.fn(),
 }))
 
 vi.mock('@/api/endpoints', () => ({
   createProvider: endpointMocks.createProvider,
   updateProvider: endpointMocks.updateProvider,
+  resetProviderQuota: endpointMocks.resetProviderQuota,
   normalizePoolAdvancedConfig: (value: unknown) => {
     if (value == null || value === false) return null
     if (value === true) return {}
@@ -145,21 +147,6 @@ const billingFieldNames = [
   'quota_expires_at',
 ] as const
 
-function expectBillingConfigurationHidden() {
-  for (const text of [
-    '计费类型',
-    '月卡额度',
-    '按量付费',
-    '免费套餐',
-    '周期额度 (USD)',
-    '重置周期 (天)',
-    '周期开始时间',
-    '过期时间',
-  ]) {
-    expect(document.body.textContent).not.toContain(text)
-  }
-}
-
 function expectBillingFieldsOmitted(payload: unknown) {
   expect(payload).toEqual(expect.any(Object))
   for (const field of billingFieldNames) {
@@ -172,6 +159,13 @@ beforeEach(() => {
   endpointMocks.createProvider.mockResolvedValue({ id: 'provider-new', name: 'New Provider' })
   endpointMocks.updateProvider.mockReset()
   endpointMocks.updateProvider.mockResolvedValue(makeProvider())
+  endpointMocks.resetProviderQuota.mockReset()
+  endpointMocks.resetProviderQuota.mockResolvedValue({
+    message: 'Provider quota reset successfully',
+    provider_name: 'Provider One',
+    previous_used: 45,
+    current_used: 0,
+  })
 })
 
 afterEach(() => {
@@ -257,11 +251,9 @@ describe('ProviderFormDialog transfer limits', () => {
 })
 
 describe('ProviderFormDialog billing configuration', () => {
-  it('hides billing configuration and omits billing fields when creating', async () => {
+  it('omits billing fields when creating with default pay-as-you-go mode', async () => {
     mountDialog(null)
     await settle()
-
-    expectBillingConfigurationHidden()
 
     await setInput('#name', 'New Provider')
     clickButton('创建')
@@ -271,23 +263,37 @@ describe('ProviderFormDialog billing configuration', () => {
     expectBillingFieldsOmitted(endpointMocks.createProvider.mock.calls[0]?.[0])
   })
 
-  it('hides existing monthly quota configuration and preserves it when editing', async () => {
+  it('loads free_tier quota limit, supports resetting used quota, and saves updated quota', async () => {
     mountDialog(makeProvider({
-      billing_type: 'monthly_quota',
-      monthly_quota_usd: 200,
-      quota_reset_day: 30,
-      quota_last_reset_at: '2026-08-01T00:00:00Z',
-      quota_expires_at: '2026-09-01T00:00:00Z',
+      billing_type: 'free_tier',
+      monthly_quota_usd: 400,
+      monthly_used_usd: 45.5,
     }))
     await settle()
 
-    expectBillingConfigurationHidden()
+    expect(document.body.querySelector<HTMLInputElement>('#monthly-quota-usd')?.value).toBe('400')
+    expect(document.body.querySelector('[data-testid="provider-form-quota-usage"]')?.textContent).toContain('$45.50 / $400.00')
 
+    const resetButton = document.body.querySelector<HTMLButtonElement>('[data-testid="provider-form-reset-quota-button"]')
+    expect(resetButton).not.toBeNull()
+    resetButton!.click()
+    await settle()
+
+    expect(endpointMocks.resetProviderQuota).toHaveBeenCalledWith('provider-1')
+    expect(document.body.querySelector('[data-testid="provider-form-quota-usage"]')?.textContent).toContain('$0.00 / $400.00')
+
+    await setInput('#monthly-quota-usd', '300')
     clickButton('保存')
     await settle()
 
-    expect(endpointMocks.updateProvider).toHaveBeenCalledTimes(1)
-    expectBillingFieldsOmitted(endpointMocks.updateProvider.mock.calls[0]?.[1])
+    expect(endpointMocks.updateProvider).toHaveBeenCalledWith(
+      'provider-1',
+      expect.objectContaining({
+        billing_type: 'free_tier',
+        monthly_quota_usd: 300,
+        quota_reset_day: null,
+      }),
+    )
   })
 })
 

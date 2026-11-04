@@ -1515,6 +1515,7 @@ fn parse_embedded_provider_model_mappings(
         api_formats: None,
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]))
 }
 
@@ -1538,6 +1539,7 @@ fn parse_provider_model_mappings_array(
                         api_formats: None,
                         endpoint_ids: None,
                         operations: None,
+                        thinking_efforts: None,
                     });
                 }
             }
@@ -1599,6 +1601,14 @@ fn parse_provider_model_mapping_object_lenient(
         "models.provider_model_mappings.operations",
     )?
     .and_then(normalize_request_operations);
+    let thinking_efforts = parse_string_list(
+        object
+            .get("thinking_efforts")
+            .or_else(|| object.get("reasoning_efforts"))
+            .cloned(),
+        "models.provider_model_mappings.thinking_efforts",
+    )?
+    .and_then(normalize_thinking_efforts);
 
     Ok(Some(StoredProviderModelMapping {
         name: name.to_string(),
@@ -1610,6 +1620,7 @@ fn parse_provider_model_mapping_object_lenient(
         api_formats,
         endpoint_ids,
         operations,
+        thinking_efforts,
     }))
 }
 
@@ -1620,6 +1631,20 @@ fn normalize_request_operations(values: Vec<String>) -> Option<Vec<String>> {
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     (!operations.is_empty()).then_some(operations)
+}
+
+fn normalize_thinking_efforts(values: Vec<String>) -> Option<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let efforts = values
+        .into_iter()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "unset" => "unspecified".to_string(),
+            other => other.to_string(),
+        })
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert(value.clone()))
+        .collect::<Vec<_>>();
+    (!efforts.is_empty()).then_some(efforts)
 }
 
 #[cfg(test)]
@@ -1940,6 +1965,7 @@ mod tests {
                 api_formats: Some(vec!["openai:chat".to_string()]),
                 endpoint_ids: None,
                 operations: Some(vec!["compact".to_string()]),
+                thinking_efforts: None,
             }])
         );
     }
@@ -1957,6 +1983,7 @@ mod tests {
                 api_formats: None,
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             }])
         );
     }
@@ -1981,6 +2008,7 @@ mod tests {
                     api_formats: None,
                     endpoint_ids: None,
                     operations: None,
+                    thinking_efforts: None,
                 },
                 StoredProviderModelMapping {
                     name: "gpt-5.2-mini".to_string(),
@@ -1988,6 +2016,7 @@ mod tests {
                     api_formats: None,
                     endpoint_ids: None,
                     operations: None,
+                    thinking_efforts: None,
                 }
             ])
         );

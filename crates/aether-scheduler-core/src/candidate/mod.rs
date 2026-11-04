@@ -72,6 +72,7 @@ mod tests {
                 api_formats: Some(vec!["openai:chat".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             }]),
             model_supports_streaming: None,
             model_is_active: true,
@@ -234,6 +235,7 @@ mod tests {
             api_formats: Some(vec!["openai:responses".to_string()]),
             endpoint_ids: Some(vec![codex.endpoint_id.clone()]),
             operations: None,
+            thinking_efforts: None,
         }]);
 
         let constraints = SchedulerAuthConstraints {

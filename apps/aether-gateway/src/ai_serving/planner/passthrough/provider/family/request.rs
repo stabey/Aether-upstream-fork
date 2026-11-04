@@ -419,11 +419,47 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         None
     };
     let mut provider_request_body = if let Some(antigravity_auth) = antigravity_auth.as_ref() {
+        let default_body = candidate
+            .requires_exact_model_permission
+            .then(|| {
+                crate::ai_serving::planner::argon_routing::with_default_variant_level(
+                    &prepared.mapped_model,
+                    &base_provider_request_body,
+                )
+            })
+            .flatten();
+        let antigravity_request_body = default_body
+            .as_ref()
+            .unwrap_or(&base_provider_request_body);
+        if candidate.requires_exact_model_permission
+            && !crate::ai_serving::planner::argon_routing::body_matches_variant(
+                &prepared.mapped_model,
+                antigravity_request_body,
+            )
+        {
+            mark_skipped_local_same_format_provider_candidate_with_extra_data(
+                state,
+                input,
+                trace_id,
+                candidate,
+                attempt.candidate_index,
+                &attempt.candidate_id,
+                "provider_request_body_missing",
+                same_format_provider_request_body_failure_extra_data(
+                    body_json,
+                    attempt.eligible.provider_api_format.as_str(),
+                    prepared.transport.endpoint.body_rules.as_ref(),
+                    "antigravity_envelope",
+                ),
+            )
+            .await;
+            return Ok(None);
+        }
         match build_antigravity_safe_v1internal_request(
             antigravity_auth,
             trace_id,
             &prepared.mapped_model,
-            &base_provider_request_body,
+            antigravity_request_body,
             AntigravityEnvelopeRequestType::Agent,
         ) {
             AntigravityRequestEnvelopeSupport::Supported(envelope) => envelope,

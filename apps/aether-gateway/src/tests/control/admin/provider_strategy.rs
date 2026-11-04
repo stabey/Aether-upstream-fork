@@ -235,6 +235,7 @@ async fn gateway_resets_admin_provider_strategy_quota_locally_with_trusted_admin
         .await
         .expect("provider query should succeed");
     assert_eq!(updated[0].monthly_used_usd, Some(0.0));
+    assert!(updated[0].quota_last_reset_at_unix_secs.unwrap_or(0) > 1_711_000_000);
     assert_eq!(*upstream_hits.lock().expect("mutex should lock"), 0);
 
     gateway_handle.abort();

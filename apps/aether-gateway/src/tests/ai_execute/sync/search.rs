@@ -111,6 +111,7 @@ fn candidate_row(api_format: &str) -> StoredMinimalCandidateSelectionRow {
             api_formats: Some(vec!["openai:responses".to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]),
         model_supports_streaming: Some(false),
         model_is_active: true,

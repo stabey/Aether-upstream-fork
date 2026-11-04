@@ -110,6 +110,7 @@ async fn same_priority_candidates_are_distributed_by_affinity_key() {
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]);
 
     let mut second = sample_row();
@@ -128,6 +129,7 @@ async fn same_priority_candidates_are_distributed_by_affinity_key() {
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]);
 
     let candidates = Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![

@@ -41,10 +41,14 @@
       <div class="space-y-6 p-4 sm:p-6">
         <!-- 配额使用情况 -->
         <ProviderMonthlyQuotaCard
-          v-if="provider.billing_type === 'monthly_quota' && provider.monthly_quota_usd"
+          v-if="(provider.billing_type === 'monthly_quota' || provider.billing_type === 'free_tier') && (provider.monthly_quota_usd ?? 0) > 0"
           :used="provider.monthly_used_usd"
           :quota="provider.monthly_quota_usd"
           :reset-day="provider.quota_reset_day"
+          :billing-type="provider.billing_type"
+          :show-reset-button="true"
+          :resetting="resettingProviderQuota"
+          @reset="handleResetProviderQuota"
         />
 
         <!-- 密钥管理 -->
@@ -475,6 +479,7 @@ import {
   updateProvider,
   getProviderModels,
   getProviderMappingPreview,
+  resetProviderQuota,
   type ProviderMappingPreviewResponse,
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
@@ -621,6 +626,7 @@ const loadingProviderEndpoints = ref(false)
 const loadingProviderKeys = ref(false)
 const loadingProviderModels = ref(false)
 const loadingProviderMappingPreview = ref(false)
+const resettingProviderQuota = ref(false)
 let providerLoadRequestId = 0
 let endpointsLoadRequestId = 0
 let keysLoadRequestId = 0
@@ -644,6 +650,34 @@ watch(() => props.initialProvider, (updated) => {
   applyProviderSnapshot(updated)
   loading.value = false
 })
+
+async function handleResetProviderQuota() {
+  if (!provider.value || resettingProviderQuota.value) return
+  const currentProvider = provider.value
+  const usedText = (currentProvider.monthly_used_usd ?? 0).toFixed(2)
+  const confirmed = await confirm({
+    title: t('providers.billing.resetQuotaConfirmTitle'),
+    description: t('providers.billing.resetQuotaConfirmDescription', {
+      name: currentProvider.name,
+      used: usedText,
+    }),
+  })
+  if (!confirmed) return
+  resettingProviderQuota.value = true
+  try {
+    await resetProviderQuota(currentProvider.id)
+    if (provider.value && provider.value.id === currentProvider.id) {
+      provider.value.monthly_used_usd = 0
+    }
+    showSuccess(t('providers.billing.resetQuotaSuccess'))
+    await loadProvider()
+    emit('refresh')
+  } catch (err: unknown) {
+    showError(localizedApiError(err, t('ui.resetFailed')), t('ui.error'))
+  } finally {
+    resettingProviderQuota.value = false
+  }
+}
 
 function getProviderKeysPageSize(providerType?: string | null): number {
   return (providerType || '').trim().toLowerCase() === 'custom'

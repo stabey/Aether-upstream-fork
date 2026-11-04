@@ -1219,7 +1219,10 @@ function getHealthScoreTextColor(score: number): string {
 
 // 获取计费标签
 function getBillingLabel(provider: RoutingProviderInfo): string {
-  if (provider.billing_type === 'monthly_quota') {
+  if (
+    provider.billing_type === 'monthly_quota'
+    || (provider.billing_type === 'free_tier' && (provider.monthly_quota_usd ?? 0) > 0)
+  ) {
     const used = provider.monthly_used_usd || 0
     const quota = provider.monthly_quota_usd
     return quota ? `$${used.toFixed(0)}/$${quota.toFixed(0)}` : '月卡'

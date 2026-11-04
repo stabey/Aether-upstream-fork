@@ -215,6 +215,101 @@
         </div>
       </div>
 
+      <!-- 额度与消费限制 -->
+      <div
+        class="space-y-3"
+        data-testid="provider-billing-config-section"
+      >
+        <h3 class="text-sm font-medium border-b pb-2">
+          {{ t('providers.billing.sectionTitle') }}
+        </h3>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div class="space-y-1.5">
+            <Label for="provider-billing-mode">{{ t('providers.billing.modeLabel') }}</Label>
+            <Select v-model="form.billing_mode">
+              <SelectTrigger id="provider-billing-mode">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="pay_as_you_go">
+                  {{ t('providers.billing.payAsYouGo') }}
+                </SelectItem>
+                <SelectItem value="free_tier">
+                  {{ t('providers.billing.freeTier') }}
+                </SelectItem>
+                <SelectItem value="monthly_quota">
+                  {{ t('providers.billing.monthlyQuota') }}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div
+            v-if="form.billing_mode !== 'pay_as_you_go'"
+            class="space-y-1.5"
+          >
+            <Label for="monthly-quota-usd">{{ t('providers.billing.quotaLimitUsd') }}</Label>
+            <Input
+              id="monthly-quota-usd"
+              :model-value="form.monthly_quota_usd ?? ''"
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="400"
+              @update:model-value="(v) => form.monthly_quota_usd = parseNumberInput(v, { min: 0 })"
+            />
+          </div>
+        </div>
+
+        <div
+          v-if="form.billing_mode === 'monthly_quota'"
+          class="grid grid-cols-1 sm:grid-cols-2 gap-4"
+        >
+          <div class="space-y-1.5">
+            <Label for="quota-reset-day">{{ t('providers.billing.resetCycleDays') }}</Label>
+            <Input
+              id="quota-reset-day"
+              :model-value="form.quota_reset_day ?? ''"
+              type="number"
+              min="1"
+              max="365"
+              step="1"
+              placeholder="30"
+              @update:model-value="(v) => form.quota_reset_day = parseNumberInput(v, { min: 1, max: 365 })"
+            />
+          </div>
+        </div>
+
+        <div
+          v-if="isEditMode && (form.billing_mode !== 'pay_as_you_go' || (props.provider?.monthly_quota_usd ?? 0) > 0)"
+          class="flex items-center justify-between gap-3 rounded-lg border bg-muted/40 px-3 py-2.5"
+          data-testid="provider-form-quota-usage"
+        >
+          <div class="space-y-0.5 text-xs">
+            <span class="text-muted-foreground">{{ t('providers.billing.currentUsedUsd') }}：</span>
+            <span class="font-semibold text-foreground">
+              ${{ currentUsedUsd.toFixed(2) }} / ${{ Number(form.monthly_quota_usd ?? props.provider?.monthly_quota_usd ?? 0).toFixed(2) }}
+            </span>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            class="h-7 px-2.5 text-xs"
+            :disabled="resettingQuota || loading"
+            data-testid="provider-form-reset-quota-button"
+            @click="handleResetQuotaInDialog"
+          >
+            <RotateCcw
+              class="w-3.5 h-3.5 mr-1"
+              :class="{ 'animate-spin': resettingQuota }"
+            />
+            {{ t('providers.billing.resetUsedQuota') }}
+          </Button>
+        </div>
+      </div>
+
       <!-- 功能开关 -->
       <div class="space-y-3">
         <h3 class="text-sm font-medium border-b pb-2">
@@ -347,7 +442,7 @@ import {
   SelectItem,
   Switch,
 } from '@/components/ui'
-import { Server, SquarePen } from 'lucide-vue-next'
+import { RotateCcw, Server, SquarePen } from 'lucide-vue-next'
 import HelpHint from '@/components/common/HelpHint.vue'
 import { useToast } from '@/composables/useToast'
 import { useFormDialog } from '@/composables/useFormDialog'
@@ -356,6 +451,7 @@ import {
   createProvider,
   normalizePoolAdvancedConfig,
   updateProvider,
+  resetProviderQuota,
   type ProviderType,
   type ProviderWithEndpointsSummary,
 } from '@/api/endpoints'
@@ -381,6 +477,17 @@ const { t } = useI18n()
 const { success, error: showError } = useToast()
 
 const loading = ref(false)
+const resettingQuota = ref(false)
+const currentUsedUsd = ref(0)
+const initialBillingSnapshot = ref<{
+  billing_mode: 'pay_as_you_go' | 'free_tier' | 'monthly_quota'
+  monthly_quota_usd: number | undefined
+  quota_reset_day: number | undefined
+}>({
+  billing_mode: 'pay_as_you_go',
+  monthly_quota_usd: undefined,
+  quota_reset_day: 30,
+})
 
 // 内部状态
 const internalOpen = computed(() => props.modelValue)
@@ -415,6 +522,10 @@ const form = ref({
   max_retries: undefined as number | undefined,
   max_transfer_count: 0,
   max_transfer_timeout_seconds: 0,
+  // 额度与消费限制
+  billing_mode: 'pay_as_you_go' as 'pay_as_you_go' | 'free_tier' | 'monthly_quota',
+  monthly_quota_usd: undefined as number | undefined,
+  quota_reset_day: 30 as number | undefined,
   // 超时配置（秒）
   stream_first_byte_timeout: undefined as number | undefined,
   request_timeout: undefined as number | undefined,
@@ -443,6 +554,10 @@ function resetForm() {
     max_retries: undefined,
     max_transfer_count: 0,
     max_transfer_timeout_seconds: 0,
+    // 额度与消费限制
+    billing_mode: 'pay_as_you_go',
+    monthly_quota_usd: undefined,
+    quota_reset_day: 30,
     // 超时配置
     stream_first_byte_timeout: undefined,
     request_timeout: undefined,
@@ -455,13 +570,31 @@ function resetForm() {
     // Responses WebSocket 配置
     responses_websocket_enabled: false,
   }
+  currentUsedUsd.value = 0
+  initialBillingSnapshot.value = {
+    billing_mode: 'pay_as_you_go',
+    monthly_quota_usd: undefined,
+    quota_reset_day: 30,
+  }
 }
 
 // 加载提供商数据（编辑模式）
 function loadProviderData() {
   if (!props.provider) return
   const poolAdvanced = normalizePoolAdvancedConfig(props.provider.pool_advanced)
-
+  const existingQuota = props.provider.monthly_quota_usd
+  const billingMode: 'pay_as_you_go' | 'free_tier' | 'monthly_quota' =
+    props.provider.billing_type === 'monthly_quota'
+      ? 'monthly_quota'
+      : props.provider.billing_type === 'free_tier'
+          ? 'free_tier'
+          : 'pay_as_you_go'
+  currentUsedUsd.value = props.provider.monthly_used_usd ?? 0
+  initialBillingSnapshot.value = {
+    billing_mode: billingMode,
+    monthly_quota_usd: existingQuota ?? undefined,
+    quota_reset_day: props.provider.quota_reset_day ?? 30,
+  }
   form.value = {
     name: props.provider.name,
     provider_type: props.provider.provider_type || 'custom',
@@ -475,6 +608,10 @@ function loadProviderData() {
     max_retries: props.provider.max_retries ?? undefined,
     max_transfer_count: props.provider.max_transfer_count ?? 0,
     max_transfer_timeout_seconds: props.provider.max_transfer_timeout_seconds ?? 0,
+    // 额度与消费限制
+    billing_mode: billingMode,
+    monthly_quota_usd: existingQuota ?? undefined,
+    quota_reset_day: props.provider.quota_reset_day ?? 30,
     // 超时配置
     stream_first_byte_timeout: props.provider.stream_first_byte_timeout ?? undefined,
     request_timeout: props.provider.request_timeout ?? undefined,
@@ -512,6 +649,24 @@ watch(() => form.value.provider_type, () => {
   }
 })
 
+
+async function handleResetQuotaInDialog() {
+  if (!props.provider || resettingQuota.value) return
+  resettingQuota.value = true
+  try {
+    await resetProviderQuota(props.provider.id)
+    currentUsedUsd.value = 0
+    success(t('providers.billing.resetQuotaSuccess'))
+    emit('providerUpdated', {
+      ...props.provider,
+      monthly_used_usd: 0,
+    })
+  } catch (error: unknown) {
+    showError(parseApiError(error, t('ui.resetFailed')), t('ui.error'))
+  } finally {
+    resettingQuota.value = false
+  }
+}
 // 提交表单
 const handleSubmit = async () => {
   loading.value = true
@@ -549,18 +704,48 @@ const handleSubmit = async () => {
           }
         : {}),
     }
+    const billingChanged =
+      form.value.billing_mode !== initialBillingSnapshot.value.billing_mode
+      || form.value.monthly_quota_usd !== initialBillingSnapshot.value.monthly_quota_usd
+      || (
+        form.value.billing_mode === 'monthly_quota'
+        && form.value.quota_reset_day !== initialBillingSnapshot.value.quota_reset_day
+      )
+    const billingPayload = !billingChanged
+      ? {}
+      : form.value.billing_mode === 'monthly_quota'
+        ? {
+            billing_type: 'monthly_quota' as const,
+            monthly_quota_usd: form.value.monthly_quota_usd ?? 0,
+            quota_reset_day: form.value.quota_reset_day ?? 30,
+          }
+        : form.value.billing_mode === 'free_tier'
+          ? {
+              billing_type: 'free_tier' as const,
+              monthly_quota_usd: form.value.monthly_quota_usd ?? 0,
+              ...(isEditMode.value ? { quota_reset_day: null } : {}),
+            }
+          : {
+              billing_type: 'pay_as_you_go' as const,
+              ...(isEditMode.value ? { monthly_quota_usd: null, quota_reset_day: null } : {}),
+            }
 
     if (isEditMode.value && props.provider) {
       // 更新提供商
       const updated = await updateProvider(props.provider.id, {
         ...basePayload,
+        ...billingPayload,
         provider_priority: form.value.provider_priority,
       })
       success(t('ui.providerUpdated'))
       emit('providerUpdated', updated)
     } else {
       // 创建提供商（优先级由后端自动置顶）
-      await createProvider({ ...basePayload, routing_group_id: props.routingGroupId })
+      await createProvider({
+        ...basePayload,
+        ...billingPayload,
+        routing_group_id: props.routingGroupId,
+      })
       success(t('ui.providerCreatedYouCanAddEndpointsAndKeysAndAdjust'), t('ui.createdSuccessfully'))
       emit('providerCreated')
     }

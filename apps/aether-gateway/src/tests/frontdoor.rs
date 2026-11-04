@@ -278,6 +278,7 @@ fn sample_models_candidate_row(
             api_formats: Some(vec![api_format.to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]),
         model_supports_streaming: Some(true),
         model_is_active: true,

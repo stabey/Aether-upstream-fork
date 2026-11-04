@@ -5,17 +5,35 @@
     data-testid="provider-monthly-quota-card"
   >
     <div class="space-y-3">
-      <div class="flex items-center justify-between">
+      <div class="flex items-center justify-between gap-2">
         <h3 class="text-sm font-semibold">
-          {{ t('ui.subscriptionQuota') }}
+          {{ billingType === 'free_tier' ? t('providers.billing.sectionTitle') : t('ui.subscriptionQuota') }}
         </h3>
-        <Badge
-          variant="secondary"
-          class="text-xs"
-          data-testid="provider-monthly-quota-percent"
-        >
-          {{ usedPercent.toFixed(1) }}%
-        </Badge>
+        <div class="flex items-center gap-2">
+          <Badge
+            variant="secondary"
+            class="text-xs"
+            data-testid="provider-monthly-quota-percent"
+          >
+            {{ usedPercent.toFixed(1) }}%
+          </Badge>
+          <Button
+            v-if="showResetButton"
+            type="button"
+            variant="outline"
+            size="sm"
+            class="h-6 px-2 text-xs"
+            :disabled="resetting"
+            data-testid="provider-monthly-quota-reset-button"
+            @click="$emit('reset')"
+          >
+            <RotateCcw
+              class="w-3 h-3 mr-1"
+              :class="{ 'animate-spin': resetting }"
+            />
+            {{ t('providers.billing.resetUsedQuota') }}
+          </Button>
+        </div>
       </div>
       <div class="relative w-full h-2 bg-border rounded-full overflow-hidden">
         <div
@@ -32,7 +50,14 @@
           ${{ used.toFixed(2) }} / ${{ quota.toFixed(2) }}
         </span>
         <span
-          v-if="resetDay"
+          v-if="billingType === 'free_tier'"
+          class="text-muted-foreground"
+          data-testid="provider-monthly-quota-reset"
+        >
+          {{ t('providers.billing.freeTierNoAutoReset') }}
+        </span>
+        <span
+          v-else-if="resetDay"
           class="text-muted-foreground"
           data-testid="provider-monthly-quota-reset"
         >
@@ -45,7 +70,9 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
+import { RotateCcw } from 'lucide-vue-next'
 import Badge from '@/components/ui/badge.vue'
+import Button from '@/components/ui/button.vue'
 import Card from '@/components/ui/card.vue'
 import { useI18n } from '@/i18n'
 
@@ -53,11 +80,21 @@ const props = withDefaults(defineProps<{
   used?: number | null
   quota?: number | null
   resetDay?: number | null
+  billingType?: string | null
+  showResetButton?: boolean
+  resetting?: boolean
 }>(), {
   used: 0,
   quota: 0,
   resetDay: null,
+  billingType: 'monthly_quota',
+  showResetButton: false,
+  resetting: false,
 })
+
+defineEmits<{
+  'reset': []
+}>()
 
 const { t } = useI18n()
 

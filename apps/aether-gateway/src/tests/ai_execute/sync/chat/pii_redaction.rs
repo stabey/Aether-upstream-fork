@@ -114,6 +114,7 @@ fn candidate_row(test_id: &str) -> StoredMinimalCandidateSelectionRow {
             api_formats: Some(vec!["openai:chat".to_string()]),
             endpoint_ids: Some(vec![format!("endpoint-{test_id}")]),
             operations: None,
+            thinking_efforts: None,
         }]),
         model_supports_streaming: Some(true),
         model_is_active: true,

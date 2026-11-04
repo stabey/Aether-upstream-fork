@@ -52,6 +52,21 @@ fn normalize_provider_model_mapping_scopes(
         normalize_provider_model_mapping_string_array_field(object, "operations", |value| {
             value.trim().to_ascii_lowercase()
         });
+        if !object.contains_key("thinking_efforts") {
+            if let Some(legacy) = object.remove("reasoning_efforts") {
+                object.insert("thinking_efforts".to_string(), legacy);
+            }
+        } else {
+            object.remove("reasoning_efforts");
+        }
+        normalize_provider_model_mapping_string_array_field(
+            object,
+            "thinking_efforts",
+            |value| match value.trim().to_ascii_lowercase().as_str() {
+                "default" | "unset" => "unspecified".to_string(),
+                other => other.to_string(),
+            },
+        );
     }
     Some(value)
 }

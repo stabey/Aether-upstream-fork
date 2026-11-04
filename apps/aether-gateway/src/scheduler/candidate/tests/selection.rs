@@ -884,6 +884,7 @@ async fn selects_next_candidate_when_first_provider_quota_is_exhausted() {
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]);
     first.key_global_priority_by_format = Some(serde_json::json!({"openai:chat": 1}));
 
@@ -900,6 +901,7 @@ async fn selects_next_candidate_when_first_provider_quota_is_exhausted() {
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]);
     second.key_global_priority_by_format = Some(serde_json::json!({"openai:chat": 2}));
 
@@ -957,6 +959,7 @@ async fn cooled_down_when_recent_failures_are_recorded_for_same_key() {
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]);
     first.key_global_priority_by_format = Some(serde_json::json!({"openai:chat": 1}));
 
@@ -973,6 +976,7 @@ async fn cooled_down_when_recent_failures_are_recorded_for_same_key() {
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]);
     second.key_global_priority_by_format = Some(serde_json::json!({"openai:chat": 2}));
 

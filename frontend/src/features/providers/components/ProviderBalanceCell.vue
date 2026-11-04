@@ -105,7 +105,7 @@
   </div>
   <!-- 显示本地配置的月度配额 -->
   <div
-    v-else-if="provider.billing_type === 'monthly_quota'"
+    v-else-if="provider.billing_type === 'monthly_quota' || (provider.billing_type === 'free_tier' && (provider.monthly_quota_usd ?? 0) > 0)"
     class="space-y-0.5 text-xs"
   >
     <Badge

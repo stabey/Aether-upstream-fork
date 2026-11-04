@@ -672,6 +672,7 @@ mod tests {
             api_formats: Some(vec!["openai:chat".to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]);
 
         let resolved = resolve_provider_model_name(&row, "gpt-5", "openai:chat")
@@ -736,6 +737,7 @@ mod tests {
             api_formats: Some(vec!["openai:responses".to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]);
 
         assert!(row_supports_requested_model(
@@ -755,6 +757,7 @@ mod tests {
             api_formats: Some(vec!["openai:search".to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]);
         assert!(!row_supports_requested_model(
             &row,
@@ -777,6 +780,7 @@ mod tests {
             api_formats: Some(vec!["openai:responses".to_string()]),
             endpoint_ids: Some(vec!["endpoint-live".to_string()]),
             operations: None,
+            thinking_efforts: None,
         }]);
 
         assert!(row_supports_requested_model(
@@ -824,6 +828,7 @@ mod tests {
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             },
             StoredProviderModelMapping {
                 name: "gpt-5.6-terra".to_string(),
@@ -831,6 +836,7 @@ mod tests {
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
                 operations: Some(vec!["compact".to_string()]),
+                thinking_efforts: None,
             },
         ]);
 
@@ -937,6 +943,7 @@ mod tests {
             api_formats: None,
             endpoint_ids: Some(vec!["endpoint-openai".to_string()]),
             operations: None,
+            thinking_efforts: None,
         }]);
 
         assert!(!row_supports_requested_model(
@@ -984,6 +991,7 @@ mod tests {
             api_formats: None,
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]);
         row
     }
@@ -1034,6 +1042,7 @@ mod tests {
             api_formats: None,
             endpoint_ids: Some(vec!["endpoint-chat".to_string()]),
             operations: None,
+            thinking_efforts: None,
         }]);
 
         assert!(row_supports_requested_model(
@@ -1105,6 +1114,7 @@ mod tests {
             api_formats: None,
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]);
 
         assert!(row_supports_requested_model_with_reserved_global_model(
@@ -1140,6 +1150,7 @@ mod tests {
             api_formats: Some(vec!["openai:responses".to_string()]),
             endpoint_ids: None,
             operations: Some(vec!["compact".to_string()]),
+            thinking_efforts: None,
         }]);
 
         assert!(row_supports_requested_model(

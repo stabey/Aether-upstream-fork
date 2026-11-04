@@ -172,7 +172,7 @@
       </span>
       <!-- 本地配额 -->
       <span
-        v-else-if="provider.billing_type === 'monthly_quota'"
+        v-else-if="provider.billing_type === 'monthly_quota' || (provider.billing_type === 'free_tier' && (provider.monthly_quota_usd ?? 0) > 0)"
         class="text-muted-foreground"
       >
         {{ t('ui.quotae284fc9') }} <span

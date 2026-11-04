@@ -279,6 +279,20 @@
             </p>
           </div>
         </div>
+
+        <div class="min-w-0 space-y-1.5">
+          <Label class="text-xs">{{ t('providers.modelMapping.scope.thinkingEfforts') }}</Label>
+          <MultiSelect
+            v-model="selectedThinkingEfforts"
+            :options="thinkingEffortOptions"
+            :placeholder="t('providers.modelMapping.scope.allThinkingEfforts')"
+            trigger-class="h-9 rounded-md"
+            :search-threshold="8"
+          />
+          <p class="text-xs leading-5 text-muted-foreground">
+            {{ t('providers.modelMapping.scope.thinkingEffortHelp') }}
+          </p>
+        </div>
       </div>
     </div>
 
@@ -340,6 +354,10 @@ import {
   modelMappingRequestScopeOptions,
   modelMappingRequestScopeValue,
   normalizeModelMappingOperations,
+  formatModelMappingThinkingEffortScope,
+  modelMappingThinkingEffortOptions,
+  modelMappingThinkingEffortsKey,
+  normalizeModelMappingThinkingEfforts,
 } from '../utils/modelMappingScope'
 
 export interface AliasGroup {
@@ -352,6 +370,8 @@ export interface AliasGroup {
   endpointIds: string[]
   operationsKey: string
   operations: string[]
+  thinkingEffortsKey?: string
+  thinkingEfforts?: string[]
   aliases: ProviderModelAlias[]
 }
 
@@ -412,6 +432,7 @@ const selectedNames = ref<string[]>([])
 const selectedEndpointIds = ref<string[]>([])
 
 const selectedOperations = ref<string[]>([])
+const selectedThinkingEfforts = ref<string[]>([])
 
 // 自定义名称列表（手动添加的）
 const allCustomNames = ref<string[]>([])
@@ -469,8 +490,21 @@ const operationScopeSummary = computed(() => {
   )
 })
 
+const thinkingEffortOptions = computed(() => {
+  return modelMappingThinkingEffortOptions()
+})
+
+const normalizedSelectedThinkingEfforts = computed(() => {
+  const selected = normalizeModelMappingThinkingEfforts(selectedThinkingEfforts.value)
+  return selected.length > 0 ? selected : undefined
+})
+
+const thinkingEffortScopeSummary = computed(() => {
+  return formatModelMappingThinkingEffortScope(normalizedSelectedThinkingEfforts.value)
+})
+
 const mappingScopeSummary = computed(() => {
-  return `${endpointScopeSummary.value} · ${operationScopeSummary.value}`
+  return `${endpointScopeSummary.value} · ${operationScopeSummary.value} · ${thinkingEffortScopeSummary.value}`
 })
 
 const requestScopeValue = computed(() => {
@@ -643,12 +677,24 @@ function operationScopesOverlap(
   return leftValues.some(value => rightSet.has(value))
 }
 
+function thinkingEffortScopesOverlap(
+  left: string[] | undefined,
+  right: string[] | undefined,
+): boolean {
+  const leftValues = normalizeModelMappingThinkingEfforts(left)
+  const rightValues = normalizeModelMappingThinkingEfforts(right)
+  if (leftValues.length === 0 || rightValues.length === 0) return true
+  const rightSet = new Set(rightValues)
+  return leftValues.some(value => rightSet.has(value))
+}
+
 function findDuplicateNames(
   existingAliases: ProviderModelAlias[],
   names: string[],
   endpointIds: string[] | undefined,
   apiFormats: string[] | undefined = undefined,
   operations: string[] | undefined = undefined,
+  thinkingEfforts: string[] | undefined = undefined,
 ): string[] {
   const duplicates = new Set<string>()
   for (const rawName of names) {
@@ -659,6 +705,7 @@ function findDuplicateNames(
         && scopesOverlap(alias.endpoint_ids, endpointIds)
         && scopesOverlap(alias.api_formats, apiFormats)
         && operationScopesOverlap(alias.operations, operations)
+        && thinkingEffortScopesOverlap(alias.thinking_efforts, thinkingEfforts)
     })
     if (duplicate) duplicates.add(name)
   }
@@ -729,6 +776,7 @@ function initForm() {
     selectedNames.value = [...existingNames]
     selectedEndpointIds.value = normalizeStringList(props.editingGroup.endpointIds)
     selectedOperations.value = normalizeModelMappingOperations(props.editingGroup.operations)
+    selectedThinkingEfforts.value = normalizeModelMappingThinkingEfforts(props.editingGroup.thinkingEfforts)
     allCustomNames.value = [...existingNames]
   } else {
     formData.value = {
@@ -737,6 +785,7 @@ function initForm() {
     selectedNames.value = []
     selectedEndpointIds.value = []
     selectedOperations.value = []
+    selectedThinkingEfforts.value = []
     allCustomNames.value = []
   }
   searchQuery.value = ''
@@ -784,6 +833,10 @@ function getOperationsKey(operations: string[] | undefined): string {
   return modelMappingOperationsKey(operations)
 }
 
+function getThinkingEffortsKey(thinkingEfforts: string[] | undefined): string {
+  return modelMappingThinkingEffortsKey(thinkingEfforts)
+}
+
 // 提交表单
 async function handleSubmit() {
   if (submitting.value) return
@@ -801,6 +854,7 @@ async function handleSubmit() {
     let newAliases: ProviderModelAlias[]
     const nextEndpointIds = normalizedSelectedEndpointIds.value
     const nextOperations = normalizedSelectedOperations.value
+    const nextThinkingEfforts = normalizedSelectedThinkingEfforts.value
 
     const buildAliases = (names: string[]): ProviderModelAlias[] => {
       return names.map((name) => {
@@ -814,6 +868,9 @@ async function handleSubmit() {
         if (nextOperations && nextOperations.length > 0) {
           alias.operations = nextOperations
         }
+        if (nextThinkingEfforts && nextThinkingEfforts.length > 0) {
+          alias.thinking_efforts = nextThinkingEfforts
+        }
         return alias
       })
     }
@@ -822,15 +879,18 @@ async function handleSubmit() {
       const oldApiFormatsKey = props.editingGroup.apiFormatsKey
       const oldEndpointIdsKey = props.editingGroup.endpointIdsKey
       const oldOperationsKey = modelMappingOperationsKey(props.editingGroup.operations)
+      const oldThinkingEffortsKey = getThinkingEffortsKey(props.editingGroup.thinkingEfforts)
       const oldAliasNames = new Set(props.editingGroup.aliases.map(a => a.name))
 
       const filteredAliases = currentAliases.filter((a: ProviderModelAlias) => {
         const currentKey = getApiFormatsKey(a.api_formats)
         const currentEndpointIdsKey = getEndpointIdsKey(a.endpoint_ids)
         const currentOperationsKey = getOperationsKey(a.operations)
+        const currentThinkingEffortsKey = getThinkingEffortsKey(a.thinking_efforts)
         return !(currentKey === oldApiFormatsKey
           && currentEndpointIdsKey === oldEndpointIdsKey
           && currentOperationsKey === oldOperationsKey
+          && currentThinkingEffortsKey === oldThinkingEffortsKey
           && oldAliasNames.has(a.name))
       })
 
@@ -840,6 +900,7 @@ async function handleSubmit() {
         nextEndpointIds,
         undefined,
         nextOperations,
+        nextThinkingEfforts,
       )
       if (duplicates.length > 0) {
         showError(t('providers.migration.theseMappingNamesAlreadyExistdcbf0a', { value: String(duplicates.join(', ')) }), t('ui.error'))
@@ -857,6 +918,7 @@ async function handleSubmit() {
         nextEndpointIds,
         undefined,
         nextOperations,
+        nextThinkingEfforts,
       )
       if (duplicates.length > 0) {
         showError(t('providers.migration.theseMappingNamesAlreadyExistdcbf0a', { value: String(duplicates.join(', ')) }), t('ui.error'))

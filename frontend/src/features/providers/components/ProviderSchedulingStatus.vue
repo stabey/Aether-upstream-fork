@@ -7,7 +7,7 @@
     <template v-if="balanceLoading">{{ t('ui.checkingBalance') }}</template>
     <template v-else-if="balance">{{ t('ui.balance') }} {{ balances?.formatBalanceDisplay(balance) }}</template>
     <template v-else-if="error">{{ t('ui.balanceTemporarilyUnavailable') }}</template>
-    <template v-else-if="provider.billing_type === 'monthly_quota'"> {{ t('ui.monthlyUsage') }}{{ (provider.monthly_used_usd ?? 0).toFixed(2) }} / ${{ (provider.monthly_quota_usd ?? 0).toFixed(2) }}
+    <template v-else-if="provider.billing_type === 'monthly_quota' || (provider.billing_type === 'free_tier' && (provider.monthly_quota_usd ?? 0) > 0)"> {{ t('ui.monthlyUsage') }}{{ (provider.monthly_used_usd ?? 0).toFixed(2) }} / ${{ (provider.monthly_quota_usd ?? 0).toFixed(2) }}
     </template>
     <template v-else-if="provider.ops_configured">{{ t('ui.balance168e5e0') }}</template>
   </span>

@@ -165,3 +165,73 @@ function formatModelMappingEndpointDiscriminator(endpoint: ModelMappingEndpoint)
     return baseUrl || endpoint.id.slice(0, 8)
   }
 }
+
+export const MODEL_MAPPING_THINKING_EFFORT_ORDER = [
+  'unspecified',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const
+
+export function normalizeModelMappingThinkingEfforts(
+  thinkingEfforts: string[] | undefined,
+): string[] {
+  const seen = new Set<string>()
+  const normalized: string[] = []
+  for (const raw of thinkingEfforts ?? []) {
+    const trimmed = raw.trim().toLowerCase()
+    if (!trimmed) continue
+    const value = (trimmed === 'default' || trimmed === 'unset') ? 'unspecified' : trimmed
+    if (seen.has(value)) continue
+    seen.add(value)
+    normalized.push(value)
+  }
+  return normalized
+}
+
+export function modelMappingThinkingEffortsKey(
+  thinkingEfforts: string[] | undefined,
+): string {
+  return normalizeModelMappingThinkingEfforts(thinkingEfforts).sort().join(',')
+}
+
+export function formatModelMappingThinkingEffortItem(effort: string): string {
+  switch (effort) {
+    case 'unspecified':
+      return t('providers.modelMapping.scope.thinkingEffort.unspecified')
+    case 'minimal':
+      return t('providers.modelMapping.scope.thinkingEffort.minimal')
+    case 'low':
+      return t('providers.modelMapping.scope.thinkingEffort.low')
+    case 'medium':
+      return t('providers.modelMapping.scope.thinkingEffort.medium')
+    case 'high':
+      return t('providers.modelMapping.scope.thinkingEffort.high')
+    case 'xhigh':
+      return t('providers.modelMapping.scope.thinkingEffort.xhigh')
+    case 'max':
+      return t('providers.modelMapping.scope.thinkingEffort.max')
+    default:
+      return effort
+  }
+}
+
+export function formatModelMappingThinkingEffortScope(
+  thinkingEfforts: string[] | undefined,
+): string {
+  const normalized = normalizeModelMappingThinkingEfforts(thinkingEfforts)
+  if (normalized.length === 0) {
+    return t('providers.modelMapping.scope.allThinkingEfforts')
+  }
+  return normalized.map(formatModelMappingThinkingEffortItem).join(', ')
+}
+
+export function modelMappingThinkingEffortOptions(): ModelMappingRequestScopeOption[] {
+  return MODEL_MAPPING_THINKING_EFFORT_ORDER.map(value => ({
+    value,
+    label: formatModelMappingThinkingEffortItem(value),
+  }))
+}

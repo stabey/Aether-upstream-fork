@@ -115,6 +115,7 @@ async fn gateway_executes_openai_responses_compact_openai_family_upstream_stream
                 api_formats: Some(vec!["openai:responses:compact".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,

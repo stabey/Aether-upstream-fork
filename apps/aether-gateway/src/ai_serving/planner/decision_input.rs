@@ -340,20 +340,53 @@ pub(crate) fn apply_provider_request_routing_policy_to_decision_with_websocket_m
     }
     // Provider-request rules run after envelope construction. They cannot
     // silently undo the variant/account decision made during preselection.
-    if provider_type.eq_ignore_ascii_case("antigravity")
-        && decision
-            .mapped_model
-            .as_deref()
-            .is_some_and(super::argon_routing::is_argon)
-    {
-        if let Some(level) = super::argon_routing::request_level(
-            super::argon_routing::enabled(),
-            &input.model_directive_policy,
-            &context.client_api_format,
-            &input.requested_model,
-            &context.effective_body_json,
-        ) {
-            if !super::argon_routing::envelope_matches_level(level, &provider_request_body) {
+    if provider_type.eq_ignore_ascii_case("antigravity") {
+        if let Some(mapped_model) = decision.mapped_model.as_deref() {
+            let had_original_envelope_thinking = original_provider_request_body
+                .as_ref()
+                .is_some_and(|orig| {
+                    orig.pointer("/request/generationConfig/thinkingConfig")
+                        .is_some()
+                        || orig
+                            .pointer("/request/generation_config/thinking_config")
+                            .is_some()
+                });
+            let has_envelope_thinking = had_original_envelope_thinking
+                || provider_request_body
+                    .pointer("/request/generationConfig/thinkingConfig")
+                    .is_some()
+                || provider_request_body
+                    .pointer("/request/generation_config/thinking_config")
+                    .is_some();
+            if super::argon_routing::variant_level(mapped_model).is_some()
+                && (super::argon_routing::enabled() || has_envelope_thinking)
+            {
+                if !super::argon_routing::envelope_matches_variant(
+                    mapped_model,
+                    &provider_request_body,
+                ) {
+                    return Err(invalid_routing_provider_contract());
+                }
+            } else if super::argon_routing::is_argon(mapped_model) {
+                if let Some(level) = super::argon_routing::request_level(
+                    super::argon_routing::enabled(),
+                    &input.model_directive_policy,
+                    &context.client_api_format,
+                    &input.requested_model,
+                    &context.effective_body_json,
+                ) {
+                    if !super::argon_routing::envelope_matches_level(level, &provider_request_body)
+                    {
+                        return Err(invalid_routing_provider_contract());
+                    }
+                }
+            } else if original_provider_request_body
+                .as_ref()
+                .and_then(|orig| orig.get("model"))
+                .and_then(Value::as_str)
+                == Some(mapped_model)
+                && provider_request_body.get("model").and_then(Value::as_str) != Some(mapped_model)
+            {
                 return Err(invalid_routing_provider_contract());
             }
         }

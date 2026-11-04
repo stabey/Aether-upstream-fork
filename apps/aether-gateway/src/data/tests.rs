@@ -558,6 +558,7 @@ fn sample_minimal_candidate_selection_row(
             api_formats: Some(vec!["openai:chat".to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]),
         model_supports_streaming: None,
         model_is_active: true,

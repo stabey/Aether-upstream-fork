@@ -55,7 +55,10 @@ pub(crate) async fn build_antigravity_v1internal_provider_request(
     let default_body = input
         .requires_exact_model_permission
         .then(|| {
-            super::argon_routing::with_default_low(input.mapped_model, input.gemini_request_body)
+            super::argon_routing::with_default_variant_level(
+                input.mapped_model,
+                input.gemini_request_body,
+            )
         })
         .flatten();
     let gemini_request_body = default_body.as_ref().unwrap_or(input.gemini_request_body);

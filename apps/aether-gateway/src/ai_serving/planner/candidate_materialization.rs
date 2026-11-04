@@ -851,6 +851,12 @@ where
         Some(trace_id),
     )
     .await
+    .with_thinking_effort(super::argon_routing::request_thinking_effort(
+        model_directive_policy,
+        client_api_format,
+        requested_model,
+        request_body,
+    ))
     .with_argon_level(super::argon_routing::request_level(
         super::argon_routing::enabled(),
         model_directive_policy,

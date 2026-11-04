@@ -361,6 +361,7 @@ pub(crate) struct LocalCandidatePreselectionPageCursor<'a> {
     candidate_api_formats: Vec<String>,
     model_directive_routing_models: BTreeMap<String, String>,
     model_directive_policy_cache_key: String,
+    thinking_effort: Option<super::argon_routing::RequestThinkingEffort>,
     argon_level: Option<super::argon_routing::ArgonLevel>,
     ordering_config: SchedulerOrderingConfig,
     ranking_seed: u64,
@@ -450,6 +451,7 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
             candidate_api_formats,
             model_directive_routing_models,
             model_directive_policy_cache_key: model_directive_policy.cache_key().to_string(),
+            thinking_effort: None,
             argon_level: None,
             ordering_config,
             ranking_seed: request_distribution_seed(),
@@ -584,11 +586,29 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         &self.model_directive_policy_cache_key
     }
 
+    pub(crate) fn with_thinking_effort(
+        mut self,
+        effort: Option<super::argon_routing::RequestThinkingEffort>,
+    ) -> Self {
+        self.thinking_effort = effort;
+        if let Some(effort) = self.thinking_effort.as_ref() {
+            self.model_directive_policy_cache_key.push_str(":effort:");
+            self.model_directive_policy_cache_key
+                .push_str(effort.as_str());
+        }
+        self
+    }
+
     pub(crate) fn with_argon_level(
         mut self,
         level: Option<super::argon_routing::ArgonLevel>,
     ) -> Self {
         self.argon_level = level;
+        if self.thinking_effort.is_none() {
+            self.thinking_effort = level.map(|value| {
+                super::argon_routing::RequestThinkingEffort::Explicit(value.as_str().to_string())
+            });
+        }
         if let Some(level) = level {
             // Both preselection and resolved-page caches use this request key.
             self.model_directive_policy_cache_key.push_str(":argon:");
@@ -1232,38 +1252,65 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         Ok(reserved_global_model_name)
     }
 
-    async fn resolve_argon_rows(
+    async fn resolve_thinking_effort_rows(
         &self,
         rows: Vec<StoredMinimalCandidateSelectionRow>,
         routing_model: &str,
         format: &str,
-        level: super::argon_routing::ArgonLevel,
-    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, GatewayError> {
-        use super::argon_routing::{configured_argon, has_variant, select_variant};
-        let provider_ids = rows
+    ) -> Result<
+        (
+            Vec<StoredMinimalCandidateSelectionRow>,
+            BTreeSet<(String, String, String, String)>,
+        ),
+        GatewayError,
+    > {
+        use super::argon_routing::{
+            configured_argon, has_variant, resolve_row_thinking_effort_model,
+            row_has_thinking_effort_mappings, select_variant,
+        };
+        let operation = self.request_operation.as_deref();
+        let effective_effort = self.thinking_effort.clone().or_else(|| {
+            self.argon_level.map(|level| {
+                super::argon_routing::RequestThinkingEffort::Explicit(level.as_str().to_string())
+            })
+        });
+        let antigravity_provider_ids = rows
             .iter()
             .filter(|row| {
-                configured_argon(
-                    row,
-                    routing_model,
-                    format,
-                    self.request_operation.as_deref(),
-                )
+                row.provider_type.eq_ignore_ascii_case("antigravity")
+                    && (row_has_thinking_effort_mappings(row, format, operation)
+                        || (self.argon_level.is_some()
+                            && configured_argon(row, routing_model, format, operation)))
             })
             .map(|row| row.provider_id.clone())
             .collect::<BTreeSet<_>>();
-        if provider_ids.is_empty() {
-            return Ok(rows);
+        let has_any_effort_rows = !antigravity_provider_ids.is_empty()
+            || rows
+                .iter()
+                .any(|row| row_has_thinking_effort_mappings(row, format, operation));
+        if !has_any_effort_rows {
+            return Ok((rows, BTreeSet::new()));
         }
-        let providers = self
-            .state
-            .app()
-            .read_provider_catalog_providers_by_ids(&provider_ids.into_iter().collect::<Vec<_>>())
-            .await?;
-        let pools = providers.iter().filter(|provider| {
-            crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value(provider.config.as_ref()).is_some()
-        }).map(|provider| provider.id.clone()).collect::<BTreeSet<_>>();
-        let model = level.model();
+        let providers = if antigravity_provider_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.state
+                .app()
+                .read_provider_catalog_providers_by_ids(
+                    &antigravity_provider_ids.into_iter().collect::<Vec<_>>(),
+                )
+                .await?
+        };
+        let pools = providers
+            .iter()
+            .filter(|provider| {
+                crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value(
+                    provider.config.as_ref(),
+                )
+                .is_some()
+            })
+            .map(|provider| provider.id.clone())
+            .collect::<BTreeSet<_>>();
         let pool_keys = if pools.is_empty() {
             Vec::new()
         } else {
@@ -1278,48 +1325,117 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 .await
                 .map_err(|error| GatewayError::Internal(error.to_string()))?
         };
-        let available_pools = pool_keys
-            .iter()
-            .filter(|key| {
-                key.is_active
+        let pool_supports_model = |provider_id: &str, model: &str| -> bool {
+            pool_keys.iter().any(|key| {
+                key.provider_id == provider_id
+                    && key.is_active
                     && key
                         .allowed_models
                         .as_ref()
                         .and_then(serde_json::Value::as_array)
                         .is_some_and(|models| {
-                            models
-                                .iter()
-                                .any(|value| value.as_str() == Some(model.as_str()))
+                            models.iter().any(|value| value.as_str() == Some(model))
                         })
             })
-            .map(|key| key.provider_id.as_str())
-            .collect::<BTreeSet<_>>();
-        Ok(rows
+        };
+        let mut exact_permission_candidates = BTreeSet::new();
+        let resolved_rows = rows
             .into_iter()
             .filter_map(|mut row| {
-                if !configured_argon(
-                    &row,
-                    routing_model,
-                    format,
-                    self.request_operation.as_deref(),
-                ) {
+                let has_explicit_effort_mappings =
+                    row_has_thinking_effort_mappings(&row, format, operation);
+                let is_fallback_argon = !has_explicit_effort_mappings
+                    && self.argon_level.is_some()
+                    && configured_argon(&row, routing_model, format, operation);
+                if !has_explicit_effort_mappings && !is_fallback_argon {
                     return Some(row);
                 }
-                if pools.contains(&row.provider_id) {
-                    if !available_pools.contains(row.provider_id.as_str()) {
+                let model = if has_explicit_effort_mappings {
+                    resolve_row_thinking_effort_model(
+                        &row,
+                        routing_model,
+                        format,
+                        operation,
+                        effective_effort.as_ref(),
+                    )?
+                } else {
+                    self.argon_level?.model()
+                };
+                if row.provider_type.eq_ignore_ascii_case("antigravity") {
+                    if pools.contains(&row.provider_id) {
+                        if !pool_supports_model(&row.provider_id, &model) {
+                            return None;
+                        }
+                        // This is a group representative, not the selected credential.
+                        // Every expanded/sticky account is checked again against the
+                        // actual variant before it can become an execution candidate.
+                        row.key_allowed_models = Some(vec![model.clone()]);
+                    } else if !has_variant(row.key_allowed_models.as_deref(), &model) {
                         return None;
                     }
-                    // This is a group representative, not the selected credential.
-                    // Every expanded/sticky account is checked again against the
-                    // actual variant before it can become an execution candidate.
-                    row.key_allowed_models = Some(vec![model.clone()]);
-                } else if !has_variant(row.key_allowed_models.as_deref(), &model) {
-                    return None;
+                    exact_permission_candidates.insert((
+                        row.endpoint_id.clone(),
+                        row.key_id.clone(),
+                        row.model_id.clone(),
+                        model.clone(),
+                    ));
                 }
                 select_variant(&mut row, &model);
                 Some(row)
             })
-            .collect())
+            .collect();
+        Ok((resolved_rows, exact_permission_candidates))
+    }
+
+    #[cfg(test)]
+    async fn resolve_argon_rows(
+        &self,
+        rows: Vec<StoredMinimalCandidateSelectionRow>,
+        routing_model: &str,
+        format: &str,
+        level: super::argon_routing::ArgonLevel,
+    ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, GatewayError> {
+        let cursor = Self {
+            state: self.state,
+            trace_id: self.trace_id.clone(),
+            client_api_format: self.client_api_format.clone(),
+            requested_model: self.requested_model.clone(),
+            request_operation: self.request_operation.clone(),
+            require_streaming: self.require_streaming,
+            required_capabilities: self.required_capabilities.clone(),
+            auth_snapshot: self.auth_snapshot.clone(),
+            routing_policy: self.routing_policy.clone(),
+            client_session_affinity: self.client_session_affinity.clone(),
+            request_auth_channel: self.request_auth_channel.clone(),
+            use_api_format_alias_match: self.use_api_format_alias_match,
+            key_mode: self.key_mode,
+            allow_priority_page_cache: self.allow_priority_page_cache,
+            candidate_api_formats: self.candidate_api_formats.clone(),
+            model_directive_routing_models: self.model_directive_routing_models.clone(),
+            model_directive_policy_cache_key: self.model_directive_policy_cache_key.clone(),
+            thinking_effort: Some(super::argon_routing::RequestThinkingEffort::Explicit(
+                level.as_str().to_string(),
+            )),
+            argon_level: Some(level),
+            ordering_config: self.ordering_config,
+            ranking_seed: self.ranking_seed,
+            priority_page_emitted: self.priority_page_emitted,
+            deferred_pages_by_format: BTreeMap::new(),
+            format_index: self.format_index,
+            requested_name_indexes: BTreeMap::new(),
+            requested_name_offsets: BTreeMap::new(),
+            scanned_rows_by_format: BTreeMap::new(),
+            resolved_global_model_names: BTreeMap::new(),
+            reserved_global_model_names: BTreeMap::new(),
+            fallback_offsets: BTreeMap::new(),
+            fallback_scan_epoch: self.fallback_scan_epoch,
+            exhausted_api_formats: BTreeSet::new(),
+            seen_candidate_keys: BTreeSet::new(),
+        };
+        cursor
+            .resolve_thinking_effort_rows(rows, routing_model, format)
+            .await
+            .map(|(rows, _)| rows)
     }
 
     async fn build_page_outcome_from_rows(
@@ -1371,11 +1487,9 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
                 value
             };
         rows.retain(|row| row.global_model_name == resolved_global_model_name);
-        if let Some(level) = self.argon_level {
-            rows = self
-                .resolve_argon_rows(rows, &routing_model, normalized_api_format, level)
-                .await?;
-        }
+        let (rows, exact_permission_candidates) = self
+            .resolve_thinking_effort_rows(rows, &routing_model, normalized_api_format)
+            .await?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -1403,9 +1517,12 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         .map_err(|err| GatewayError::Internal(err.to_string()))?;
         let mut candidates = Vec::new();
         for mut candidate in enumerated_candidates {
-            candidate.requires_exact_model_permission = self.argon_level.is_some()
-                && candidate.provider_type.eq_ignore_ascii_case("antigravity")
-                && super::argon_routing::is_argon(&candidate.selected_provider_model_name);
+            candidate.requires_exact_model_permission = exact_permission_candidates.contains(&(
+                candidate.endpoint_id.clone(),
+                candidate.key_id.clone(),
+                candidate.model_id.clone(),
+                candidate.selected_provider_model_name.clone(),
+            )) && candidate.provider_type.eq_ignore_ascii_case("antigravity");
             if !self.candidate_allowed_for_page(&candidate, candidate_api_format) {
                 continue;
             }
@@ -2461,6 +2578,7 @@ mod tests {
             api_formats: None,
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }]);
 
         let mut bound = standard_candidate_row("anti", "gemini:generate_content", 2);
@@ -2687,6 +2805,7 @@ mod tests {
             api_formats: None,
             endpoint_ids: Some(vec!["different-endpoint".to_string()]),
             operations: None,
+            thinking_efforts: None,
         }]);
         assert!(!configured_argon(
             &row,
@@ -2922,6 +3041,7 @@ mod tests {
                 api_formats: None,
                 endpoint_ids: Some(vec!["endpoint-opg-openai".to_string()]),
                 operations: None,
+                thinking_efforts: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -2995,6 +3115,7 @@ mod tests {
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             },
             StoredProviderModelMapping {
                 name: "gpt-5.6-terra".to_string(),
@@ -3002,6 +3123,7 @@ mod tests {
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
                 operations: Some(vec!["compact".to_string()]),
+                thinking_efforts: None,
             },
         ]);
         let repository: Arc<dyn MinimalCandidateSelectionReadRepository> =
@@ -3445,6 +3567,147 @@ mod tests {
                 .map(|candidate| candidate.candidate.provider_id.as_str())
                 .collect::<Vec<_>>(),
             vec!["provider-codex", "provider-custom"]
+        );
+    }
+
+    #[tokio::test]
+    async fn thinking_effort_model_mappings_route_variants_and_enforce_antigravity_account_permissions_without_argon_env(
+    ) {
+        let mut anti_row = standard_candidate_row("anti-flash", "gemini:generate_content", 1);
+        anti_row.provider_type = "antigravity".to_string();
+        anti_row.key_auth_type = "oauth".to_string();
+        anti_row.global_model_id = "gm-flash".to_string();
+        anti_row.global_model_name = "gemini-3.8-flash".to_string();
+        anti_row.model_provider_model_name = "gemini-3.8-flash".to_string();
+        anti_row.key_allowed_models = Some(vec![
+            "gemini-3.8-flash-low".to_string(),
+            "gemini-3.8-flash-medium".to_string(),
+        ]);
+        anti_row.model_provider_model_mappings = Some(vec![
+            StoredProviderModelMapping {
+                name: "gemini-3.8-flash-low".to_string(),
+                priority: 1,
+                api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+                thinking_efforts: Some(vec!["low".to_string()]),
+            },
+            StoredProviderModelMapping {
+                name: "gemini-3.8-flash-medium".to_string(),
+                priority: 2,
+                api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+                thinking_efforts: Some(vec!["medium".to_string()]),
+            },
+            StoredProviderModelMapping {
+                name: "gemini-3.8-flash-high".to_string(),
+                priority: 3,
+                api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                endpoint_ids: None,
+                operations: None,
+                thinking_efforts: Some(vec!["high".to_string()]),
+            },
+        ]);
+        let mut vertex_row = standard_candidate_row("vertex-flash", "gemini:generate_content", 2);
+        vertex_row.provider_type = "vertex_ai".to_string();
+        vertex_row.global_model_id = "gm-flash".to_string();
+        vertex_row.global_model_name = "gemini-3.8-flash".to_string();
+        vertex_row.model_provider_model_name = "gemini-3.8-flash".to_string();
+        let rows = vec![anti_row, vertex_row];
+        let catalog = rows
+            .iter()
+            .map(|row| {
+                let (provider, endpoint, mut key) = provider_catalog_for_standard_row(row, true);
+                key.allowed_models = Some(serde_json::json!(row.key_allowed_models));
+                (provider, endpoint, key)
+            })
+            .collect::<Vec<_>>();
+        let app = AppState::new().unwrap().with_data_state_for_tests(
+            GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                    catalog.iter().map(|(p, _, _)| p.clone()).collect(),
+                    catalog.iter().map(|(_, e, _)| e.clone()).collect(),
+                    catalog.iter().map(|(_, _, k)| k.clone()).collect(),
+                )),
+                Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+            )
+            .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
+        );
+        let auth = unrestricted_auth_snapshot();
+        let policy = crate::system_features::ModelDirectivePolicySnapshot::default();
+
+        let run_for_effort = |effort: super::super::argon_routing::RequestThinkingEffort| {
+            let app = &app;
+            let auth = &auth;
+            let policy = &policy;
+            async move {
+                let mut cursor = LocalCandidatePreselectionPageCursor::new(
+                    PlannerAppState::new(app),
+                    policy,
+                    "gemini:generate_content",
+                    "gemini-3.8-flash",
+                    None,
+                    true,
+                    None,
+                    auth,
+                    None,
+                    None,
+                    None,
+                    false,
+                    LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
+                    true,
+                    None,
+                )
+                .await
+                .with_thinking_effort(Some(effort));
+                let mut candidates = Vec::new();
+                while let Some(page) = cursor.next_page().await.unwrap() {
+                    candidates.extend(page.candidates);
+                }
+                candidates
+                    .into_iter()
+                    .map(|c| {
+                        (
+                            c.provider_id,
+                            (
+                                c.selected_provider_model_name,
+                                c.requires_exact_model_permission,
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            }
+        };
+
+        let medium_models = run_for_effort(
+            super::super::argon_routing::RequestThinkingEffort::Explicit("medium".to_string()),
+        )
+        .await;
+        assert_eq!(
+            medium_models.get("anti-flash"),
+            Some(&("gemini-3.8-flash-medium".to_string(), true))
+        );
+        assert_eq!(
+            medium_models.get("vertex-flash"),
+            Some(&("gemini-3.8-flash".to_string(), false))
+        );
+
+        let unspecified_models =
+            run_for_effort(super::super::argon_routing::RequestThinkingEffort::Unspecified).await;
+        assert_eq!(
+            unspecified_models.get("anti-flash"),
+            Some(&("gemini-3.8-flash-low".to_string(), true))
+        );
+
+        let high_models = run_for_effort(
+            super::super::argon_routing::RequestThinkingEffort::Explicit("high".to_string()),
+        )
+        .await;
+        assert!(!high_models.contains_key("anti-flash"));
+        assert_eq!(
+            high_models.get("vertex-flash"),
+            Some(&("gemini-3.8-flash".to_string(), false))
         );
     }
 }

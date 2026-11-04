@@ -111,6 +111,7 @@ fn sample_codex_models_candidate_row(
             api_formats: Some(vec!["openai:responses".to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         },
     ]);
     row
@@ -1448,6 +1449,7 @@ async fn run_openai_realtime_websocket_frontdoor_scenario() {
             api_formats: Some(vec!["openai:realtime".to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         },
     ]);
     let candidate_repository =

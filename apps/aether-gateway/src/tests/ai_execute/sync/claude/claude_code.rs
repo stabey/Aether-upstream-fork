@@ -132,6 +132,7 @@ async fn gateway_executes_claude_code_cli_sync_via_local_decision_gate_with_loca
                 api_formats: Some(vec!["claude:messages".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,

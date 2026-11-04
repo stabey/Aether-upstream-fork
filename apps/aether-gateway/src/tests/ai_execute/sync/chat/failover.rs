@@ -92,6 +92,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
                 api_formats: Some(vec!["openai:chat".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -298,6 +299,7 @@ async fn gateway_skips_unsupported_local_openai_chat_sync_candidate_before_tryin
         api_formats: Some(vec!["openai:chat".to_string()]),
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]);
     let candidate_selection_repository =
         Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![
@@ -500,6 +502,7 @@ async fn gateway_surfaces_local_execution_runtime_miss_reason_when_all_openai_ch
                 api_formats: Some(vec!["openai:chat".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,
@@ -779,6 +782,7 @@ async fn gateway_retries_next_local_openai_chat_sync_candidate_after_auth_failur
                 api_formats: Some(vec!["openai:chat".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             }]),
             model_supports_streaming: Some(true),
             model_is_active: true,

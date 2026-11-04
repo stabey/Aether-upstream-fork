@@ -245,17 +245,28 @@ pub(crate) async fn build_provider_strategy_reset_quota_response(
         return Ok(admin_provider_strategy_provider_not_found_response());
     };
 
-    if provider.billing_type.as_deref() != Some("monthly_quota") {
+    let has_resettable_quota = matches!(
+        provider.billing_type.as_deref(),
+        Some("monthly_quota" | "free_tier")
+    ) || provider
+        .monthly_quota_usd
+        .is_some_and(|value| value.is_finite() && value > 0.0);
+    if !has_resettable_quota {
         return Ok((
             http::StatusCode::BAD_REQUEST,
-            Json(json!({ "detail": "Only monthly quota providers can be reset" })),
+            Json(json!({ "detail": "Only monthly quota or free tier providers can be reset" })),
         )
             .into_response());
     }
 
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let previous_used = provider.monthly_used_usd.unwrap_or(0.0);
     let mut updated = provider.clone();
     updated.monthly_used_usd = Some(0.0);
+    updated.quota_last_reset_at_unix_secs = Some(now_unix_secs);
     let Some(updated) = state
         .app()
         .update_provider_catalog_provider(&updated)

@@ -1006,6 +1006,7 @@ export interface ProviderModelMapping {
   api_formats?: string[]  // 作用域（适用的 API 格式），为空表示对所有格式生效
   endpoint_ids?: string[]  // 作用域（适用的端点 ID），为空表示对所有端点生效
   operations?: string[]  // 作用域（适用的请求操作），为空表示对该格式的全部操作生效
+  thinking_efforts?: string[]  // 作用域（适用的思考强度：unspecified / minimal / low / medium / high / xhigh / max），为空表示不限制思考强度
 }
 
 // 保留别名以保持向后兼容

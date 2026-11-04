@@ -214,6 +214,7 @@ fn provider_query_parse_embedded_provider_model_mappings(
         api_formats: None,
         endpoint_ids: None,
         operations: None,
+        thinking_efforts: None,
     }]))
 }
 
@@ -239,6 +240,7 @@ fn provider_query_parse_provider_model_mappings_array(
                         api_formats: None,
                         endpoint_ids: None,
                         operations: None,
+                        thinking_efforts: None,
                     });
                 }
             }
@@ -300,6 +302,13 @@ fn provider_query_parse_provider_model_mapping_object_lenient(
         "models.provider_model_mappings.operations",
     )?
     .and_then(provider_query_normalize_request_operations);
+    let thinking_efforts = provider_query_parse_mapping_string_list(
+        object
+            .get("thinking_efforts")
+            .or_else(|| object.get("reasoning_efforts")),
+        "models.provider_model_mappings.thinking_efforts",
+    )?
+    .and_then(provider_query_normalize_thinking_efforts);
 
     Ok(Some(StoredProviderModelMapping {
         name: name.to_string(),
@@ -311,6 +320,7 @@ fn provider_query_parse_provider_model_mapping_object_lenient(
         api_formats,
         endpoint_ids,
         operations,
+        thinking_efforts,
     }))
 }
 
@@ -321,6 +331,20 @@ fn provider_query_normalize_request_operations(values: Vec<String>) -> Option<Ve
         .filter(|value| !value.is_empty())
         .collect::<Vec<_>>();
     (!operations.is_empty()).then_some(operations)
+}
+
+fn provider_query_normalize_thinking_efforts(values: Vec<String>) -> Option<Vec<String>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let efforts = values
+        .into_iter()
+        .map(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "unset" => "unspecified".to_string(),
+            other => other.to_string(),
+        })
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert(value.clone()))
+        .collect::<Vec<_>>();
+    (!efforts.is_empty()).then_some(efforts)
 }
 
 fn provider_query_parse_mapping_string_list(
@@ -407,6 +431,7 @@ mod tests {
             api_formats: Some(vec![api_format.to_string()]),
             endpoint_ids: None,
             operations: None,
+            thinking_efforts: None,
         }
     }
 

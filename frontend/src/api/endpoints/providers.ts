@@ -118,11 +118,11 @@ export async function updateProvider(
     provider_priority: number
     keep_priority_on_conversion: boolean
     responses_websocket_enabled: boolean
-    billing_type: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
-    monthly_quota_usd: number
-    quota_reset_day: number
-    quota_last_reset_at: string  // 周期开始时间
-    quota_expires_at: string
+    billing_type: 'monthly_quota' | 'pay_as_you_go' | 'free_tier' | null
+    monthly_quota_usd: number | null
+    quota_reset_day: number | null
+    quota_last_reset_at: string | null  // 周期开始时间
+    quota_expires_at: string | null
     rpm_limit: number | null
     // 请求配置（从 Endpoint 迁移）
     max_retries: number
@@ -164,11 +164,11 @@ export async function createProvider(
     provider_type?: ProviderType
     description?: string
     website?: string
-    billing_type?: 'monthly_quota' | 'pay_as_you_go' | 'free_tier'
-    monthly_quota_usd?: number
-    quota_reset_day?: number
-    quota_last_reset_at?: string
-    quota_expires_at?: string
+    billing_type?: 'monthly_quota' | 'pay_as_you_go' | 'free_tier' | null
+    monthly_quota_usd?: number | null
+    quota_reset_day?: number | null
+    quota_last_reset_at?: string | null
+    quota_expires_at?: string | null
     provider_priority?: number
     keep_priority_on_conversion?: boolean
     responses_websocket_enabled?: boolean
@@ -496,4 +496,25 @@ export async function getProviderMappingPreview(
     const response = await client.get<ProviderMappingPreviewResponse>(`/api/admin/providers/${providerId}/mapping-preview`)
     return normalizeProviderMappingPreview(response.data, providerId)
   })
+}
+
+export interface ResetProviderQuotaResponse {
+  message: string
+  provider_name: string
+  previous_used: number
+  current_used: number
+}
+
+/**
+ * 重置提供商已用额度
+ */
+export async function resetProviderQuota(
+  providerId: string,
+): Promise<ResetProviderQuotaResponse> {
+  const response = await client.delete<ResetProviderQuotaResponse>(
+    `/api/admin/provider-strategy/providers/${providerId}/quota`,
+  )
+  cache.delete(`providers:detail:${providerId}`)
+  cache.deleteByPrefix('providers:summary')
+  return response.data
 }

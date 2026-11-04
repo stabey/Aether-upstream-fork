@@ -41,6 +41,7 @@ pub(super) fn sample_row() -> StoredMinimalCandidateSelectionRow {
                 api_formats: Some(vec!["openai:chat".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             },
             StoredProviderModelMapping {
                 name: "gpt-4.1-responses".to_string(),
@@ -48,6 +49,7 @@ pub(super) fn sample_row() -> StoredMinimalCandidateSelectionRow {
                 api_formats: Some(vec!["openai:responses".to_string()]),
                 endpoint_ids: None,
                 operations: None,
+                thinking_efforts: None,
             },
         ]),
         model_supports_streaming: None,

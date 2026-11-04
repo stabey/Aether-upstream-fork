@@ -62,6 +62,7 @@ pub(crate) async fn build_admin_create_provider_record(
     let quota_reset_day = match payload.quota_reset_day {
         Some(value) if (1..=365).contains(&value) => Some(value),
         Some(_) => return Err("quota_reset_day 必须是 1 到 365 之间的整数".to_string()),
+        None if billing_type == "free_tier" => None,
         None => Some(30),
     };
     let quota_last_reset_at_unix_secs = payload
