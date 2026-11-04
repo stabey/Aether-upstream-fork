@@ -66,8 +66,8 @@ fn gemini_level(body: &Value) -> Option<ArgonLevel> {
         .and_then(ArgonLevel::parse)
 }
 
-/// Only explicit three-level inputs participate. Do not approximate a token
-/// budget, invent a default, or silently map xhigh/max/none to a different level.
+/// Missing effort defaults to low for eligible Antigravity Argon mappings.
+/// Explicit budgets and unsupported levels retain their existing semantics.
 pub(crate) fn request_level(
     enabled: bool,
     policy: &ModelDirectivePolicySnapshot,
@@ -86,18 +86,81 @@ pub(crate) fn request_level(
         Ok(None) => {}
     }
     let value = match aether_ai_formats::normalize_api_format_alias(client_format).as_str() {
-        "gemini:generate_content" => return gemini_level(body),
+        "gemini:generate_content" => {
+            return if gemini_effort_unspecified(body) {
+                Some(ArgonLevel::Low)
+            } else {
+                gemini_level(body)
+            };
+        }
         "openai:chat" => body.get("reasoning_effort"),
         "openai:responses" => body.get("reasoning").and_then(|v| v.get("effort")),
         "claude:messages" => {
             if body.pointer("/thinking/type").and_then(Value::as_str) == Some("disabled") {
                 return None;
             }
+            if body.get("thinking").is_some() && body.pointer("/output_config/effort").is_none() {
+                return None;
+            }
             body.pointer("/output_config/effort")
         }
-        _ => None,
+        _ => return None,
     };
-    value.and_then(Value::as_str).and_then(ArgonLevel::parse)
+    match value {
+        None => Some(ArgonLevel::Low),
+        Some(value) => value.as_str().and_then(ArgonLevel::parse),
+    }
+}
+
+fn gemini_effort_unspecified(body: &Value) -> bool {
+    let thinking = body
+        .get("generationConfig")
+        .or_else(|| body.get("generation_config"))
+        .and_then(|g| g.get("thinkingConfig").or_else(|| g.get("thinking_config")));
+    thinking.is_none_or(|t| {
+        t.is_object()
+            && [
+                "thinkingLevel",
+                "thinking_level",
+                "thinkingBudget",
+                "thinking_budget",
+            ]
+            .iter()
+            .all(|key| t.get(*key).is_none())
+    })
+}
+
+/// Modify only an owned Antigravity body after exact-account routing selected low.
+pub(crate) fn with_default_low(model: &str, body: &Value) -> Option<Value> {
+    if model != "gemini-4-argon-low" || !gemini_effort_unspecified(body) {
+        return None;
+    }
+    let mut result = body.clone();
+    let root = result.as_object_mut()?;
+    let generation_key = if root.contains_key("generationConfig") {
+        "generationConfig"
+    } else if root.contains_key("generation_config") {
+        "generation_config"
+    } else {
+        "generationConfig"
+    };
+    let generation = root
+        .entry(generation_key)
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()?;
+    let thinking_key = if generation.contains_key("thinkingConfig") {
+        "thinkingConfig"
+    } else if generation.contains_key("thinking_config") {
+        "thinking_config"
+    } else {
+        "thinkingConfig"
+    };
+    let thinking = generation
+        .entry(thinking_key)
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()?;
+    thinking.insert("thinkingLevel".into(), serde_json::json!("LOW"));
+    Some(result)
 }
 
 pub(crate) fn is_argon(model: &str) -> bool {
@@ -249,7 +312,6 @@ mod tests {
             );
         }
         for (format, body) in [
-            ("openai:chat", json!({})),
             ("openai:chat", json!({"reasoning_effort":"xhigh"})),
             ("openai:responses", json!({"reasoning":{"effort":"none"}})),
             (
@@ -274,6 +336,36 @@ mod tests {
                 None,
                 "{format} {body}"
             );
+        }
+    }
+
+    #[test]
+    fn argon_missing_effort_defaults_low_without_mutating_shared_body() {
+        let policy = ModelDirectivePolicySnapshot::default();
+        for format in [
+            "gemini:generate_content",
+            "openai:chat",
+            "openai:responses",
+            "claude:messages",
+        ] {
+            assert_eq!(
+                request_level(true, &policy, format, "gemini-4-argon", &json!({})),
+                Some(ArgonLevel::Low)
+            );
+        }
+        let body =
+            json!({"tools":[{"googleSearch":{}}],"generationConfig":{"maxOutputTokens":100}});
+        let patched = with_default_low("gemini-4-argon-low", &body).unwrap();
+        assert!(body_matches_variant("gemini-4-argon-low", &patched));
+        assert_eq!(patched["tools"], body["tools"]);
+        assert_eq!(patched["generationConfig"]["maxOutputTokens"], 100);
+        assert!(body.pointer("/generationConfig/thinkingConfig").is_none());
+        assert!(with_default_low("gemini-4-argon-high", &body).is_none());
+        for body in [
+            json!({"generationConfig":{"thinkingConfig":{"thinkingBudget":0}}}),
+            json!({"generationConfig":{"thinkingConfig":{"thinkingLevel":"HIGH"}}}),
+        ] {
+            assert!(with_default_low("gemini-4-argon-low", &body).is_none());
         }
     }
 

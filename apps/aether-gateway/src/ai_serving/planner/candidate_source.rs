@@ -2768,7 +2768,14 @@ mod tests {
                 vec![row.clone()],
                 "gemini-4-argon",
                 "gemini:generate_content",
-                ArgonLevel::Low,
+                super::super::argon_routing::request_level(
+                    true,
+                    &policy,
+                    "gemini:generate_content",
+                    "gemini-4-argon",
+                    &serde_json::json!({"tools": [{"googleSearch": {}}]}),
+                )
+                .expect("search requests without effort default to low"),
             )
             .await
             .unwrap();
