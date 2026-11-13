@@ -1,5 +1,8 @@
 <template>
-  <div class="relative">
+  <div
+    ref="rootElement"
+    class="relative"
+  >
     <button
       ref="triggerElement"
       type="button"
@@ -11,6 +14,8 @@
         )
       "
       :disabled="disabled"
+      :aria-expanded="isOpen"
+      aria-haspopup="listbox"
       @click="toggleDropdown"
     >
       <span
@@ -34,13 +39,17 @@
     >
       <div
         v-if="isOpen"
-        class="fixed inset-0 z-[80]"
-        @click.stop="isOpen = false"
-      />
-      <div
-        v-if="isOpen"
-        class="z-[90] overflow-hidden rounded-2xl border border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
-        :class="teleport ? 'fixed' : 'absolute mt-1 w-full'"
+        ref="dropdownElement"
+        data-multiselect-dropdown
+        :data-side="dropdownSide"
+        class="z-[210] overflow-hidden rounded-2xl border border-border bg-card text-foreground shadow-2xl backdrop-blur-xl"
+        :class="
+          teleport
+            ? 'fixed'
+            : dropdownSide === 'top'
+              ? 'absolute bottom-full mb-1 w-full'
+              : 'absolute top-full mt-1 w-full'
+        "
         :style="dropdownStyle"
       >
         <div
@@ -60,7 +69,10 @@
           </div>
         </div>
 
-        <div class="max-h-64 overflow-y-auto p-1">
+        <div
+          class="overflow-y-auto overscroll-contain p-1"
+          :style="{ maxHeight: `${listMaxHeight}px` }"
+        >
           <div
             v-if="hasOptions"
             class="sticky top-0 z-10 flex cursor-pointer items-center gap-2 rounded-lg border-b border-border/60 bg-card/95 px-3 py-2 backdrop-blur hover:bg-muted/50 supports-[backdrop-filter]:bg-card/85"
@@ -126,13 +138,13 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { ChevronDown, Search } from 'lucide-vue-next'
 import { Input } from '@/components/ui'
+import { useEscapeKey } from '@/composables/useEscapeKey'
 import { cn } from '@/lib/utils'
 import { matchesSearchQuery } from '@/utils/search'
 import { useI18n } from '@/i18n'
-
 export interface MultiSelectOption {
   value: string
   label: string
@@ -163,7 +175,7 @@ const props = withDefaults(
     searchable: true,
     searchThreshold: 8,
     searchPlaceholder: undefined,
-    teleport: false,
+    teleport: true,
   },
 )
 
@@ -172,42 +184,37 @@ const emit = defineEmits<{
 }>()
 const { t } = useI18n()
 
+const DROPDOWN_OFFSET = 4
+const VIEWPORT_PADDING = 12
+const DEFAULT_LIST_MAX_HEIGHT = 320
+const MIN_LIST_MAX_HEIGHT = 96
+const SEARCH_BAR_HEIGHT = 46
+const ESTIMATED_ROW_HEIGHT = 36
+const SCROLLABLE_OVERFLOW_RE = /(auto|scroll|hidden|clip)/
+
 const isOpen = ref(false)
 const searchQuery = ref('')
+const rootElement = ref<HTMLElement | null>(null)
 const triggerElement = ref<HTMLElement | null>(null)
+const dropdownElement = ref<HTMLElement | null>(null)
+const dropdownSide = ref<'top' | 'bottom'>('bottom')
+const listMaxHeight = ref(DEFAULT_LIST_MAX_HEIGHT)
 const dropdownPosition = ref<Record<string, string>>({})
 
-const dropdownStyle = computed(() => {
-  const style: Record<string, string> = { ...dropdownPosition.value }
-  if (props.dropdownMinWidth) {
-    style.minWidth = props.dropdownMinWidth
+const { addToStack: addEscapeListener, removeFromStack: removeEscapeListener } = useEscapeKey(
+  () => {
+    if (!isOpen.value) return false
+    isOpen.value = false
+    return true
+  },
+  { disableOnInput: false },
+)
+
+onMounted(() => {
+  if (!isOpen.value) {
+    removeEscapeListener()
   }
-  return style
 })
-
-function updateDropdownPosition() {
-  if (!props.teleport || !triggerElement.value) return
-  const rect = triggerElement.value.getBoundingClientRect()
-  dropdownPosition.value = {
-    top: `${rect.bottom + 4}px`,
-    left: `${rect.left}px`,
-    width: `${rect.width}px`,
-  }
-}
-
-async function toggleDropdown() {
-  isOpen.value = !isOpen.value
-  if (isOpen.value && props.teleport) {
-    await nextTick()
-    updateDropdownPosition()
-  }
-}
-
-function removePositionListeners() {
-  if (typeof window === 'undefined') return
-  window.removeEventListener('resize', updateDropdownPosition)
-  window.removeEventListener('scroll', updateDropdownPosition, true)
-}
 
 const validValues = computed(() => new Set(props.options.map(o => o.value)))
 
@@ -272,18 +279,188 @@ const displayText = computed(() => {
   }
   return t('feedback.select.selectedCount', { count: props.modelValue.length })
 })
+const dropdownStyle = computed(() => {
+  const style: Record<string, string> = props.teleport ? { ...dropdownPosition.value } : {}
+  if (props.dropdownMinWidth) {
+    style.minWidth = `min(${props.dropdownMinWidth}, calc(100vw - ${VIEWPORT_PADDING * 2}px))`
+  }
+  return style
+})
+
+function isEventInsideComponent(event: Event): boolean {
+  const rootEl = rootElement.value
+  const dropdownEl = dropdownElement.value
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : []
+  if ((rootEl && path.includes(rootEl)) || (dropdownEl && path.includes(dropdownEl))) {
+    return true
+  }
+  const target = event.target
+  if (target instanceof Node) {
+    return Boolean(rootEl?.contains(target) || dropdownEl?.contains(target))
+  }
+  return false
+}
+
+function isTriggerClippedByScrollParent(rect: { top: number; bottom: number }): boolean {
+  if (typeof window === 'undefined' || !triggerElement.value) return false
+  let parent = triggerElement.value.parentElement
+  while (parent && parent !== document.body && parent !== document.documentElement) {
+    const style = window.getComputedStyle(parent)
+    if (SCROLLABLE_OVERFLOW_RE.test(style.overflowY) || SCROLLABLE_OVERFLOW_RE.test(style.overflow)) {
+      const parentRect = parent.getBoundingClientRect()
+      if (parentRect.height > 0 && (rect.bottom <= parentRect.top || rect.top >= parentRect.bottom)) {
+        return true
+      }
+    }
+    parent = parent.parentElement
+  }
+  return false
+}
+
+function updateDropdownPosition(recalculateSide = false) {
+  if (typeof window === 'undefined' || !triggerElement.value) return
+  const rect = triggerElement.value.getBoundingClientRect()
+  const viewportWidth = window.innerWidth || 0
+  const viewportHeight = window.innerHeight || 0
+  const searchHeight = showSearch.value ? SEARCH_BAR_HEIGHT : 0
+  const rowCount =
+    (hasOptions.value ? 1 : 0) +
+    filteredInvalidItems.value.length +
+    Math.max(1, filteredOptions.value.length)
+  const desiredListHeight = Math.min(DEFAULT_LIST_MAX_HEIGHT, rowCount * ESTIMATED_ROW_HEIGHT + 8)
+  const desiredTotalHeight = searchHeight + desiredListHeight
+
+  if (viewportHeight > 0) {
+    const spaceBelow = viewportHeight - rect.bottom - DROPDOWN_OFFSET - VIEWPORT_PADDING
+    const spaceAbove = rect.top - DROPDOWN_OFFSET - VIEWPORT_PADDING
+
+    if (recalculateSide) {
+      dropdownSide.value = spaceBelow < desiredTotalHeight && spaceAbove > spaceBelow ? 'top' : 'bottom'
+    } else if (
+      dropdownSide.value === 'bottom' &&
+      spaceBelow < MIN_LIST_MAX_HEIGHT + searchHeight &&
+      spaceAbove > spaceBelow
+    ) {
+      dropdownSide.value = 'top'
+    } else if (
+      dropdownSide.value === 'top' &&
+      spaceAbove < MIN_LIST_MAX_HEIGHT + searchHeight &&
+      spaceBelow > spaceAbove
+    ) {
+      dropdownSide.value = 'bottom'
+    }
+
+    const availableSideSpace = dropdownSide.value === 'top' ? spaceAbove : spaceBelow
+    listMaxHeight.value = Math.min(
+      DEFAULT_LIST_MAX_HEIGHT,
+      Math.max(MIN_LIST_MAX_HEIGHT, Math.floor(availableSideSpace - searchHeight)),
+    )
+  } else {
+    dropdownSide.value = 'bottom'
+    listMaxHeight.value = DEFAULT_LIST_MAX_HEIGHT
+  }
+
+  if (!props.teleport) {
+    dropdownPosition.value = {}
+    return
+  }
+
+  const renderedWidth = Math.max(rect.width, dropdownElement.value?.offsetWidth ?? 0)
+  const clampedLeft =
+    viewportWidth > 0 && renderedWidth > 0
+      ? Math.min(
+        Math.max(VIEWPORT_PADDING, rect.left),
+        Math.max(VIEWPORT_PADDING, viewportWidth - renderedWidth - VIEWPORT_PADDING),
+      )
+      : rect.left
+
+  const nextPosition: Record<string, string> = {
+    left: `${clampedLeft}px`,
+    maxWidth: `calc(100vw - ${VIEWPORT_PADDING * 2}px)`,
+  }
+  if (rect.width > 0) {
+    nextPosition.width = `${rect.width}px`
+  }
+  if (viewportHeight > 0) {
+    nextPosition.maxHeight = `${Math.max(120, viewportHeight - VIEWPORT_PADDING * 2)}px`
+  }
+  if (dropdownSide.value === 'top' && viewportHeight > 0) {
+    nextPosition.bottom = `${Math.max(VIEWPORT_PADDING, viewportHeight - rect.top + DROPDOWN_OFFSET)}px`
+  } else {
+    nextPosition.top = `${Math.max(VIEWPORT_PADDING, rect.bottom + DROPDOWN_OFFSET)}px`
+  }
+  dropdownPosition.value = nextPosition
+}
+
+function handleWindowResize() {
+  updateDropdownPosition(true)
+}
+
+function handleViewportScroll(event: Event) {
+  const target = event.target
+  if (dropdownElement.value && target instanceof Node && dropdownElement.value.contains(target)) {
+    return
+  }
+  if (triggerElement.value) {
+    const rect = triggerElement.value.getBoundingClientRect()
+    if ((rect.width > 0 || rect.height > 0) && isTriggerClippedByScrollParent(rect)) {
+      isOpen.value = false
+      return
+    }
+  }
+  updateDropdownPosition(false)
+}
+
+function handleOutsideInteraction(event: Event) {
+  if (!isOpen.value || isEventInsideComponent(event)) return
+  isOpen.value = false
+}
+
+async function toggleDropdown() {
+  if (props.disabled) return
+  const nextOpen = !isOpen.value
+  if (nextOpen) {
+    updateDropdownPosition(true)
+  }
+  isOpen.value = nextOpen
+  if (nextOpen) {
+    await nextTick()
+    updateDropdownPosition(false)
+  }
+}
+
+function removeOpenListeners() {
+  if (typeof window === 'undefined') return
+  window.removeEventListener('resize', handleWindowResize)
+  window.removeEventListener('scroll', handleViewportScroll, true)
+  document.removeEventListener('pointerdown', handleOutsideInteraction, true)
+  document.removeEventListener('click', handleOutsideInteraction, true)
+  removeEscapeListener()
+}
+watch(
+  () => props.disabled,
+  (disabled) => {
+    if (disabled && isOpen.value) {
+      isOpen.value = false
+    }
+  },
+)
 
 watch(isOpen, (open) => {
-  if (open && props.teleport && typeof window !== 'undefined') {
-    window.addEventListener('resize', updateDropdownPosition)
-    window.addEventListener('scroll', updateDropdownPosition, true)
+  if (open && typeof window !== 'undefined') {
+    window.addEventListener('resize', handleWindowResize)
+    window.addEventListener('scroll', handleViewportScroll, true)
+    document.addEventListener('pointerdown', handleOutsideInteraction, true)
+    document.addEventListener('click', handleOutsideInteraction, true)
+    removeEscapeListener()
+    addEscapeListener()
   } else {
     searchQuery.value = ''
-    removePositionListeners()
+    removeOpenListeners()
   }
 })
 
-onBeforeUnmount(removePositionListeners)
+onBeforeUnmount(removeOpenListeners)
 
 function toggle(value: string) {
   const newValue = [...props.modelValue]
