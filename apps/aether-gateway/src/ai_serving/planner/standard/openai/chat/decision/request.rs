@@ -2712,6 +2712,12 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}],
             "stream": true
         });
+        let mut eligible = sample_antigravity_eligible();
+        Arc::make_mut(&mut eligible.transport).endpoint.body_rules = Some(json!([
+            {"action": "regex_replace", "path": "contents[*].parts[*].text",
+             "pattern": "hello", "replacement": "hello once"},
+            {"action": "set", "path": "generationConfig.temperature", "value": 0.25}
+        ]));
 
         let payload = resolve_local_openai_chat_candidate_payload_parts(
             &state,
@@ -2720,7 +2726,7 @@ mod tests {
             &body_json,
             &sample_input(),
             None,
-            &sample_antigravity_eligible(),
+            &eligible,
             0,
             "candidate-0",
             OPENAI_CHAT_STREAM_PLAN_KIND,
@@ -2785,6 +2791,14 @@ mod tests {
         assert!(payload.provider_request_body["request"]
             .get("model")
             .is_none());
+        assert_eq!(
+            payload.provider_request_body["request"]["contents"][0]["parts"][0]["text"],
+            "hello once"
+        );
+        assert_eq!(
+            payload.provider_request_body["request"]["generationConfig"]["temperature"],
+            0.25
+        );
     }
 
     #[test]

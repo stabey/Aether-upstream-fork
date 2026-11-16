@@ -37,6 +37,8 @@ pub(crate) struct AntigravityV1InternalRequestInput<'a> {
     pub(crate) auth_value: &'a str,
     pub(crate) request_headers: &'a http::HeaderMap,
     pub(crate) original_request_body: &'a Value,
+    // The planner's Gemini body builder has already applied endpoint body rules.
+    // Wrapping must not apply them again (replacement/append rules are not idempotent).
     pub(crate) gemini_request_body: &'a Value,
     pub(crate) upstream_is_stream: bool,
     pub(crate) same_format: bool,

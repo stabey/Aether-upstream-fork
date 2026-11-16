@@ -10,7 +10,7 @@ use super::request::{
     classify_antigravity_safe_request_body, AntigravityEnvelopeRequestType,
     AntigravityRequestEnvelopeUnsupportedReason,
 };
-use crate::rules::{body_rules_have_enabled_rules, header_rules_have_enabled_rules};
+use crate::rules::{body_rules_are_locally_supported, header_rules_have_enabled_rules};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AntigravityRequestSideSpec {
@@ -83,7 +83,7 @@ pub fn classify_local_antigravity_request_support(
             AntigravityRequestSideUnsupportedReason::UnsupportedHeaderRules,
         );
     }
-    if body_rules_have_enabled_rules(transport.endpoint.body_rules.as_ref()) {
+    if !body_rules_are_locally_supported(transport.endpoint.body_rules.as_ref()) {
         return AntigravityRequestSideSupport::Unsupported(
             AntigravityRequestSideUnsupportedReason::UnsupportedBodyRules,
         );
@@ -202,6 +202,31 @@ mod tests {
             support,
             AntigravityRequestSideSupport::Unsupported(
                 AntigravityRequestSideUnsupportedReason::UnsupportedNetworkConfig,
+            )
+        );
+    }
+
+    #[test]
+    fn locally_supported_body_rules_do_not_disqualify_the_envelope() {
+        let mut transport = sample_transport();
+        transport.endpoint.body_rules = Some(json!([
+            {"action": "regex_replace", "path": "contents[*].parts[*].text",
+             "pattern": "hello", "replacement": "hello once"}
+        ]));
+        assert!(matches!(
+            classify(&transport),
+            AntigravityRequestSideSupport::Supported(_)
+        ));
+    }
+
+    #[test]
+    fn non_array_body_rules_still_disqualify_the_envelope() {
+        let mut transport = sample_transport();
+        transport.endpoint.body_rules = Some(json!({"action": "set", "path": "contents"}));
+        assert_eq!(
+            classify(&transport),
+            AntigravityRequestSideSupport::Unsupported(
+                AntigravityRequestSideUnsupportedReason::UnsupportedBodyRules
             )
         );
     }

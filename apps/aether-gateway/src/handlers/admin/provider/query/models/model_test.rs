@@ -2620,6 +2620,27 @@ async fn provider_query_finalize_antigravity_result(
         .map_err(|err| GatewayError::Internal(err.to_string()))
 }
 
+fn provider_query_build_antigravity_test_body(
+    request_body: &Value,
+    request_model: &str,
+    transport: &AdminGatewayProviderTransportSnapshot,
+    request_headers: &http::HeaderMap,
+) -> Option<Value> {
+    let body = crate::ai_serving::build_cross_format_openai_chat_request_body(
+        request_body,
+        request_model,
+        "gemini:generate_content",
+        false,
+    )?;
+    // Apply endpoint rules to the Gemini body, never the v1internal envelope.
+    crate::provider_transport::apply_standard_provider_request_body_rules_with_request_headers(
+        body,
+        transport.endpoint.body_rules.as_ref(),
+        request_body,
+        request_headers,
+    )
+}
+
 async fn provider_query_execute_antigravity_test_candidate(
     state: &AdminAppState<'_>,
     provider: &StoredProviderCatalogProvider,
@@ -2654,14 +2675,13 @@ async fn provider_query_execute_antigravity_test_candidate(
     }
     let request_model =
         provider_query_request_body_model(&request_body, &candidate.effective_model).to_string();
-    let Some(base_provider_request_body) =
-        crate::ai_serving::build_cross_format_openai_chat_request_body(
-            &request_body,
-            &request_model,
-            "gemini:generate_content",
-            false,
-        )
-    else {
+    let incoming_request_headers = provider_query_extract_request_headers(payload);
+    let Some(base_provider_request_body) = provider_query_build_antigravity_test_body(
+        &request_body,
+        &request_model,
+        &transport,
+        &incoming_request_headers,
+    ) else {
         return Ok(provider_query_skipped_execution_outcome(
             request_body.clone(),
             "Provider request body could not be built for antigravity",
@@ -2739,7 +2759,6 @@ async fn provider_query_execute_antigravity_test_candidate(
             "Provider auth is unavailable for antigravity",
         ));
     };
-    let incoming_request_headers = provider_query_extract_request_headers(payload);
     let mut synthetic_request = http::Request::builder()
         .uri(route_path)
         .body(())

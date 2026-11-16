@@ -73,6 +73,10 @@ Hub 内置版本为 `2.28.2`，使用 `antigravity/hub/{version} (aidev_client; 
 - Grok CLI 默认版本头和 UA 从同一个快照产生；保留既有显式头覆盖规则。
 - Antigravity 在认证解析时捕获完整画像快照，推理头和新建 envelope 共用该快照；
   已显式传入的 envelope `userAgent` 继续保留。模型发现、loadCodeAssist 和配额头复用同一画像来源。
+  端点 `body_rules` 支持本地规则引擎已实现的操作：原生透传、格式转换和管理端模型测试
+  均在 Gemini 请求体上执行一次，再包装 `v1internal` envelope；路径使用 `contents`、
+  `systemInstruction` 等 Gemini 字段，不加 `request.` 前缀。非数组规则配置拒绝执行；
+  数组内未知操作沿用公共规则引擎的跳过语义。启用的 `header_rules` 仍不受支持。
 - Gemini CLI 的推理、配额和模型发现读取同一进程内画像来源，而不是各自维护版本常量。
 - Claude Code 在共同出站策略边界重新对齐固定头、beta 和 billing `cc_version`，
   使用一次取得的画像完成头/体校准。保留内容协商和流式行为；count-tokens 不执行

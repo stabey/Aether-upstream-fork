@@ -70,6 +70,64 @@ fn sample_openai_image_transport(provider_type: &str) -> AdminGatewayProviderTra
     }
 }
 
+#[test]
+fn provider_query_antigravity_body_rules_transform_outgoing_envelope_once() {
+    let mut transport = sample_openai_image_transport("antigravity");
+    transport.endpoint.api_format = "gemini:generate_content".to_string();
+    transport.key.decrypted_auth_config =
+        Some(json!({"provider_type": "antigravity", "project_id": "test-project"}).to_string());
+    transport.endpoint.body_rules = Some(json!([
+        {"action": "regex_replace", "path": "contents[*].parts[*].text",
+         "pattern": "hello", "replacement": "hello once"},
+        {"action": "set", "path": "generationConfig.temperature", "value": 0.25}
+    ]));
+    let original = json!({
+        "model": "gemini-3.8-flash",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let body = provider_query_build_antigravity_test_body(
+        &original,
+        "gemini-3.8-flash",
+        &transport,
+        &http::HeaderMap::new(),
+    )
+    .expect("supported rules should build the Gemini body");
+    let AntigravityRequestSideSupport::Supported(spec) = classify_local_antigravity_request_support(
+        &transport,
+        &body,
+        AntigravityEnvelopeRequestType::EndpointTest,
+    ) else {
+        panic!("supported rules should allow the admin model test");
+    };
+    let AntigravityRequestEnvelopeSupport::Supported(envelope) =
+        build_antigravity_safe_v1internal_request(
+            &spec.auth,
+            "test-body-rules",
+            "gemini-3.8-flash",
+            &body,
+            AntigravityEnvelopeRequestType::EndpointTest,
+        )
+    else {
+        panic!("transformed request should build an envelope");
+    };
+    assert_eq!(
+        envelope["request"]["contents"][0]["parts"][0]["text"],
+        "hello once"
+    );
+    assert_eq!(envelope["request"]["generationConfig"]["temperature"], 0.25);
+    assert!(envelope.get("contents").is_none());
+
+    transport.endpoint.body_rules = Some(json!({"action": "set", "path": "contents"}));
+    assert!(provider_query_build_antigravity_test_body(
+        &original,
+        "gemini-3.8-flash",
+        &transport,
+        &http::HeaderMap::new(),
+    )
+    .is_none());
+    assert!(provider_query_antigravity_test_unsupported_reason(&transport, &body).is_some());
+}
+
 fn sample_catalog_key_with_allowed_models(
     allowed_models: Option<serde_json::Value>,
 ) -> aether_data_contracts::repository::provider_catalog::StoredProviderCatalogKey {

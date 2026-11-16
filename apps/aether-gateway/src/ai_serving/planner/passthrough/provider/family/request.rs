@@ -757,6 +757,90 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_native_body_rules_transform_outgoing_envelope_once() {
+        use super::{
+            build_antigravity_safe_v1internal_request, classify_local_antigravity_request_support,
+            AntigravityEnvelopeRequestType, AntigravityRequestEnvelopeSupport,
+            AntigravityRequestSideSupport,
+        };
+        use serde_json::json;
+
+        let mut transport = private_adapter_transport("antigravity");
+        transport.endpoint.api_format = "gemini:generate_content".to_string();
+        transport.key.decrypted_auth_config =
+            Some(json!({"project_id": "test-project"}).to_string());
+        transport.endpoint.body_rules = Some(json!([
+            {"action": "regex_replace", "path": "systemInstruction.parts[*].text",
+             "pattern": "hello", "replacement": "hello once"},
+            {"action": "set", "path": "generationConfig.temperature", "value": 0.25}
+        ]));
+        let original = json!({
+            "systemInstruction": {"parts": [{"text": "keep hello unchanged"}]},
+            "contents": [{"role": "user", "parts": [{"text": "Reply with OK."}]}]
+        });
+        let spec = super::LocalSameFormatProviderSpec {
+            api_format: "gemini:generate_content",
+            decision_kind: "gemini_chat_sync",
+            report_kind: "gemini_chat_sync_success",
+            family: crate::ai_serving::planner::passthrough::provider::LocalSameFormatProviderFamily::Gemini,
+            require_streaming: false,
+            operation: None,
+        };
+        let build_body = |rules| {
+            super::super::super::request::build_same_format_provider_request_body_with_compatibility_report(
+                &original,
+                "gemini:generate_content",
+                "gemini-3.8-flash",
+                spec,
+                rules,
+                None,
+                false,
+                false,
+                None,
+                false,
+                false,
+                false,
+                super::openai_responses_reasoning_replay_policy(
+                    "antigravity",
+                    &transport.endpoint.base_url,
+                    "gemini-3.8-flash",
+                ),
+            )
+        };
+        let body = build_body(transport.endpoint.body_rules.as_ref())
+            .expect("native body should apply supported rules")
+            .body;
+        let AntigravityRequestSideSupport::Supported(spec) =
+            classify_local_antigravity_request_support(
+                &transport,
+                &body,
+                AntigravityEnvelopeRequestType::Agent,
+            )
+        else {
+            panic!("native transport should support body rules");
+        };
+        let AntigravityRequestEnvelopeSupport::Supported(envelope) =
+            build_antigravity_safe_v1internal_request(
+                &spec.auth,
+                "native-body-rules",
+                "gemini-3.8-flash",
+                &body,
+                AntigravityEnvelopeRequestType::Agent,
+            )
+        else {
+            panic!("native body should build an envelope");
+        };
+        assert_eq!(
+            envelope["request"]["systemInstruction"]["parts"][0]["text"],
+            "keep hello once unchanged"
+        );
+        assert_eq!(envelope["request"]["generationConfig"]["temperature"], 0.25);
+        assert!(envelope.get("systemInstruction").is_none());
+        let unsupported = json!({"action": "set", "path": "contents"});
+        assert!(build_body(Some(&unsupported)).is_none());
+    }
+
+    #[test]
     fn private_adapter_count_tokens_is_rejected_by_pre_auth_operation_gate() {
         for provider_type in ["kiro", "grok"] {
             let transport = private_adapter_transport(provider_type);
