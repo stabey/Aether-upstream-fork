@@ -420,7 +420,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
     };
     let mut provider_request_body = if let Some(antigravity_auth) = antigravity_auth.as_ref() {
         let default_body = candidate
-            .requires_exact_model_permission
+            .enforce_thinking_effort_consistency
             .then(|| {
                 crate::ai_serving::planner::argon_routing::with_default_variant_level(
                     &prepared.mapped_model,
@@ -431,7 +431,7 @@ pub(crate) async fn resolve_local_same_format_provider_candidate_payload_parts(
         let antigravity_request_body = default_body
             .as_ref()
             .unwrap_or(&base_provider_request_body);
-        if candidate.requires_exact_model_permission
+        if candidate.enforce_thinking_effort_consistency
             && !crate::ai_serving::planner::argon_routing::body_matches_variant(
                 &prepared.mapped_model,
                 antigravity_request_body,

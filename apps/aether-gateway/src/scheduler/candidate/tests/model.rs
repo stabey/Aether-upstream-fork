@@ -81,15 +81,29 @@ fn resolves_mapping_matched_model_from_key_allowed_models() {
 }
 
 #[test]
-fn resolves_mapping_matched_model_from_global_regex_mapping() {
+fn mapped_and_alias_permissions_cannot_grant_provider_model_access() {
+    for allowed_model in ["gpt-4.1-canary", "gpt-4.1", "gpt-4.1-variant", "gpt-4.1.*"] {
+        let mut row = sample_row();
+        row.key_allowed_models = Some(vec![allowed_model.to_string()]);
+
+        assert!(
+            resolve_provider_model_name(&row, "gpt-4.1", "openai:chat").is_none(),
+            "permission for {allowed_model} must not authorize the stored provider model"
+        );
+    }
+}
+
+#[test]
+fn provider_model_permissions_preserve_null_and_empty_semantics() {
     let mut row = sample_row();
-    row.key_allowed_models = Some(vec!["gpt-4.1-variant".to_string()]);
-
+    row.key_allowed_models = None;
     let resolved = resolve_provider_model_name(&row, "gpt-4.1", "openai:chat")
-        .expect("candidate should resolve");
+        .expect("null account permissions are unrestricted");
+    assert_eq!(resolved.0, "gpt-4.1-canary");
+    assert_eq!(resolved.1, None);
 
-    assert_eq!(resolved.0, "gpt-4.1-variant");
-    assert_eq!(resolved.1, Some("gpt-4.1-variant".to_string()));
+    row.key_allowed_models = Some(Vec::new());
+    assert!(resolve_provider_model_name(&row, "gpt-4.1", "openai:chat").is_none());
 }
 
 #[test]
@@ -130,7 +144,8 @@ fn resolves_requested_global_model_from_global_regex_mapping() {
 #[test]
 fn scheduler_candidate_is_serializable() {
     let candidate = SchedulerMinimalCandidateSelectionCandidate {
-        requires_exact_model_permission: false,
+        enforce_thinking_effort_consistency: false,
+        permission_provider_model_name: "gpt-4.1-upstream".to_string(),
         provider_id: "provider-1".to_string(),
         provider_name: "OpenAI".to_string(),
         provider_type: "custom".to_string(),
@@ -153,6 +168,8 @@ fn scheduler_candidate_is_serializable() {
 
     let json = serde_json::to_value(candidate).expect("candidate should serialize");
     assert_eq!(json["provider_name"], "OpenAI");
+    assert!(json.get("permission_provider_model_name").is_none());
+    assert!(json.get("enforce_thinking_effort_consistency").is_none());
 }
 
 /// A provider whose own model reaches the upstream under a borrowed name must not

@@ -461,7 +461,6 @@ impl MinimalCandidateSelectionReadRepository for CachedMinimalCandidateSelection
             provider_id: query.provider_id.clone(),
             endpoint_id: query.endpoint_id.clone(),
             model_id: query.model_id.clone(),
-            selected_provider_model_name: query.selected_provider_model_name.clone(),
             order: CandidateSelectionPoolOrderKey::from(&query.order),
             offset: query.offset,
             limit: query.limit,
@@ -479,7 +478,6 @@ impl MinimalCandidateSelectionReadRepository for CachedMinimalCandidateSelection
             provider_id: query.provider_id.clone(),
             endpoint_id: query.endpoint_id.clone(),
             model_id: query.model_id.clone(),
-            selected_provider_model_name: query.selected_provider_model_name.clone(),
             key_ids: query.key_ids.clone(),
         };
         self.get_or_load(key, || {
@@ -518,7 +516,6 @@ enum CandidateSelectionCacheKey {
         provider_id: String,
         endpoint_id: String,
         model_id: String,
-        selected_provider_model_name: String,
         order: CandidateSelectionPoolOrderKey,
         offset: u32,
         limit: u32,
@@ -528,7 +525,6 @@ enum CandidateSelectionCacheKey {
         provider_id: String,
         endpoint_id: String,
         model_id: String,
-        selected_provider_model_name: String,
         key_ids: Vec<String>,
     },
 }
@@ -1223,7 +1219,6 @@ mod tests {
             provider_id: "provider-1".to_string(),
             endpoint_id: "endpoint-1".to_string(),
             model_id: "model-1".to_string(),
-            selected_provider_model_name: "mock-model".to_string(),
             order: StoredPoolKeyCandidateOrder::LoadBalance {
                 seed: seed.to_string(),
             },

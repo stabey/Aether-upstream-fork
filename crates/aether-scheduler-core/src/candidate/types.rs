@@ -9,10 +9,13 @@ pub enum SchedulerPriorityMode {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SchedulerMinimalCandidateSelectionCandidate {
-    /// Request-time variant resolution must be checked against the concrete
-    /// account model permission, not a client/global alias. Pool clones retain it.
+    /// Request-time variant resolution must agree with the final body effort.
+    /// This does not change the provider model used for account permissions.
     #[serde(skip_serializing)]
-    pub requires_exact_model_permission: bool,
+    pub enforce_thinking_effort_consistency: bool,
+    /// Original stored provider model name, before request-time routing mappings.
+    #[serde(skip_serializing)]
+    pub permission_provider_model_name: String,
     pub provider_id: String,
     pub provider_name: String,
     pub provider_type: String,

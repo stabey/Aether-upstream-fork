@@ -467,7 +467,7 @@ mod tests {
         endpoint_id: &str,
     ) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
             provider_id: "provider-1".to_string(),
             provider_name: "provider".to_string(),
             provider_type: "custom".to_string(),
@@ -484,6 +484,11 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "claude-sonnet-4-5".to_string(),
             selected_provider_model_name: if api_format == "claude:messages" {
+                "claude-sonnet-4-5-upstream".to_string()
+            } else {
+                "gpt-4o-upstream".to_string()
+            },
+            permission_provider_model_name: if api_format == "claude:messages" {
                 "claude-sonnet-4-5-upstream".to_string()
             } else {
                 "gpt-4o-upstream".to_string()

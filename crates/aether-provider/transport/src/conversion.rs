@@ -32,9 +32,7 @@ use crate::GatewayProviderTransportSnapshot;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CandidateTransportPolicyFacts<'a> {
     pub endpoint_api_format: &'a str,
-    pub global_model_name: &'a str,
-    pub selected_provider_model_name: &'a str,
-    pub mapping_matched_model: Option<&'a str>,
+    pub permission_provider_model_name: &'a str,
 }
 
 pub fn request_conversion_enabled_for_transport(
@@ -263,10 +261,7 @@ fn request_direct_auth_for_provider_format(
 pub fn candidate_common_transport_skip_reason(
     transport: &GatewayProviderTransportSnapshot,
     candidate: CandidateTransportPolicyFacts<'_>,
-    requested_model: Option<&str>,
 ) -> Option<&'static str> {
-    let requested_model = requested_model.unwrap_or_default();
-
     if !transport.provider.is_active {
         return Some("provider_inactive");
     }
@@ -288,7 +283,7 @@ pub fn candidate_common_transport_skip_reason(
     if !transport_key_supports_api_format(transport, endpoint_api_format) {
         return Some("key_api_format_disabled");
     }
-    if !transport_key_allows_candidate_model(transport, requested_model, candidate) {
+    if !transport_key_allows_candidate_model(transport, candidate) {
         return Some("key_model_disabled");
     }
 
@@ -375,39 +370,17 @@ fn transport_key_supports_api_format(
 
 fn transport_key_allows_candidate_model(
     transport: &GatewayProviderTransportSnapshot,
-    requested_model: &str,
     candidate: CandidateTransportPolicyFacts<'_>,
 ) -> bool {
     let Some(allowed_models) = transport.key.allowed_models.as_deref() else {
         return true;
     };
 
-    let requested_model = requested_model.trim();
-    let global_model_name = candidate.global_model_name.trim();
-    let selected_provider_model_name = candidate.selected_provider_model_name.trim();
-    let mapping_matched_model = candidate
-        .mapping_matched_model
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let requested_base_model = aether_ai_formats::model_directive_base_model(requested_model);
-
-    for allowed_model in allowed_models.iter().map(String::as_str).map(str::trim) {
-        if allowed_model.is_empty() {
-            continue;
-        }
-        if allowed_model == requested_model
-            || requested_base_model
-                .as_deref()
-                .is_some_and(|base_model| allowed_model == base_model)
-            || allowed_model == global_model_name
-            || allowed_model == selected_provider_model_name
-            || mapping_matched_model.is_some_and(|value| value == allowed_model)
-        {
-            return true;
-        }
-    }
-
-    false
+    let provider_model_name = candidate.permission_provider_model_name.trim();
+    allowed_models.iter().any(|allowed_model| {
+        let allowed_model = allowed_model.trim();
+        !allowed_model.is_empty() && allowed_model == provider_model_name
+    })
 }
 
 fn endpoint_accepts_client_api_format(
@@ -541,9 +514,7 @@ mod tests {
     fn candidate_facts(api_format: &str) -> CandidateTransportPolicyFacts<'_> {
         CandidateTransportPolicyFacts {
             endpoint_api_format: api_format,
-            global_model_name: "gpt-4.1",
-            selected_provider_model_name: "provider-gpt-4.1",
-            mapping_matched_model: Some("gpt-4.1-mini"),
+            permission_provider_model_name: "provider-gpt-4.1",
         }
     }
 
@@ -870,13 +841,12 @@ mod tests {
     #[test]
     fn candidate_common_transport_policy_checks_active_state_format_and_allowed_models() {
         let mut transport = transport_snapshot("custom", "openai:chat", "bearer", true, None);
-        transport.key.allowed_models = Some(vec!["gpt-4.1-mini".to_string()]);
+        transport.key.allowed_models = Some(vec!["provider-gpt-4.1".to_string()]);
 
         assert_eq!(
             candidate_common_transport_skip_reason(
                 &transport,
                 candidate_facts("openai:chat"),
-                Some("gpt-4.1")
             ),
             None
         );
@@ -885,7 +855,6 @@ mod tests {
             candidate_common_transport_skip_reason(
                 &transport,
                 candidate_facts("claude:messages"),
-                Some("gpt-4.1")
             ),
             Some("endpoint_api_format_changed")
         );
@@ -895,30 +864,40 @@ mod tests {
             candidate_common_transport_skip_reason(
                 &transport,
                 candidate_facts("openai:chat"),
-                Some("gpt-4.1")
             ),
             Some("key_model_disabled")
         );
     }
 
     #[test]
-    fn candidate_common_transport_policy_allows_model_directive_base_model() {
+    fn candidate_common_transport_policy_uses_only_pre_mapping_provider_identity() {
         let mut transport = transport_snapshot("custom", "openai:responses", "bearer", true, None);
-        transport.key.allowed_models = Some(vec!["gpt-5.5".to_string()]);
-
-        assert_eq!(
-            candidate_common_transport_skip_reason(
-                &transport,
-                CandidateTransportPolicyFacts {
-                    endpoint_api_format: "openai:responses",
-                    global_model_name: "gpt-5",
-                    selected_provider_model_name: "provider-gpt-5",
-                    mapping_matched_model: None,
-                },
-                Some("gpt-5.5-xhigh"),
+        let candidate = CandidateTransportPolicyFacts {
+            endpoint_api_format: "openai:responses",
+            permission_provider_model_name: "provider-gpt-5",
+        };
+        for (allowed_models, expected) in [
+            (None, None),
+            (Some(vec!["provider-gpt-5".to_string()]), None),
+            (
+                Some(vec!["provider-gpt-5".to_string(), "provider-gpt-5-high".to_string()]),
+                None,
             ),
-            None
-        );
+            (Some(vec!["provider-gpt-5-high".to_string()]), Some("key_model_disabled")),
+            (Some(vec!["gpt-5".to_string()]), Some("key_model_disabled")),
+            (Some(vec!["gpt-5-high".to_string()]), Some("key_model_disabled")),
+            (Some(Vec::new()), Some("key_model_disabled")),
+            (Some(vec![" ".to_string()]), Some("key_model_disabled")),
+            (Some(vec![" provider-gpt-5 ".to_string()]), None),
+        ] {
+            transport.key.allowed_models = allowed_models;
+            assert_eq!(
+                candidate_common_transport_skip_reason(&transport, candidate),
+                expected,
+                "allowed models: {:?}",
+                transport.key.allowed_models,
+            );
+        }
     }
 
     #[test]
@@ -930,7 +909,6 @@ mod tests {
             candidate_common_transport_skip_reason(
                 &transport,
                 candidate_facts("openai:responses"),
-                None,
             ),
             None
         );
@@ -945,7 +923,6 @@ mod tests {
             candidate_common_transport_skip_reason(
                 &transport,
                 candidate_facts("openai:search"),
-                None,
             ),
             None
         );
@@ -953,7 +930,6 @@ mod tests {
             candidate_common_transport_skip_reason(
                 &transport,
                 candidate_facts("openai:responses"),
-                None,
             ),
             Some("endpoint_api_format_changed")
         );

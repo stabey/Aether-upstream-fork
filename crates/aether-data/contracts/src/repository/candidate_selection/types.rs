@@ -73,7 +73,6 @@ pub struct StoredPoolKeyCandidateRowsQuery {
     pub provider_id: String,
     pub endpoint_id: String,
     pub model_id: String,
-    pub selected_provider_model_name: String,
     #[serde(default)]
     pub order: StoredPoolKeyCandidateOrder,
     pub offset: u32,
@@ -86,7 +85,6 @@ pub struct StoredPoolKeyCandidateRowsByKeyIdsQuery {
     pub provider_id: String,
     pub endpoint_id: String,
     pub model_id: String,
-    pub selected_provider_model_name: String,
     pub key_ids: Vec<String>,
 }
 

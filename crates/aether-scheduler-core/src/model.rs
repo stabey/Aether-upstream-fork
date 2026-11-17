@@ -260,57 +260,24 @@ pub fn resolve_provider_model_name_with_model_directives_and_request_operation(
     row: &StoredMinimalCandidateSelectionRow,
     requested_model_name: &str,
     api_format: &str,
-    enable_model_directives: bool,
+    _enable_model_directives: bool,
     request_operation: Option<&str>,
 ) -> Option<(String, Option<String>)> {
-    let selected_provider_model_name =
-        resolve_selected_provider_model_name(row, api_format, request_operation)?;
-    let Some(key_allowed_models) = row.key_allowed_models.as_ref() else {
-        return Some((selected_provider_model_name, None));
-    };
-    if key_allowed_models.is_empty() {
+    // Account permissions apply to the stored provider model, before any routing
+    // mapping or client alias changes the name sent upstream.
+    if row
+        .key_allowed_models
+        .as_ref()
+        .is_some_and(|allowed| !allowed.contains(&row.model_provider_model_name))
+    {
         return None;
     }
-
-    for candidate_name in
-        requested_model_name_candidates(requested_model_name, enable_model_directives)
-    {
-        if key_allowed_models
-            .iter()
-            .any(|value| value == candidate_name.as_ref())
-        {
-            let matched = (candidate_name.as_ref() != requested_model_name)
-                .then(|| candidate_name.into_owned());
-            return Some((selected_provider_model_name, matched));
-        }
-    }
-
-    let mut sorted_allowed_models = key_allowed_models
-        .iter()
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    sorted_allowed_models.sort_unstable();
-
-    for &allowed_model in &sorted_allowed_models {
-        if row_has_candidate_model_name(row, api_format, request_operation, allowed_model) {
-            let allowed_model = allowed_model.to_owned();
-            return Some((selected_provider_model_name.clone(), Some(allowed_model)));
-        }
-    }
-
-    let global_model_mappings = row.global_model_mappings.as_ref()?;
-    for &allowed_model in &sorted_allowed_models {
-        for pattern in global_model_mappings {
-            if matches_model_mapping(pattern, allowed_model) {
-                let allowed_model = allowed_model.to_owned();
-                return Some((allowed_model.clone(), Some(allowed_model)));
-            }
-        }
-    }
-
-    None
+    let selected_provider_model_name =
+        resolve_selected_provider_model_name(row, api_format, request_operation)?;
+    let mapping_matched_model = (row.key_allowed_models.is_some()
+        && row.model_provider_model_name != requested_model_name)
+        .then(|| row.model_provider_model_name.clone());
+    Some((selected_provider_model_name, mapping_matched_model))
 }
 
 pub fn select_provider_model_name(
@@ -550,25 +517,6 @@ pub fn normalize_api_format(value: &str) -> String {
     aether_ai_formats::normalize_api_format_alias(value)
 }
 
-fn row_has_candidate_model_name(
-    row: &StoredMinimalCandidateSelectionRow,
-    api_format: &str,
-    request_operation: Option<&str>,
-    model_name: &str,
-) -> bool {
-    (row_default_provider_model_name_available(row, api_format, request_operation)
-        && row.model_provider_model_name == model_name)
-        || row
-            .model_provider_model_mappings
-            .as_ref()
-            .is_some_and(|mappings| {
-                mappings.iter().any(|mapping| {
-                    mapping_scope_matches(mapping, row, api_format, request_operation)
-                        && mapping.name == model_name
-                })
-            })
-}
-
 fn api_format_matches(left: &str, right: &str) -> bool {
     normalize_api_format(left) == normalize_api_format(right)
 }
@@ -662,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn regex_allowed_model_replaces_selected_provider_model_name() {
+    fn regex_allowed_alias_cannot_authorize_or_replace_selected_provider_model() {
         let mut row = sample_row("gpt-5", "gpt-5-upstream");
         row.key_allowed_models = Some(vec!["gpt-5.4".to_string()]);
         row.global_model_mappings = Some(vec!["gpt-5(?:\\.\\d+)?".to_string()]);
@@ -675,11 +623,84 @@ mod tests {
             thinking_efforts: None,
         }]);
 
-        let resolved = resolve_provider_model_name(&row, "gpt-5", "openai:chat")
-            .expect("regex-matched allowed model should allow the key");
+        assert!(resolve_provider_model_name(&row, "gpt-5", "openai:chat").is_none());
 
-        assert_eq!(resolved.0, "gpt-5.4");
-        assert_eq!(resolved.1.as_deref(), Some("gpt-5.4"));
+        row.key_allowed_models = Some(vec!["gpt-5-upstream".to_string()]);
+        let resolved = resolve_provider_model_name(&row, "gpt-5", "openai:chat")
+            .expect("stored provider model permission should allow the mapped selection");
+        assert_eq!(resolved.0, "gpt-5-canonical-upstream");
+        assert_eq!(resolved.1.as_deref(), Some("gpt-5-upstream"));
+    }
+
+    #[test]
+    fn provider_model_permissions_ignore_mapped_and_requested_names() {
+        let mut row = sample_row("global-alias", "provider-base");
+        row.global_model_mappings = Some(vec!["client-.*".to_string()]);
+        row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: "mapped-upstream".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:chat".to_string()]),
+            endpoint_ids: None,
+            operations: None,
+            thinking_efforts: None,
+        }]);
+
+        for requested in ["global-alias", "mapped-upstream", "client-alias"] {
+            assert!(row_supports_requested_model(&row, requested, "openai:chat"));
+            for allowed in [
+                None,
+                Some(vec!["provider-base".to_string()]),
+                Some(vec!["provider-base".to_string(), "mapped-upstream".to_string()]),
+            ] {
+                row.key_allowed_models = allowed;
+                let resolved = resolve_provider_model_name(&row, requested, "openai:chat")
+                    .expect("unrestricted or base-authorized account should retain routing");
+                assert_eq!(resolved.0, "mapped-upstream");
+            }
+
+            for forbidden in [
+                Vec::new(),
+                vec!["mapped-upstream".to_string()],
+                vec!["global-alias".to_string()],
+                vec!["client-alias".to_string()],
+                vec!["client-other".to_string()],
+                vec!["provider-.*".to_string()],
+                vec!["PROVIDER-BASE".to_string()],
+            ] {
+                row.key_allowed_models = Some(forbidden);
+                assert!(resolve_provider_model_name(&row, requested, "openai:chat").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn provider_model_permission_does_not_bypass_mapping_operation_scope() {
+        let mut row = sample_row("global-alias", "provider-base");
+        row.key_allowed_models = Some(vec!["provider-base".to_string()]);
+        row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+            name: "compact-upstream".to_string(),
+            priority: 1,
+            api_formats: Some(vec!["openai:responses".to_string()]),
+            endpoint_ids: None,
+            operations: Some(vec!["compact".to_string()]),
+            thinking_efforts: None,
+        }]);
+
+        for (operation, expected) in [
+            (None, "provider-base"),
+            (Some("compact"), "compact-upstream"),
+        ] {
+            let resolved =
+                resolve_provider_model_name_with_model_directives_and_request_operation(
+                    &row,
+                    "global-alias",
+                    "openai:responses",
+                    false,
+                    operation,
+                )
+                .expect("base permission should retain operation-scoped routing");
+            assert_eq!(resolved.0, expected);
+        }
     }
 
     #[test]
@@ -882,21 +903,33 @@ mod tests {
     }
 
     #[test]
-    fn model_directive_base_model_satisfies_key_allowed_models() {
+    fn model_directives_do_not_change_provider_model_permissions() {
         let mut row = sample_row("gpt-5.4", "gpt-5.4-upstream");
-        row.key_allowed_models = Some(vec!["gpt-5.4".to_string()]);
+        for allowed_model in ["gpt-5.4", "gpt-5.4-max"] {
+            row.key_allowed_models = Some(vec![allowed_model.to_string()]);
+            for enabled in [false, true] {
+                assert!(resolve_provider_model_name_with_model_directives(
+                    &row,
+                    "gpt-5.4-max",
+                    "openai:chat",
+                    enabled,
+                )
+                .is_none());
+            }
+        }
 
-        assert!(resolve_provider_model_name(&row, "gpt-5.4-max", "openai:chat").is_none());
-        let resolved = resolve_provider_model_name_with_model_directives(
-            &row,
-            "gpt-5.4-max",
-            "openai:chat",
-            true,
-        )
-        .expect("base model should satisfy key allowed models");
-
-        assert_eq!(resolved.0, "gpt-5.4-upstream");
-        assert_eq!(resolved.1.as_deref(), Some("gpt-5.4"));
+        row.key_allowed_models = Some(vec!["gpt-5.4-upstream".to_string()]);
+        for enabled in [false, true] {
+            let resolved = resolve_provider_model_name_with_model_directives(
+                &row,
+                "gpt-5.4-max",
+                "openai:chat",
+                enabled,
+            )
+            .expect("stored provider model permission should allow the key");
+            assert_eq!(resolved.0, "gpt-5.4-upstream");
+            assert_eq!(resolved.1.as_deref(), Some("gpt-5.4-upstream"));
+        }
     }
 
     #[test]
@@ -921,15 +954,18 @@ mod tests {
     }
 
     #[test]
-    fn windsurf_dashed_gpt55_alias_satisfies_key_allowed_models() {
+    fn windsurf_aliases_cannot_grant_provider_model_permissions() {
         let mut row = sample_row("gpt-5.5-low", "windsurf-upstream-uid");
-        row.key_allowed_models = Some(vec!["gpt-5.5-low".to_string()]);
+        for allowed_model in ["gpt-5.5-low", "gpt-5-5-low"] {
+            row.key_allowed_models = Some(vec![allowed_model.to_string()]);
+            assert!(resolve_provider_model_name(&row, "gpt-5-5-low", "openai:chat").is_none());
+        }
 
+        row.key_allowed_models = Some(vec!["windsurf-upstream-uid".to_string()]);
         let resolved = resolve_provider_model_name(&row, "gpt-5-5-low", "openai:chat")
-            .expect("dashed alias should satisfy dotted allowed model");
-
+            .expect("stored provider model permission should allow the alias route");
         assert_eq!(resolved.0, "windsurf-upstream-uid");
-        assert_eq!(resolved.1.as_deref(), Some("gpt-5.5-low"));
+        assert_eq!(resolved.1.as_deref(), Some("windsurf-upstream-uid"));
     }
 
     #[test]

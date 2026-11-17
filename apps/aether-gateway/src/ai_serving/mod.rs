@@ -26,7 +26,7 @@ pub(crate) use self::finalize::internal::{
 };
 pub(crate) use self::planner::openai_responses_reasoning_replay_policy;
 pub(crate) use self::planner::{
-    apply_local_runtime_candidate_terminal_reason, argon_variant_transport_skip_reason,
+    apply_local_runtime_candidate_terminal_reason,
     build_gemini_stream_plan_from_decision, build_gemini_sync_plan_from_decision,
     build_local_gemini_files_stream_attempt_source_for_kind,
     build_local_gemini_files_stream_plan_and_reports_for_kind,

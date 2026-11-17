@@ -77,7 +77,8 @@ fn enumerate_minimal_candidate_selection_inner(
 
         let supports_streaming = row.supports_streaming();
         candidates.push(SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
+            permission_provider_model_name: row.model_provider_model_name,
             provider_id: row.provider_id,
             provider_name: row.provider_name,
             provider_type: row.provider_type,

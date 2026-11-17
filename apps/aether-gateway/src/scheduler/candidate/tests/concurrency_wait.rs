@@ -179,6 +179,13 @@ impl MinimalCandidateSelectionRowSource for CountingState {
     ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
         panic!("the test has no provider pool")
     }
+
+    async fn read_pool_provider_ids(
+        &self,
+        _provider_ids: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, DataLayerError> {
+        panic!("the test has no provider pool")
+    }
 }
 
 #[async_trait]

@@ -447,7 +447,6 @@ where
             self.routing_policy,
             self.client_api_format,
             self.sticky_session_token,
-            self.requested_model,
             self.request_auth_channel,
             &self.build_available_extra_data,
         )
@@ -719,7 +718,6 @@ where
         Some(trace_id),
         persistence_policy.skipped.record_runtime_miss_diagnostic,
         sticky_session_token,
-        requested_model,
         request_auth_channel,
         routing_policy,
         Some(PoolGroupExhaustionPersistenceContext::new(
@@ -749,7 +747,6 @@ fn build_logical_candidate_items<'a>(
     trace_id: Option<&str>,
     record_runtime_miss_diagnostic: bool,
     sticky_session_token: Option<&str>,
-    requested_model: Option<&str>,
     request_auth_channel: Option<&str>,
     routing_policy: Option<&ResolvedRoutingPolicy>,
     pool_exhaustion_persistence: Option<PoolGroupExhaustionPersistenceContext>,
@@ -776,7 +773,6 @@ fn build_logical_candidate_items<'a>(
                     state,
                     candidate,
                     sticky_session_token,
-                    requested_model,
                     request_auth_channel,
                     routing_policy,
                 );
@@ -1057,7 +1053,6 @@ impl<'a> RequestedModelAttemptPageCursor<'a> {
                 Some(&self.trace_id),
                 self.record_runtime_miss_diagnostic,
                 self.sticky_session_token.as_deref(),
-                Some(&self.requested_model),
                 self.request_auth_channel.as_deref(),
                 self.routing_policy.as_ref(),
                 Some(PoolGroupExhaustionPersistenceContext {
@@ -1537,7 +1532,6 @@ async fn materialize_logical_local_execution_candidate_attempts<F>(
     routing_policy: Option<&ResolvedRoutingPolicy>,
     client_api_format: &str,
     sticky_session_token: Option<&str>,
-    requested_model: Option<&str>,
     request_auth_channel: Option<&str>,
     build_extra_data: &F,
 ) -> Vec<LocalExecutionCandidateAttempt>
@@ -1569,7 +1563,6 @@ where
                     state,
                     candidate,
                     sticky_session_token,
-                    requested_model,
                     request_auth_channel,
                     routing_policy,
                 )
@@ -2161,7 +2154,7 @@ mod tests {
 
     fn sample_candidate(key_id: &str) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
             provider_id: "provider-1".to_string(),
             provider_name: "provider-1".to_string(),
             provider_type: "codex".to_string(),
@@ -2178,6 +2171,7 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-5".to_string(),
             selected_provider_model_name: "gpt-5".to_string(),
+            permission_provider_model_name: "gpt-5".to_string(),
             supports_streaming: true,
             mapping_matched_model: None,
         }
@@ -2704,7 +2698,6 @@ mod tests {
             None,
             "openai:chat",
             None,
-            Some("gpt-5"),
             None,
             &|_| None,
         )
@@ -2919,7 +2912,6 @@ mod tests {
             PlannerAppState::new(&app),
             pool_group,
             None,
-            Some("gpt-5"),
             None,
         );
         let pool_key_attempts = dispatch_sequence_from_attempts(
@@ -2974,7 +2966,6 @@ mod tests {
             PlannerAppState::new(&app),
             pool_group,
             None,
-            Some("gpt-5"),
             None,
         );
 
@@ -3042,7 +3033,6 @@ mod tests {
             PlannerAppState::new(&app),
             pool_group,
             None,
-            Some("gpt-5"),
             None,
         );
         let pool_exhaustion_persistence = PoolGroupExhaustionPersistenceContext::new(

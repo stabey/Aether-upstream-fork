@@ -116,7 +116,7 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         &self,
         candidate: &Self::Candidate,
         transport: &Self::Transport,
-        requested_model: Option<&str>,
+        _requested_model: Option<&str>,
     ) -> Option<&'static str> {
         if let Some(skip_reason) =
             routing_policy_candidate_skip_reason(self.routing_policy, candidate, transport)
@@ -126,13 +126,6 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         if provider_transport_uses_pool(transport) {
             return pool_group_common_transport_skip_reason(candidate, transport);
         }
-        if let Some(reason) = super::argon_routing::transport_skip_reason(
-            transport,
-            &candidate.selected_provider_model_name,
-            candidate.requires_exact_model_permission,
-        ) {
-            return Some(reason);
-        }
         if let Some(skip_reason) =
             candidate_auth_channel_skip_reason(transport, self.request_auth_channel)
         {
@@ -141,7 +134,6 @@ impl AiCandidateResolutionPort for GatewayLocalCandidateResolutionPort<'_> {
         candidate_common_transport_skip_reason(
             transport,
             candidate_transport_policy_facts(candidate),
-            requested_model,
         )
     }
 
@@ -430,9 +422,7 @@ fn candidate_transport_policy_facts(
 ) -> CandidateTransportPolicyFacts<'_> {
     CandidateTransportPolicyFacts {
         endpoint_api_format: candidate.endpoint_api_format.as_str(),
-        global_model_name: candidate.global_model_name.as_str(),
-        selected_provider_model_name: candidate.selected_provider_model_name.as_str(),
-        mapping_matched_model: candidate.mapping_matched_model.as_deref(),
+        permission_provider_model_name: candidate.permission_provider_model_name.as_str(),
     }
 }
 
@@ -665,7 +655,7 @@ mod tests {
 
     fn sample_candidate() -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
             provider_id: "provider-1".to_string(),
             provider_name: "provider".to_string(),
             provider_type: "custom".to_string(),
@@ -682,8 +672,46 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "claude-sonnet".to_string(),
             selected_provider_model_name: "claude-sonnet".to_string(),
+            permission_provider_model_name: "claude-sonnet".to_string(),
             supports_streaming: true,
             mapping_matched_model: None,
+        }
+    }
+
+    #[test]
+    fn concrete_transport_gate_uses_pre_mapping_provider_identity() {
+        let mut candidate = sample_candidate();
+        candidate.global_model_name = "client-alias".to_string();
+        candidate.selected_provider_model_name = "claude-sonnet-high".to_string();
+        candidate.mapping_matched_model = Some("mapping-alias".to_string());
+        candidate.enforce_thinking_effort_consistency = true;
+        let mut transport = sample_transport("bearer");
+
+        for (allowed_models, expected) in [
+            (None, None),
+            (Some(vec!["claude-sonnet".to_string()]), None),
+            (
+                Some(vec!["claude-sonnet".to_string(), "claude-sonnet-high".to_string()]),
+                None,
+            ),
+            (
+                Some(vec!["claude-sonnet-high".to_string()]),
+                Some("key_model_disabled"),
+            ),
+            (Some(vec!["client-alias".to_string()]), Some("key_model_disabled")),
+            (Some(vec!["mapping-alias".to_string()]), Some("key_model_disabled")),
+            (Some(Vec::new()), Some("key_model_disabled")),
+        ] {
+            transport.key.allowed_models = allowed_models;
+            assert_eq!(
+                super::candidate_common_transport_skip_reason(
+                    &transport,
+                    super::candidate_transport_policy_facts(&candidate),
+                ),
+                expected,
+                "allowed models: {:?}",
+                transport.key.allowed_models,
+            );
         }
     }
 

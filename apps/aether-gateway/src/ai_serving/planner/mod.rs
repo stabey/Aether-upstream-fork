@@ -30,7 +30,6 @@ mod specialized;
 mod standard;
 mod state;
 
-pub(crate) use self::argon_routing::transport_skip_reason as argon_variant_transport_skip_reason;
 pub(crate) use self::candidate_materialization::LocalExecutionAttemptSource;
 pub(crate) use self::candidate_resolution::{
     candidate_auth_channel_skip_reason, read_candidate_transport_snapshot,

@@ -930,7 +930,6 @@ mod tests {
                 provider_id: "provider-pool".to_string(),
                 endpoint_id: "endpoint-pool".to_string(),
                 model_id: "model-pool".to_string(),
-                selected_provider_model_name: "gpt-5".to_string(),
                 order: StoredPoolKeyCandidateOrder::InternalPriority,
                 offset: 2,
                 limit: 2,

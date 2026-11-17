@@ -831,7 +831,7 @@ async fn data_state_reads_minimal_candidate_selection_with_auth_filters() {
             ),
             StoredMinimalCandidateSelectionRow {
                 key_global_priority_by_format: Some(serde_json::json!({"openai:chat": 4})),
-                key_allowed_models: Some(vec!["gpt-4.1-edge".to_string()]),
+                key_allowed_models: Some(vec!["gpt-4.1-upstream".to_string()]),
                 ..sample_minimal_candidate_selection_row(
                     "provider-1",
                     "OpenAI",
@@ -892,12 +892,47 @@ async fn data_state_reads_minimal_candidate_selection_with_auth_filters() {
     assert_eq!(selection[1].key_id, "key-3");
     assert_eq!(
         selection[1].selected_provider_model_name,
-        "gpt-4.1-edge".to_string()
+        "gpt-4.1-canary".to_string()
     );
     assert_eq!(
-        selection[1].mapping_matched_model,
-        Some("gpt-4.1-edge".to_string())
+        selection[1].mapping_matched_model.as_deref(),
+        Some("gpt-4.1-upstream")
     );
+    assert_eq!(selection[1].permission_provider_model_name, "gpt-4.1-upstream");
+}
+
+#[tokio::test]
+async fn data_state_defers_only_pool_representative_model_permissions() {
+    for pooled in [false, true] {
+        for allowed_models in [vec![], vec!["gpt-4.1-canary".to_string()]] {
+            let mut provider = sample_provider_catalog_provider();
+            if pooled {
+                provider.config = Some(serde_json::json!({"pool_advanced": {}}));
+            }
+            let mut row = sample_minimal_candidate_selection_row(
+                "provider-1", "OpenAI", 10, "representative", "representative", 10,
+            );
+            row.key_allowed_models = Some(allowed_models);
+            let state =
+                GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                    Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                        vec![provider], Vec::new(), Vec::new(),
+                    )),
+                    Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(vec![row])),
+                );
+            let candidates =
+                super::candidate_selection::enumerate_minimal_candidate_selection_with_required_capabilities(
+                    &state, "openai:chat", "gpt-4.1", false, None, None, true,
+                )
+                .await
+                .expect("candidate selection should succeed");
+            assert_eq!(candidates.len(), usize::from(pooled));
+            if let Some(candidate) = candidates.first() {
+                assert_eq!(candidate.permission_provider_model_name, "gpt-4.1-upstream");
+                assert_eq!(candidate.selected_provider_model_name, "gpt-4.1-canary");
+            }
+        }
+    }
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ pub(crate) struct AntigravityV1InternalRequestInput<'a> {
     pub(crate) transport: &'a Arc<GatewayProviderTransportSnapshot>,
     pub(crate) trace_id: &'a str,
     pub(crate) mapped_model: &'a str,
-    pub(crate) requires_exact_model_permission: bool,
+    pub(crate) enforce_thinking_effort_consistency: bool,
     pub(crate) provider_api_format: &'a str,
     pub(crate) auth_header: &'a str,
     pub(crate) auth_value: &'a str,
@@ -55,7 +55,7 @@ pub(crate) async fn build_antigravity_v1internal_provider_request(
     input: AntigravityV1InternalRequestInput<'_>,
 ) -> Result<AntigravityV1InternalRequest, AntigravityV1InternalRequestError> {
     let default_body = input
-        .requires_exact_model_permission
+        .enforce_thinking_effort_consistency
         .then(|| {
             super::argon_routing::with_default_variant_level(
                 input.mapped_model,
@@ -64,7 +64,7 @@ pub(crate) async fn build_antigravity_v1internal_provider_request(
         })
         .flatten();
     let gemini_request_body = default_body.as_ref().unwrap_or(input.gemini_request_body);
-    if input.requires_exact_model_permission
+    if input.enforce_thinking_effort_consistency
         && !super::argon_routing::body_matches_variant(input.mapped_model, gemini_request_body)
     {
         return Err(AntigravityV1InternalRequestError::EnvelopeUnsupported);

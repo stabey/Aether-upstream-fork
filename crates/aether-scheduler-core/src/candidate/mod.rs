@@ -84,7 +84,8 @@ mod tests {
         capabilities: Option<serde_json::Value>,
     ) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
+            permission_provider_model_name: "gpt-5".to_string(),
             provider_id: format!("provider-{id}"),
             provider_name: format!("Provider {id}"),
             provider_type: "openai".to_string(),
@@ -214,6 +215,42 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].provider_id, "provider-1");
         assert_eq!(candidates[0].selected_provider_model_name, "gpt-5-canary-1");
+        assert_eq!(candidates[0].permission_provider_model_name, "gpt-5-upstream-1");
+    }
+
+    #[test]
+    fn enumeration_authorizes_only_the_original_provider_model() {
+        for (allowed_models, expected_count) in [
+            (None, 1),
+            (Some(vec!["gpt-5-upstream-1".to_string()]), 1),
+            (Some(Vec::new()), 0),
+            (Some(vec!["gpt-5-canary-1".to_string()]), 0),
+            (Some(vec!["gpt-5".to_string()]), 0),
+            (Some(vec!["gpt-5.4".to_string()]), 0),
+        ] {
+            let mut row = sample_row("1");
+            row.key_allowed_models = allowed_models;
+            let candidates = super::enumerate_minimal_candidate_selection(
+                EnumerateMinimalCandidateSelectionInput {
+                    rows: vec![row],
+                    normalized_api_format: "openai:chat",
+                    request_operation: None,
+                    requested_model_name: "gpt-5",
+                    resolved_global_model_name: "gpt-5",
+                    require_streaming: false,
+                    required_capabilities: None,
+                    auth_constraints: None,
+                },
+            )
+            .expect("candidate enumeration should build");
+
+            assert_eq!(candidates.len(), expected_count);
+            if let Some(candidate) = candidates.first() {
+                assert_eq!(candidate.permission_provider_model_name, "gpt-5-upstream-1");
+                assert_eq!(candidate.selected_provider_model_name, "gpt-5-canary-1");
+                assert!(!candidate.enforce_thinking_effort_consistency);
+            }
+        }
     }
 
     #[test]

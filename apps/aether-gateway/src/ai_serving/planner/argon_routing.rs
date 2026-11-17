@@ -292,8 +292,8 @@ pub(crate) fn is_argon(model: &str) -> bool {
     )
 }
 
-/// Resolve the configured mapping and its endpoint/operation scope first, but
-/// check credentials against the *new* variant, not the configured default.
+/// Resolve the configured mapping and its endpoint/operation scope independently
+/// of account authorization, which uses the original provider model name.
 pub(crate) fn configured_argon(
     row: &StoredMinimalCandidateSelectionRow,
     requested_model: &str,
@@ -468,10 +468,6 @@ pub(crate) fn resolve_row_thinking_effort_model(
     pick_best(unscoped_matches)
 }
 
-pub(crate) fn has_variant(allowed: Option<&[String]>, model: &str) -> bool {
-    allowed.is_some_and(|models| models.iter().any(|name| name.trim() == model))
-}
-
 pub(crate) fn body_matches_variant(model: &str, body: &Value) -> bool {
     match variant_level(model) {
         Some(expected) => gemini_level(body) == Some(expected),
@@ -491,38 +487,16 @@ pub(crate) fn envelope_matches_level(level: ArgonLevel, envelope: &Value) -> boo
 }
 
 pub(crate) fn select_variant(row: &mut StoredMinimalCandidateSelectionRow, model: &str) {
-    // Scope has already been evaluated for this row. The owned copy is used
-    // only for this request, before permission checks, quota checks and ranking.
-    row.model_provider_model_name = model.to_string();
-    row.model_provider_model_mappings = None;
-    row.global_model_mappings = None;
-}
-
-/// Recheck the concrete variant against the current account snapshot, including
-/// pool/sticky-account expansion. A global-model alias cannot grant a variant.
-pub(crate) fn transport_skip_reason(
-    transport: &crate::ai_serving::GatewayProviderTransportSnapshot,
-    model: &str,
-    requires_exact_model_permission: bool,
-) -> Option<&'static str> {
-    exact_permission_skip_reason(
-        &transport.provider.provider_type,
-        transport.key.allowed_models.as_deref(),
-        model,
-        requires_exact_model_permission,
-    )
-}
-
-fn exact_permission_skip_reason(
-    provider_type: &str,
-    allowed: Option<&[String]>,
-    model: &str,
-    requires_exact_model_permission: bool,
-) -> Option<&'static str> {
-    (requires_exact_model_permission
-        && provider_type.eq_ignore_ascii_case("antigravity")
-        && !has_variant(allowed, model))
-    .then_some("argon_variant_not_allowed")
+    // Scope has already been evaluated for this request. Keep the original
+    // provider model as the permission identity; only the upstream mapping changes.
+    row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
+        name: model.to_string(),
+        priority: 0,
+        api_formats: None,
+        endpoint_ids: None,
+        operations: None,
+        thinking_efforts: None,
+    }]);
 }
 
 #[cfg(test)]
@@ -682,11 +656,6 @@ mod tests {
         assert!(body_matches_variant("gemini-4-argon-low", &body));
         assert!(!body_matches_variant("gemini-4-argon-high", &body));
         assert!(!body_matches_variant("gemini-4-argon-low", &json!({})));
-        assert!(!has_variant(
-            Some(&["gemini-4-argon".to_string()]),
-            "gemini-4-argon-low"
-        ));
-        assert!(!has_variant(None, "gemini-4-argon-low"));
         let envelope = json!({"model":"gemini-4-argon-low", "request":body});
         assert!(envelope_matches_level(ArgonLevel::Low, &envelope));
         assert!(!envelope_matches_level(ArgonLevel::High, &envelope));
@@ -694,44 +663,6 @@ mod tests {
             ArgonLevel::Low,
             &json!({"model":"gemini-4-argon-high", "request":body})
         ));
-    }
-
-    #[test]
-    fn argon_concrete_account_recheck_does_not_borrow_pool_or_alias_permissions() {
-        let high_only = vec![
-            "gemini-4-argon-high".to_string(),
-            "gemini-4-argon".to_string(),
-        ];
-        assert_eq!(
-            exact_permission_skip_reason(
-                "antigravity",
-                Some(&high_only),
-                "gemini-4-argon-low",
-                true
-            ),
-            Some("argon_variant_not_allowed")
-        );
-        assert_eq!(
-            exact_permission_skip_reason(
-                "antigravity",
-                Some(&high_only),
-                "gemini-4-argon-high",
-                true
-            ),
-            None
-        );
-        assert_eq!(
-            exact_permission_skip_reason("antigravity", None, "gemini-4-argon-low", true),
-            Some("argon_variant_not_allowed")
-        );
-        assert_eq!(
-            exact_permission_skip_reason("antigravity", None, "gemini-4-argon-low", false),
-            None
-        );
-        assert_eq!(
-            exact_permission_skip_reason("vertex_ai", None, "gemini-4-argon", false),
-            None
-        );
     }
 
     #[test]
@@ -752,10 +683,7 @@ mod tests {
             key_auth_type: "api_key".to_string(),
             key_is_active: true,
             key_api_formats: Some(vec!["gemini:generate_content".to_string()]),
-            key_allowed_models: Some(vec![
-                "gemini-3.8-flash-low".to_string(),
-                "gemini-3.8-flash-medium".to_string(),
-            ]),
+            key_allowed_models: Some(vec!["gemini-3.8-flash".to_string()]),
             key_capabilities: None,
             key_internal_priority: 1,
             key_global_priority_by_format: None,

@@ -619,7 +619,7 @@ mod reserve_minimum_quota_tests {
     #[test]
     fn reserve_minimum_quota_is_independent_of_skip_exhausted_accounts() {
         let candidate = SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
             provider_id: "provider-codex".to_string(),
             provider_name: "codex".to_string(),
             provider_type: "codex".to_string(),
@@ -636,6 +636,7 @@ mod reserve_minimum_quota_tests {
             global_model_id: "global-model-codex".to_string(),
             global_model_name: "gpt-5".to_string(),
             selected_provider_model_name: "gpt-5".to_string(),
+            permission_provider_model_name: "gpt-5".to_string(),
             supports_streaming: true,
             mapping_matched_model: None,
         };

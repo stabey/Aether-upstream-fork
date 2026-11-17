@@ -57,6 +57,11 @@ pub(crate) trait MinimalCandidateSelectionRowSource {
         query: &StoredPoolKeyCandidateRowsQuery,
     ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError>;
 
+    async fn read_pool_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<BTreeSet<String>, DataLayerError>;
+
     /// Returns the canonical global model name when `model_name` is one, so the
     /// caller can keep provider-side aliases out of a request that names a
     /// global model. Sources without a global model reader answer `None`, which
@@ -347,7 +352,7 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
         return Ok(Vec::new());
     }
 
-    let Some((resolved_global_model_name, rows)) = read_requested_model_rows(
+    let Some((resolved_global_model_name, mut rows)) = read_requested_model_rows(
         state,
         &normalized_api_format,
         requested_model_name,
@@ -357,6 +362,7 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
     else {
         return Ok(Vec::new());
     };
+    defer_pool_representative_model_permissions(state, &mut rows).await?;
     let auth_constraints = auth_snapshot.map(auth_snapshot_constraints);
     enumerate_minimal_candidate_selection_with_model_directives(
         EnumerateMinimalCandidateSelectionInput {
@@ -371,6 +377,32 @@ pub(crate) async fn enumerate_minimal_candidate_selection_with_required_capabili
         },
         enable_model_directives,
     )
+}
+
+async fn defer_pool_representative_model_permissions(
+    state: &(impl MinimalCandidateSelectionRowSource + Sync),
+    rows: &mut [StoredMinimalCandidateSelectionRow],
+) -> Result<(), DataLayerError> {
+    let provider_ids = rows
+        .iter()
+        .filter(|row| row.key_allowed_models.is_some())
+        .map(|row| row.provider_id.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if provider_ids.is_empty() {
+        return Ok(());
+    }
+    let pool_provider_ids = state.read_pool_provider_ids(&provider_ids).await?;
+    for row in rows {
+        if pool_provider_ids.contains(&row.provider_id) {
+            // A pool row represents the group, not an authorized concrete account.
+            // The pool cursor checks each materialized account's current policy.
+            row.key_allowed_models = None;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) async fn read_global_model_names_for_required_capability(
@@ -550,6 +582,13 @@ mod tests {
             _query: &StoredPoolKeyCandidateRowsQuery,
         ) -> Result<Vec<StoredMinimalCandidateSelectionRow>, DataLayerError> {
             Ok(Vec::new())
+        }
+
+        async fn read_pool_provider_ids(
+            &self,
+            _provider_ids: &[String],
+        ) -> Result<std::collections::BTreeSet<String>, DataLayerError> {
+            panic!("the row paging fixture has no provider pools")
         }
     }
 

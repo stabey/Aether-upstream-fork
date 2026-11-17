@@ -66,7 +66,6 @@ pub(crate) async fn apply_local_execution_pool_scheduler(
     state: PlannerAppState<'_>,
     candidates: Vec<EligibleLocalExecutionCandidate>,
     sticky_session_token: Option<&str>,
-    requested_model: Option<&str>,
     request_auth_channel: Option<&str>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
@@ -88,7 +87,6 @@ pub(crate) async fn apply_local_execution_pool_scheduler(
                 state,
                 candidate,
                 sticky_session_token,
-                requested_model,
                 request_auth_channel,
             )
             .await;
@@ -336,7 +334,6 @@ async fn expand_pool_group_candidate(
     state: PlannerAppState<'_>,
     group: EligibleLocalExecutionCandidate,
     sticky_session_token: Option<&str>,
-    requested_model: Option<&str>,
     request_auth_channel: Option<&str>,
 ) -> (
     Vec<EligibleLocalExecutionCandidate>,
@@ -346,7 +343,6 @@ async fn expand_pool_group_candidate(
         state,
         group,
         sticky_session_token,
-        requested_model,
         request_auth_channel,
     );
     let mut scheduled = Vec::new();
@@ -367,7 +363,6 @@ pub(crate) struct PoolKeyCursor<'a> {
     state: PlannerAppState<'a>,
     group: EligibleLocalExecutionCandidate,
     sticky_session_token: Option<String>,
-    requested_model: Option<String>,
     request_auth_channel: Option<String>,
     routing_overlay: Option<RankingOverlay>,
     routing_allowed_key_ids: Option<Vec<String>>,
@@ -412,14 +407,12 @@ impl<'a> PoolKeyCursor<'a> {
         state: PlannerAppState<'a>,
         group: EligibleLocalExecutionCandidate,
         sticky_session_token: Option<&str>,
-        requested_model: Option<&str>,
         request_auth_channel: Option<&str>,
     ) -> Self {
         Self::new_with_routing_policy(
             state,
             group,
             sticky_session_token,
-            requested_model,
             request_auth_channel,
             None,
         )
@@ -429,7 +422,6 @@ impl<'a> PoolKeyCursor<'a> {
         state: PlannerAppState<'a>,
         group: EligibleLocalExecutionCandidate,
         sticky_session_token: Option<&str>,
-        requested_model: Option<&str>,
         request_auth_channel: Option<&str>,
         routing_policy: Option<&ResolvedRoutingPolicy>,
     ) -> Self {
@@ -465,7 +457,6 @@ impl<'a> PoolKeyCursor<'a> {
             state,
             group,
             sticky_session_token: sticky_session_token.map(str::to_string),
-            requested_model: requested_model.map(str::to_string),
             request_auth_channel: request_auth_channel.map(str::to_string),
             routing_overlay,
             routing_allowed_key_ids,
@@ -662,7 +653,6 @@ impl<'a> PoolKeyCursor<'a> {
             provider_id: self.group.candidate.provider_id.clone(),
             endpoint_id: self.group.candidate.endpoint_id.clone(),
             model_id: self.group.candidate.model_id.clone(),
-            selected_provider_model_name: self.group.candidate.selected_provider_model_name.clone(),
             order: self.pool_key_order.clone(),
             offset: self.next_offset,
             limit,
@@ -739,11 +729,6 @@ impl<'a> PoolKeyCursor<'a> {
                     provider_id: self.group.candidate.provider_id.clone(),
                     endpoint_id: self.group.candidate.endpoint_id.clone(),
                     model_id: self.group.candidate.model_id.clone(),
-                    selected_provider_model_name: self
-                        .group
-                        .candidate
-                        .selected_provider_model_name
-                        .clone(),
                     key_ids: key_ids.clone(),
                 };
                 let mut rows = match self
@@ -812,11 +797,6 @@ impl<'a> PoolKeyCursor<'a> {
                     provider_id: self.group.candidate.provider_id.clone(),
                     endpoint_id: self.group.candidate.endpoint_id.clone(),
                     model_id: self.group.candidate.model_id.clone(),
-                    selected_provider_model_name: self
-                        .group
-                        .candidate
-                        .selected_provider_model_name
-                        .clone(),
                     key_ids: page_key_ids,
                 };
                 match self
@@ -935,7 +915,6 @@ impl<'a> PoolKeyCursor<'a> {
             provider_id: self.group.candidate.provider_id.clone(),
             endpoint_id: self.group.candidate.endpoint_id.clone(),
             model_id: self.group.candidate.model_id.clone(),
-            selected_provider_model_name: self.group.candidate.selected_provider_model_name.clone(),
             key_ids,
         };
         let rows_started_at = std::time::Instant::now();
@@ -1358,18 +1337,9 @@ impl<'a> PoolKeyCursor<'a> {
             self.record_skip_reason(skip_reason);
             return None;
         }
-        if let Some(skip_reason) = crate::ai_serving::argon_variant_transport_skip_reason(
-            &transport,
-            &candidate.selected_provider_model_name,
-            candidate.requires_exact_model_permission,
-        ) {
-            self.record_skip_reason(skip_reason);
-            return None;
-        }
         if let Some(skip_reason) = candidate_common_transport_skip_reason(
             &transport,
             pool_candidate_transport_policy_facts(&candidate),
-            self.requested_model.as_deref(),
         ) {
             self.record_skip_reason(skip_reason);
             return None;
@@ -1414,9 +1384,7 @@ fn pool_candidate_transport_policy_facts(
 ) -> CandidateTransportPolicyFacts<'_> {
     CandidateTransportPolicyFacts {
         endpoint_api_format: candidate.endpoint_api_format.as_str(),
-        global_model_name: candidate.global_model_name.as_str(),
-        selected_provider_model_name: candidate.selected_provider_model_name.as_str(),
-        mapping_matched_model: candidate.mapping_matched_model.as_deref(),
+        permission_provider_model_name: candidate.permission_provider_model_name.as_str(),
     }
 }
 
@@ -1425,6 +1393,7 @@ fn pool_candidate_from_row(
     row: StoredMinimalCandidateSelectionRow,
 ) -> aether_scheduler_core::SchedulerMinimalCandidateSelectionCandidate {
     let mut candidate = group.candidate.clone();
+    candidate.permission_provider_model_name = row.model_provider_model_name;
     candidate.key_id = row.key_id;
     candidate.key_name = row.key_name;
     candidate.key_auth_type = row.key_auth_type;
@@ -3355,7 +3324,6 @@ mod tests {
             load_balance_group,
             None,
             None,
-            None,
         );
         assert!(matches!(
             load_balance_cursor.pool_key_order,
@@ -3370,7 +3338,7 @@ mod tests {
             Some(json!({ "pool_advanced": { "lru_enabled": true } })),
         );
         let lru_cursor =
-            PoolKeyCursor::new(PlannerAppState::new(&app), lru_group, None, None, None);
+            PoolKeyCursor::new(PlannerAppState::new(&app), lru_group, None, None);
         assert_eq!(lru_cursor.pool_key_order, StoredPoolKeyCandidateOrder::Lru);
     }
 
@@ -3465,7 +3433,6 @@ mod tests {
             cache_affinity_group,
             None,
             None,
-            None,
             Some(&routing_policy),
         );
         assert!(admin_provider_pool_cache_affinity_enabled(
@@ -3533,7 +3500,7 @@ mod tests {
             10,
             Some(json!({ "pool_advanced": { "lru_enabled": true } })),
         );
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None)
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None)
             .with_runtime_miss_diagnostic(trace_id, true);
         cursor.record_skip_reason("pool_cooldown");
         cursor.record_skip_reason("pool_cooldown");
@@ -3570,7 +3537,7 @@ mod tests {
             provider_config.clone(),
         );
         let mut cursor =
-            PoolKeyCursor::new(PlannerAppState::new(&app), group.clone(), None, None, None);
+            PoolKeyCursor::new(PlannerAppState::new(&app), group.clone(), None, None);
         cursor.queued_candidates = VecDeque::from([
             sample_eligible_candidate(
                 "provider-pool",
@@ -3636,7 +3603,6 @@ mod tests {
         let mut cursor = PoolKeyCursor::new_with_routing_policy(
             PlannerAppState::new(&app),
             group,
-            None,
             None,
             None,
             Some(&routing_policy),
@@ -3727,7 +3693,6 @@ mod tests {
             group,
             None,
             None,
-            None,
             Some(&routing_policy),
         );
 
@@ -3779,7 +3744,6 @@ mod tests {
         let mut cursor = PoolKeyCursor::new_with_routing_policy(
             PlannerAppState::new(&app),
             group,
-            None,
             None,
             None,
             Some(&routing_policy),
@@ -3841,7 +3805,6 @@ mod tests {
             group,
             None,
             None,
-            None,
             Some(&routing_policy),
         );
 
@@ -3864,7 +3827,7 @@ mod tests {
             10,
             provider_config.clone(),
         );
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
         cursor.queued_candidates = VecDeque::from([
             sample_eligible_candidate(
                 "provider-pool",
@@ -3901,7 +3864,7 @@ mod tests {
             provider_config,
         );
         let mut second_cursor =
-            PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+            PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
         second_cursor.queued_candidates = VecDeque::from([
             sample_eligible_candidate(
                 "provider-pool",
@@ -3938,7 +3901,7 @@ mod tests {
             provider_config.clone(),
         );
         let pool_config = pool_config_for_candidate(&group).expect("pool config should parse");
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
         cursor.queued_candidates = VecDeque::from([
             sample_eligible_candidate(
                 "provider-pool",
@@ -4017,7 +3980,7 @@ mod tests {
             provider_config,
         );
 
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
         cursor.window_size = 2;
         cursor.page_size = 2;
         cursor.max_scanned_keys = 4;
@@ -4041,6 +4004,99 @@ mod tests {
         assert!(skipped.iter().all(|candidate| {
             candidate.skip_reason == aether_pool_core::POOL_ACCOUNT_EXHAUSTED_SKIP_REASON
         }));
+    }
+
+    #[tokio::test]
+    async fn pool_key_cursor_checks_each_page_and_sticky_account_provider_model_permission() {
+        for representative_allowed in [false, true] {
+            for sticky_key_id in [None, Some("key-00000"), Some("key-00002")] {
+                let provider_config = Some(json!({
+                    "pool_advanced": {
+                        "skip_exhausted_accounts": false
+                    }
+                }));
+                let policies = [
+                    Some(json!(["gpt-5"])),
+                    Some(json!(["gpt-5", "gpt-5-high"])),
+                    Some(json!(["gpt-5-high"])),
+                    Some(json!(["client-alias", "mapping-alias"])),
+                    None,
+                    Some(json!([])),
+                ];
+                let (provider, endpoint, mut keys, mut rows) =
+                    large_pool_fixture(policies.len(), provider_config.clone());
+                for ((key, row), policy) in keys.iter_mut().zip(&mut rows).zip(policies) {
+                    key.allowed_models = policy;
+                    row.key_allowed_models = key.allowed_models.as_ref().map(|value| {
+                        value.as_array().unwrap().iter()
+                            .map(|model| model.as_str().unwrap().to_string())
+                            .collect()
+                    });
+                    row.global_model_name = "client-alias".to_string();
+                }
+                let data_state =
+                    GatewayDataState::with_provider_catalog_and_minimal_candidate_selection_for_tests(
+                        Arc::new(InMemoryProviderCatalogReadRepository::seed(
+                            vec![provider],
+                            vec![endpoint],
+                            keys,
+                        )),
+                        Arc::new(InMemoryMinimalCandidateSelectionReadRepository::seed(rows)),
+                    )
+                    .with_encryption_key_for_tests(aether_crypto::DEVELOPMENT_ENCRYPTION_KEY);
+                let app = AppState::new()
+                    .expect("state should build")
+                    .with_data_state_for_tests(data_state);
+                let mut group = sample_eligible_candidate(
+                    "provider-pool", "endpoint-1", "pool-group", 10, provider_config,
+                );
+                group.candidate.global_model_name = "client-alias".to_string();
+                group.candidate.selected_provider_model_name = "gpt-5-high".to_string();
+                group.candidate.mapping_matched_model = Some("mapping-alias".to_string());
+                group.candidate.enforce_thinking_effort_consistency = true;
+                Arc::make_mut(&mut group.transport).key.allowed_models = Some(vec![
+                    if representative_allowed { "gpt-5" } else { "gpt-5-high" }.to_string(),
+                ]);
+                let sticky_token = sticky_key_id.map(|_| "permission-session");
+                if let Some(key_id) = sticky_key_id {
+                    let config = pool_config_for_candidate(&group).expect("pool config");
+                    record_admin_provider_pool_success(
+                        app.runtime_state.as_ref(),
+                        "provider-pool",
+                        key_id,
+                        &config,
+                        sticky_token,
+                        0,
+                        None,
+                    )
+                    .await;
+                }
+                let mut cursor = PoolKeyCursor::new(
+                    PlannerAppState::new(&app), group, sticky_token, None,
+                );
+                cursor.window_size = 1;
+                cursor.page_size = 1;
+                let mut returned = BTreeSet::new();
+                while let Some(candidate) = cursor.next_key().await {
+                    assert_eq!(candidate.candidate.permission_provider_model_name, "gpt-5");
+                    assert_eq!(candidate.candidate.selected_provider_model_name, "gpt-5-high");
+                    returned.insert(candidate.candidate.key_id);
+                }
+                assert_eq!(
+                    returned,
+                    BTreeSet::from([
+                        "key-00000".to_string(),
+                        "key-00001".to_string(),
+                        "key-00004".to_string(),
+                    ]),
+                    "representative_allowed={representative_allowed}, sticky={sticky_key_id:?}",
+                );
+                assert_eq!(cursor.skip_reason_counts.get("key_model_disabled"), Some(&3));
+                if sticky_key_id == Some("key-00002") {
+                    assert!(cursor.seen_key_ids.contains("key-00002"));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -4117,7 +4173,6 @@ mod tests {
                         group,
                         sticky_token,
                         None,
-                        None,
                     );
                     cursor.window_size = 1;
                     cursor.page_size = 1;
@@ -4193,7 +4248,7 @@ mod tests {
             provider_config,
         );
 
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
         assert_eq!(
             cursor.max_scanned_keys,
             aether_dispatch_core::DEFAULT_POOL_MAX_SCAN
@@ -4259,7 +4314,7 @@ mod tests {
             provider_config,
         );
 
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
         assert_eq!(
             cursor.max_scanned_keys,
             aether_dispatch_core::DEFAULT_POOL_MAX_SCAN
@@ -4338,7 +4393,7 @@ mod tests {
             provider_config,
         );
 
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
         let candidate = cursor
             .next_key()
             .await
@@ -4395,7 +4450,7 @@ mod tests {
             10,
             provider_config,
         );
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
 
         let candidate = cursor
             .next_key()
@@ -4452,7 +4507,7 @@ mod tests {
             10,
             provider_config,
         );
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
 
         let candidate = cursor
             .next_key()
@@ -4503,7 +4558,7 @@ mod tests {
             10,
             provider_config,
         );
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
 
         let mut returned_key_ids = Vec::new();
         while let Some(candidate) = cursor.next_key().await {
@@ -4556,7 +4611,7 @@ mod tests {
             10,
             provider_config,
         );
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
 
         let mut returned_key_ids = vec![
             cursor
@@ -4660,7 +4715,6 @@ mod tests {
             PlannerAppState::new(&app),
             vec![group_a, group_b],
             None,
-            Some("gpt-5"),
             None,
         )
         .await;
@@ -4760,7 +4814,6 @@ mod tests {
             PlannerAppState::new(&app),
             vec![group_a, group_b],
             None,
-            Some("gpt-5"),
             None,
         )
         .await;
@@ -4866,7 +4919,7 @@ mod tests {
             .await;
         }
 
-        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None, None);
+        let mut cursor = PoolKeyCursor::new(PlannerAppState::new(&app), group, None, None);
         assert_eq!(
             cursor.window_size,
             aether_dispatch_core::DEFAULT_POOL_WINDOW_SIZE
@@ -5484,7 +5537,7 @@ mod tests {
         EligibleLocalExecutionCandidate {
             kind: LocalExecutionCandidateKind::PoolGroup,
             candidate: SchedulerMinimalCandidateSelectionCandidate {
-                requires_exact_model_permission: false,
+                enforce_thinking_effort_consistency: false,
                 provider_id: provider_id.to_string(),
                 provider_name: provider_id.to_string(),
                 provider_type: "codex".to_string(),
@@ -5501,6 +5554,7 @@ mod tests {
                 global_model_id: "global-model-1".to_string(),
                 global_model_name: "gpt-5".to_string(),
                 selected_provider_model_name: "gpt-5".to_string(),
+                permission_provider_model_name: "gpt-5".to_string(),
                 supports_streaming: true,
                 mapping_matched_model: None,
             },
@@ -5603,7 +5657,7 @@ mod tests {
                 LocalExecutionCandidateKind::SingleKey
             },
             candidate: SchedulerMinimalCandidateSelectionCandidate {
-                requires_exact_model_permission: false,
+                enforce_thinking_effort_consistency: false,
                 provider_id: provider_id.to_string(),
                 provider_name: provider_id.to_string(),
                 provider_type: "codex".to_string(),
@@ -5620,6 +5674,7 @@ mod tests {
                 global_model_id: "global-model-1".to_string(),
                 global_model_name: "gpt-5".to_string(),
                 selected_provider_model_name: "gpt-5".to_string(),
+                permission_provider_model_name: "gpt-5".to_string(),
                 supports_streaming: true,
                 mapping_matched_model: None,
             },

@@ -196,6 +196,24 @@ impl MinimalCandidateSelectionRowSource for GatewayDataState {
         self.list_pool_key_candidate_rows_for_group(query).await
     }
 
+    async fn read_pool_provider_ids(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<std::collections::BTreeSet<String>, DataLayerError> {
+        Ok(self
+            .list_provider_catalog_providers_by_ids(provider_ids)
+            .await?
+            .into_iter()
+            .filter(|provider| {
+                crate::handlers::shared::provider_pool::admin_provider_pool_config_from_config_value(
+                    provider.config.as_ref(),
+                )
+                .is_some()
+            })
+            .map(|provider| provider.id)
+            .collect())
+    }
+
     async fn read_reserved_global_model_name(
         &self,
         model_name: &str,

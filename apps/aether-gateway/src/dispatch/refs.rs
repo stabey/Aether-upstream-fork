@@ -130,7 +130,7 @@ mod tests {
         EligibleLocalExecutionCandidate {
             kind,
             candidate: SchedulerMinimalCandidateSelectionCandidate {
-                requires_exact_model_permission: false,
+                enforce_thinking_effort_consistency: false,
                 provider_id: "provider-1".to_string(),
                 provider_name: "Provider 1".to_string(),
                 provider_type: "openai".to_string(),
@@ -147,6 +147,7 @@ mod tests {
                 global_model_id: "global-model-1".to_string(),
                 global_model_name: "gpt-5".to_string(),
                 selected_provider_model_name: "gpt-5".to_string(),
+                permission_provider_model_name: "gpt-5".to_string(),
                 supports_streaming: true,
                 mapping_matched_model: None,
             },

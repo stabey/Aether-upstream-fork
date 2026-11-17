@@ -334,7 +334,7 @@ mod tests {
         key_id: &str,
     ) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
             provider_id: "provider-1".to_string(),
             provider_name: "provider-1".to_string(),
             provider_type: "custom".to_string(),
@@ -351,6 +351,7 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-4.1".to_string(),
             selected_provider_model_name: "gpt-4.1".to_string(),
+            permission_provider_model_name: "gpt-4.1".to_string(),
             supports_streaming: true,
             mapping_matched_model: None,
         }
@@ -660,7 +661,7 @@ mod tests {
         provider_priority: i32,
     ) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
             provider_id: provider_id.to_string(),
             provider_name: provider_id.to_string(),
             provider_type: "custom".to_string(),
@@ -677,6 +678,7 @@ mod tests {
             global_model_id: "global-model-1".to_string(),
             global_model_name: "gpt-4.1".to_string(),
             selected_provider_model_name: "gpt-4.1".to_string(),
+            permission_provider_model_name: "gpt-4.1".to_string(),
             supports_streaming: true,
             mapping_matched_model: None,
         }

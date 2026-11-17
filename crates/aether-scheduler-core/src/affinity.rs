@@ -214,7 +214,8 @@ mod tests {
 
     fn sample_candidate(id: &str) -> SchedulerMinimalCandidateSelectionCandidate {
         SchedulerMinimalCandidateSelectionCandidate {
-            requires_exact_model_permission: false,
+            enforce_thinking_effort_consistency: false,
+            permission_provider_model_name: "gpt-5".to_string(),
             provider_id: format!("provider-{id}"),
             provider_name: format!("Provider {id}"),
             provider_type: "custom".to_string(),
