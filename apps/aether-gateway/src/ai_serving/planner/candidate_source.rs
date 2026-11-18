@@ -43,6 +43,8 @@ use crate::GatewayError;
 pub(crate) enum LocalCandidatePreselectionKeyMode {
     ProviderEndpointKeyModel,
     ProviderEndpointKeyModelAndApiFormat,
+    /// Native passthrough cannot execute a candidate from a different format.
+    ExactClientFormat,
 }
 
 impl LocalCandidatePreselectionKeyMode {
@@ -50,6 +52,7 @@ impl LocalCandidatePreselectionKeyMode {
         match self {
             Self::ProviderEndpointKeyModel => "provider_endpoint_key_model",
             Self::ProviderEndpointKeyModelAndApiFormat => "provider_endpoint_key_model_api_format",
+            Self::ExactClientFormat => "exact_client_format",
         }
     }
 }
@@ -419,11 +422,11 @@ impl<'a> LocalCandidatePreselectionPageCursor<'a> {
         allow_priority_page_cache: bool,
         trace_id: Option<&str>,
     ) -> Self {
-        let candidate_api_formats = request_candidate_api_formats_for_operation(
-            client_api_format,
-            require_streaming,
-            request_operation,
-        );
+        let candidate_api_formats = if key_mode == LocalCandidatePreselectionKeyMode::ExactClientFormat {
+            vec![client_api_format.to_string()]
+        } else {
+            request_candidate_api_formats_for_operation(client_api_format, require_streaming, request_operation)
+        };
         let model_directive_routing_models = resolve_model_directive_routing_models(
             model_directive_policy,
             &candidate_api_formats,
@@ -1582,7 +1585,8 @@ fn local_candidate_preselection_key(
     mode: LocalCandidatePreselectionKeyMode,
 ) -> String {
     match mode {
-        LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel => format!(
+        LocalCandidatePreselectionKeyMode::ExactClientFormat
+        | LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModel => format!(
             "{}:{}:{}:{}:{}",
             candidate.provider_id,
             candidate.endpoint_id,
@@ -3677,7 +3681,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thinking_effort_hydrogen_xhigh_authorizes_only_the_pre_mapping_provider_model() {
+    async fn native_gemini_hydrogen_routes_by_thinking_level_with_base_model_permissions() {
         let mut rows = Vec::new();
         for (id, allowed) in [
             (
@@ -3697,14 +3701,18 @@ mod tests {
             row.model_provider_model_name = "gemini-4-hydrogen".to_string();
             row.key_allowed_models =
                 allowed.map(|models| models.into_iter().map(str::to_string).collect());
-            row.model_provider_model_mappings = Some(vec![StoredProviderModelMapping {
-                name: "gemini-4-hydrogen-xhigh".to_string(),
-                priority: 0,
-                api_formats: Some(vec!["gemini:generate_content".to_string()]),
-                endpoint_ids: None,
-                operations: None,
-                thinking_efforts: Some(vec!["xhigh".to_string()]),
-            }]);
+            row.model_provider_model_mappings = Some(
+                ["high", "low", "medium", "xhigh"]
+                    .map(|level| StoredProviderModelMapping {
+                        name: format!("gemini-4-hydrogen-{level}"),
+                        priority: 1,
+                        api_formats: Some(vec!["gemini:generate_content".to_string()]),
+                        endpoint_ids: None,
+                        operations: None,
+                        thinking_efforts: Some(vec![level.to_string()]),
+                    })
+                    .into(),
+            );
             rows.push(row);
         }
         let catalog = rows
@@ -3730,40 +3738,54 @@ mod tests {
             .with_encryption_key_for_tests(DEVELOPMENT_ENCRYPTION_KEY),
         );
         let auth = unrestricted_auth_snapshot();
-        let policy = crate::system_features::ModelDirectivePolicySnapshot::default();
-        let mut cursor = LocalCandidatePreselectionPageCursor::new(
-            PlannerAppState::new(&app),
-            &policy,
-            "gemini:generate_content",
-            "hydrogen-public",
-            None,
-            true,
-            None,
-            &auth,
-            None,
-            None,
-            None,
-            false,
-            LocalCandidatePreselectionKeyMode::ProviderEndpointKeyModelAndApiFormat,
-            true,
-            None,
-        )
-        .await
-        .with_thinking_effort(Some(
-            super::super::argon_routing::RequestThinkingEffort::Explicit("xhigh".to_string()),
-        ));
-        let mut selected = BTreeSet::new();
-        while let Some(page) = cursor.next_page().await.unwrap() {
-            for candidate in page.candidates {
+        let input = super::super::decision_input::LocalRequestedModelDecisionInput {
+            auth_context: crate::ai_serving::ExecutionRuntimeAuthContext {
+                user_id: auth.user_id.clone(),
+                api_key_id: auth.api_key_id.clone(),
+                username: None,
+                api_key_name: None,
+                balance_remaining: None,
+                access_allowed: true,
+                api_key_is_standalone: false,
+            },
+            auth_snapshot: auth,
+            requested_model: "hydrogen-public".into(),
+            required_capabilities: None,
+            request_auth_channel: None,
+            client_surface: None,
+            gateway_credential_carrier: None,
+            client_session_affinity: None,
+            provider_outbound_context: None,
+            routing_policy: None,
+            routing_trace_seed: None,
+            routing_context: None,
+            model_directive_policy: Default::default(),
+        };
+        for level in ["xhigh", "low", "medium", "high"] {
+            let body = serde_json::json!({
+                "contents": [{"role":"user","parts":[{"text":"hi"}]}],
+                "generationConfig": {"thinkingConfig": {"thinkingLevel": level}}
+            });
+            let spec = crate::ai_serving::LocalSameFormatProviderSpec {
+                api_format: "gemini:generate_content",
+                decision_kind: "gemini_chat_stream",
+                report_kind: "gemini_chat_stream_success",
+                family: crate::ai_serving::LocalSameFormatProviderFamily::Gemini,
+                require_streaming: true,
+                operation: None,
+            };
+            let (mut source, _) = super::super::passthrough::build_local_same_format_provider_candidate_attempt_source(
+                &app, level, &input, &body, spec,
+            ).await.unwrap();
+            let mut selected = BTreeSet::new();
+            while let Some(attempt) = source.next_attempt().await.unwrap() {
+                let candidate = attempt.eligible.candidate;
                 assert_eq!(candidate.permission_provider_model_name, "gemini-4-hydrogen");
-                assert_eq!(candidate.selected_provider_model_name, "gemini-4-hydrogen-xhigh");
+                assert_eq!(candidate.selected_provider_model_name, format!("gemini-4-hydrogen-{level}"));
                 assert!(candidate.enforce_thinking_effort_consistency);
                 selected.insert(candidate.provider_id);
             }
+            assert_eq!(selected, BTreeSet::from(["base-allowed".into(), "unrestricted".into()]));
         }
-        assert_eq!(
-            selected,
-            BTreeSet::from(["base-allowed".to_string(), "unrestricted".to_string()])
-        );
     }
 }

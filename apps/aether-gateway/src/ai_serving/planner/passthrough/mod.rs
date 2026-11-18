@@ -2,6 +2,9 @@
 
 mod provider;
 
+#[cfg(test)]
+pub(super) use provider::build_local_same_format_provider_candidate_attempt_source;
+
 pub(crate) use self::provider::{
     build_local_stream_attempt_source as build_local_same_format_stream_attempt_source,
     build_local_stream_plan_and_reports as build_local_same_format_stream_plan_and_reports,

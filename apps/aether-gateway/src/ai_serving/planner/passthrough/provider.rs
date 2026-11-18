@@ -62,7 +62,6 @@ mod request;
 
 pub(crate) use self::family::{
     build_local_same_format_provider_candidate_attempt_source,
-    materialize_local_same_format_provider_candidate_attempts,
     maybe_build_local_same_format_provider_decision_payload_for_candidate,
     resolve_local_same_format_provider_decision_input, LocalSameFormatProviderCandidateAttempt,
     LocalSameFormatProviderCandidateAttemptSource, LocalSameFormatProviderDecisionInput,

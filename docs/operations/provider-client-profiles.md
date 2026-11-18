@@ -98,6 +98,8 @@ Kiro 复用 OAuth 的 SDK 模板，Grok Web 继续复用既有浏览器画像。
 - 普通映射和 thinking/reasoning effort 映射使用同一规则。例如账号允许
   `gemini-4-hydrogen` 时，`xhigh` 可以映射到 `gemini-4-hydrogen-xhigh`，
   无需再允许该变体；仅允许后者不能授权前者。
+- Gemini 原生同格式请求按 `generationConfig.thinkingConfig.thinkingLevel` 筛选档位映射；
+  多条映射优先级相同不会让 `high` 抢占只匹配 `xhigh` 的请求。
 - 不选择模型时保留现有 `null`（允许全部）语义；显式空数组仍表示不允许任何模型。
 - 账号池代表行不代表实际账号权限。展开账号池、粘性账号选择和最终 transport
   检查都使用具体账号自己的权限与原始提供商模型名，不能借用其他账号的授权。
